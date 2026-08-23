@@ -104,6 +104,14 @@ typedef u32 (*PPCSPRRead)(CPUState* cpu, u16 spr, u32 cia);
 typedef void (*PPCSPRWrite)(CPUState* cpu, u16 spr, u32 value, u32 cia);
 typedef void (*PPCCacheControl)(CPUState* cpu, u8 operation, u32 ea, u32 cia);
 
+// Fixed linked REL data keeps its authentic guest address while the runtime
+// backs it with storage outside the contiguous game heap. The table is owned
+// by GXRuntime rather than CPUState so the generated CPU ABI remains stable.
+bool ppc_guest_alias_add(u32 linked_start, u32 size, const u8* initial_bytes);
+void ppc_guest_alias_clear(void);
+bool ppc_guest_alias_resolve(u32 address, u32 size, u8** pointer,
+                             u32* journal_offset);
+
 enum {
     PPC_CACHE_DCBST,
     PPC_CACHE_DCBF,
@@ -173,6 +181,14 @@ extern void* g_mem_write_journal_user;
 
 static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size, u32* out_offset) {
     u32 masked_addr = addr & ~0x40000000u;
+
+    u8* alias = NULL;
+    u32 alias_offset = 0u;
+    if (ppc_guest_alias_resolve(masked_addr, size, &alias, &alias_offset)) {
+        if (out_offset)
+            *out_offset = alias_offset;
+        return alias;
+    }
     
     // Check MEM2 (EXRAM) first as it is much more common in Wii titles
     if (cpu->exram) {

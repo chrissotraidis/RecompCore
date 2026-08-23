@@ -1027,6 +1027,22 @@ static void test_boot_globals(void) {
     cpu_free(&cpu);
 }
 
+static void test_guest_data_alias(void) {
+    CPUState cpu;
+    assert(cpu_init(&cpu));
+    const u8 initial[4] = {0x12u, 0x34u, 0x56u, 0x78u};
+    const u32 linked = 0x815581A0u;
+    ppc_guest_alias_clear();
+    assert(ppc_guest_alias_add(linked, sizeof(initial), initial));
+    assert(mem_read32(&cpu, linked) == 0x12345678u);
+    assert(mem_read32(&cpu, linked | 0x40000000u) == 0x12345678u);
+    mem_write32(&cpu, linked, 0xAABBCCDDu);
+    assert(mem_read32(&cpu, linked) == 0xAABBCCDDu);
+    assert(read_be32(cpu.ram + (linked - GC_RAM_BASE)) == 0u);
+    ppc_guest_alias_clear();
+    cpu_free(&cpu);
+}
+
 static void test_aram(void) {
     CPUState cpu;
     assert(cpu_init(&cpu));
@@ -2309,6 +2325,7 @@ int main(void) {
     test_loader();
     test_loader_failures();
     test_boot_globals();
+    test_guest_data_alias();
     test_aram();
     test_aram_boundaries();
     test_dvd_fst();

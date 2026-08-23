@@ -14,6 +14,12 @@
 #include <stdatomic.h>
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define GXRUNTIME_EXPORT __attribute__((visibility("default")))
+#else
+#define GXRUNTIME_EXPORT
+#endif
+
 /* --- Chassis lockstep journal (debug-only, NOT part of the CPU ABI) ---------
  * Optional callback fired just before every committed RAM write. The
  * dolphin-chassis differential ("lockstep") harness installs it to snapshot
@@ -27,6 +33,61 @@ void* g_mem_write_journal_user = NULL;
 __attribute__((visibility("default"))) void ppc_set_mem_write_journal(PPCMemWriteJournal fn, void* user) {
     g_mem_write_journal = fn;
     g_mem_write_journal_user = user;
+}
+
+#define PPC_GUEST_ALIAS_MAX 4096u
+
+typedef struct PPCGuestAlias {
+    u32 linked_start;
+    u32 size;
+    u8* storage;
+} PPCGuestAlias;
+
+static PPCGuestAlias g_guest_aliases[PPC_GUEST_ALIAS_MAX];
+static u32 g_guest_alias_count;
+
+GXRUNTIME_EXPORT void ppc_guest_alias_clear(void) {
+    for (u32 i = 0; i < g_guest_alias_count; ++i) {
+        free(g_guest_aliases[i].storage);
+        g_guest_aliases[i].storage = NULL;
+    }
+    g_guest_alias_count = 0u;
+}
+
+GXRUNTIME_EXPORT bool ppc_guest_alias_add(u32 linked_start, u32 size,
+                                          const u8* initial_bytes) {
+    if (size == 0u || g_guest_alias_count >= PPC_GUEST_ALIAS_MAX)
+        return false;
+
+    u8* storage = (u8*)calloc(1u, size);
+    if (storage == NULL)
+        return false;
+    if (initial_bytes != NULL)
+        memcpy(storage, initial_bytes, size);
+
+    PPCGuestAlias* alias = &g_guest_aliases[g_guest_alias_count++];
+    alias->linked_start = linked_start & ~0x40000000u;
+    alias->size = size;
+    alias->storage = storage;
+    return true;
+}
+
+GXRUNTIME_EXPORT bool ppc_guest_alias_resolve(u32 address, u32 size,
+                                              u8** pointer,
+                                              u32* journal_offset) {
+    if (pointer == NULL || size == 0u)
+        return false;
+    for (u32 i = 0; i < g_guest_alias_count; ++i) {
+        const PPCGuestAlias* alias = &g_guest_aliases[i];
+        if (address < alias->linked_start || size > alias->size ||
+            address - alias->linked_start > alias->size - size)
+            continue;
+        *pointer = alias->storage + (address - alias->linked_start);
+        if (journal_offset != NULL)
+            *journal_offset = address - GC_RAM_BASE;
+        return true;
+    }
+    return false;
 }
 
 bool cpu_init(CPUState* cpu) {
