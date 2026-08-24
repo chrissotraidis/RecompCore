@@ -265,6 +265,17 @@ void dvd_read_to_guest(CPUState* cpu, u32 guest_addr, u32 disc_off, u32 length) 
             got = fread(dst, 1, length, g_iso);
         if (got < length)
             memset(dst + got, 0, length - got);  // zero-fill past image end
+        if (g_materialization_trace && guest_addr == 0x814DE360u &&
+            length == 0x52060u) {
+            const u32 target_offset = 0x81512AC0u - guest_addr;
+            const u8* target = dst + target_offset;
+            fprintf(stderr,
+                    "[dvd-materialize-readback] guest=0x81512AC0 "
+                    "word0=%02X%02X%02X%02X d84=%02X%02X%02X%02X got=0x%zX\n",
+                    target[0], target[1], target[2], target[3],
+                    target[0xD84], target[0xD85], target[0xD86], target[0xD87],
+                    got);
+        }
         return;
     }
 

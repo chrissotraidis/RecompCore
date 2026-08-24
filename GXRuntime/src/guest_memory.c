@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gxruntime/guest_memory.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -345,6 +346,20 @@ void dol_guest_memory_copy(DolGuestMemory* memory, CPUState* cpu, u32 dest,
     if (bytes == 0)
         return;
 
+    static bool trace_initialized;
+    static bool trace_overlap;
+    static unsigned trace_reports;
+    if (!trace_initialized) {
+        trace_overlap = getenv("BLUEWAKE_TRACE_GUEST_BULK_OVERLAP") != NULL;
+        trace_initialized = true;
+    }
+    const u32 target_start = 0x81512AC0u;
+    const u32 target_end = target_start + 0x4360u;
+    const u64 dest_end = (u64)dest + bytes;
+    const u64 src_end = (u64)src + bytes;
+    const bool overlaps = (dest < target_end && dest_end > target_start) ||
+                          (src < target_end && src_end > target_start);
+
     u32 dest_available = 0;
     u32 src_available = 0;
     void* dest_ptr =
@@ -353,6 +368,15 @@ void dol_guest_memory_copy(DolGuestMemory* memory, CPUState* cpu, u32 dest,
         dol_guest_memory_pointer(memory, cpu, src, &src_available);
     if (dest_ptr != NULL && src_ptr != NULL &&
         dest_available >= bytes && src_available >= bytes) {
+        if (trace_overlap && overlaps && trace_reports < 64u) {
+            const u8* source = (const u8*)src_ptr;
+            fprintf(stderr,
+                    "[guest-bulk-overlap] dest=0x%08X src=0x%08X bytes=0x%X "
+                    "source=%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                    dest, src, bytes, source[0], source[1], source[2], source[3],
+                    source[4], source[5], source[6], source[7]);
+            trace_reports++;
+        }
         memmove(dest_ptr, src_ptr, bytes);
         return;
     }

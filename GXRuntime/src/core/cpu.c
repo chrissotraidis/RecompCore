@@ -69,6 +69,13 @@ GXRUNTIME_EXPORT bool ppc_guest_alias_add(u32 linked_start, u32 size,
     alias->linked_start = linked_start & ~0x40000000u;
     alias->size = size;
     alias->storage = storage;
+    if (getenv("BLUEWAKE_TRACE_GUEST_ALIASES") != NULL &&
+        alias->linked_start < 0x81516E20u &&
+        (u64)alias->linked_start + alias->size > 0x81512AC0u) {
+        fprintf(stderr,
+                "[guest-alias-target] start=0x%08X size=0x%08X storage=%p\n",
+                alias->linked_start, alias->size, (void*)alias->storage);
+    }
     return true;
 }
 
