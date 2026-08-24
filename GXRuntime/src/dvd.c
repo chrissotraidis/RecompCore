@@ -23,6 +23,8 @@ static u32   g_fst_size;
 static u32   g_num_entries;  // total entries; equals root entry's "next" field
 static const char* g_strings;  // string table, inside g_fst
 static bool  g_ready;
+static bool  g_materialization_trace;
+static unsigned g_materialization_reports;
 
 static u32 be32(const u8* p) {
     return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
@@ -108,8 +110,11 @@ static bool load_from(const char* path) {
 bool dvd_open_image(const char* path) {
     if (g_ready)
         return true;
-    if (path != NULL && path[0] != '\0' && load_from(path))
+    if (path != NULL && path[0] != '\0' && load_from(path)) {
+        g_materialization_trace = getenv("BLUEWAKE_TRACE_DVD_MATERIALIZATION") != NULL;
+        g_materialization_reports = 0u;
         return true;
+    }
     fprintf(stderr, "[dvd] no readable GameCube disc image at '%s'\n",
             path != NULL ? path : "(null)");
     return false;
@@ -123,6 +128,8 @@ void dvd_close_image(void) {
     g_fst = NULL;
     g_strings = NULL;
     g_ready = false;
+    g_materialization_trace = false;
+    g_materialization_reports = 0u;
 }
 
 bool dvd_image_ready(void) {
@@ -208,6 +215,39 @@ bool dvd_entry_info(s32 entrynum, u32* start, u32* length) {
 void dvd_read_to_guest(CPUState* cpu, u32 guest_addr, u32 disc_off, u32 length) {
     if (!g_ready || length == 0)
         return;
+
+    // MEM1 reads use the authentic bulk-DMA fast path below, which bypasses
+    // mem_write8 and its journal. Observe only the file-select resource range
+    // so source ownership is visible without changing emulation behavior.
+    const u32 target_start = 0x81512AC0u;
+    const u32 target_end = target_start + 0x4360u;
+    const u64 read_end = (u64)guest_addr + length;
+    if (g_materialization_trace && g_materialization_reports < 64u &&
+        guest_addr < target_end && read_end > target_start) {
+        const char* name = "<unknown>";
+        u32 entry = 0xFFFFFFFFu;
+        for (u32 i = 1u; i < g_num_entries; ++i) {
+            if (entry_is_dir(i) || entry_filepos(i) != disc_off)
+                continue;
+            name = g_strings + entry_stroff(i);
+            entry = i;
+            break;
+        }
+        u8 prefix[16] = {0};
+        const u32 prefix_length = length < sizeof(prefix) ? length : sizeof(prefix);
+        if (fseeko(g_iso, (off_t)disc_off, SEEK_SET) == 0)
+            (void)fread(prefix, 1, prefix_length, g_iso);
+        fprintf(stderr,
+                "[dvd-materialize] guest=0x%08X length=0x%X disc=0x%08X "
+                "entry=%u name=\"%s\" prefix=%02X%02X%02X%02X%02X%02X%02X%02X"
+                "%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                guest_addr, length, disc_off, entry, name,
+                prefix[0], prefix[1], prefix[2], prefix[3],
+                prefix[4], prefix[5], prefix[6], prefix[7],
+                prefix[8], prefix[9], prefix[10], prefix[11],
+                prefix[12], prefix[13], prefix[14], prefix[15]);
+        g_materialization_reports++;
+    }
 
     // Fast path: the destination lives entirely in cached or uncached MEM1, so
     // copy disc bytes straight into the flat guest RAM (both are big-endian raw
