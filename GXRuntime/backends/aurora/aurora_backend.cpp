@@ -43,6 +43,7 @@ bool g_shadow_frontend_failed = false;
 gxruntime::gxcore::GxCoreSink g_core_sink;
 unsigned long long g_core_submitted = 0;
 unsigned long long g_core_rejected = 0;
+bool g_display_copy_pending = false;
 
 unsigned long long g_shadow_last_draw_total = 0;
 unsigned long long g_shadow_last_vertex_total = 0;
@@ -230,6 +231,7 @@ bool dol_aurora_initialize(int argc, char** argv,
     gx_aurora::g_force_untextured = backend_config->force_untextured;
     gx_aurora::g_frame_pacing_log = std::getenv("DOL_FRAME_PACING_LOG") != nullptr;
 #if GXRUNTIME_HAS_AURORA_RECOMP
+    gx_aurora::g_display_copy_pending = false;
     gx_aurora::g_shadow_light_log_enabled =
         std::getenv("DOL_AURORA_RECOMP_DRAW_LIGHT_LOG") != nullptr;
     gx_aurora::g_shadow_light_log_lit_only =

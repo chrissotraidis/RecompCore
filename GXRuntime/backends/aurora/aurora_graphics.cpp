@@ -38,6 +38,8 @@ void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
 
 void core_copy_observer(const gxruntime::gxcore::EfbCopyCommand& cmd, void*) {
     aurora::gfx::gxcore::copy_efb_to_texture(cmd);
+    if (cmd.format == 0xFu)
+        g_display_copy_pending = true;
 }
 #endif
 
@@ -866,6 +868,11 @@ void aurora_backend_gx_write(u64 value, u8 size) {
     if (gx_aurora::trace_should_record())
         gx_aurora::g_trace_writer.gx_write(size, value);
     if (gx_aurora::g_gx_core_enabled)
+        if (gx_aurora::g_display_copy_pending) {
+            gx_aurora::g_display_copy_pending = false;
+            aurora_backend_present();
+        }
+    if (gx_aurora::g_gx_core_enabled)
         return;
 #endif
 
@@ -874,6 +881,7 @@ void aurora_backend_gx_write(u64 value, u8 size) {
     static bool s_cull_all_active = false;
     static u8 s_last_opcode = 0;
 
+    bool display_copy = false;
     switch (size) {
     case 1: {
         const u8 command = static_cast<u8>(value);
@@ -904,6 +912,7 @@ void aurora_backend_gx_write(u64 value, u8 size) {
 
         if (s_last_opcode == 0x61) {
             u8 regId = (val32 >> 24) & 0xFF;
+            display_copy = regId == 0x52u && (val32 & (1u << 14)) != 0;
 
             if (regId == 0x40) {
                 s_last_zmode = val32;
@@ -952,6 +961,8 @@ void aurora_backend_gx_write(u64 value, u8 size) {
     case 8: GXCmd1u64(value); break;
     default: break;
     }
+    if (display_copy)
+        aurora_backend_present();
 }
 
 void aurora_backend_set_array(u32 attr, const void* data, u32 size, u8 stride) {

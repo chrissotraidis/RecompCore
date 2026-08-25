@@ -83,6 +83,7 @@ extern bool g_shadow_frontend_failed;
 extern gxruntime::gxcore::GxCoreSink g_core_sink;
 extern unsigned long long g_core_submitted;
 extern unsigned long long g_core_rejected;
+extern bool g_display_copy_pending;
 
 
 
