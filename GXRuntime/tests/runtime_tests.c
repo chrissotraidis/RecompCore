@@ -6,6 +6,7 @@
 #include "gxruntime/aram.h"
 #include "gxruntime/audio_adpcm.h"
 #include "gxruntime/audio_dma.h"
+#include "gxruntime/audio_voice.h"
 #include "gxruntime/boot.h"
 #include "gxruntime/dvd.h"
 #include "gxruntime/di.h"
@@ -1964,6 +1965,29 @@ static void test_audio_adpcm_decoder(void) {
     assert(dol_dsp_adpcm_decode(encoded, 7u, 14u, &info, decoded) == 0u);
 }
 
+static void test_audio_voice_mixer(void) {
+    const s16 samples[] = {1000, -1000};
+    s16 output[6] = {0};
+    DolAudioVoiceMixer mixer;
+    dol_audio_voice_init(&mixer);
+    const s32 voice = dol_audio_voice_start(&mixer, samples, 2u, 16384u, 0);
+    assert(voice == 0);
+    assert(dol_audio_voice_mix(&mixer, output, 3u) == 3u);
+    assert(output[0] == 500 && output[1] == 500);
+    assert(output[2] == -500 && output[3] == -500);
+    assert(!mixer.voices[voice].active);
+    assert(output[4] == 0 && output[5] == 0);
+
+    dol_audio_voice_init(&mixer);
+    assert(dol_audio_voice_start(&mixer, samples, 2u, 32767u, 16384) == 0);
+    memset(output, 0, sizeof output);
+    dol_audio_voice_mix(&mixer, output, 1u);
+    assert(output[0] > 490 && output[0] < 510);
+    assert(output[1] > 1490 && output[1] < 1510);
+    assert(dol_audio_voice_stop(&mixer, 0));
+    assert(!dol_audio_voice_stop(&mixer, 0));
+}
+
 static void test_audio_device(void) {
     const DolPlatformOps ops = {
         .audio_set_sample_rate = test_audio_set_sample_rate,
@@ -2422,6 +2446,7 @@ int main(void) {
     test_audio_dma();
     test_audio_dma_pcm_boundary();
     test_audio_adpcm_decoder();
+    test_audio_voice_mixer();
     test_audio_device();
     test_headless_backend();
     test_memory_card();
