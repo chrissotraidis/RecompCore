@@ -6,6 +6,7 @@
 #include "gxruntime/aram.h"
 #include "gxruntime/audio_adpcm.h"
 #include "gxruntime/audio_dma.h"
+#include "gxruntime/audio_event.h"
 #include "gxruntime/audio_voice.h"
 #include "gxruntime/boot.h"
 #include "gxruntime/dvd.h"
@@ -1988,6 +1989,23 @@ static void test_audio_voice_mixer(void) {
     assert(!dol_audio_voice_stop(&mixer, 0));
 }
 
+static void test_audio_event_adapter(void) {
+    const s16 samples[] = {1200, -1200};
+    s16 output[4] = {0};
+    DolAudioEventAdapter adapter;
+    dol_audio_event_init(&adapter);
+    assert(dol_audio_event_register(&adapter, 0x1234u, samples, 2u));
+    assert(!dol_audio_event_register(&adapter, 0x1234u, samples, 2u));
+    assert(dol_audio_event_start(&adapter, 0x9999u, 32767u, 0) == -1);
+    const s32 voice = dol_audio_event_start(&adapter, 0x1234u, 32767u, 0);
+    assert(voice == 0);
+    assert(dol_audio_event_mix(&adapter, output, 2u) == 2u);
+    assert(output[0] == 1200 && output[1] == 1200);
+    assert(output[2] == -1200 && output[3] == -1200);
+    assert(!adapter.mixer.voices[voice].active);
+    assert(!dol_audio_event_stop(&adapter, voice));
+}
+
 static void test_audio_device(void) {
     const DolPlatformOps ops = {
         .audio_set_sample_rate = test_audio_set_sample_rate,
@@ -2447,6 +2465,7 @@ int main(void) {
     test_audio_dma_pcm_boundary();
     test_audio_adpcm_decoder();
     test_audio_voice_mixer();
+    test_audio_event_adapter();
     test_audio_device();
     test_headless_backend();
     test_memory_card();

@@ -71,6 +71,8 @@ u32 dol_audio_voice_mix(DolAudioVoiceMixer* mixer, s16* output,
                               (sample * right_gain) / 32767;
             output[output_index] = clamp_s16(left);
             output[output_index + 1u] = clamp_s16(right);
+            if (voice->position >= voice->sample_count)
+                voice->active = false;
         }
     }
     return frame_count;

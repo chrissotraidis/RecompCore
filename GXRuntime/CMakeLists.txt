@@ -30,6 +30,7 @@ add_library(gxruntime STATIC
     src/audio_dma.c
     src/audio_adpcm.c
     src/audio_voice.c
+    src/audio_event.c
     src/vi_clock.c
     src/memory_card.c
     src/headless_backend.c
