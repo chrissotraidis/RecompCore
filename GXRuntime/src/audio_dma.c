@@ -169,6 +169,26 @@ bool dol_audio_dma_poll(DolAudioDma* dma, u32* source_address) {
     return true;
 }
 
+bool dol_audio_dma_consume_pcm16_stereo(DolAudioDma* dma,
+                                        DolAudioDmaReadFn read_source,
+                                        void* user) {
+    u32 source_address = 0;
+    u8 bytes[DOL_AUDIO_DMA_FRAMES_PER_CHUNK * 4u];
+    s16 samples[DOL_AUDIO_DMA_FRAMES_PER_CHUNK * 2u];
+
+    if (read_source == NULL ||
+        !dol_audio_dma_poll(dma, &source_address) ||
+        !read_source(user, source_address, bytes, sizeof bytes))
+        return false;
+
+    for (u32 i = 0; i < DOL_AUDIO_DMA_FRAMES_PER_CHUNK * 2u; i++) {
+        const u32 offset = i * 2u;
+        samples[i] = (s16)(((u16)bytes[offset] << 8) | bytes[offset + 1u]);
+    }
+    dol_platform_audio_push(samples, DOL_AUDIO_DMA_FRAMES_PER_CHUNK);
+    return true;
+}
+
 static u32 latched_dma_source(const DolAudioDma* dma) {
     // Dolphin AUDIO_DMA_START_HI/LO form a 32-bit source address; the top 10
     // bits of the high half and the low 11 bits (aligned to 32 bytes) are

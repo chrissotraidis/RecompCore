@@ -66,6 +66,8 @@ _Static_assert(sizeof(((CPUState*)0)->gqr) / sizeof(((CPUState*)0)->gqr[0]) == 8
 
 static unsigned g_gx_writes;
 static unsigned g_audio_frames;
+static s16 g_captured_audio[16];
+static u32 g_captured_audio_frames;
 static u32 g_platform_sample_rate;
 static unsigned g_platform_rate_calls;
 static unsigned g_guest_resolver_sets;
@@ -139,6 +141,22 @@ static void test_gx_write(u64 value, u8 size) {
 static void test_audio_push(const s16* samples, u32 frames) {
     assert(samples != NULL);
     g_audio_frames += frames;
+}
+
+static void test_audio_push_capture(const s16* samples, u32 frames) {
+    assert(samples != NULL);
+    assert(frames == 8u);
+    memcpy(g_captured_audio, samples, frames * 2u * sizeof(samples[0]));
+    g_captured_audio_frames = frames;
+}
+
+static bool test_audio_read(void* user, u32 source_address, u8* data,
+                            u32 size) {
+    const u8* source = (const u8*)user;
+    assert(source_address == 0x00100000u);
+    assert(size == 32u);
+    memcpy(data, source, size);
+    return true;
 }
 
 static void test_audio_set_sample_rate(u32 sample_rate) {
@@ -1883,6 +1901,42 @@ static void test_audio_dma(void) {
     assert(!dol_audio_dma_poll(&dma, NULL));
 }
 
+static void test_audio_dma_pcm_boundary(void) {
+    const DolPlatformOps ops = {
+        .audio_push = test_audio_push_capture,
+    };
+    const u8 pcm_chunk[32] = {
+        0x80, 0x00, 0x7F, 0xFF, 0x00, 0x01, 0xFF, 0xFF,
+        0x12, 0x34, 0xAB, 0xCD, 0x01, 0x02, 0xFE, 0xFD,
+        0x20, 0x00, 0xE0, 0x00, 0x30, 0x00, 0xD0, 0x00,
+        0x40, 0x00, 0xC0, 0x00, 0x50, 0x00, 0xB0, 0x00,
+    };
+    DolAudioDma dma;
+
+    dol_platform_install(&ops);
+    memset(g_captured_audio, 0, sizeof g_captured_audio);
+    g_captured_audio_frames = 0;
+    dol_audio_dma_init(&dma);
+    dol_audio_dma_set_work_rate(&dma, 4000000u);
+    dol_audio_dma_set_source(&dma, 0x00100000u);
+    dol_audio_dma_write_control(&dma, DOL_AUDIO_DMA_ENABLE | 1u);
+    dol_audio_dma_ack_interrupt(&dma);
+
+    for (u32 i = 0; i < 999u; i++)
+        assert(!dol_audio_dma_consume_pcm16_stereo(&dma, test_audio_read,
+                                                   (void*)pcm_chunk));
+    assert(dol_audio_dma_consume_pcm16_stereo(&dma, test_audio_read,
+                                              (void*)pcm_chunk));
+    assert(g_captured_audio_frames == 8u);
+    assert(g_captured_audio[0] == (s16)0x8000);
+    assert(g_captured_audio[1] == (s16)0x7FFF);
+    assert(g_captured_audio[2] == 1);
+    assert(g_captured_audio[3] == -1);
+    assert(g_captured_audio[4] == (s16)0x1234);
+    assert(g_captured_audio[5] == (s16)0xABCD);
+    dol_platform_reset();
+}
+
 static void test_audio_device(void) {
     const DolPlatformOps ops = {
         .audio_set_sample_rate = test_audio_set_sample_rate,
@@ -2339,6 +2393,7 @@ int main(void) {
     test_exi_device();
     test_di_device();
     test_audio_dma();
+    test_audio_dma_pcm_boundary();
     test_audio_device();
     test_headless_backend();
     test_memory_card();

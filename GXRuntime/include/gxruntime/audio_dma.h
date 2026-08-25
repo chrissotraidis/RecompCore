@@ -56,6 +56,13 @@ typedef struct DolAudioDma {
     u8 dsp_regs[DOL_AUDIO_DMA_DSP_REG_BYTES];
 } DolAudioDma;
 
+// Reads one hardware audio-DMA source chunk. The source is intentionally
+// supplied by the caller so the runtime can use ARAM, a test fixture, or a
+// future DSP-owned PCM store without baking storage ownership into this
+// device primitive.
+typedef bool (*DolAudioDmaReadFn)(void* user, u32 source_address, u8* data,
+                                  u32 size);
+
 void dol_audio_dma_init(DolAudioDma* dma);
 void dol_audio_dma_set_work_rate(DolAudioDma* dma, u64 work_units_per_second);
 void dol_audio_dma_set_vi_clock(DolAudioDma* dma, u64 work_units_per_frame,
@@ -75,6 +82,13 @@ bool dol_audio_dma_interrupt_pending(const DolAudioDma* dma);
 // when DolRecomp exposes it. Returns each 32-byte source chunk at the
 // hardware's AID consumption cadence.
 bool dol_audio_dma_poll(DolAudioDma* dma, u32* source_address);
+
+// Consume one timed 32-byte big-endian stereo PCM16 chunk and send its eight
+// frames to the installed platform audio sink. Returns false until the DMA
+// cadence is ready or when the source callback fails.
+bool dol_audio_dma_consume_pcm16_stereo(DolAudioDma* dma,
+                                        DolAudioDmaReadFn read_source,
+                                        void* user);
 
 // AI/DSP-AID device register MMIO. The game writes the AI control register to
 // select the AID sample rate; DSP control carries the AID interrupt status/mask
