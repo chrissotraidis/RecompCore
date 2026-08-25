@@ -36,6 +36,19 @@ void aurora_backend_audio_push(const s16* samples, u32 frames) {
     const int max_queued_bytes = bytes_per_second * gx_aurora::g_audio_max_queue_ms / 1000;
     const int bytes = static_cast<int>(frames * 2u * sizeof(s16));
     gx_aurora::g_audio_push_count++;
+    u32 nonzero_samples = 0;
+    s32 peak_sample = 0;
+    u32 sample_hash = 2166136261u;
+    for (u32 i = 0; i < frames * 2u; i++) {
+        const s32 sample = samples[i];
+        if (sample != 0)
+            nonzero_samples++;
+        const s32 magnitude = sample < 0 ? -sample : sample;
+        if (magnitude > peak_sample)
+            peak_sample = magnitude;
+        sample_hash ^= static_cast<u16>(sample);
+        sample_hash *= 16777619u;
+    }
 
     int queued = SDL_GetAudioStreamQueued(gx_aurora::g_audio_stream);
     unsigned waited_ms = 0;
@@ -63,15 +76,25 @@ void aurora_backend_audio_push(const s16* samples, u32 frames) {
             gx_aurora::g_audio_low_log_push = gx_aurora::g_audio_push_count;
         std::fprintf(stderr,
                      "[audio-queue] push=%llu queued_before=%d queued_after=%d "
-                     "playing=%u throttles=%llu\n",
+                     "playing=%u nonzero=%u peak=%d hash=0x%08X throttles=%llu\n",
                      gx_aurora::g_audio_push_count, queued, queued + bytes,
-                     gx_aurora::g_audio_playing ? 1u : 0u, gx_aurora::g_audio_throttle_count);
+                     gx_aurora::g_audio_playing ? 1u : 0u, nonzero_samples, peak_sample,
+                     sample_hash, gx_aurora::g_audio_throttle_count);
     }
     if (!SDL_PutAudioStreamData(gx_aurora::g_audio_stream, samples, bytes))
         std::fprintf(stderr, "[audio] failed to queue samples: %s\n", SDL_GetError());
     else if (!gx_aurora::g_audio_playing && queued + bytes >= prebuffer_bytes) {
         if (SDL_ResumeAudioStreamDevice(gx_aurora::g_audio_stream))
+        {
             gx_aurora::g_audio_playing = true;
+            if (gx_aurora::g_audio_queue_log)
+                std::fprintf(stderr,
+                             "[audio-queue] playback-start push=%llu "
+                             "queued_before=%d queued_after=%d prebuffer=%d "
+                             "nonzero=%u peak=%d hash=0x%08X\n",
+                             gx_aurora::g_audio_push_count, queued, queued + bytes,
+                             prebuffer_bytes, nonzero_samples, peak_sample, sample_hash);
+        }
         else
             std::fprintf(stderr, "[audio] failed to start playback: %s\n", SDL_GetError());
     }
