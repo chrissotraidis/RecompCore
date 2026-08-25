@@ -148,12 +148,14 @@ bool dol_audio_dma_interrupt_pending(const DolAudioDma* dma) {
     return dma != NULL && dma->interrupt_pending;
 }
 
-bool dol_audio_dma_poll(DolAudioDma* dma, u32* source_address) {
+bool dol_audio_dma_advance(DolAudioDma* dma, u64 work_units,
+                           u32* source_address) {
     if (dma == NULL || (dma->control & DOL_AUDIO_DMA_ENABLE) == 0)
         return false;
-    if (++dma->work_counter < dma->work_units_per_chunk)
+    dma->work_counter += work_units;
+    if (dma->work_counter < dma->work_units_per_chunk)
         return false;
-    dma->work_counter = 0;
+    dma->work_counter -= dma->work_units_per_chunk;
 
     if (source_address != NULL)
         *source_address = dma->current_source_address;
@@ -169,15 +171,20 @@ bool dol_audio_dma_poll(DolAudioDma* dma, u32* source_address) {
     return true;
 }
 
-bool dol_audio_dma_consume_pcm16_stereo(DolAudioDma* dma,
-                                        DolAudioDmaReadFn read_source,
-                                        void* user) {
+bool dol_audio_dma_poll(DolAudioDma* dma, u32* source_address) {
+    return dol_audio_dma_advance(dma, 1u, source_address);
+}
+
+bool dol_audio_dma_consume_pcm16_stereo_work(DolAudioDma* dma,
+                                             u64 work_units,
+                                             DolAudioDmaReadFn read_source,
+                                             void* user) {
     u32 source_address = 0;
     u8 bytes[DOL_AUDIO_DMA_FRAMES_PER_CHUNK * 4u];
     s16 samples[DOL_AUDIO_DMA_FRAMES_PER_CHUNK * 2u];
 
     if (read_source == NULL ||
-        !dol_audio_dma_poll(dma, &source_address) ||
+        !dol_audio_dma_advance(dma, work_units, &source_address) ||
         !read_source(user, source_address, bytes, sizeof bytes))
         return false;
 
@@ -187,6 +194,13 @@ bool dol_audio_dma_consume_pcm16_stereo(DolAudioDma* dma,
     }
     dol_platform_audio_push(samples, DOL_AUDIO_DMA_FRAMES_PER_CHUNK);
     return true;
+}
+
+bool dol_audio_dma_consume_pcm16_stereo(DolAudioDma* dma,
+                                        DolAudioDmaReadFn read_source,
+                                        void* user) {
+    return dol_audio_dma_consume_pcm16_stereo_work(dma, 1u, read_source,
+                                                   user);
 }
 
 static u32 latched_dma_source(const DolAudioDma* dma) {

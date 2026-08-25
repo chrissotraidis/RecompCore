@@ -1890,10 +1890,18 @@ static void test_audio_dma(void) {
     dol_audio_dma_ack_interrupt(&dma);
     assert(dol_audio_dma_blocks_left(&dma) == 19u);
 
-    for (u32 block = 0; block < 20u; block++) {
+    // Variable guest-cycle charges accumulate without losing the remainder.
+    u32 source = 0;
+    assert(!dol_audio_dma_advance(&dma, 5249u, &source));
+    assert(dol_audio_dma_advance(&dma, 1u, &source));
+    assert(source == 0x00100000u);
+    assert(!dol_audio_dma_advance(&dma, 5000u, &source));
+    assert(dol_audio_dma_advance(&dma, 250u, &source));
+    assert(source == 0x00100020u);
+
+    for (u32 block = 2u; block < 20u; block++) {
         for (u32 work = 1; work < 5250u; work++)
             assert(!dol_audio_dma_poll(&dma, NULL));
-        u32 source = 0;
         assert(dol_audio_dma_poll(&dma, &source));
         assert(source == 0x00100000u + block * 32u);
     }
@@ -1925,11 +1933,10 @@ static void test_audio_dma_pcm_boundary(void) {
     dol_audio_dma_write_control(&dma, DOL_AUDIO_DMA_ENABLE | 1u);
     dol_audio_dma_ack_interrupt(&dma);
 
-    for (u32 i = 0; i < 999u; i++)
-        assert(!dol_audio_dma_consume_pcm16_stereo(&dma, test_audio_read,
-                                                   (void*)pcm_chunk));
-    assert(dol_audio_dma_consume_pcm16_stereo(&dma, test_audio_read,
-                                              (void*)pcm_chunk));
+    assert(!dol_audio_dma_consume_pcm16_stereo_work(
+        &dma, 999u, test_audio_read, (void*)pcm_chunk));
+    assert(dol_audio_dma_consume_pcm16_stereo_work(
+        &dma, 1u, test_audio_read, (void*)pcm_chunk));
     assert(g_captured_audio_frames == 8u);
     assert(g_captured_audio[0] == (s16)0x8000);
     assert(g_captured_audio[1] == (s16)0x7FFF);

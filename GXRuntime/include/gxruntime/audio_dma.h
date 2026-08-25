@@ -76,12 +76,16 @@ u16 dol_audio_dma_blocks_left(const DolAudioDma* dma);
 void dol_audio_dma_ack_interrupt(DolAudioDma* dma);
 bool dol_audio_dma_interrupt_pending(const DolAudioDma* dma);
 
-// Advance one guest-work unit. Today Strikers feeds this once per recompiled
-// dispatch through the compatibility VI-clock API, but the unit is deliberately
-// named as guest work so the caller can switch to instruction/cycle accounting
-// when DolRecomp exposes it. Returns each 32-byte source chunk at the
-// hardware's AID consumption cadence.
+// Advance one guest-work unit through the compatibility API. New runtimes
+// should use dol_audio_dma_advance with generated guest-cycle charges.
+// Returns each 32-byte source chunk at the hardware's AID cadence.
 bool dol_audio_dma_poll(DolAudioDma* dma, u32* source_address);
+
+// Advance by an explicit number of units from the caller's guest clock.
+// Unlike poll(), this preserves variable generated-cycle charges and their
+// fractional progress toward the next 32-byte hardware chunk.
+bool dol_audio_dma_advance(DolAudioDma* dma, u64 work_units,
+                           u32* source_address);
 
 // Consume one timed 32-byte big-endian stereo PCM16 chunk and send its eight
 // frames to the installed platform audio sink. Returns false until the DMA
@@ -89,6 +93,10 @@ bool dol_audio_dma_poll(DolAudioDma* dma, u32* source_address);
 bool dol_audio_dma_consume_pcm16_stereo(DolAudioDma* dma,
                                         DolAudioDmaReadFn read_source,
                                         void* user);
+bool dol_audio_dma_consume_pcm16_stereo_work(DolAudioDma* dma,
+                                             u64 work_units,
+                                             DolAudioDmaReadFn read_source,
+                                             void* user);
 
 // AI/DSP-AID device register MMIO. The game writes the AI control register to
 // select the AID sample rate; DSP control carries the AID interrupt status/mask
