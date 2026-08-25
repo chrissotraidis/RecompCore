@@ -368,7 +368,8 @@ void shadow_frontend_write(u64 value, u8 size) {
             g_shadow_frontend_failed = true;
             std::fprintf(stderr,
                          "[gx-core] frontend rejected FIFO after %llu byte(s): "
-                         "%s (opcode=0x%02X offset=%llu); consumer=%s\n",
+                         "%s (opcode=0x%02X offset=%llu a=0x%08X b=0x%08X "
+                         "c=0x%08X d=0x%08X); consumer=%s\n",
                          g_fifo_bytes,
                          g_shadow_frontend.last_error() != nullptr
                              ? g_shadow_frontend.last_error()
@@ -377,6 +378,10 @@ void shadow_frontend_write(u64 value, u8 size) {
                              g_shadow_frontend.last_error_opcode()),
                          static_cast<unsigned long long>(
                              g_shadow_frontend.last_error_offset()),
+                         g_shadow_frontend.last_error_a(),
+                         g_shadow_frontend.last_error_b(),
+                         g_shadow_frontend.last_error_c(),
+                         g_shadow_frontend.last_error_d(),
                          g_core_sink.failure_reason() != nullptr
                              ? g_core_sink.failure_reason()
                              : "none");

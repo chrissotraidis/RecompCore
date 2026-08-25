@@ -173,11 +173,14 @@ std::string tev_compare(bool vec, std::uint8_t comparison,
            cmp + " (tevin_b.r + tevin_b.g*256 + tevin_b.b*65536))";
     break;
   default: // RGB8/A8 componentwise
-    if (comparison == 1)
+    if (vec && comparison == 1)
       return "(" + d + " + (vec3i(1,1,1) - sign(abs(tevin_a.rgb - "
                        "tevin_b.rgb))) * tevin_c.rgb)";
-    return "(" + d + " + max(sign(tevin_a.rgb - tevin_b.rgb), vec3i(0,0,0)) "
-                     "* tevin_c.rgb)";
+    if (vec)
+      return "(" + d + " + max(sign(tevin_a.rgb - tevin_b.rgb), vec3i(0,0,0)) "
+                       "* tevin_c.rgb)";
+    cond = std::string("(tevin_a.a ") + cmp + " tevin_b.a)";
+    break;
   }
   if (compare_mode == 3 && !vec) { // A8 uses .a comparison
     cond = std::string("(tevin_a.a ") + cmp + " tevin_b.a)";
@@ -196,7 +199,7 @@ void emit_fog(std::string& out, const ShaderKey& key) {
     return;
   emit(out, "    // Fog (Dolphin WriteFog)\n"
             "    var zCoord = i32((1.0 - in.pos.z) * 16777216.0);\n"
-            "    zCoord = clamp(zCoord, 0, 16777215);\n");
+            "    zCoord = clamp(zCoord, i32(0), i32(16777215));\n");
   if (static_cast<FogProjection>(key.fog_proj) == FogProjection::Perspective) {
     // ze = A / (B - (Zs >> B_SHF))
     emit(out, "    var ze = (psc.fogf.x * 16777216.0) / "
@@ -329,12 +332,10 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
                            ? tev_compare(true, s.cc_op, s.cc_scale)
                            : tev_regular(true, "rgb", s.cc_bias, s.cc_op,
                                          s.cc_scale);
-    const char* clo = s.cc_clamp ? "vec3i(0,0,0)" : "vec3i(-1024,-1024,-1024)";
-    const char* chi =
-        s.cc_clamp ? "vec3i(255,255,255)" : "vec3i(1023,1023,1023)";
     const char* cdest = kTevOutput[s.cc_dest];
-    emitf(out, "    %s = vec4i(clamp(%s, %s, %s), %s.a);\n", cdest,
-          crgb.c_str(), clo, chi, cdest);
+    emitf(out, "    %s = vec4i(clamp(%s, vec3<i32>(%s), vec3<i32>(%s)), %s.a);\n",
+          cdest, crgb.c_str(), s.cc_clamp ? "0" : "-1024",
+          s.cc_clamp ? "255" : "1023", cdest);
 
     // Alpha combine.
     std::string aexp = s.ac_bias == 3
@@ -344,8 +345,8 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
     const char* alo = s.ac_clamp ? "0" : "-1024";
     const char* ahi = s.ac_clamp ? "255" : "1023";
     const char* adest = kTevOutput[s.ac_dest];
-    emitf(out, "    %s = vec4i(%s.rgb, clamp(%s, %s, %s));\n", adest, adest,
-          aexp.c_str(), alo, ahi);
+    emitf(out, "    %s = vec4i(%s.rgb, clamp(%s, i32(%s), i32(%s)));\n",
+          adest, adest, aexp.c_str(), alo, ahi);
   }
 
   // The last stage's destination register is what reaches the framebuffer.
@@ -488,7 +489,7 @@ void emit_lighting_chan(std::string& out, const ShaderKey& key,
       if ((alp.light_mask & (1u << i)) != 0u)
         emit_light(out, alp, i, true);
   }
-  emit(out, "    lacc = clamp(lacc, vec4i(0), vec4i(255));\n"
+  emit(out, "    lacc = clamp(lacc, vec4<i32>(0), vec4<i32>(255));\n"
             "    return vec4f((mat * (lacc + (lacc >> vec4u(7)))) >> vec4u(8)) "
             "/ 255.0;\n}\n\n");
 }

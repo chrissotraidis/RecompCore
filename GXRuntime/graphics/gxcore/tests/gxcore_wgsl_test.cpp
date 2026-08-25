@@ -535,8 +535,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4f {
     tevin_b = vec4i(textemp.rgb, textemp.a) & vec4i(255,255,255,255);
     tevin_c = vec4i(rastemp.rgb, rastemp.a) & vec4i(255,255,255,255);
     tevin_d = vec4i(vec3i(0,0,0), 0);
-    prev = vec4i(clamp(((tevin_d.rgb) + ((((tevin_a.rgb << vec3u(8u)) + (tevin_b.rgb - tevin_a.rgb) * (tevin_c.rgb + (tevin_c.rgb >> vec3u(7u)))) + 128) >> vec3u(8u))), vec3i(0,0,0), vec3i(255,255,255)), prev.a);
-    prev = vec4i(prev.rgb, clamp(((tevin_d.a) + ((((tevin_a.a << 8u) + (tevin_b.a - tevin_a.a) * (tevin_c.a + (tevin_c.a >> 7u))) + 128) >> 8u)), 0, 255));
+    prev = vec4i(clamp(((tevin_d.rgb) + ((((tevin_a.rgb << vec3u(8u)) + (tevin_b.rgb - tevin_a.rgb) * (tevin_c.rgb + (tevin_c.rgb >> vec3u(7u)))) + 128) >> vec3u(8u))), vec3<i32>(0), vec3<i32>(255)), prev.a);
+    prev = vec4i(prev.rgb, clamp(((tevin_d.a) + ((((tevin_a.a << 8u) + (tevin_b.a - tevin_a.a) * (tevin_c.a + (tevin_c.a >> 7u))) + 128) >> 8u)), i32(0), i32(255)));
     if (!( (true) && (true) )) { discard; }
     return vec4f(prev) / 255.0;
 }
@@ -754,7 +754,7 @@ fn calc_lighting_chn0(base_color: vec4f, pos: vec3f, _normal: vec3f) -> vec4f {
             if (length(ldir) == 0.0) { ldir = _normal; }
             lacc = lacc + vec4i(vec3i(round(attn * max(0.0, dot(ldir, _normal)) * vec3f(vsc.lights[0].color.rgb))), 0);
         }
-    lacc = clamp(lacc, vec4i(0), vec4i(255));
+    lacc = clamp(lacc, vec4<i32>(0), vec4<i32>(255));
     return vec4f((mat * (lacc + (lacc >> vec4u(7)))) >> vec4u(8)) / 255.0;
 }
 
