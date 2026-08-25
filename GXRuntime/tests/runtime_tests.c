@@ -4,6 +4,7 @@
 #endif
 #include "core/cpu.h"
 #include "gxruntime/aram.h"
+#include "gxruntime/audio_adpcm.h"
 #include "gxruntime/audio_dma.h"
 #include "gxruntime/boot.h"
 #include "gxruntime/dvd.h"
@@ -1937,6 +1938,32 @@ static void test_audio_dma_pcm_boundary(void) {
     dol_platform_reset();
 }
 
+static void test_audio_adpcm_decoder(void) {
+    const DolDspAdpcmInfo info = {
+        .coef = {0},
+        .yn1 = 0,
+        .yn2 = 0,
+    };
+    const u8 encoded[8] = {
+        0x00, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE,
+    };
+    s16 decoded[14] = {0};
+    assert(dol_dsp_adpcm_decode(encoded, sizeof encoded, 14u, &info,
+                                decoded) == 14u);
+    assert(decoded[0] == 1);
+    assert(decoded[1] == 2);
+    assert(decoded[2] == 3);
+    assert(decoded[3] == 4);
+    assert(decoded[4] == 5);
+    assert(decoded[5] == 6);
+    assert(decoded[6] == 7);
+    assert(decoded[7] == -8);
+    assert(decoded[8] == -7);
+    assert(decoded[9] == -6);
+    assert(decoded[13] == -2);
+    assert(dol_dsp_adpcm_decode(encoded, 7u, 14u, &info, decoded) == 0u);
+}
+
 static void test_audio_device(void) {
     const DolPlatformOps ops = {
         .audio_set_sample_rate = test_audio_set_sample_rate,
@@ -2394,6 +2421,7 @@ int main(void) {
     test_di_device();
     test_audio_dma();
     test_audio_dma_pcm_boundary();
+    test_audio_adpcm_decoder();
     test_audio_device();
     test_headless_backend();
     test_memory_card();

@@ -28,6 +28,7 @@ add_library(gxruntime STATIC
     src/mmio_bus.c
     src/platform.c
     src/audio_dma.c
+    src/audio_adpcm.c
     src/vi_clock.c
     src/memory_card.c
     src/headless_backend.c
