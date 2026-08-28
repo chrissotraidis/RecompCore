@@ -24,6 +24,14 @@ struct GapCounters {
   unsigned long long cull_all_draws = 0;        // culled by state, not a gap
   unsigned long long missing_vcd = 0;           // draw before VCD/VAT seen
   unsigned long long vertex_decode_failures = 0;
+  unsigned long long vertex_projection_missing = 0;
+  unsigned long long vertex_payload_empty = 0;
+  unsigned long long vertex_walk_underivable = 0;
+  unsigned long long vertex_stride_mismatch = 0;
+  unsigned long long vertex_topology_unsupported = 0;
+  unsigned long long vertex_payload_overrun = 0;
+  unsigned long long vertex_array_unresolved = 0;
+  unsigned long long vertex_array_out_of_bounds = 0;
   unsigned long long unsupported_texgen = 0;    // emboss/SRTG or >kMaxTexGens
   unsigned long long per_vertex_tex_mtx = 0;    // TEXMTXIDX attrs (stubbed)
   unsigned long long unresolved_tex_matrix = 0; // matrix rows never written

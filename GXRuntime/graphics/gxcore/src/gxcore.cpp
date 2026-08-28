@@ -493,10 +493,12 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
   if ((draw.transform_flags &
        ar::kDrawTransformProjectionValid) == 0u) {
     ++counters.vertex_decode_failures;
+    ++counters.vertex_projection_missing;
     return skip("projection never captured");
   }
   if (draw.vertex_payload.empty()) {
     ++counters.vertex_decode_failures;
+    ++counters.vertex_payload_empty;
     return skip("draw carried no payload");
   }
 
@@ -521,11 +523,13 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
   WalkLayout walk;
   if (!derive_walk(vcd_lo_, vcd_hi_, vat_[draw.vtx_fmt], walk)) {
     ++counters.vertex_decode_failures;
+    ++counters.vertex_walk_underivable;
     return skip("VCD/VAT walk underivable");
   }
   if (walk.vertex_size != draw.vertex_size) {
     // Layout disagreement with the frontend is a correctness bug, not data.
     ++counters.vertex_decode_failures;
+    ++counters.vertex_stride_mismatch;
     return skip("walk stride != frontend stride");
   }
   // Shader key.
@@ -735,6 +739,7 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
       &plan.indices);
   if (index_count == 0u) {
     ++counters.vertex_decode_failures;
+    ++counters.vertex_topology_unsupported;
     return skip("line/point primitive (outside slice)");
   }
 
@@ -761,6 +766,7 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
       const WalkEntry& entry = walk.entries[e];
       if (offset >= payload_size) {
         ++counters.vertex_decode_failures;
+        ++counters.vertex_payload_overrun;
         return skip("payload overrun");
       }
       const std::uint8_t* p = payload + offset;
@@ -792,12 +798,14 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
         if (array == nullptr || !array->resolved ||
             array->host_data == nullptr) {
           ++counters.vertex_decode_failures;
+          ++counters.vertex_array_unresolved;
           return skip("indexed attr has no resolved array");
         }
         const std::uint64_t element_offset =
             static_cast<std::uint64_t>(index) * array->stride;
         if (element_offset + entry.element_size > array->host_available) {
           ++counters.vertex_decode_failures;
+          ++counters.vertex_array_out_of_bounds;
           return skip("indexed element outside resolved array");
         }
         element =

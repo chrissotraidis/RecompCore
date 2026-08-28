@@ -401,6 +401,10 @@ void dol_aurora_shutdown(void) {
                      "[gx-core] shutdown: submitted=%llu rejected=%llu "
                      "failed=%d planned=%llu skipped=%llu cull_all=%llu "
                      "missing_vcd=%llu vertex_decode_failures=%llu "
+                     "projection_missing=%llu payload_empty=%llu "
+                     "walk_underivable=%llu stride_mismatch=%llu "
+                     "topology_unsupported=%llu payload_overrun=%llu "
+                     "array_unresolved=%llu array_out_of_bounds=%llu "
                      "unsupported_texgen=%llu per_vertex_tex_mtx=%llu "
                      "unresolved_tex_matrix=%llu normals_ignored=%llu "
                      "lighting_ignored=%llu tlut_texture=%llu "
@@ -413,7 +417,16 @@ void dol_aurora_shutdown(void) {
                      gx_aurora::g_shadow_frontend_failed ? 1 : 0,
                      gaps.draws_planned, gaps.draws_skipped,
                      gaps.cull_all_draws, gaps.missing_vcd,
-                     gaps.vertex_decode_failures, gaps.unsupported_texgen,
+                     gaps.vertex_decode_failures,
+                     gaps.vertex_projection_missing,
+                     gaps.vertex_payload_empty,
+                     gaps.vertex_walk_underivable,
+                     gaps.vertex_stride_mismatch,
+                     gaps.vertex_topology_unsupported,
+                     gaps.vertex_payload_overrun,
+                     gaps.vertex_array_unresolved,
+                     gaps.vertex_array_out_of_bounds,
+                     gaps.unsupported_texgen,
                      gaps.per_vertex_tex_mtx, gaps.unresolved_tex_matrix,
                      gaps.normals_ignored, gaps.lighting_ignored,
                      gaps.tlut_texture, gaps.alpha_compare_ignored,
