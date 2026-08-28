@@ -101,8 +101,10 @@ enum class FogProjection : std::uint8_t { Perspective = 0, Orthographic = 1 };
 
 // --- Shader / pipeline keys -------------------------------------------------
 
-// Slice cap: the S9 corpus histogram shows texgens <= 4 across all scenes.
-inline constexpr std::uint32_t kMaxTexGens = 4;
+// Wind Waker's first-play scene requests five texgens. The hardware supports
+// eight; keep the admitted slice at the measured route maximum until a later
+// scene proves another count.
+inline constexpr std::uint32_t kMaxTexGens = 5;
 
 // Slice cap: the S9 gameplay histogram shows numtevstages <= 6.
 inline constexpr std::uint32_t kMaxTevStages = 8;
@@ -200,7 +202,7 @@ struct ShaderKey {
   std::uint8_t has_tex_mtx_idx = 0; // per-vertex TEXMTXIDX attr present (item 5)
   std::uint8_t has_color0 = 0;
   std::uint8_t has_color1 = 0;
-  std::uint8_t uv_mask = 0;  // raw uv inputs present (bit per tex0..3)
+  std::uint8_t uv_mask = 0;  // raw uv inputs present (bit per tex0..4)
   std::uint8_t textured = 0; // fragment samples texmap0 via texcoord0
   // TEV combiner (S14). tev_valid==0 keeps the S12/S13 passthrough fragment
   // (used when combiner regs were never seen, e.g. synthetic slices).
@@ -296,7 +298,7 @@ static_assert(sizeof(GpuLight) == 5 * 16);
 struct VertexShaderConstants {
   float posnormalmatrix[6][4]{};    // rows 0-2 current pos mtx, 3-5 normal
   float projection[4][4]{};         // row-dot form (VertexShaderGen o.pos)
-  float texmatrices[24][4]{};       // per texgen: 3 rows resolved via matidx
+  float texmatrices[24][4]{};       // hardware max 8 texgens * 3 matrix rows
   float transformmatrices[64][4]{}; // raw XF matrix memory rows
   // Lighting (S15): the 8 XF lights and the four material/ambient registers
   // (Dolphin I_MATERIALS: [0]=ambient0, [1]=ambient1, [2]=material0,
@@ -344,14 +346,14 @@ static_assert(sizeof(PixelShaderConstants) ==
 // The CPU vertex decoder (Dolphin VertexLoader semantics) normalizes every
 // draw to this one interleaved layout so the pipeline vertex state is
 // constant: pos vec3f | posmtx u32 (matrix ROW index) | color0 vec4f |
-// color1 vec4f | uv0..3 vec2f | normal vec3f | texmtxidx u32 | binormal vec3f |
-// tangent vec3f. Each block is appended at the end so every earlier offset is
-// unchanged and shaders that omit the trailing @locations stay byte-identical:
+// color1 vec4f | uv0..4 vec2f | normal vec3f | texmtxidx low/high u32 |
+// binormal vec3f | tangent vec3f. Input locations preserve the established
+// uv0..3/NBT ABI; uv4 and the high matrix-index word use locations 12/13.
 // normal (S15, @location 8), then the item-5 texgen block — per-vertex tex-matrix
 // indices packed one byte per texgen (@location 9), and the NBT binormal/tangent
 // emboss needs in view space (@location 10/11).
 inline constexpr std::uint32_t kVertexFloats =
-    3 + 1 + 4 + 4 + 2 * kMaxTexGens + 3 + 1 + 3 + 3;
+    3 + 1 + 4 + 4 + 2 * kMaxTexGens + 3 + 2 + 3 + 3;
 inline constexpr std::uint32_t kVertexStrideBytes = kVertexFloats * 4;
 inline constexpr std::uint32_t kVertexPosOffset = 0;
 inline constexpr std::uint32_t kVertexPosMtxOffset = 12;
@@ -360,7 +362,10 @@ inline constexpr std::uint32_t kVertexColor1Offset = 32;
 inline constexpr std::uint32_t kVertexUvOffset = 48; // + 8*i
 inline constexpr std::uint32_t kVertexNormalOffset = 48 + 8 * kMaxTexGens;
 inline constexpr std::uint32_t kVertexTexMtxIdxOffset = kVertexNormalOffset + 12;
-inline constexpr std::uint32_t kVertexBinormalOffset = kVertexTexMtxIdxOffset + 4;
+inline constexpr std::uint32_t kVertexTexMtxIdxHiOffset =
+    kVertexTexMtxIdxOffset + 4;
+inline constexpr std::uint32_t kVertexBinormalOffset =
+    kVertexTexMtxIdxHiOffset + 4;
 inline constexpr std::uint32_t kVertexTangentOffset = kVertexBinormalOffset + 12;
 
 // --- Draw plan ---------------------------------------------------------------

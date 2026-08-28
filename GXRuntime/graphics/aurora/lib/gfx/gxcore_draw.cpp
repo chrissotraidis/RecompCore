@@ -267,16 +267,22 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   // NBT normal/binormal/tangent + light dir; a Color1/emboss key that is unlit
   // still declares the normal (location 8). Detect emboss demand from the key.
   bool has_emboss = false;
+  bool has_normal_source = false;
   for (std::uint32_t i = 0; i < key.shader.num_tex_gens; ++i) {
-    if (static_cast<gxc::TexGenType>(key.shader.tex_gens[i].texgentype) ==
-        gxc::TexGenType::EmbossMap)
+    const auto type =
+        static_cast<gxc::TexGenType>(key.shader.tex_gens[i].texgentype);
+    if (type == gxc::TexGenType::EmbossMap)
       has_emboss = true;
+    if (type == gxc::TexGenType::Regular &&
+        static_cast<gxc::TexSourceRow>(key.shader.tex_gens[i].sourcerow) ==
+            gxc::TexSourceRow::Normal)
+      has_normal_source = true;
   }
   // Mirror the generator exactly: locations 8/10/11 are declared only when the
   // vertex FORMAT carries that attribute. A lit/emboss draw whose format omits
   // it reads the cached fallback from the uniform instead (I_CACHED_NORMAL), so
   // the shader does not declare the input and the layout must not provide it.
-  if ((key.shader.lit_valid != 0 || has_emboss) &&
+  if ((key.shader.lit_valid != 0 || has_emboss || has_normal_source) &&
       key.shader.has_vertex_normal != 0) {
     attributes.push_back(wgpu::VertexAttribute{
         .format = wgpu::VertexFormat::Float32x3,
@@ -303,6 +309,21 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
         .format = wgpu::VertexFormat::Float32x3,
         .offset = gxc::kVertexTangentOffset,
         .shaderLocation = 11,
+    });
+  }
+  if ((key.shader.uv_mask & (1u << 4u)) != 0u) {
+    attributes.push_back(wgpu::VertexAttribute{
+        .format = wgpu::VertexFormat::Float32x2,
+        .offset = gxc::kVertexUvOffset + 32u,
+        .shaderLocation = 12,
+    });
+  }
+  if (key.shader.has_tex_mtx_idx != 0 &&
+      (key.shader.tex_mtx_idx_mask & 0xF0u) != 0u) {
+    attributes.push_back(wgpu::VertexAttribute{
+        .format = wgpu::VertexFormat::Uint32,
+        .offset = gxc::kVertexTexMtxIdxHiOffset,
+        .shaderLocation = 13,
     });
   }
   const wgpu::VertexBufferLayout vertexLayout{

@@ -233,8 +233,8 @@ void test_state_to_plan_and_wgsl() {
   {
     gxc::GapCounters gaps;
     CHECK(classify_texgen(9u << 7u, gaps).ok); // Tex4
-    CHECK(gaps.unsupported_texgen == 1u);
-    CHECK(gaps.texgen_source_tex47 == 1u);
+    CHECK(gaps.unsupported_texgen == 0u);
+    CHECK(gaps.texgen_source_tex47 == 0u);
   }
   {
     gxc::GapCounters gaps;
@@ -253,8 +253,8 @@ void test_state_to_plan_and_wgsl() {
     ar::ConsumedDraw overflow = draw;
     overflow.xf_regs[0x27] = 5u;
     CHECK(state.build_draw_plan(overflow, gaps).ok);
-    CHECK(gaps.unsupported_texgen == 1u);
-    CHECK(gaps.texgen_count_overflow == 1u);
+    CHECK(gaps.unsupported_texgen == 0u);
+    CHECK(gaps.texgen_count_overflow == 0u);
     CHECK(gaps.texgen_count_5 == 1u);
   }
 
@@ -490,6 +490,8 @@ void test_texgen_normal_source() {
   key.tex_gens[0].sourcerow = static_cast<std::uint8_t>(gxc::TexSourceRow::Normal);
   key.has_vertex_normal = 1;
   const std::string with_normal = gxc::generate_wgsl(key);
+  CHECK(with_normal.find("@location(8) rawnormal: vec3f") !=
+        std::string::npos);
   CHECK(with_normal.find("coord = vec4f(in.rawnormal, 1.0);") !=
         std::string::npos);
 
@@ -497,6 +499,134 @@ void test_texgen_normal_source() {
   const std::string without_normal = gxc::generate_wgsl(key);
   CHECK(without_normal.find("coord = vec4f(in.rawnormal, 1.0);") ==
         std::string::npos);
+}
+
+// Wind Waker's first-play scene requests exactly five texgens. Keep the fifth
+// raw coordinate and high per-vertex matrix-index word at new locations so the
+// established 0..3/NBT shader ABI remains stable.
+void test_five_texgens() {
+  CHECK(gxc::kMaxTexGens >= 5u);
+  if (gxc::kMaxTexGens < 5u)
+    return;
+
+  gxc::ShaderKey key{};
+  key.num_tex_gens = 5;
+  key.uv_mask = 0x1Fu;
+  key.textured = 1;
+  key.tev_valid = 1;
+  key.num_tev_stages = 1;
+  key.has_tex_mtx_idx = 1;
+  key.tex_mtx_idx_mask = 0x10u;
+  for (std::uint32_t i = 0; i < 5u; ++i) {
+    key.tex_gens[i].enabled = 1;
+    key.tex_gens[i].texgentype =
+        static_cast<std::uint8_t>(gxc::TexGenType::Regular);
+    key.tex_gens[i].sourcerow =
+        static_cast<std::uint8_t>(gxc::TexSourceRow::Tex0) + i;
+  }
+  key.tev_stages[0].tevorders_enable = 1;
+  key.tev_stages[0].tevorders_texmap = 0;
+  key.tev_stages[0].tevorders_texcoord = 4;
+
+  const std::string w = gxc::generate_wgsl(key);
+  CHECK(w.find("@location(12) rawtex4: vec2f") != std::string::npos);
+  CHECK(w.find("@location(13) texmtxidx_hi: u32") != std::string::npos);
+  CHECK(w.find("@location(6) uv4: vec3f") != std::string::npos);
+  CHECK(w.find("coord = vec4f(in.rawtex4.x, in.rawtex4.y, 1.0, 1.0)") !=
+        std::string::npos);
+  CHECK(w.find("let ti4 = (in.texmtxidx_hi >> (8u * 0u)) & 0xFFu") !=
+        std::string::npos);
+  CHECK(w.find("let uv = in.uv4.xy; rawtextemp") != std::string::npos);
+}
+
+void test_fifth_texgen_plan_decode() {
+  gxc::GxCoreState state;
+  state.reset();
+  state.apply(bp(0x00u, 5u));
+  state.apply({.kind = ar::RenderStateKind::CpVcd,
+               .index = 0u,
+               .value = (1u << 5u) | (1u << 9u)}); // TEXMTXIDX4 + position
+  state.apply({.kind = ar::RenderStateKind::CpVcd,
+               .index = 1u,
+               .value = 1u << 8u}); // tex4 direct
+  state.apply({.kind = ar::RenderStateKind::CpVat,
+               .index = 0u,
+               .value = 1u | (4u << 1u),
+               .aux0 = 0u});
+  state.apply({.kind = ar::RenderStateKind::CpVat,
+               .index = 0u,
+               .value = (1u << 27u) | (4u << 28u),
+               .aux0 = 1u});
+  state.apply({.kind = ar::RenderStateKind::CpVat,
+               .index = 0u,
+               .value = 0u,
+               .aux0 = 2u});
+
+  ar::ConsumedDraw draw{};
+  draw.primitive = 0x80u;
+  draw.vertex_count = 4u;
+  draw.vertex_size = 21u; // matrix index + f32x3 position + f32x2 tex4
+  constexpr float vertices[4][5] = {
+      {-1.f, -1.f, 0.f, 0.25f, 0.5f},
+      {1.f, -1.f, 0.f, 0.75f, 0.5f},
+      {1.f, 1.f, 0.f, 0.75f, 1.f},
+      {-1.f, 1.f, 0.f, 0.25f, 1.f},
+  };
+  for (const auto& vertex : vertices) {
+    draw.vertex_payload.push_back(33u); // fifth matrix row from MatrixIndexB
+    for (float value : vertex)
+      append_be_f32(draw.vertex_payload, value);
+  }
+
+  draw.transform_flags = ar::kDrawTransformProjectionValid;
+  draw.projection[0] = 1.f;
+  draw.projection[2] = 1.f;
+  draw.projection[4] = -1.f;
+  draw.projection_type = 1u;
+  draw.current_pn_matrix = 0u;
+  draw.position_matrix_valid_mask = 1u;
+  draw.position_matrices[0][0] = 1.f;
+  draw.position_matrices[0][5] = 1.f;
+  draw.position_matrices[0][10] = 1.f;
+
+  std::uint32_t matrix_a = 0u;
+  for (std::uint32_t i = 0; i < 4u; ++i)
+    matrix_a |= 60u << (6u + 6u * i);
+  draw.xf_regs[0] = matrix_a;
+  draw.xf_regs[1] = 33u;
+  draw.xf_regs[0x27] = 5u;
+  draw.xf_regs[0x2C] = 9u << 7u; // texgen4 regular source Tex4
+  draw.xf_reg_mask =
+      (1ull << 0u) | (1ull << 1u) | (1ull << 0x27u) | (1ull << 0x2Cu);
+  draw.tex_matrices[10][0] = 1.f;
+  draw.tex_matrices[10][5] = 1.f;
+  draw.tex_matrices[10][10] = 1.f;
+  draw.tex_matrix_word_mask[10] = 0xFFFu;
+  draw.tex_matrices[1][0] = 2.f;
+  draw.tex_matrices[1][5] = 3.f;
+  draw.tex_matrices[1][10] = 4.f;
+  draw.tex_matrix_word_mask[1] = 0xFFFu;
+
+  gxc::GapCounters gaps;
+  const gxc::DrawPlan plan = state.build_draw_plan(draw, gaps);
+  CHECK(plan.ok);
+  CHECK(plan.pipeline.shader.num_tex_gens == 5u);
+  CHECK(plan.pipeline.shader.uv_mask == 0x10u);
+  CHECK(plan.pipeline.shader.tex_mtx_idx_mask == 0x10u);
+  CHECK(gaps.texgen_count_5 == 1u);
+  CHECK(gaps.texgen_count_overflow == 0u);
+  CHECK(gaps.unsupported_texgen == 0u);
+  CHECK(plan.constants.texmatrices[12][0] == 2.f);
+  CHECK(plan.constants.texmatrices[13][1] == 3.f);
+  CHECK(plan.constants.texmatrices[14][2] == 4.f);
+  const float* vertex = plan.vertices.data();
+  CHECK(vertex[(gxc::kVertexUvOffset + 32u) / 4u] == 0.25f);
+  CHECK(vertex[(gxc::kVertexUvOffset + 36u) / 4u] == 0.5f);
+  std::uint32_t texidx_hi = 0u;
+  std::memcpy(&texidx_hi,
+              vertex + gxc::kVertexTexMtxIdxHiOffset / 4u,
+              sizeof texidx_hi);
+  CHECK((texidx_hi & 0xFFu) == 33u);
 }
 
 // Item 5: Emboss texgen (Dolphin VertexShaderGen) adds the view-space light dir
@@ -1538,6 +1668,8 @@ int main() {
   test_untextured_defaults();
   test_texgen_color();
   test_texgen_normal_source();
+  test_five_texgens();
+  test_fifth_texgen_plan_decode();
   test_texgen_emboss();
   test_texgen_per_vertex_mtx();
   test_tev_indirect_matrix();

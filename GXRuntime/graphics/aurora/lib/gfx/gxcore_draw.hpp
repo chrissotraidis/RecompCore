@@ -33,7 +33,8 @@ struct DrawData {
 // now emits per-texmap samplers + a wider texture bind group under an unchanged
 // key, so a persisted v4 pipeline for such a draw is stale). v6: indirect TEV
 // stages add shader structure, pixel constants, and indirect texmap bindings.
-constexpr uint32_t GXCorePipelineConfigVersion = 6;
+// v7: fifth texgen adds UV4 and a high per-vertex matrix-index word.
+constexpr uint32_t GXCorePipelineConfigVersion = 7;
 
 struct PipelineConfig {
   uint32_t version = GXCorePipelineConfigVersion;

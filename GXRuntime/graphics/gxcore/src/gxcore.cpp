@@ -156,7 +156,7 @@ struct WalkLayout {
   bool has_nbt = false; // normal attr carries binormal+tangent (emboss inputs)
   bool has_color[2] = {false, false};
   std::uint8_t uv_mask = 0;          // tex0-7 presence
-  std::uint8_t tex_mtx_idx_mask = 0; // per-vertex TEXMTXIDX per texgen (0..3)
+  std::uint8_t tex_mtx_idx_mask = 0; // per-vertex TEXMTXIDX per texgen (0..4)
 };
 
 // Derive the payload walk from raw VCD/VAT (CPMemory.h bit positions).
@@ -548,17 +548,17 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
     num_tex_gens = draw.xf_regs[xf_numtexgens_reg] & 0xFu;
   else
     num_tex_gens = bits(gen_mode, 4, 0);
+  if (num_tex_gens == 5u)
+    ++counters.texgen_count_5;
+  else if (num_tex_gens == 6u)
+    ++counters.texgen_count_6;
+  else if (num_tex_gens == 7u)
+    ++counters.texgen_count_7;
+  else if (num_tex_gens >= 8u)
+    ++counters.texgen_count_8plus;
   if (num_tex_gens > kMaxTexGens) {
     ++counters.unsupported_texgen;
     ++counters.texgen_count_overflow;
-    if (num_tex_gens == 5u)
-      ++counters.texgen_count_5;
-    else if (num_tex_gens == 6u)
-      ++counters.texgen_count_6;
-    else if (num_tex_gens == 7u)
-      ++counters.texgen_count_7;
-    else
-      ++counters.texgen_count_8plus;
     num_tex_gens = kMaxTexGens;
   }
   key.num_tex_gens = static_cast<std::uint8_t>(num_tex_gens);
@@ -567,7 +567,8 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
   key.tex_mtx_idx_mask = walk.tex_mtx_idx_mask;
   key.has_color0 = walk.has_color[0] ? 1u : 0u;
   key.has_color1 = walk.has_color[1] ? 1u : 0u;
-  key.uv_mask = static_cast<std::uint8_t>(walk.uv_mask & 0xFu);
+  key.uv_mask = static_cast<std::uint8_t>(
+      walk.uv_mask & ((1u << kMaxTexGens) - 1u));
   // Vertex-format N/B/T presence (GC packs all three in one NBT attribute, so
   // binormal/tangent presence follows has_nbt). A lit/emboss draw that omits
   // one substitutes the cached fallback from the uniform instead of a
@@ -660,7 +661,7 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
       if (source == TexSourceRow::Geom ||
           (tg.sourcerow >= static_cast<std::uint8_t>(TexSourceRow::Tex0) &&
            tg.sourcerow <
-               static_cast<std::uint8_t>(TexSourceRow::Tex0) + 4u)) {
+               static_cast<std::uint8_t>(TexSourceRow::Tex0) + kMaxTexGens)) {
         unsupported_source = false;
       } else if (source == TexSourceRow::Normal) {
         ++counters.texgen_source_normal;
@@ -877,7 +878,8 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
     // entries); a single 9-component entry decodes all three at once.
     std::uint32_t normal_part = 0;
     std::uint32_t posmtx_row = draw.current_pn_matrix * 3u;
-    std::uint32_t texmtxidx_packed = 0; // one byte per texgen (item-5 TEXMTXIDX)
+    std::uint32_t texmtxidx_packed = 0; // texgens 0..3, one byte each
+    std::uint32_t texmtxidx_packed_hi = 0; // texgens 4..7, one byte each
     std::size_t offset =
         static_cast<std::size_t>(v) * walk.vertex_size;
     for (std::uint32_t e = 0; e < walk.entry_count; ++e) {
@@ -899,9 +901,13 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
         // GX per-vertex TEXMTXIDX: the byte is a matrix-memory row index (GX
         // pre-multiplies by 3, same convention as PNMTXIDX). Pack one byte per
         // texgen so the VS can select transformmatrices[row] per vertex.
-        if (entry.out_slot < 4u)
+        if (entry.out_slot < 4u) {
           texmtxidx_packed |= static_cast<std::uint32_t>(p[0])
                               << (8u * entry.out_slot);
+        } else if (entry.out_slot < 8u) {
+          texmtxidx_packed_hi |= static_cast<std::uint32_t>(p[0])
+                                 << (8u * (entry.out_slot - 4u));
+        }
         offset += 1;
         continue;
       }
@@ -999,6 +1005,8 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
     std::memcpy(out_vertex + 3, &posmtx_row, sizeof posmtx_row);
     std::memcpy(out_vertex + kVertexTexMtxIdxOffset / 4u, &texmtxidx_packed,
                 sizeof texmtxidx_packed);
+    std::memcpy(out_vertex + kVertexTexMtxIdxHiOffset / 4u,
+                &texmtxidx_packed_hi, sizeof texmtxidx_packed_hi);
   }
 
   // Uniforms.
@@ -1101,6 +1109,8 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
       row = bits(mat_idx_a, 6, 6 + 6 * i);
       row_known = true;
     } else if (i >= 4u && mat_idx_b_valid) {
+      // CPMemory.h TMatrixIndexB begins Tex4MtxIdx at bit 0; unlike A it has
+      // no leading PosNormalMtxIdx field.
       row = bits(mat_idx_b, 6, 6 * (i - 4u));
       row_known = true;
     }

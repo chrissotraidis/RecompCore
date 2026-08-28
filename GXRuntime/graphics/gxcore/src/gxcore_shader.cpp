@@ -676,12 +676,17 @@ std::string generate_wgsl(const ShaderKey& key) {
   // tangent space, so detect demand up front to widen the varyings/uniform/inputs.
   bool needs_color1 = false;
   bool has_emboss = false;
+  bool has_normal_source = false;
   for (std::uint32_t i = 0; i < key.num_tex_gens; ++i) {
     const auto t = static_cast<TexGenType>(key.tex_gens[i].texgentype);
     if (t == TexGenType::Color1)
       needs_color1 = true;
     else if (t == TexGenType::EmbossMap)
       has_emboss = true;
+    if (t == TexGenType::Regular &&
+        static_cast<TexSourceRow>(key.tex_gens[i].sourcerow) ==
+            TexSourceRow::Normal)
+      has_normal_source = true;
   }
   // Emboss transforms the light dir into tangent space, so the lights uniform +
   // the NBT binormal/tangent vertex attrs must be present even on an unlit draw.
@@ -798,7 +803,7 @@ std::string generate_wgsl(const ShaderKey& key) {
             "    @location(5) rawtex1: vec2f,\n"
             "    @location(6) rawtex2: vec2f,\n"
             "    @location(7) rawtex3: vec2f,\n");
-  if ((lit || emit_nbt) && has_normal)
+  if ((lit || emit_nbt || has_normal_source) && has_normal)
     emit(out, "    @location(8) rawnormal: vec3f,\n");
   if (key.has_tex_mtx_idx != 0)
     emit(out, "    @location(9) texmtxidx: u32,\n");
@@ -806,6 +811,10 @@ std::string generate_wgsl(const ShaderKey& key) {
     emit(out, "    @location(10) rawbinormal: vec3f,\n");
   if (emit_nbt && has_tangent)
     emit(out, "    @location(11) rawtangent: vec3f,\n");
+  if ((key.uv_mask & (1u << 4u)) != 0u)
+    emit(out, "    @location(12) rawtex4: vec2f,\n");
+  if (key.has_tex_mtx_idx != 0 && (key.tex_mtx_idx_mask & 0xF0u) != 0u)
+    emit(out, "    @location(13) texmtxidx_hi: u32,\n");
   emit(out, "};\n");
 
   emit(out, "struct VertexOut {\n"
@@ -908,7 +917,7 @@ std::string generate_wgsl(const ShaderKey& key) {
         emit(out, "        coord = vec4f(in.rawnormal, 1.0);\n");
     } else if (tg.sourcerow >= static_cast<std::uint8_t>(TexSourceRow::Tex0) &&
                tg.sourcerow <
-                   static_cast<std::uint8_t>(TexSourceRow::Tex0) + 4u) {
+                   static_cast<std::uint8_t>(TexSourceRow::Tex0) + kMaxTexGens) {
       const std::uint32_t texnum =
           tg.sourcerow - static_cast<std::uint8_t>(TexSourceRow::Tex0);
       if ((key.uv_mask & (1u << texnum)) != 0u) {
@@ -931,8 +940,14 @@ std::string generate_wgsl(const ShaderKey& key) {
       const bool per_vertex =
           key.has_tex_mtx_idx != 0 && (key.tex_mtx_idx_mask & (1u << i)) != 0u;
       if (per_vertex) {
-        emitf(out, "        let ti%u = (in.texmtxidx >> (8u * %uu)) & 0xFFu;\n",
-              i, i);
+        if (i < 4u)
+          emitf(out,
+                "        let ti%u = (in.texmtxidx >> (8u * %uu)) & 0xFFu;\n",
+                i, i);
+        else
+          emitf(out,
+                "        let ti%u = (in.texmtxidx_hi >> (8u * %uu)) & 0xFFu;\n",
+                i, i - 4u);
         emitf(out, "        let m%u0 = vsc.transformmatrices[ti%u];\n", i, i);
         emitf(out, "        let m%u1 = vsc.transformmatrices[ti%u + 1u];\n", i, i);
         emitf(out, "        let m%u2 = vsc.transformmatrices[ti%u + 2u];\n", i, i);
