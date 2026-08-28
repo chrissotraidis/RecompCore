@@ -976,6 +976,27 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
   pipe.early_depth_test = static_cast<std::uint8_t>(bits(pe_control, 1, 6));
   if (pipe.depth_test != 0u && pipe.early_depth_test != 0u)
     ++counters.early_depth_active;
+
+  // BP F4/F5 ZTexture. Dolphin writes the sampled depth only for late Z tests;
+  // Wind Waker's JFWDisplay clear quad is REPLACE/U24 with depth writes on.
+  // Keep early-Z/fog-only and malformed forms explicit gaps rather than
+  // silently emitting the wrong fragment-depth contract.
+  const std::uint32_t ztex2 = bp_valid_[0xF5] ? bp_regs_[0xF5] : 0u;
+  const std::uint32_t ztex_type = bits(ztex2, 2, 0);
+  const std::uint32_t ztex_op = bits(ztex2, 2, 2);
+  if (ztex_op != 0u) {
+    const bool supported = ztex_op <= 2u && ztex_type <= 2u &&
+                           key.tev_valid != 0u && key.textured != 0u &&
+                           pipe.depth_test != 0u && pipe.depth_update != 0u &&
+                           pipe.early_depth_test == 0u;
+    if (supported) {
+      key.ztex_op = static_cast<std::uint8_t>(ztex_op);
+      key.ztex_type = static_cast<std::uint8_t>(ztex_type);
+      ++counters.ztexture_active;
+    } else {
+      ++counters.ztexture_ignored;
+    }
+  }
   const bool use_dst_alpha = bits(dst_alpha, 1, 8) != 0u &&
                              pipe.alpha_update != 0u &&
                              target_has_alpha;
@@ -1414,6 +1435,8 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
     plan.pixel_constants.alpha_ref[1] =
         static_cast<std::int32_t>(bits(bp_regs_[0xF3], 8, 8));
   }
+  plan.pixel_constants.zbias[3] = static_cast<std::int32_t>(
+      bp_valid_[0xF4] ? (bp_regs_[0xF4] & 0xFFFFFFu) : 0u);
 
   // BP SU_SSIZE/SU_TSIZE own rasterized texcoord scale. J3D normally writes
   // image width/height, but the hardware pairing is texcoord rather than

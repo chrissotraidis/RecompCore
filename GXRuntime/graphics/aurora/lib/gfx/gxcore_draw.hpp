@@ -39,7 +39,7 @@ struct DrawData {
 // v9: GXSetZCompLoc early depth adds a depth-only pipeline variant. v10:
 // RGB and alpha blending carry donor-exact independent factors. v11: BP SU
 // texture-coordinate scales enlarge pixel constants and alter TEV WGSL.
-constexpr uint32_t GXCorePipelineConfigVersion = 11;
+constexpr uint32_t GXCorePipelineConfigVersion = 12;
 
 struct PipelineConfig {
   uint32_t version = GXCorePipelineConfigVersion;

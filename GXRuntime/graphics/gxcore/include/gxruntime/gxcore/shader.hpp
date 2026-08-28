@@ -250,9 +250,13 @@ struct ShaderKey {
   // BP 0x42 constant destination alpha, admitted only for RGBA6 + alpha write.
   std::uint8_t use_dst_alpha = 0;
   std::uint8_t dst_alpha = 0;
+  // Late BP ZTexture output. Disabled/unsupported forms remain zero so they do
+  // not perturb ordinary shader identity. Values match GXZTexOp/ZTexFormat.
+  std::uint8_t ztex_op = 0;
+  std::uint8_t ztex_type = 0;
   // Re-pad the scalar block to a multiple of 4, keeping ShaderKey a
   // unique-object-representation (memcmp identity) type.
-  std::uint8_t pad2[3]{};
+  std::uint8_t pad2[1]{};
   LightChanKey litchan[4]{}; // color0, color1, alpha0, alpha1
   TexGenKey tex_gens[kMaxTexGens]{};
   IndirectStageKey ind_stages[kMaxIndirectStages]{};
@@ -345,6 +349,8 @@ struct PixelShaderConstants {
   std::int32_t fogi[4]{};       // .y = b_magnitude, .w = b_shift
   float fogf[4]{};              // .x=A .y=C .z=center .w=width
   float fogrange[3][4]{};       // Dolphin I_FOGRANGE K table (indices 0..9)
+  // BP ZTexture bias. .w is the unsigned 24-bit BP F4 payload; xyz unused.
+  std::int32_t zbias[4]{};
   // Dolphin I_TEXDIMS: .zw are BP SU_SSIZE/SU_TSIZE scale_minus_1 + 1.
   // They describe rasterized texcoords independently of image dimensions.
   std::int32_t texdims[8][4]{};
@@ -353,7 +359,7 @@ struct PixelShaderConstants {
   std::int32_t indtexmtx[6][4]{};
 };
 static_assert(sizeof(PixelShaderConstants) ==
-              (4 + 4 + 1 + 1 + 1 + 1 + 3 + 8 + 6) * 16);
+              (4 + 4 + 1 + 1 + 1 + 1 + 3 + 1 + 8 + 6) * 16);
 
 // --- Fixed decoded-vertex layout (slice) ------------------------------------
 //

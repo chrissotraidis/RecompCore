@@ -40,11 +40,20 @@ void emitf(std::string& out, const char* fmt, ...) {
 }
 
 void emit_fragment_entry(std::string& out, const ShaderKey& key) {
+  const bool writes_depth = key.ztex_op != 0;
   if (key.use_dst_alpha != 0) {
     emit(out,
          "struct FragmentOut {\n"
          "    @location(0) @blend_src(0) color: vec4f,\n"
-         "    @location(0) @blend_src(1) blend: vec4f,\n"
+         "    @location(0) @blend_src(1) blend: vec4f,\n");
+    if (writes_depth)
+      emit(out, "    @builtin(frag_depth) depth: f32,\n");
+    emit(out, "};\n@fragment\nfn fs_main(in: VertexOut) -> FragmentOut {\n");
+  } else if (writes_depth) {
+    emit(out,
+         "struct FragmentOut {\n"
+         "    @location(0) color: vec4f,\n"
+         "    @builtin(frag_depth) depth: f32,\n"
          "};\n"
          "@fragment\nfn fs_main(in: VertexOut) -> FragmentOut {\n");
   } else {
@@ -536,11 +545,42 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
   // Fog runs after the alpha test (Dolphin order), modifying prev.rgb only.
   emit_fog(out, key);
 
+  if (key.ztex_op != 0) {
+    const char* sample = nullptr;
+    switch (key.ztex_type) {
+    case 0:
+      sample = "rawtextemp.a";
+      break;
+    case 1:
+      sample = "rawtextemp.r + rawtextemp.a * 256";
+      break;
+    case 2:
+    default:
+      sample = "rawtextemp.r * 65536 + rawtextemp.g * 256 + rawtextemp.b";
+      break;
+    }
+    emitf(out, "    var ztex_z = %s + psc.zbias.w", sample);
+    if (key.ztex_op == 1)
+      emit(out, " + i32((1.0 - in.pos.z) * 16777216.0)");
+    emit(out,
+         ";\n"
+         "    ztex_z = ztex_z & 0xFFFFFF;\n"
+         "    let ztex_depth = 1.0 - f32(ztex_z) / 16777216.0;\n");
+  }
+
   if (key.use_dst_alpha != 0) {
-    emitf(out,
-          "    return FragmentOut(vec4f(vec3f(prev.rgb), %u.0) / 255.0, "
-          "vec4f(0.0, 0.0, 0.0, f32(prev.a) / 255.0));\n}\n",
-          static_cast<unsigned>(key.dst_alpha));
+    if (key.ztex_op != 0)
+      emitf(out,
+            "    return FragmentOut(vec4f(vec3f(prev.rgb), %u.0) / 255.0, "
+            "vec4f(0.0, 0.0, 0.0, f32(prev.a) / 255.0), ztex_depth);\n}\n",
+            static_cast<unsigned>(key.dst_alpha));
+    else
+      emitf(out,
+            "    return FragmentOut(vec4f(vec3f(prev.rgb), %u.0) / 255.0, "
+            "vec4f(0.0, 0.0, 0.0, f32(prev.a) / 255.0));\n}\n",
+            static_cast<unsigned>(key.dst_alpha));
+  } else if (key.ztex_op != 0) {
+    emit(out, "    return FragmentOut(vec4f(prev) / 255.0, ztex_depth);\n}\n");
   } else {
     emit(out, "    return vec4f(prev) / 255.0;\n}\n");
   }
@@ -805,6 +845,7 @@ std::string generate_wgsl(const ShaderKey& key) {
               "    fogi: vec4i,\n"
               "    fogf: vec4f,\n"
               "    fogrange: array<vec4f, 3>,\n"
+              "    zbias: vec4i,\n"
               "    texdims: array<vec4i, 8>,\n");
     if (key.num_ind_stages != 0u)
       emit(out, "    indtexmtx: array<vec4i, 6>,\n");

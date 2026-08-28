@@ -883,6 +883,7 @@ struct PixelShaderConstants {
     fogi: vec4i,
     fogf: vec4f,
     fogrange: array<vec4f, 3>,
+    zbias: vec4i,
     texdims: array<vec4i, 8>,
 };
 @group(2) @binding(0) var<uniform> psc: PixelShaderConstants;
@@ -1085,6 +1086,25 @@ void test_tev_modulate() {
                  wgsl.c_str());
     ++g_failures;
   }
+
+  // Wind Waker's JFWDisplay::clearEfb uses a late ZTexture REPLACE draw to
+  // write 0xFFFFFF across the EFB. BP F4 carries the bias; F5 selects U24 and
+  // REPLACE. The resulting shader must own fragment depth rather than silently
+  // falling back to the clear quad's geometric depth.
+  state.apply(bp(0xF4, 0x001234u));
+  state.apply(bp(0xF5, 2u | (2u << 2u)));
+  gxc::GapCounters ztex_counters;
+  const gxc::DrawPlan ztex_plan = state.build_draw_plan(draw, ztex_counters);
+  CHECK(ztex_plan.ok);
+  CHECK(ztex_plan.pipeline.shader.ztex_op == 2u);
+  CHECK(ztex_plan.pipeline.shader.ztex_type == 2u);
+  CHECK(ztex_plan.pixel_constants.zbias[3] == 0x1234);
+  CHECK(ztex_counters.ztexture_active == 1u);
+  CHECK(ztex_counters.ztexture_ignored == 0u);
+  const std::string ztex_wgsl = gxc::generate_wgsl(ztex_plan.pipeline.shader);
+  CHECK(ztex_wgsl.find("@builtin(frag_depth)") != std::string::npos);
+  CHECK(ztex_wgsl.find("rawtextemp.r * 65536") != std::string::npos);
+  CHECK(ztex_wgsl.find("+ psc.zbias.w") != std::string::npos);
 }
 
 void test_tev_konst_and_alpha() {

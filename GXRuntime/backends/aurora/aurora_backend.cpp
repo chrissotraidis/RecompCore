@@ -427,7 +427,8 @@ void dol_aurora_shutdown(void) {
                      "efb_display_copies=%llu fog_ignored=%llu "
                      "indirect_active=%llu indirect_ignored=%llu "
                      "logic_op_ignored=%llu dst_alpha_active=%llu "
-                     "early_depth_active=%llu\n",
+                     "early_depth_active=%llu ztexture_active=%llu "
+                     "ztexture_ignored=%llu\n",
                      gx_aurora::g_core_submitted, gx_aurora::g_core_rejected,
                      gx_aurora::g_shadow_frontend_failed ? 1 : 0,
                      gaps.draws_planned, gaps.draws_skipped,
@@ -474,7 +475,8 @@ void dol_aurora_shutdown(void) {
                      gaps.fog_ignored, gaps.indirect_active,
                      gaps.indirect_ignored,
                      gaps.logic_op_ignored, gaps.dst_alpha_active,
-                     gaps.early_depth_active);
+                     gaps.early_depth_active, gaps.ztexture_active,
+                     gaps.ztexture_ignored);
     }
 #endif
     if (gx_aurora::g_audio_stream != nullptr) {
