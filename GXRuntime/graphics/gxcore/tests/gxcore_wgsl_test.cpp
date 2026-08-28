@@ -203,6 +203,33 @@ void test_state_to_plan_and_wgsl() {
   CHECK(counters.draws_skipped == 0);
   CHECK(counters.unresolved_tex_matrix == 0);
 
+  // TexMode0 unit 0: clamp S, mirror T, nearest mag, linear min, no mips.
+  // Sampler state is per texmap and must survive into the draw plan.
+  {
+    gxc::GxCoreState sampler_state = state;
+    sampler_state.apply(bp(0x80u, (2u << 2u) | (4u << 5u)));
+    gxc::GapCounters gaps;
+    const gxc::DrawPlan sampler_plan =
+        sampler_state.build_draw_plan(draw, gaps);
+    CHECK(sampler_plan.ok);
+    CHECK(sampler_plan.samplers[0].wrap_s == 0u);
+    CHECK(sampler_plan.samplers[0].wrap_t == 2u);
+    CHECK(sampler_plan.samplers[0].mag_filter == 0u);
+    CHECK(sampler_plan.samplers[0].min_filter == 1u);
+    CHECK(sampler_plan.samplers[0].mipmap_filter == 0u);
+  }
+
+  // Hardware filter 6 is linear minification with linear mip interpolation.
+  {
+    gxc::GxCoreState sampler_state = state;
+    sampler_state.apply(bp(0x80u, 6u << 5u));
+    gxc::GapCounters gaps;
+    const gxc::DrawPlan sampler_plan =
+        sampler_state.build_draw_plan(draw, gaps);
+    CHECK(sampler_plan.samplers[0].min_filter == 1u);
+    CHECK(sampler_plan.samplers[0].mipmap_filter == 2u);
+  }
+
   // BP 0x42 only overrides stored alpha for an alpha-writing RGBA6 target.
   // The fragment keeps TEV alpha in blend source 1 so color blending still
   // observes the unmodified source alpha, matching Dolphin's dual-source path.

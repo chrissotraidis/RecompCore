@@ -102,6 +102,55 @@ wgpu::BlendFactor to_blend_factor_dst(gxc::DstBlendFactor factor,
   }
 }
 
+wgpu::AddressMode to_address_mode(std::uint8_t wrap) {
+  switch (wrap) {
+  case 1:
+    return wgpu::AddressMode::Repeat;
+  case 2:
+    return wgpu::AddressMode::MirrorRepeat;
+  case 0:
+  default:
+    return wgpu::AddressMode::ClampToEdge;
+  }
+}
+
+wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler) {
+  const bool mipmaps = sampler.mipmap_filter != 0u;
+  std::uint16_t maxAnisotropy = 1;
+  if (mipmaps && (sampler.max_aniso == 1u || sampler.max_aniso == 2u)) {
+    maxAnisotropy = sampler.max_aniso == 1u
+                        ? std::max<std::uint16_t>(
+                              webgpu::g_graphicsConfig.textureAnisotropy / 2u,
+                              1u)
+                        : std::max<std::uint16_t>(
+                              webgpu::g_graphicsConfig.textureAnisotropy, 1u);
+  }
+  auto magFilter = sampler.mag_filter != 0u ? wgpu::FilterMode::Linear
+                                             : wgpu::FilterMode::Nearest;
+  auto minFilter = sampler.min_filter != 0u ? wgpu::FilterMode::Linear
+                                             : wgpu::FilterMode::Nearest;
+  auto mipFilter = sampler.mipmap_filter == 2u
+                       ? wgpu::MipmapFilterMode::Linear
+                       : wgpu::MipmapFilterMode::Nearest;
+  if (maxAnisotropy > 1u) {
+    magFilter = wgpu::FilterMode::Linear;
+    minFilter = wgpu::FilterMode::Linear;
+    mipFilter = wgpu::MipmapFilterMode::Linear;
+  }
+  return {
+      .label = "GXCore Sampler",
+      .addressModeU = to_address_mode(sampler.wrap_s),
+      .addressModeV = to_address_mode(sampler.wrap_t),
+      .addressModeW = wgpu::AddressMode::Repeat,
+      .magFilter = magFilter,
+      .minFilter = minFilter,
+      .mipmapFilter = mipFilter,
+      .lodMinClamp = mipmaps ? static_cast<float>(sampler.min_lod) / 16.f : 0.f,
+      .lodMaxClamp = mipmaps ? static_cast<float>(sampler.max_lod) / 16.f : 0.f,
+      .maxAnisotropy = maxAnisotropy,
+  };
+}
+
 // Texture bind group layout for a used-texmap set (63/Mfin multi-texmap): texmap
 // t occupies binding 2t (texture) + 2t+1 (sampler), matching the WGSL. Cached per
 // mask; used_mask=1 (texmap 0 only) reproduces the pre-Mfin single-texmap layout.
@@ -721,15 +770,6 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
 
   BindGroupRef textureBindGroup = 0;
   if (plan.pipeline.shader.textured != 0) {
-    const wgpu::SamplerDescriptor samplerDescriptor{
-        .label = "GXCore Sampler",
-        .addressModeU = wgpu::AddressMode::Repeat,
-        .addressModeV = wgpu::AddressMode::Repeat,
-        .magFilter = wgpu::FilterMode::Linear,
-        .minFilter = wgpu::FilterMode::Linear,
-        .mipmapFilter = wgpu::MipmapFilterMode::Nearest,
-    };
-    const auto sampler = sampler_ref(samplerDescriptor);
     if (plan.texmap_mask == 0u) {
       // Single-texmap fast path: primary texture at binding 0/1 (unchanged).
       if (plan.has_texture) {
@@ -739,6 +779,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
             plan.tlut_address, plan.tlut_format, plan.tlut_entries,
             plan.tlut_data, plan.tlut_available);
         if (bound) {
+          const auto sampler =
+              sampler_ref(sampler_descriptor(plan.samplers[plan.tex_slot & 7u]));
           const std::array entries{
               WGPUBindGroupEntry{.binding = 0,
                                  .textureView =
@@ -759,6 +801,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       // matching the WGSL declarations. If any referenced texmap fails to
       // resolve the draw is not drawable (avoids a missing-bind-group error).
       std::vector<TextureHandle> held;
+      std::vector<wgpu::Sampler> heldSamplers;
       std::vector<WGPUBindGroupEntry> entries;
       bool complete = true;
       for (uint32_t t = 0; t < 8u; ++t) {
@@ -776,10 +819,12 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
           break;
         }
         held.push_back(bound);
+        heldSamplers.push_back(
+            sampler_ref(sampler_descriptor(plan.samplers[t])));
         entries.push_back(WGPUBindGroupEntry{
             .binding = 2u * t, .textureView = bound->sampleTextureView.Get()});
         entries.push_back(WGPUBindGroupEntry{.binding = 2u * t + 1u,
-                                             .sampler = sampler.Get()});
+                                             .sampler = heldSamplers.back().Get()});
       }
       if (!complete)
         return false;

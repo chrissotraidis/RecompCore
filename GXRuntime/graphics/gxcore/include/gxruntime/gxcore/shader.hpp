@@ -416,6 +416,17 @@ inline std::uint32_t used_texmap_mask(const ShaderKey& key) {
 // than one distinct texmap is sampled (e.g. a THP YUV movie draws Y/U/V on
 // texmap 0/1/2 and a TEV combines them to RGB) the per-texmap set is carried in
 // DrawPlan::textures and texmap_mask marks which slots are live.
+struct PlanSampler {
+  std::uint8_t wrap_s = 1; // BP TexMode0: clamp=0, repeat=1, mirror=2
+  std::uint8_t wrap_t = 1;
+  std::uint8_t mag_filter = 1;    // nearest=0, linear=1
+  std::uint8_t min_filter = 1;
+  std::uint8_t mipmap_filter = 1; // none=0, point=1, linear=2
+  std::uint8_t min_lod = 0;       // BP TexMode1 unsigned 4.4
+  std::uint8_t max_lod = 0xFF;
+  std::uint8_t max_aniso = 0;     // 1x=0, 2x=1, 4x=2
+};
+
 struct PlanTexture {
   bool valid = false;
   std::uint32_t address = 0;
@@ -456,6 +467,7 @@ struct DrawPlan {
   std::int32_t scissor_width = 0;
   std::int32_t scissor_height = 0;
   bool has_texture = false;
+  std::uint32_t tex_slot = 0;
   std::uint32_t tex_address = 0;
   std::uint32_t tex_size = 0;
   std::uint32_t tex_format = 0;
@@ -476,6 +488,7 @@ struct DrawPlan {
   // by an enabled TEV stage. 0 or a single bit keeps the single-texmap fast path
   // (the flat tex_* fields above); >1 bit makes the per-texmap set authoritative.
   std::uint32_t texmap_mask = 0;
+  PlanSampler samplers[8]{};
   PlanTexture textures[8]{};
 };
 

@@ -1287,8 +1287,36 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
         bp_valid_[0x59u] ? bp_regs_[0x59u] : (171u | (171u << 10u));
     decode_scissor(plan, bp_regs_[0x20u], bp_regs_[0x21u], offset);
   }
+  for (std::uint32_t t = 0; t < 8u; ++t) {
+    const std::uint32_t mode0_reg =
+        0x80u | ((t & 3u) | ((t & 4u) << 3u));
+    const std::uint32_t mode1_reg = mode0_reg + 4u;
+    PlanSampler& sampler = plan.samplers[t];
+    if (bp_valid_[mode0_reg]) {
+      const std::uint32_t mode0 = bp_regs_[mode0_reg];
+      const std::uint32_t min_filter = bits(mode0, 3, 5);
+      static constexpr std::uint8_t kMinFilter[8] = {
+          0, 0, 1, 0, 1, 0, 1, 0,
+      };
+      static constexpr std::uint8_t kMipmapFilter[8] = {
+          0, 1, 1, 0, 0, 2, 2, 0,
+      };
+      sampler.wrap_s = static_cast<std::uint8_t>(bits(mode0, 2, 0));
+      sampler.wrap_t = static_cast<std::uint8_t>(bits(mode0, 2, 2));
+      sampler.mag_filter = static_cast<std::uint8_t>(bits(mode0, 1, 4));
+      sampler.min_filter = kMinFilter[min_filter];
+      sampler.mipmap_filter = kMipmapFilter[min_filter];
+      sampler.max_aniso = static_cast<std::uint8_t>(bits(mode0, 2, 19));
+    }
+    if (bp_valid_[mode1_reg]) {
+      const std::uint32_t mode1 = bp_regs_[mode1_reg];
+      sampler.min_lod = static_cast<std::uint8_t>(bits(mode1, 8, 0));
+      sampler.max_lod = static_cast<std::uint8_t>(bits(mode1, 8, 8));
+    }
+  }
   if (key.textured != 0u) {
     plan.has_texture = true;
+    plan.tex_slot = draw.texture.slot & 7u;
     plan.tex_address = draw.texture.address;
     plan.tex_size = draw.texture.size;
     plan.tex_format = draw.texture.format;
