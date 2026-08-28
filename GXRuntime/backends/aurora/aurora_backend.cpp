@@ -404,6 +404,11 @@ void dol_aurora_shutdown(void) {
                      "projection_missing=%llu payload_empty=%llu "
                      "walk_underivable=%llu stride_mismatch=%llu "
                      "topology_unsupported=%llu payload_overrun=%llu "
+                     "topology_zero_quads=%llu topology_zero_triangles=%llu "
+                     "topology_zero_triangle_strip=%llu "
+                     "topology_zero_triangle_fan=%llu "
+                     "topology_zero_lines=%llu topology_zero_line_strip=%llu "
+                     "topology_zero_points=%llu topology_zero_unknown=%llu "
                      "array_unresolved=%llu array_out_of_bounds=%llu "
                      "unsupported_texgen=%llu per_vertex_tex_mtx=%llu "
                      "unresolved_tex_matrix=%llu normals_ignored=%llu "
@@ -424,6 +429,14 @@ void dol_aurora_shutdown(void) {
                      gaps.vertex_stride_mismatch,
                      gaps.vertex_topology_unsupported,
                      gaps.vertex_payload_overrun,
+                     gaps.topology_zero_quads,
+                     gaps.topology_zero_triangles,
+                     gaps.topology_zero_triangle_strip,
+                     gaps.topology_zero_triangle_fan,
+                     gaps.topology_zero_lines,
+                     gaps.topology_zero_line_strip,
+                     gaps.topology_zero_points,
+                     gaps.topology_zero_unknown,
                      gaps.vertex_array_unresolved,
                      gaps.vertex_array_out_of_bounds,
                      gaps.unsupported_texgen,

@@ -746,6 +746,32 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
   if (index_count == 0u) {
     ++counters.vertex_decode_failures;
     ++counters.vertex_topology_unsupported;
+    switch (primitive) {
+    case ar::GxPrimitive::Quads:
+      ++counters.topology_zero_quads;
+      break;
+    case ar::GxPrimitive::Triangles:
+      ++counters.topology_zero_triangles;
+      break;
+    case ar::GxPrimitive::TriangleStrip:
+      ++counters.topology_zero_triangle_strip;
+      break;
+    case ar::GxPrimitive::TriangleFan:
+      ++counters.topology_zero_triangle_fan;
+      break;
+    case ar::GxPrimitive::Lines:
+      ++counters.topology_zero_lines;
+      break;
+    case ar::GxPrimitive::LineStrip:
+      ++counters.topology_zero_line_strip;
+      break;
+    case ar::GxPrimitive::Points:
+      ++counters.topology_zero_points;
+      break;
+    default:
+      ++counters.topology_zero_unknown;
+      break;
+    }
     return skip("unsupported or empty primitive");
   }
 

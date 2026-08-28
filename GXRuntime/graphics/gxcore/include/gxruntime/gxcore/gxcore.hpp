@@ -29,6 +29,14 @@ struct GapCounters {
   unsigned long long vertex_walk_underivable = 0;
   unsigned long long vertex_stride_mismatch = 0;
   unsigned long long vertex_topology_unsupported = 0;
+  unsigned long long topology_zero_quads = 0;
+  unsigned long long topology_zero_triangles = 0;
+  unsigned long long topology_zero_triangle_strip = 0;
+  unsigned long long topology_zero_triangle_fan = 0;
+  unsigned long long topology_zero_lines = 0;
+  unsigned long long topology_zero_line_strip = 0;
+  unsigned long long topology_zero_points = 0;
+  unsigned long long topology_zero_unknown = 0;
   unsigned long long vertex_payload_overrun = 0;
   unsigned long long vertex_array_unresolved = 0;
   unsigned long long vertex_array_out_of_bounds = 0;

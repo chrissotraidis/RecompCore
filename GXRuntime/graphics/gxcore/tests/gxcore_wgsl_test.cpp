@@ -203,6 +203,35 @@ void test_state_to_plan_and_wgsl() {
   CHECK(counters.draws_skipped == 0);
   CHECK(counters.unresolved_tex_matrix == 0);
 
+  // Topology admission is distinct from the shared zero-index exit: valid
+  // lines/points build plans, while an incomplete quad is rejected.
+  {
+    ar::ConsumedDraw line = draw;
+    line.primitive = 0xA8;
+    const gxc::DrawPlan line_plan = state.build_draw_plan(line, counters);
+    CHECK(line_plan.ok);
+    CHECK(line_plan.pipeline.primitive_topology == 1u);
+    CHECK(line_plan.indices.size() == 4u);
+
+    ar::ConsumedDraw points = draw;
+    points.primitive = 0xB8;
+    const gxc::DrawPlan point_plan = state.build_draw_plan(points, counters);
+    CHECK(point_plan.ok);
+    CHECK(point_plan.pipeline.primitive_topology == 2u);
+    CHECK(point_plan.indices.size() == 4u);
+
+    ar::ConsumedDraw partial_quad = draw;
+    partial_quad.vertex_count = 3u;
+    partial_quad.vertex_payload.resize(3u * partial_quad.vertex_size);
+    const gxc::DrawPlan partial_plan =
+        state.build_draw_plan(partial_quad, counters);
+    CHECK(!partial_plan.ok);
+    CHECK(counters.vertex_topology_unsupported == 1u);
+    CHECK(counters.topology_zero_quads == 1u);
+    CHECK(counters.topology_zero_lines == 0u);
+    CHECK(counters.topology_zero_points == 0u);
+  }
+
   // Shader key.
   const gxc::ShaderKey& key = plan.pipeline.shader;
   CHECK(key.num_tex_gens == 1);
