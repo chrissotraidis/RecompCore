@@ -550,6 +550,7 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
     num_tex_gens = bits(gen_mode, 4, 0);
   if (num_tex_gens > kMaxTexGens) {
     ++counters.unsupported_texgen;
+    ++counters.texgen_count_overflow;
     num_tex_gens = kMaxTexGens;
   }
   key.num_tex_gens = static_cast<std::uint8_t>(num_tex_gens);
@@ -636,11 +637,39 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
           static_cast<std::uint8_t>(i);
     }
     // Regular / Color0 / Color1 / Emboss are all generated (item 5). Emboss
-    // needs the NBT binormal/tangent vertex inputs; without them in the layout
-    // the offset can't be computed, so count that residual case as a gap.
+    // without per-vertex NBT uses the cross-draw cached tangent/binormal, so it
+    // is an exercised fallback rather than an unsupported path.
     if (static_cast<TexGenType>(tg.texgentype) == TexGenType::EmbossMap &&
         !walk.has_nbt)
-      ++counters.unsupported_texgen;
+      ++counters.texgen_emboss_cached_nbt;
+
+    // The current vertex layout emits position and Tex0..Tex3 source rows for
+    // regular matrix texgens. Classify every other legal source instead of
+    // silently leaving its coordinate at the shader default.
+    if (static_cast<TexGenType>(tg.texgentype) == TexGenType::Regular) {
+      const auto source = static_cast<TexSourceRow>(tg.sourcerow);
+      bool unsupported_source = true;
+      if (source == TexSourceRow::Geom ||
+          (tg.sourcerow >= static_cast<std::uint8_t>(TexSourceRow::Tex0) &&
+           tg.sourcerow <
+               static_cast<std::uint8_t>(TexSourceRow::Tex0) + 4u)) {
+        unsupported_source = false;
+      } else if (source == TexSourceRow::Normal) {
+        ++counters.texgen_source_normal;
+      } else if (source == TexSourceRow::Colors) {
+        ++counters.texgen_source_colors;
+      } else if (source == TexSourceRow::BinormalT ||
+                 source == TexSourceRow::BinormalB) {
+        ++counters.texgen_source_binormal;
+      } else if (tg.sourcerow <
+                 static_cast<std::uint8_t>(TexSourceRow::Tex0) + 8u) {
+        ++counters.texgen_source_tex47;
+      } else {
+        ++counters.texgen_source_unknown;
+      }
+      if (unsupported_source)
+        ++counters.unsupported_texgen;
+    }
   }
   std::uint32_t num_ind_stages = bits(gen_mode, 3, 16);
   if (num_ind_stages > kMaxIndirectStages) {

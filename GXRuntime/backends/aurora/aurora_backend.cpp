@@ -410,7 +410,11 @@ void dol_aurora_shutdown(void) {
                      "topology_zero_lines=%llu topology_zero_line_strip=%llu "
                      "topology_zero_points=%llu topology_zero_unknown=%llu "
                      "array_unresolved=%llu array_out_of_bounds=%llu "
-                     "unsupported_texgen=%llu per_vertex_tex_mtx=%llu "
+                     "unsupported_texgen=%llu texgen_count_overflow=%llu "
+                     "texgen_emboss_cached_nbt=%llu texgen_source_normal=%llu "
+                     "texgen_source_colors=%llu texgen_source_binormal=%llu "
+                     "texgen_source_tex47=%llu texgen_source_unknown=%llu "
+                     "per_vertex_tex_mtx=%llu "
                      "unresolved_tex_matrix=%llu normals_ignored=%llu "
                      "lighting_ignored=%llu tlut_texture=%llu "
                      "alpha_compare_ignored=%llu tev_stages_over=%llu "
@@ -441,6 +445,13 @@ void dol_aurora_shutdown(void) {
                      gaps.vertex_array_unresolved,
                      gaps.vertex_array_out_of_bounds,
                      gaps.unsupported_texgen,
+                     gaps.texgen_count_overflow,
+                     gaps.texgen_emboss_cached_nbt,
+                     gaps.texgen_source_normal,
+                     gaps.texgen_source_colors,
+                     gaps.texgen_source_binormal,
+                     gaps.texgen_source_tex47,
+                     gaps.texgen_source_unknown,
                      gaps.per_vertex_tex_mtx, gaps.unresolved_tex_matrix,
                      gaps.normals_ignored, gaps.lighting_ignored,
                      gaps.tlut_texture, gaps.alpha_compare_ignored,

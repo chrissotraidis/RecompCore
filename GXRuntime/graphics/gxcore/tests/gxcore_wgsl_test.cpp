@@ -203,6 +203,59 @@ void test_state_to_plan_and_wgsl() {
   CHECK(counters.draws_skipped == 0);
   CHECK(counters.unresolved_tex_matrix == 0);
 
+  // Texgen residuals are classified by the unsupported source row. Emboss
+  // without per-vertex NBT is not a gap: it uses the cached N/B/T uniform.
+  auto classify_texgen = [&](std::uint32_t info, gxc::GapCounters& gaps) {
+    ar::ConsumedDraw classified = draw;
+    classified.xf_regs[0x28] = info;
+    return state.build_draw_plan(classified, gaps);
+  };
+  {
+    gxc::GapCounters gaps;
+    CHECK(classify_texgen(1u << 7u, gaps).ok); // Normal
+    CHECK(gaps.unsupported_texgen == 1u);
+    CHECK(gaps.texgen_source_normal == 1u);
+  }
+  {
+    gxc::GapCounters gaps;
+    CHECK(classify_texgen(2u << 7u, gaps).ok); // Colors
+    CHECK(gaps.unsupported_texgen == 1u);
+    CHECK(gaps.texgen_source_colors == 1u);
+  }
+  {
+    gxc::GapCounters gaps;
+    CHECK(classify_texgen(3u << 7u, gaps).ok); // BinormalT
+    CHECK(classify_texgen(4u << 7u, gaps).ok); // BinormalB
+    CHECK(gaps.unsupported_texgen == 2u);
+    CHECK(gaps.texgen_source_binormal == 2u);
+  }
+  {
+    gxc::GapCounters gaps;
+    CHECK(classify_texgen(9u << 7u, gaps).ok); // Tex4
+    CHECK(gaps.unsupported_texgen == 1u);
+    CHECK(gaps.texgen_source_tex47 == 1u);
+  }
+  {
+    gxc::GapCounters gaps;
+    CHECK(classify_texgen(13u << 7u, gaps).ok);
+    CHECK(gaps.unsupported_texgen == 1u);
+    CHECK(gaps.texgen_source_unknown == 1u);
+  }
+  {
+    gxc::GapCounters gaps;
+    CHECK(classify_texgen((1u << 4u) | (5u << 7u), gaps).ok); // Emboss
+    CHECK(gaps.unsupported_texgen == 0u);
+    CHECK(gaps.texgen_emboss_cached_nbt == 1u);
+  }
+  {
+    gxc::GapCounters gaps;
+    ar::ConsumedDraw overflow = draw;
+    overflow.xf_regs[0x27] = 5u;
+    CHECK(state.build_draw_plan(overflow, gaps).ok);
+    CHECK(gaps.unsupported_texgen == 1u);
+    CHECK(gaps.texgen_count_overflow == 1u);
+  }
+
   // Topology admission is distinct from the shared zero-index exit: valid
   // lines/points build plans, while an incomplete quad is rejected.
   {

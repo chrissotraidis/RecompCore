@@ -913,7 +913,7 @@ std::string generate_wgsl(const ShaderKey& key) {
       }
     }
     // Other source rows (normal/colors/binormals, tex4-7) are outside the
-    // slice; the plan builder counted them and coord stays the default.
+    // slice; the plan builder classifies each residual and coord stays default.
     if (tg.inputform == 0u) // AB11
       emit(out, "        coord.z = 1.0;\n");
     const auto tgtype = static_cast<TexGenType>(tg.texgentype);

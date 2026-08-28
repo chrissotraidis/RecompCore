@@ -41,7 +41,14 @@ struct GapCounters {
   unsigned long long vertex_payload_overrun = 0;
   unsigned long long vertex_array_unresolved = 0;
   unsigned long long vertex_array_out_of_bounds = 0;
-  unsigned long long unsupported_texgen = 0;    // emboss/SRTG or >kMaxTexGens
+  unsigned long long unsupported_texgen = 0;    // sum of actual texgen gaps below
+  unsigned long long texgen_count_overflow = 0; // XF count > captured shader cap
+  unsigned long long texgen_emboss_cached_nbt = 0; // supported cached N/B/T fallback
+  unsigned long long texgen_source_normal = 0;  // regular source row not emitted
+  unsigned long long texgen_source_colors = 0;  // regular source row not emitted
+  unsigned long long texgen_source_binormal = 0; // regular T/B source not emitted
+  unsigned long long texgen_source_tex47 = 0;   // regular Tex4..Tex7 not captured
+  unsigned long long texgen_source_unknown = 0; // regular source row > Tex7
   unsigned long long per_vertex_tex_mtx = 0;    // TEXMTXIDX attrs (stubbed)
   unsigned long long unresolved_tex_matrix = 0; // matrix rows never written
   unsigned long long normals_ignored = 0;       // decoded past, not lit (S15)
