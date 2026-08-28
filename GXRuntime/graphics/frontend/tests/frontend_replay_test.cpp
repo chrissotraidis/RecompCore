@@ -706,10 +706,13 @@ int main() {
     // target 12 under PE_CONTROL Z24 -> GX_TF_Z24X8 (0x16, depth source).
     std::vector<std::uint32_t> copy_formats;
     std::vector<std::uint32_t> copy_dimensions;
+    std::vector<std::uint32_t> copy_source_dimensions;
     for (const auto& ev : trace) {
       if (ev.kind == DOL_GX_RECOMP_EVENT_COPY_DESTINATION) {
         copy_formats.push_back(ev.c);
         copy_dimensions.push_back(ev.g);
+        copy_source_dimensions.push_back((ev.copy_src_width << 16u) |
+                                         ev.copy_src_height);
       }
     }
     assert(copy_formats.size() == 5u);
@@ -721,6 +724,9 @@ int main() {
     assert(copy_dimensions[0] == ((8u << 16u) | 8u));
     assert(copy_dimensions[1] == ((4u << 16u) | 4u));
     assert(copy_dimensions[2] == ((4u << 16u) | 4u));
+    assert(copy_source_dimensions[0] == ((8u << 16u) | 8u));
+    assert(copy_source_dimensions[1] == ((8u << 16u) | 8u));
+    assert(copy_source_dimensions[2] == ((8u << 16u) | 8u));
     assert(state.copy.is_depth);
   }
   assert(sink.packets().size() == trace.size());

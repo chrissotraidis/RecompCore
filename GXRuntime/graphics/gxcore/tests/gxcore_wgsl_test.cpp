@@ -1827,10 +1827,12 @@ void test_efb_copy_sink() {
     copy.resource.address = 0x0053A4E0u;
     copy.resource.size = 6080u;
     copy.resource.format = 1u; // I8
-    copy.resource.width = 96u;
-    copy.resource.height = 32u;
+    copy.resource.width = 320u;
+    copy.resource.height = 240u;
     copy.resource.copy_src_x = 12u;
     copy.resource.copy_src_y = 34u;
+    copy.resource.copy_src_width = 640u;
+    copy.resource.copy_src_height = 480u;
     copy.resource.copy_clear = 1u;
     sink.submit_packet(copy);
     CHECK(g_copy_fire_count == 1);
@@ -1839,8 +1841,10 @@ void test_efb_copy_sink() {
     CHECK(g_captured_copy.dest_address == 0x0053A4E0u);
     CHECK(g_captured_copy.byte_size == 6080u);
     CHECK(g_captured_copy.format == 1u);
-    CHECK(g_captured_copy.width == 96u);
-    CHECK(g_captured_copy.height == 32u);
+    CHECK(g_captured_copy.width == 640u);
+    CHECK(g_captured_copy.height == 480u);
+    CHECK(g_captured_copy.destination_width == 320u);
+    CHECK(g_captured_copy.destination_height == 240u);
     CHECK(g_captured_copy.src_x == 12u);
     CHECK(g_captured_copy.src_y == 34u);
     CHECK(g_captured_copy.clear == true);

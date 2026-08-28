@@ -772,6 +772,8 @@ static void test_gx_recomp_all_module_replay(void) {
         saw_tlut |= trace[i].kind == DOL_GX_RECOMP_EVENT_TLUT;
         if (trace[i].kind == DOL_GX_RECOMP_EVENT_COPY_DESTINATION) {
             saw_copy = true;
+            assert(trace[i].copy_src_width == 8u);
+            assert(trace[i].copy_src_height == 8u);
             if (copy_count == 0u)
                 assert(trace[i].g == ((8u << 16u) | 8u));
             else

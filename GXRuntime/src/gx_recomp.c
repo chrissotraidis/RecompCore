@@ -20,6 +20,8 @@ void dol_gx_recomp_trace_event(DolGxRecompState* gx, DolGxRecompEventKind kind,
     event->e = 0u;
     event->f = 0u;
     event->g = 0u;
+    event->copy_src_width = 0u;
+    event->copy_src_height = 0u;
 }
 
 static u32 round_up(u32 value, u32 multiple) {
@@ -792,14 +794,17 @@ bool dol_gx_recomp_resolve_copy_destination(DolGxRecompState* gx,
      * trigger, incl. the Z bit (0x10) when PE_CONTROL was Z24 at trigger time
      * (depth-source copy, Dolphin BPStructs.cpp is_depth_copy) and the CTF bit
      * (0x20) for channel-select formats — d=clear flag, e=EFB source x,
-     * f=source y, g=packed dims (width<<16 | height). In-memory only (never
-     * in .dolt). */
+     * f=source y, g=packed destination dims (width<<16 | height), and the
+     * dedicated fields carry the persistent BP 0x4A source dimensions.
+     * In-memory only (never in .dolt). */
     dol_gx_recomp_trace_event(gx, DOL_GX_RECOMP_EVENT_COPY_DESTINATION, physical_base,
                 byte_size, gx->copy.format, gx->copy.clear);
     if (gx->trace_count > 0u) {
         DolGxRecompTraceEvent* ev = &gx->trace[gx->trace_count - 1u];
         ev->e = gx->copy.src_x;
         ev->f = gx->copy.src_y;
+        ev->copy_src_width = gx->copy.width;
+        ev->copy_src_height = gx->copy.height;
         const u32 width = gx->copy.destination_width != 0u
                               ? gx->copy.destination_width
                               : gx->copy.width;
@@ -823,6 +828,8 @@ bool dol_gx_recomp_note_display_copy(DolGxRecompState* gx, u32 clear) {
         ev->e = gx->copy.src_x;
         ev->f = gx->copy.src_y;
         ev->g = (gx->copy.width << 16u) | (gx->copy.height & 0xFFFFu);
+        ev->copy_src_width = gx->copy.width;
+        ev->copy_src_height = gx->copy.height;
     }
     return true;
 }

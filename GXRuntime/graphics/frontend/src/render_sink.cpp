@@ -685,6 +685,8 @@ RenderPacket make_render_packet(std::uint32_t sequence,
         .height = event.g & 0xFFFFu,
         .copy_src_x = event.e,
         .copy_src_y = event.f,
+        .copy_src_width = event.copy_src_width,
+        .copy_src_height = event.copy_src_height,
         .copy_clear = event.d,
     };
     break;

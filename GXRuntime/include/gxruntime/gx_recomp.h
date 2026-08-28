@@ -107,6 +107,12 @@ typedef struct DolGxRecompTraceEvent {
     u32 tlut_address;
     u32 tlut_format;
     u32 tlut_entries;
+    /* COPY_DESTINATION only: persistent BP 0x4A source dimensions. `g`
+     * remains the packed destination dimensions after half-scale. Keeping
+     * both prevents a 640x480 -> 320x240 copy from cropping the source to its
+     * top-left quarter. In-memory only (never serialized into .dolt). */
+    u32 copy_src_width;
+    u32 copy_src_height;
 } DolGxRecompTraceEvent;
 
 typedef struct DolGxRecompFifo {

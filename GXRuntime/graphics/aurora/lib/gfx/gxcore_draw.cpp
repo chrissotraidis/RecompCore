@@ -632,8 +632,10 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
       .width = static_cast<int32_t>(cmd.width),
       .height = static_cast<int32_t>(cmd.height),
   });
-  const uint32_t dstWidth = static_cast<uint32_t>(std::max(srcRect.width, 1));
-  const uint32_t dstHeight = static_cast<uint32_t>(std::max(srcRect.height, 1));
+  const uint32_t dstWidth =
+      std::max(cmd.destination_width, static_cast<uint32_t>(1));
+  const uint32_t dstHeight =
+      std::max(cmd.destination_height, static_cast<uint32_t>(1));
 
   auto it = g_efbCopyTextures.find(cmd.dest_address);
   if (it == g_efbCopyTextures.end() || !it->second) {

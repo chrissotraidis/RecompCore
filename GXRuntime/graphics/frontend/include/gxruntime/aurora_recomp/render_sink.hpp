@@ -87,12 +87,15 @@ struct RenderResourcePacket {
   std::uint32_t tlut_address = 0;
   std::uint32_t tlut_format = 0;
   std::uint32_t tlut_entries = 0;
-  // CopyDestination packets only: the EFB source rect origin
-  // and whether the EFB is cleared after the copy. width/height carry the copy
-  // dimensions and format carries the GX copy texture format (incl. Z target).
+  // CopyDestination packets only: the EFB source rectangle and whether the
+  // EFB is cleared after the copy. width/height carry destination texture
+  // dimensions; copy_src_width/height retain the unscaled BP source rectangle.
+  // format carries the GX copy texture format (incl. Z target).
   // Consumed by the gxcore EFB-copy path; in-memory only (never in .dolt).
   std::uint32_t copy_src_x = 0;
   std::uint32_t copy_src_y = 0;
+  std::uint32_t copy_src_width = 0;
+  std::uint32_t copy_src_height = 0;
   std::uint32_t copy_clear = 0;
 };
 

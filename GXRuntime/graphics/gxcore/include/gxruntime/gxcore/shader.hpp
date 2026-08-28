@@ -521,6 +521,8 @@ struct EfbCopyCommand {
   std::uint32_t src_y = 0;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
+  std::uint32_t destination_width = 0;
+  std::uint32_t destination_height = 0;
   bool clear = false;
   // EFB clear color/Z applied after the copy (BP 0x4F/0x50/0x51, read from the
   // sink's live state). rgba 0..255; z is the raw 24-bit copy-clear depth.
