@@ -1109,6 +1109,22 @@ static void test_guest_data_alias(void) {
     assert(ppc_guest_alias_remove(second_linked, sizeof(initial)));
     assert(!ppc_guest_alias_resolve(second_linked, 4u, &resolved, NULL));
     ppc_guest_alias_clear();
+
+    u8 shared_storage[4] = {0x01u, 0x23u, 0x45u, 0x67u};
+    assert(ppc_guest_alias_add_shared(linked, sizeof(shared_storage),
+                                      shared_storage));
+    resolved = NULL;
+    assert(ppc_guest_alias_get_storage(linked, sizeof(shared_storage),
+                                       &resolved));
+    assert(resolved == shared_storage);
+    assert(mem_read32(&cpu, linked) == 0x01234567u);
+    mem_write32(&cpu, linked, 0x89ABCDEFu);
+    assert(read_be32(shared_storage) == 0x89ABCDEFu);
+    write_be32(shared_storage, 0x76543210u);
+    assert(mem_read32(&cpu, linked) == 0x76543210u);
+    ppc_guest_alias_clear();
+    shared_storage[0] = 0xAAu;
+    assert(shared_storage[0] == 0xAAu);
     cpu_free(&cpu);
 }
 

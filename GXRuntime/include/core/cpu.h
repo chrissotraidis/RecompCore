@@ -108,6 +108,8 @@ typedef void (*PPCCacheControl)(CPUState* cpu, u8 operation, u32 ea, u32 cia);
 // backs it with storage outside the contiguous game heap. The table is owned
 // by GXRuntime rather than CPUState so the generated CPU ABI remains stable.
 bool ppc_guest_alias_add(u32 linked_start, u32 size, const u8* initial_bytes);
+bool ppc_guest_alias_add_shared(u32 linked_start, u32 size, u8* storage);
+bool ppc_guest_alias_get_storage(u32 linked_start, u32 size, u8** storage);
 bool ppc_guest_alias_remove(u32 linked_start, u32 size);
 void ppc_guest_alias_clear(void);
 bool ppc_guest_alias_resolve(u32 address, u32 size, u8** pointer,

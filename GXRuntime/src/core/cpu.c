@@ -41,6 +41,7 @@ typedef struct PPCGuestAlias {
     u32 linked_start;
     u32 size;
     u8* storage;
+    bool owns_storage;
 } PPCGuestAlias;
 
 static PPCGuestAlias g_guest_aliases[PPC_GUEST_ALIAS_MAX];
@@ -63,7 +64,8 @@ static void ppc_guest_alias_recompute_bounds(void) {
 
 GXRUNTIME_EXPORT void ppc_guest_alias_clear(void) {
     for (u32 i = 0; i < g_guest_alias_count; ++i) {
-        free(g_guest_aliases[i].storage);
+        if (g_guest_aliases[i].owns_storage)
+            free(g_guest_aliases[i].storage);
         g_guest_aliases[i].storage = NULL;
     }
     g_guest_alias_count = 0u;
@@ -71,21 +73,17 @@ GXRUNTIME_EXPORT void ppc_guest_alias_clear(void) {
     g_guest_alias_max_end = 0u;
 }
 
-GXRUNTIME_EXPORT bool ppc_guest_alias_add(u32 linked_start, u32 size,
-                                          const u8* initial_bytes) {
-    if (size == 0u || g_guest_alias_count >= PPC_GUEST_ALIAS_MAX)
+static bool ppc_guest_alias_add_storage(u32 linked_start, u32 size,
+                                        u8* storage, bool owns_storage) {
+    if (size == 0u || storage == NULL ||
+        g_guest_alias_count >= PPC_GUEST_ALIAS_MAX)
         return false;
-
-    u8* storage = (u8*)calloc(1u, size);
-    if (storage == NULL)
-        return false;
-    if (initial_bytes != NULL)
-        memcpy(storage, initial_bytes, size);
 
     PPCGuestAlias* alias = &g_guest_aliases[g_guest_alias_count++];
     alias->linked_start = linked_start;
     alias->size = size;
     alias->storage = storage;
+    alias->owns_storage = owns_storage;
     if (alias->linked_start < g_guest_alias_min_start)
         g_guest_alias_min_start = alias->linked_start;
     const u64 alias_end = (u64)alias->linked_start + alias->size;
@@ -101,12 +99,48 @@ GXRUNTIME_EXPORT bool ppc_guest_alias_add(u32 linked_start, u32 size,
     return true;
 }
 
+GXRUNTIME_EXPORT bool ppc_guest_alias_add(u32 linked_start, u32 size,
+                                          const u8* initial_bytes) {
+    if (size == 0u)
+        return false;
+    u8* storage = (u8*)calloc(1u, size);
+    if (storage == NULL)
+        return false;
+    if (initial_bytes != NULL)
+        memcpy(storage, initial_bytes, size);
+    if (!ppc_guest_alias_add_storage(linked_start, size, storage, true)) {
+        free(storage);
+        return false;
+    }
+    return true;
+}
+
+GXRUNTIME_EXPORT bool ppc_guest_alias_add_shared(u32 linked_start, u32 size,
+                                                 u8* storage) {
+    return ppc_guest_alias_add_storage(linked_start, size, storage, false);
+}
+
+GXRUNTIME_EXPORT bool ppc_guest_alias_get_storage(u32 linked_start, u32 size,
+                                                  u8** storage) {
+    if (storage == NULL)
+        return false;
+    for (u32 i = 0u; i < g_guest_alias_count; ++i) {
+        const PPCGuestAlias* alias = &g_guest_aliases[i];
+        if (alias->linked_start == linked_start && alias->size == size) {
+            *storage = alias->storage;
+            return true;
+        }
+    }
+    return false;
+}
+
 GXRUNTIME_EXPORT bool ppc_guest_alias_remove(u32 linked_start, u32 size) {
     for (u32 i = 0u; i < g_guest_alias_count; ++i) {
         PPCGuestAlias* alias = &g_guest_aliases[i];
         if (alias->linked_start != linked_start || alias->size != size)
             continue;
-        free(alias->storage);
+        if (alias->owns_storage)
+            free(alias->storage);
         if (i + 1u < g_guest_alias_count) {
             memmove(alias, alias + 1u,
                     (g_guest_alias_count - i - 1u) * sizeof(*alias));
