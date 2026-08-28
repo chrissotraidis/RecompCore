@@ -399,7 +399,7 @@ void dol_aurora_shutdown(void) {
         const auto& gaps = gx_aurora::g_core_sink.counters();
         std::fprintf(stderr,
                      "[gx-core] shutdown: submitted=%llu rejected=%llu "
-                     "failed=%d planned=%llu skipped=%llu cull_all=%llu "
+                     "failed=%d planned=%llu skipped=%llu noops=%llu cull_all=%llu "
                      "missing_vcd=%llu vertex_decode_failures=%llu "
                      "projection_missing=%llu payload_empty=%llu "
                      "walk_underivable=%llu stride_mismatch=%llu "
@@ -421,7 +421,7 @@ void dol_aurora_shutdown(void) {
                      gx_aurora::g_core_submitted, gx_aurora::g_core_rejected,
                      gx_aurora::g_shadow_frontend_failed ? 1 : 0,
                      gaps.draws_planned, gaps.draws_skipped,
-                     gaps.cull_all_draws, gaps.missing_vcd,
+                     gaps.draws_noop, gaps.cull_all_draws, gaps.missing_vcd,
                      gaps.vertex_decode_failures,
                      gaps.vertex_projection_missing,
                      gaps.vertex_payload_empty,

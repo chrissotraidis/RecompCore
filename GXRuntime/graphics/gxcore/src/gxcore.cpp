@@ -480,6 +480,12 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
     ++counters.draws_skipped;
     return plan;
   };
+  auto noop = [&](const char* reason) {
+    plan.ok = false;
+    plan.skip_reason = reason;
+    ++counters.draws_noop;
+    return plan;
+  };
 
   if (draw.cull_all) {
     ++counters.cull_all_draws;
@@ -744,34 +750,34 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
       primitive, 0u, static_cast<std::uint16_t>(draw.vertex_count),
       &plan.indices);
   if (index_count == 0u) {
-    ++counters.vertex_decode_failures;
-    ++counters.vertex_topology_unsupported;
     switch (primitive) {
     case ar::GxPrimitive::Quads:
       ++counters.topology_zero_quads;
-      break;
+      return noop("incomplete quad no-op");
     case ar::GxPrimitive::Triangles:
       ++counters.topology_zero_triangles;
-      break;
+      return noop("incomplete triangle no-op");
     case ar::GxPrimitive::TriangleStrip:
       ++counters.topology_zero_triangle_strip;
-      break;
+      return noop("incomplete triangle strip no-op");
     case ar::GxPrimitive::TriangleFan:
       ++counters.topology_zero_triangle_fan;
-      break;
+      return noop("incomplete triangle fan no-op");
     case ar::GxPrimitive::Lines:
       ++counters.topology_zero_lines;
-      break;
+      return noop("incomplete line no-op");
     case ar::GxPrimitive::LineStrip:
       ++counters.topology_zero_line_strip;
-      break;
+      return noop("incomplete line strip no-op");
     case ar::GxPrimitive::Points:
       ++counters.topology_zero_points;
-      break;
+      return noop("incomplete point no-op");
     default:
       ++counters.topology_zero_unknown;
       break;
     }
+    ++counters.vertex_decode_failures;
+    ++counters.vertex_topology_unsupported;
     return skip("unsupported or empty primitive");
   }
 

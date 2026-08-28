@@ -226,7 +226,10 @@ void test_state_to_plan_and_wgsl() {
     const gxc::DrawPlan partial_plan =
         state.build_draw_plan(partial_quad, counters);
     CHECK(!partial_plan.ok);
-    CHECK(counters.vertex_topology_unsupported == 1u);
+    CHECK(counters.draws_noop == 1u);
+    CHECK(counters.draws_skipped == 0u);
+    CHECK(counters.vertex_decode_failures == 0u);
+    CHECK(counters.vertex_topology_unsupported == 0u);
     CHECK(counters.topology_zero_quads == 1u);
     CHECK(counters.topology_zero_lines == 0u);
     CHECK(counters.topology_zero_points == 0u);

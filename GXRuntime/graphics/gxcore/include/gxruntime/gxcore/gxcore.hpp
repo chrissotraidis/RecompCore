@@ -21,6 +21,7 @@ namespace gxruntime::gxcore {
 struct GapCounters {
   unsigned long long draws_planned = 0;
   unsigned long long draws_skipped = 0;         // plan.ok == false
+  unsigned long long draws_noop = 0;            // valid incomplete primitive
   unsigned long long cull_all_draws = 0;        // culled by state, not a gap
   unsigned long long missing_vcd = 0;           // draw before VCD/VAT seen
   unsigned long long vertex_decode_failures = 0;
