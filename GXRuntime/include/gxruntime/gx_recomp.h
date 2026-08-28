@@ -170,8 +170,12 @@ typedef struct DolGxRecompVertexLayout {
 typedef struct DolGxRecompCopyState {
     u32 src_x;
     u32 src_y;
+    /* Persistent BP 0x4A source rectangle dimensions. */
     u32 width;
     u32 height;
+    /* Per-trigger texture destination dimensions after half-scale. */
+    u32 destination_width;
+    u32 destination_height;
     u32 physical_base;
     bool physical_base_valid;
     u32 format;

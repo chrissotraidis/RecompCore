@@ -703,6 +703,10 @@ static void test_gx_recomp_all_module_replay(void) {
             (7u << 10) | 7u);
     fifo_bp(dl, &dl_pos, DOL_GX_BP_REG_EFB_ADDR, copy_base >> 5);
     fifo_bp(dl, &dl_pos, DOL_GX_BP_REG_TRIGGER_EFB_COPY, 2u << 3);
+    fifo_bp(dl, &dl_pos, DOL_GX_BP_REG_TRIGGER_EFB_COPY,
+            (2u << 3) | (1u << 9));
+    fifo_bp(dl, &dl_pos, DOL_GX_BP_REG_TRIGGER_EFB_COPY,
+            (2u << 3) | (1u << 9));
     const u32 xf_value = 0x12345678u;
     fifo_xf(dl, &dl_pos, 0x1008u, &xf_value, 1u);
     fifo_indexed_xf(dl, &dl_pos, 0x20u, 1u, 0x0000u, 12u);
@@ -739,7 +743,7 @@ static void test_gx_recomp_all_module_replay(void) {
     assert(gx.tmem_tluts[0x20u].range.data == cpu.ram + tlut_base);
     assert(gx.copy.range_valid);
     assert(gx.copy.physical_base == copy_base);
-    assert(gx.copy.byte_size == 64u);
+    assert(gx.copy.byte_size == 32u);
     assert(gx.copy.range.data == cpu.ram + copy_base);
     assert(gx.last_xf_base == 0x0000u);
     assert(gx.last_xf_count == 12u);
@@ -758,6 +762,7 @@ static void test_gx_recomp_all_module_replay(void) {
     bool saw_draw = false;
     bool saw_indexed_span = false;
     bool saw_indexed_xf = false;
+    u32 copy_count = 0;
     for (u32 i = 0; i < trace_count; ++i) {
         saw_display_list |=
             trace[i].kind == DOL_GX_RECOMP_EVENT_DISPLAY_LIST;
@@ -765,7 +770,14 @@ static void test_gx_recomp_all_module_replay(void) {
         saw_array |= trace[i].kind == DOL_GX_RECOMP_EVENT_CP_ARRAY_BASE;
         saw_texture |= trace[i].kind == DOL_GX_RECOMP_EVENT_TEXTURE;
         saw_tlut |= trace[i].kind == DOL_GX_RECOMP_EVENT_TLUT;
-        saw_copy |= trace[i].kind == DOL_GX_RECOMP_EVENT_COPY_DESTINATION;
+        if (trace[i].kind == DOL_GX_RECOMP_EVENT_COPY_DESTINATION) {
+            saw_copy = true;
+            if (copy_count == 0u)
+                assert(trace[i].g == ((8u << 16u) | 8u));
+            else
+                assert(trace[i].g == ((4u << 16u) | 4u));
+            ++copy_count;
+        }
         saw_cull |= trace[i].kind == DOL_GX_RECOMP_EVENT_CULL_ALL;
         saw_xf |= trace[i].kind == DOL_GX_RECOMP_EVENT_XF_LOAD;
         saw_draw |= trace[i].kind == DOL_GX_RECOMP_EVENT_DRAW;
@@ -783,6 +795,7 @@ static void test_gx_recomp_all_module_replay(void) {
     assert(saw_texture);
     assert(saw_tlut);
     assert(saw_copy);
+    assert(copy_count == 3u);
     assert(saw_cull);
     assert(saw_xf);
     assert(saw_draw);

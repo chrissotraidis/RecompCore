@@ -635,6 +635,12 @@ int main() {
   push_bp(display_list, DOL_GX_BP_REG_EFB_WH, (7u << 10u) | 7u);
   push_bp(display_list, DOL_GX_BP_REG_EFB_ADDR, copy_base >> 5u);
   push_bp(display_list, DOL_GX_BP_REG_TRIGGER_EFB_COPY, 2u << 3u);
+  // Repeating a half-scale copy without rewriting BP 0x4A must halve the
+  // persistent source dimensions once per trigger, not recursively.
+  push_bp(display_list, DOL_GX_BP_REG_TRIGGER_EFB_COPY,
+          (2u << 3u) | (1u << 9u));
+  push_bp(display_list, DOL_GX_BP_REG_TRIGGER_EFB_COPY,
+          (2u << 3u) | (1u << 9u));
   // Faithful copy-format reconstruction (PROGRAM 64/A): target 14 is the
   // GX_CTF_A8 channel-select grab (Strikers glx_ShadowTextureGrab), and the
   // same trigger with PE_CONTROL pixel format Z24 becomes a depth-source copy.
@@ -699,13 +705,22 @@ int main() {
     // GX_CTF_R8 (0x28), target 14 -> GX_CTF_A8 (0x27, EFB alpha channel),
     // target 12 under PE_CONTROL Z24 -> GX_TF_Z24X8 (0x16, depth source).
     std::vector<std::uint32_t> copy_formats;
-    for (const auto& ev : trace)
-      if (ev.kind == DOL_GX_RECOMP_EVENT_COPY_DESTINATION)
+    std::vector<std::uint32_t> copy_dimensions;
+    for (const auto& ev : trace) {
+      if (ev.kind == DOL_GX_RECOMP_EVENT_COPY_DESTINATION) {
         copy_formats.push_back(ev.c);
-    assert(copy_formats.size() == 3u);
+        copy_dimensions.push_back(ev.g);
+      }
+    }
+    assert(copy_formats.size() == 5u);
     assert(copy_formats[0] == 0x28u);
-    assert(copy_formats[1] == 0x27u);
-    assert(copy_formats[2] == 0x16u);
+    assert(copy_formats[1] == 0x28u);
+    assert(copy_formats[2] == 0x28u);
+    assert(copy_formats[3] == 0x27u);
+    assert(copy_formats[4] == 0x16u);
+    assert(copy_dimensions[0] == ((8u << 16u) | 8u));
+    assert(copy_dimensions[1] == ((4u << 16u) | 4u));
+    assert(copy_dimensions[2] == ((4u << 16u) | 4u));
     assert(state.copy.is_depth);
   }
   assert(sink.packets().size() == trace.size());
@@ -774,7 +789,7 @@ int main() {
     assert(consume_sink.bound_texture().size == 128u);
 
     assert(consume_sink.texture_count() == 1u);
-    assert(consume_sink.copy_count() == 3u); // R8 + A8 + Z24X8 triggers
+    assert(consume_sink.copy_count() == 5u); // R8 x3 + A8 + Z24X8 triggers
     assert(consume_sink.indexed_span_count() == 1u);
     assert(consume_sink.tlut_count() >= 1u);
 

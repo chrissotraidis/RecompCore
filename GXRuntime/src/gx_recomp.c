@@ -800,7 +800,13 @@ bool dol_gx_recomp_resolve_copy_destination(DolGxRecompState* gx,
         DolGxRecompTraceEvent* ev = &gx->trace[gx->trace_count - 1u];
         ev->e = gx->copy.src_x;
         ev->f = gx->copy.src_y;
-        ev->g = (gx->copy.width << 16u) | (gx->copy.height & 0xFFFFu);
+        const u32 width = gx->copy.destination_width != 0u
+                              ? gx->copy.destination_width
+                              : gx->copy.width;
+        const u32 height = gx->copy.destination_height != 0u
+                               ? gx->copy.destination_height
+                               : gx->copy.height;
+        ev->g = (width << 16u) | (height & 0xFFFFu);
     }
     return true;
 }
@@ -1011,4 +1017,3 @@ bool dol_gx_recomp_derive_vertex_layout(DolGxRecompState* gx, u8 vtx_fmt) {
                 layout.vertex_size, layout.indexed_attr_count, 0u);
     return true;
 }
-

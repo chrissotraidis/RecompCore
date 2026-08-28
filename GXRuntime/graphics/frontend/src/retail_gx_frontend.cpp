@@ -780,8 +780,8 @@ bool RetailGxFrontend::handle_copy_trigger(std::uint32_t value) {
                                   state_.copy.format,
                                   &state_.copy.byte_size))
     return false;
-  state_.copy.width = width;
-  state_.copy.height = height;
+  state_.copy.destination_width = width;
+  state_.copy.destination_height = height;
   if (!dol_gx_recomp_resolve_copy_destination(
           &state_, state_.copy.physical_base, state_.copy.byte_size,
           &state_.copy.range))

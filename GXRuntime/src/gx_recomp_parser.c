@@ -60,8 +60,8 @@ static bool replay_handle_copy_trigger(DolGxRecompState* gx, u32 value) {
     if (!dol_gx_recomp_texture_size((u16)width, (u16)height,
                                     gx->copy.format, &gx->copy.byte_size))
         return false;
-    gx->copy.width = width;
-    gx->copy.height = height;
+    gx->copy.destination_width = width;
+    gx->copy.destination_height = height;
     if (!dol_gx_recomp_resolve_copy_destination(
             gx, gx->copy.physical_base, gx->copy.byte_size, &gx->copy.range))
         return false;
