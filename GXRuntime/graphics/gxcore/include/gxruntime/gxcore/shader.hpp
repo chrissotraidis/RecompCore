@@ -247,9 +247,12 @@ struct ShaderKey {
   std::uint8_t has_vertex_normal = 0;
   std::uint8_t has_vertex_binormal = 0;
   std::uint8_t has_vertex_tangent = 0;
+  // BP 0x42 constant destination alpha, admitted only for RGBA6 + alpha write.
+  std::uint8_t use_dst_alpha = 0;
+  std::uint8_t dst_alpha = 0;
   // Re-pad the scalar block to a multiple of 4, keeping ShaderKey a
   // unique-object-representation (memcmp identity) type.
-  std::uint8_t pad2 = 0;
+  std::uint8_t pad2[3]{};
   LightChanKey litchan[4]{}; // color0, color1, alpha0, alpha1
   TexGenKey tex_gens[kMaxTexGens]{};
   IndirectStageKey ind_stages[kMaxIndirectStages]{};

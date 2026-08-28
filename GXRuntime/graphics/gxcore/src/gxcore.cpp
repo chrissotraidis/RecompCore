@@ -815,6 +815,15 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
   pipe.src_factor = static_cast<std::uint8_t>(bits(cmode0, 3, 8));
   pipe.color_update = static_cast<std::uint8_t>(bits(cmode0, 1, 3));
   pipe.alpha_update = static_cast<std::uint8_t>(bits(cmode0, 1, 4));
+  const std::uint32_t dst_alpha = bp_valid_[0x42] ? bp_regs_[0x42] : 0u;
+  const std::uint32_t pe_control = bp_valid_[0x43] ? bp_regs_[0x43] : 0u;
+  const bool use_dst_alpha = bits(dst_alpha, 1, 8) != 0u &&
+                             pipe.alpha_update != 0u &&
+                             bits(pe_control, 3, 0) == 1u;
+  key.use_dst_alpha = use_dst_alpha ? 1u : 0u;
+  key.dst_alpha = static_cast<std::uint8_t>(bits(dst_alpha, 8, 0));
+  if (use_dst_alpha)
+    ++counters.dst_alpha_active;
   if (bits(cmode0, 1, 1) != 0u)
     ++counters.logic_op_ignored;
 

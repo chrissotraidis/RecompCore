@@ -52,7 +52,8 @@ wgpu::CompareFunction to_compare(gxc::CompareMode func) {
   }
 }
 
-wgpu::BlendFactor to_blend_factor_src(gxc::SrcBlendFactor factor) {
+wgpu::BlendFactor to_blend_factor_src(gxc::SrcBlendFactor factor,
+                                      bool dual_source) {
   switch (factor) {
   case gxc::SrcBlendFactor::Zero:
     return wgpu::BlendFactor::Zero;
@@ -63,9 +64,11 @@ wgpu::BlendFactor to_blend_factor_src(gxc::SrcBlendFactor factor) {
   case gxc::SrcBlendFactor::InvDstClr:
     return wgpu::BlendFactor::OneMinusDst;
   case gxc::SrcBlendFactor::SrcAlpha:
-    return wgpu::BlendFactor::SrcAlpha;
+    return dual_source ? wgpu::BlendFactor::Src1Alpha
+                       : wgpu::BlendFactor::SrcAlpha;
   case gxc::SrcBlendFactor::InvSrcAlpha:
-    return wgpu::BlendFactor::OneMinusSrcAlpha;
+    return dual_source ? wgpu::BlendFactor::OneMinusSrc1Alpha
+                       : wgpu::BlendFactor::OneMinusSrcAlpha;
   case gxc::SrcBlendFactor::DstAlpha:
     return wgpu::BlendFactor::DstAlpha;
   case gxc::SrcBlendFactor::InvDstAlpha:
@@ -74,7 +77,8 @@ wgpu::BlendFactor to_blend_factor_src(gxc::SrcBlendFactor factor) {
   }
 }
 
-wgpu::BlendFactor to_blend_factor_dst(gxc::DstBlendFactor factor) {
+wgpu::BlendFactor to_blend_factor_dst(gxc::DstBlendFactor factor,
+                                      bool dual_source) {
   switch (factor) {
   case gxc::DstBlendFactor::Zero:
     return wgpu::BlendFactor::Zero;
@@ -85,9 +89,11 @@ wgpu::BlendFactor to_blend_factor_dst(gxc::DstBlendFactor factor) {
   case gxc::DstBlendFactor::InvSrcClr:
     return wgpu::BlendFactor::OneMinusSrc;
   case gxc::DstBlendFactor::SrcAlpha:
-    return wgpu::BlendFactor::SrcAlpha;
+    return dual_source ? wgpu::BlendFactor::Src1Alpha
+                       : wgpu::BlendFactor::SrcAlpha;
   case gxc::DstBlendFactor::InvSrcAlpha:
-    return wgpu::BlendFactor::OneMinusSrcAlpha;
+    return dual_source ? wgpu::BlendFactor::OneMinusSrc1Alpha
+                       : wgpu::BlendFactor::OneMinusSrcAlpha;
   case gxc::DstBlendFactor::DstAlpha:
     return wgpu::BlendFactor::DstAlpha;
   case gxc::DstBlendFactor::InvDstAlpha:
@@ -184,6 +190,9 @@ absl::flat_hash_map<uint32_t, TextureHandle> g_efbCopyTextures;
 
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   const gxc::PipelineKey& key = config.key;
+  CHECK(key.shader.use_dst_alpha == 0 ||
+            webgpu::g_dualSourceBlendingSupported,
+        "GX destination alpha requires WebGPU dual-source blending");
   const std::string wgsl = gxc::generate_wgsl(key.shader);
   wgpu::ShaderSourceWGSL sourceDescriptor{};
   sourceDescriptor.code = wgsl.c_str();
@@ -344,6 +353,7 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   };
 
   // GC subtract mode forces ONE/ONE with dst - src (Dolphin RenderState).
+  const bool dual_source = key.shader.use_dst_alpha != 0;
   wgpu::BlendState blendState{};
   if (key.blend_subtract != 0) {
     blendState.color = {
@@ -351,16 +361,28 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
         .srcFactor = wgpu::BlendFactor::One,
         .dstFactor = wgpu::BlendFactor::One,
     };
-    blendState.alpha = blendState.color;
+    blendState.alpha = dual_source
+                           ? wgpu::BlendComponent{
+                                 .operation = wgpu::BlendOperation::Add,
+                                 .srcFactor = wgpu::BlendFactor::One,
+                                 .dstFactor = wgpu::BlendFactor::Zero,
+                             }
+                           : blendState.color;
   } else {
     blendState.color = {
         .operation = wgpu::BlendOperation::Add,
         .srcFactor = to_blend_factor_src(
-            static_cast<gxc::SrcBlendFactor>(key.src_factor)),
+            static_cast<gxc::SrcBlendFactor>(key.src_factor), dual_source),
         .dstFactor = to_blend_factor_dst(
-            static_cast<gxc::DstBlendFactor>(key.dst_factor)),
+            static_cast<gxc::DstBlendFactor>(key.dst_factor), dual_source),
     };
-    blendState.alpha = blendState.color;
+    blendState.alpha = dual_source
+                           ? wgpu::BlendComponent{
+                                 .operation = wgpu::BlendOperation::Add,
+                                 .srcFactor = wgpu::BlendFactor::One,
+                                 .dstFactor = wgpu::BlendFactor::Zero,
+                             }
+                           : blendState.color;
   }
   auto writeMask = wgpu::ColorWriteMask::None;
   if (key.color_update != 0) {

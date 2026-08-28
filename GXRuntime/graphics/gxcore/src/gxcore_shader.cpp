@@ -39,6 +39,20 @@ void emitf(std::string& out, const char* fmt, ...) {
   out += buffer;
 }
 
+void emit_fragment_entry(std::string& out, const ShaderKey& key) {
+  if (key.use_dst_alpha != 0) {
+    emit(out,
+         "struct FragmentOut {\n"
+         "    @location(0) @blend_src(0) color: vec4f,\n"
+         "    @location(0) @blend_src(1) blend: vec4f,\n"
+         "};\n"
+         "@fragment\nfn fs_main(in: VertexOut) -> FragmentOut {\n");
+  } else {
+    emit(out,
+         "@fragment\nfn fs_main(in: VertexOut) -> @location(0) vec4f {\n");
+  }
+}
+
 } // namespace
 
 namespace {
@@ -251,7 +265,7 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
   // multi-texmap TEV (e.g. THP YUV Y/U/V on texmap 0/1/2) samples tex{texmap}.
   const bool multi_texmap = texmap_popcount(used_texmap_mask(key)) > 1u;
   const bool indirect_enabled = key.num_ind_stages != 0u;
-  emit(out, "@fragment\nfn fs_main(in: VertexOut) -> @location(0) vec4f {\n");
+  emit_fragment_entry(out, key);
   emit(out, "    var prev = psc.colors[0];\n"
             "    var c0 = psc.colors[1];\n"
             "    var c1 = psc.colors[2];\n"
@@ -514,7 +528,14 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
   // Fog runs after the alpha test (Dolphin order), modifying prev.rgb only.
   emit_fog(out, key);
 
-  emit(out, "    return vec4f(prev) / 255.0;\n}\n");
+  if (key.use_dst_alpha != 0) {
+    emitf(out,
+          "    return FragmentOut(vec4f(vec3f(prev.rgb), %u.0) / 255.0, "
+          "vec4f(0.0, 0.0, 0.0, f32(prev.a) / 255.0));\n}\n",
+          static_cast<unsigned>(key.dst_alpha));
+  } else {
+    emit(out, "    return vec4f(prev) / 255.0;\n}\n");
+  }
 }
 
 // --- Integer lighting (Dolphin LightingShaderGen port) -----------------------
@@ -668,6 +689,8 @@ std::string generate_wgsl(const ShaderKey& key) {
 
   std::string out;
   out.reserve(4096);
+  if (key.use_dst_alpha != 0)
+    emit(out, "enable dual_source_blending;\n\n");
   const bool tev = key.tev_valid != 0;
   const bool lit = key.lit_valid != 0;
   // Color texgens (Dolphin VertexShaderGen texgentype switch, TexGenType::Color0/
@@ -1012,7 +1035,7 @@ std::string generate_wgsl(const ShaderKey& key) {
     emit_tev_fragment(out, key);
     return out;
   }
-  emit(out, "@fragment\nfn fs_main(in: VertexOut) -> @location(0) vec4f {\n");
+  emit_fragment_entry(out, key);
   emit(out, "    var prev = in.color0;\n");
   if (key.textured != 0) {
     if (key.num_tex_gens > 0 && key.tex_gens[0].projection != 0u) {
@@ -1022,7 +1045,14 @@ std::string generate_wgsl(const ShaderKey& key) {
     }
     emit(out, "    prev = textureSample(tex0, samp0, uv);\n");
   }
-  emit(out, "    return prev;\n}\n");
+  if (key.use_dst_alpha != 0) {
+    emitf(out,
+          "    return FragmentOut(vec4f(prev.rgb, %u.0 / 255.0), "
+          "vec4f(0.0, 0.0, 0.0, prev.a));\n}\n",
+          static_cast<unsigned>(key.dst_alpha));
+  } else {
+    emit(out, "    return prev;\n}\n");
+  }
   return out;
 }
 

@@ -203,6 +203,31 @@ void test_state_to_plan_and_wgsl() {
   CHECK(counters.draws_skipped == 0);
   CHECK(counters.unresolved_tex_matrix == 0);
 
+  // BP 0x42 only overrides stored alpha for an alpha-writing RGBA6 target.
+  // The fragment keeps TEV alpha in blend source 1 so color blending still
+  // observes the unmodified source alpha, matching Dolphin's dual-source path.
+  {
+    gxc::GxCoreState dst_state = state;
+    dst_state.apply(bp(0x41u, 1u << 4u));
+    dst_state.apply(bp(0x42u, 0x100u | 0x5Au));
+    dst_state.apply(bp(0x43u, 1u));
+    gxc::GapCounters gaps;
+    const gxc::DrawPlan dst_plan = dst_state.build_draw_plan(draw, gaps);
+    CHECK(dst_plan.ok);
+    CHECK(dst_plan.pipeline.shader.use_dst_alpha == 1u);
+    CHECK(dst_plan.pipeline.shader.dst_alpha == 0x5Au);
+    CHECK(gaps.dst_alpha_active == 1u);
+    const std::string dst_wgsl =
+        gxc::generate_wgsl(dst_plan.pipeline.shader);
+    CHECK(dst_wgsl.find("@location(0) @blend_src(0) color") !=
+          std::string::npos);
+    CHECK(dst_wgsl.find("@location(0) @blend_src(1) blend") !=
+          std::string::npos);
+    CHECK(dst_wgsl.find("90.0 / 255.0") != std::string::npos);
+    CHECK(dst_wgsl.find("vec4f(0.0, 0.0, 0.0, prev.a)") !=
+          std::string::npos);
+  }
+
   // Texgen residuals are classified by the unsupported source row. Emboss
   // without per-vertex NBT is not a gap: it uses the cached N/B/T uniform.
   auto classify_texgen = [&](std::uint32_t info, gxc::GapCounters& gaps) {
