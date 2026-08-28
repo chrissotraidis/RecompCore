@@ -819,6 +819,9 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
   pipe.alpha_update = static_cast<std::uint8_t>(bits(cmode0, 1, 4));
   const std::uint32_t dst_alpha = bp_valid_[0x42] ? bp_regs_[0x42] : 0u;
   const std::uint32_t pe_control = bp_valid_[0x43] ? bp_regs_[0x43] : 0u;
+  pipe.early_depth_test = static_cast<std::uint8_t>(bits(pe_control, 1, 6));
+  if (pipe.depth_test != 0u && pipe.early_depth_test != 0u)
+    ++counters.early_depth_active;
   const bool use_dst_alpha = bits(dst_alpha, 1, 8) != 0u &&
                              pipe.alpha_update != 0u &&
                              bits(pe_control, 3, 0) == 1u;

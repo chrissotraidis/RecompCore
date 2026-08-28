@@ -72,6 +72,7 @@ struct GapCounters {
   unsigned long long indirect_ignored = 0;      // invalid/undefined indirect state
   unsigned long long logic_op_ignored = 0;      // cmode0 logic-op enable
   unsigned long long dst_alpha_active = 0;      // BP 0x42 forced EFB alpha
+  unsigned long long early_depth_active = 0;    // GXSetZCompLoc before alpha test
 };
 
 // Cross-draw cached vertex attributes (Dolphin VertexLoaderManager::

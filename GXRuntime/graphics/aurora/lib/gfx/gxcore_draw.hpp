@@ -15,6 +15,7 @@ namespace aurora::gfx::gxcore {
 
 struct DrawData {
   PipelineRef pipeline;
+  PipelineRef depthPipeline; // early-Z depth-only pass, 0 when unnecessary
   Range vertRange;
   Range idxRange;
   Range uniformRange;       // VertexShaderConstants (group 1)
@@ -35,16 +36,20 @@ struct DrawData {
 // stages add shader structure, pixel constants, and indirect texmap bindings.
 // v7: fifth texgen adds UV4 and a high per-vertex matrix-index word. v8:
 // destination-alpha override adds a dual-source fragment output/blend state.
-constexpr uint32_t GXCorePipelineConfigVersion = 8;
+// v9: GXSetZCompLoc early depth adds a depth-only pipeline variant.
+constexpr uint32_t GXCorePipelineConfigVersion = 9;
 
 struct PipelineConfig {
   uint32_t version = GXCorePipelineConfigVersion;
   gxruntime::gxcore::PipelineKey key;
   uint32_t msaaSamples = 1;
+  uint32_t depthOnly = 0;
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);
 
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config);
+bool needs_early_depth_emulation(
+    const gxruntime::gxcore::PipelineKey& key);
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 
 // Perform one EFB copy-to-texture (63/S16): resolve the current EFB region into

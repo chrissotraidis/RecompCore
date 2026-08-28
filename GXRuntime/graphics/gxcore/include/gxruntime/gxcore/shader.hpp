@@ -267,6 +267,7 @@ struct PipelineKey {
   std::uint8_t depth_test = 0; // BP zmode bit 0
   std::uint8_t depth_func = 0; // CompareMode (zmode bits 1-3)
   std::uint8_t depth_update = 0; // zmode bit 4
+  std::uint8_t early_depth_test = 0; // PEControl bit 6 (GXSetZCompLoc)
   std::uint8_t blend_enable = 0; // cmode0 bit 0
   std::uint8_t blend_subtract = 0; // cmode0 bit 11
   std::uint8_t src_factor = 0;     // SrcBlendFactor (cmode0 bits 8-10)
@@ -276,7 +277,6 @@ struct PipelineKey {
   // 0 triangle list, 1 line list, 2 point list. Line strips are expanded to
   // line-list pairs by build_topology_indices.
   std::uint8_t primitive_topology = 0;
-  std::uint8_t pad1 = 0;
 };
 static_assert(std::has_unique_object_representations_v<PipelineKey>);
 

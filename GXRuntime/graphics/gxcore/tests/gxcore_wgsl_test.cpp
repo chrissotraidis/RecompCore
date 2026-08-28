@@ -228,6 +228,19 @@ void test_state_to_plan_and_wgsl() {
           std::string::npos);
   }
 
+  // GXSetZCompLoc is PEControl bit 6. It must remain draw state so the backend
+  // can preserve an early depth update when the fragment alpha test discards.
+  {
+    gxc::GxCoreState early_z_state = state;
+    early_z_state.apply(bp(0x43u, 1u << 6u));
+    gxc::GapCounters gaps;
+    const gxc::DrawPlan early_z_plan =
+        early_z_state.build_draw_plan(draw, gaps);
+    CHECK(early_z_plan.ok);
+    CHECK(early_z_plan.pipeline.early_depth_test == 1u);
+    CHECK(gaps.early_depth_active == 1u);
+  }
+
   // Texgen residuals are classified by the unsupported source row. Emboss
   // without per-vertex NBT is not a gap: it uses the cached N/B/T uniform.
   auto classify_texgen = [&](std::uint32_t info, gxc::GapCounters& gaps) {

@@ -188,12 +188,50 @@ absl::flat_hash_map<uint32_t, TextureHandle> g_efbCopyTextures;
 
 } // namespace
 
+bool needs_early_depth_emulation(const gxc::PipelineKey& key) {
+  if (key.depth_test == 0u || key.depth_update == 0u ||
+      key.early_depth_test == 0u || key.shader.tev_valid == 0u) {
+    return false;
+  }
+
+  // Mirror AlphaTest::TestResult enough to omit the extra pass when the test is
+  // statically guaranteed to pass. Fail and undetermined both need an early
+  // depth write; the ordinary color shader will discard failures afterward.
+  const bool c0_never = key.shader.alpha_comp0 == 0u;
+  const bool c1_never = key.shader.alpha_comp1 == 0u;
+  const bool c0_always = key.shader.alpha_comp0 == 7u;
+  const bool c1_always = key.shader.alpha_comp1 == 7u;
+  bool always_passes = false;
+  switch (key.shader.alpha_logic) {
+  case 0u: // And
+    always_passes = c0_always && c1_always;
+    break;
+  case 1u: // Or
+    always_passes = c0_always || c1_always;
+    break;
+  case 2u: // Xor
+    always_passes = (c0_always && c1_never) ||
+                    (c0_never && c1_always);
+    break;
+  case 3u: // Xnor
+    always_passes = (c0_always && c1_always) ||
+                    (c0_never && c1_never);
+    break;
+  }
+  return !always_passes;
+}
+
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   const gxc::PipelineKey& key = config.key;
+  const bool depthOnly = config.depthOnly != 0u;
   CHECK(key.shader.use_dst_alpha == 0 ||
             webgpu::g_dualSourceBlendingSupported,
         "GX destination alpha requires WebGPU dual-source blending");
-  const std::string wgsl = gxc::generate_wgsl(key.shader);
+  std::string wgsl = gxc::generate_wgsl(key.shader);
+  if (depthOnly) {
+    wgsl += "\n@fragment\nfn fs_depth_only() -> @location(0) vec4f {\n"
+            "    return vec4f(0.0);\n}\n";
+  }
   wgpu::ShaderSourceWGSL sourceDescriptor{};
   sourceDescriptor.code = wgsl.c_str();
   const wgpu::ShaderModuleDescriptor moduleDescriptor{
@@ -218,7 +256,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
       tev ? g_uniformBindGroupLayout : texture_bind_group_layout(tex_mask),
       texture_bind_group_layout(tex_mask),
   };
-  const size_t layoutCount = tev ? (textured ? 4 : 3) : (textured ? 3 : 2);
+  const size_t layoutCount =
+      depthOnly ? 2 : tev ? (textured ? 4 : 3) : (textured ? 3 : 2);
   const wgpu::PipelineLayoutDescriptor layoutDescriptor{
       .label = "GXCore Pipeline Layout",
       .bindGroupLayoutCount = layoutCount,
@@ -342,14 +381,20 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
       .attributes = attributes.data(),
   };
 
+  const bool emulateEarlyDepth = needs_early_depth_emulation(key);
   const bool depthCompare = key.depth_test != 0;
   const wgpu::DepthStencilState depthStencil{
       .format = g_graphicsConfig.depthFormat,
-      .depthWriteEnabled = depthCompare && key.depth_update != 0,
+      .depthWriteEnabled =
+          depthOnly ? depthCompare && key.depth_update != 0
+                    : depthCompare && key.depth_update != 0 &&
+                          !emulateEarlyDepth,
       .depthCompare =
-          depthCompare ? to_compare(static_cast<gxc::CompareMode>(
-                             key.depth_func))
-                       : wgpu::CompareFunction::Always,
+          emulateEarlyDepth && !depthOnly
+              ? wgpu::CompareFunction::Equal
+              : depthCompare ? to_compare(static_cast<gxc::CompareMode>(
+                                   key.depth_func))
+                             : wgpu::CompareFunction::Always,
   };
 
   // GC subtract mode forces ONE/ONE with dst - src (Dolphin RenderState).
@@ -398,11 +443,16 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
       .blend = blending ? &blendState : nullptr,
       .writeMask = writeMask,
   };
+  const wgpu::ColorTargetState depthOnlyTarget{
+      .format = g_graphicsConfig.surfaceConfiguration.format,
+      .blend = nullptr,
+      .writeMask = wgpu::ColorWriteMask::None,
+  };
   const wgpu::FragmentState fragmentState{
       .module = module,
-      .entryPoint = "fs_main",
+      .entryPoint = depthOnly ? "fs_depth_only" : "fs_main",
       .targetCount = 1,
-      .targets = &colorTarget,
+      .targets = depthOnly ? &depthOnlyTarget : &colorTarget,
   };
 
   auto cullMode = wgpu::CullMode::None;
@@ -453,11 +503,26 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
 }
 
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+  // Ensure both asynchronous pipelines are ready before the prepass writes any
+  // depth. Binding the color pipeline first is harmless; it is rebound below.
   if (!bind_pipeline(data.pipeline, pass)) {
     return;
   }
+  if (data.depthPipeline != 0 && !bind_pipeline(data.depthPipeline, pass))
+    return;
   const std::array vsOffsets{data.uniformRange.offset};
   pass.SetBindGroup(1, g_uniformBindGroup, vsOffsets.size(), vsOffsets.data());
+  pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset,
+                       data.vertRange.size);
+  pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16,
+                      data.idxRange.offset, data.idxRange.size);
+  if (data.depthPipeline != 0) {
+    pass.DrawIndexed(data.indexCount);
+    if (!bind_pipeline(data.pipeline, pass))
+      return;
+    pass.SetBindGroup(1, g_uniformBindGroup, vsOffsets.size(),
+                      vsOffsets.data());
+  }
   if (data.tev) {
     // group 2 = PS uniform (same dynamic-uniform bind group, its own offset);
     // group 3 = texture.
@@ -470,10 +535,6 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   } else if (data.textureBindGroup != 0) {
     pass.SetBindGroup(2, find_bind_group(data.textureBindGroup));
   }
-  pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset,
-                       data.vertRange.size);
-  pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16,
-                      data.idxRange.offset, data.idxRange.size);
   pass.DrawIndexed(data.indexCount);
 }
 
@@ -752,12 +813,20 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         sizeof(plan.pixel_constants));
   }
 
+  const PipelineConfig colorConfig{
+      .version = GXCorePipelineConfigVersion,
+      .key = plan.pipeline,
+      .msaaSamples = get_sample_count(),
+  };
+  PipelineRef depthPipeline = 0;
+  if (needs_early_depth_emulation(plan.pipeline)) {
+    PipelineConfig depthConfig = colorConfig;
+    depthConfig.depthOnly = 1u;
+    depthPipeline = pipeline_ref(depthConfig);
+  }
   push_draw_command(DrawData{
-      .pipeline = pipeline_ref(PipelineConfig{
-          .version = GXCorePipelineConfigVersion,
-          .key = plan.pipeline,
-          .msaaSamples = get_sample_count(),
-      }),
+      .pipeline = pipeline_ref(colorConfig),
+      .depthPipeline = depthPipeline,
       .vertRange = vertRange,
       .idxRange = idxRange,
       .uniformRange = uniformRange,
