@@ -45,6 +45,21 @@ typedef struct PPCGuestAlias {
 
 static PPCGuestAlias g_guest_aliases[PPC_GUEST_ALIAS_MAX];
 static u32 g_guest_alias_count;
+static u32 g_guest_alias_min_start = UINT32_MAX;
+static u64 g_guest_alias_max_end;
+
+static void ppc_guest_alias_recompute_bounds(void) {
+    g_guest_alias_min_start = UINT32_MAX;
+    g_guest_alias_max_end = 0u;
+    for (u32 i = 0u; i < g_guest_alias_count; ++i) {
+        const PPCGuestAlias* alias = &g_guest_aliases[i];
+        if (alias->linked_start < g_guest_alias_min_start)
+            g_guest_alias_min_start = alias->linked_start;
+        const u64 alias_end = (u64)alias->linked_start + alias->size;
+        if (alias_end > g_guest_alias_max_end)
+            g_guest_alias_max_end = alias_end;
+    }
+}
 
 GXRUNTIME_EXPORT void ppc_guest_alias_clear(void) {
     for (u32 i = 0; i < g_guest_alias_count; ++i) {
@@ -52,6 +67,8 @@ GXRUNTIME_EXPORT void ppc_guest_alias_clear(void) {
         g_guest_aliases[i].storage = NULL;
     }
     g_guest_alias_count = 0u;
+    g_guest_alias_min_start = UINT32_MAX;
+    g_guest_alias_max_end = 0u;
 }
 
 GXRUNTIME_EXPORT bool ppc_guest_alias_add(u32 linked_start, u32 size,
@@ -66,9 +83,14 @@ GXRUNTIME_EXPORT bool ppc_guest_alias_add(u32 linked_start, u32 size,
         memcpy(storage, initial_bytes, size);
 
     PPCGuestAlias* alias = &g_guest_aliases[g_guest_alias_count++];
-    alias->linked_start = linked_start & ~0x40000000u;
+    alias->linked_start = linked_start;
     alias->size = size;
     alias->storage = storage;
+    if (alias->linked_start < g_guest_alias_min_start)
+        g_guest_alias_min_start = alias->linked_start;
+    const u64 alias_end = (u64)alias->linked_start + alias->size;
+    if (alias_end > g_guest_alias_max_end)
+        g_guest_alias_max_end = alias_end;
     if (getenv("BLUEWAKE_TRACE_GUEST_ALIASES") != NULL &&
         alias->linked_start < 0x81516E20u &&
         (u64)alias->linked_start + alias->size > 0x81512AC0u) {
@@ -79,10 +101,31 @@ GXRUNTIME_EXPORT bool ppc_guest_alias_add(u32 linked_start, u32 size,
     return true;
 }
 
+GXRUNTIME_EXPORT bool ppc_guest_alias_remove(u32 linked_start, u32 size) {
+    for (u32 i = 0u; i < g_guest_alias_count; ++i) {
+        PPCGuestAlias* alias = &g_guest_aliases[i];
+        if (alias->linked_start != linked_start || alias->size != size)
+            continue;
+        free(alias->storage);
+        if (i + 1u < g_guest_alias_count) {
+            memmove(alias, alias + 1u,
+                    (g_guest_alias_count - i - 1u) * sizeof(*alias));
+        }
+        g_guest_alias_count--;
+        g_guest_aliases[g_guest_alias_count] = (PPCGuestAlias){0};
+        ppc_guest_alias_recompute_bounds();
+        return true;
+    }
+    return false;
+}
+
 GXRUNTIME_EXPORT bool ppc_guest_alias_resolve(u32 address, u32 size,
                                               u8** pointer,
                                               u32* journal_offset) {
     if (pointer == NULL || size == 0u)
+        return false;
+    if (address < g_guest_alias_min_start ||
+        (u64)address + size > g_guest_alias_max_end)
         return false;
     for (u32 i = 0; i < g_guest_alias_count; ++i) {
         const PPCGuestAlias* alias = &g_guest_aliases[i];

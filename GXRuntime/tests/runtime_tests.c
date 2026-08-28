@@ -1055,11 +1055,32 @@ static void test_guest_data_alias(void) {
     const u32 linked = 0x815581A0u;
     ppc_guest_alias_clear();
     assert(ppc_guest_alias_add(linked, sizeof(initial), initial));
+    u8* resolved = NULL;
+    assert(!ppc_guest_alias_resolve(0x80000000u, 4u, &resolved, NULL));
+    assert(!ppc_guest_alias_resolve(0x817FFFFCu, 4u, &resolved, NULL));
+    assert(ppc_guest_alias_resolve(linked, 4u, &resolved, NULL));
+    assert(resolved != NULL);
     assert(mem_read32(&cpu, linked) == 0x12345678u);
     assert(mem_read32(&cpu, linked | 0x40000000u) == 0x12345678u);
+    const u32 tagged_linked = linked | 0x40000000u;
+    const u8 tagged_initial[4] = {0xDEu, 0xADu, 0xBEu, 0xEFu};
+    assert(ppc_guest_alias_add(tagged_linked, sizeof(tagged_initial),
+                               tagged_initial));
+    assert(mem_read32(&cpu, tagged_linked) == 0xDEADBEEFu);
+    assert(mem_read32(&cpu, linked) == 0x12345678u);
     mem_write32(&cpu, linked, 0xAABBCCDDu);
     assert(mem_read32(&cpu, linked) == 0xAABBCCDDu);
     assert(read_be32(cpu.ram + (linked - GC_RAM_BASE)) == 0u);
+    const u32 second_linked = 0x81600000u;
+    assert(ppc_guest_alias_add(second_linked, sizeof(initial), initial));
+    assert(ppc_guest_alias_remove(tagged_linked, sizeof(tagged_initial)));
+    assert(ppc_guest_alias_resolve(linked, 4u, &resolved, NULL));
+    assert(ppc_guest_alias_remove(linked, sizeof(initial)));
+    assert(!ppc_guest_alias_resolve(linked, 4u, &resolved, NULL));
+    assert(ppc_guest_alias_resolve(second_linked, 4u, &resolved, NULL));
+    assert(!ppc_guest_alias_remove(linked, sizeof(initial)));
+    assert(ppc_guest_alias_remove(second_linked, sizeof(initial)));
+    assert(!ppc_guest_alias_resolve(second_linked, 4u, &resolved, NULL));
     ppc_guest_alias_clear();
     cpu_free(&cpu);
 }
