@@ -417,7 +417,8 @@ void dol_aurora_shutdown(void) {
                      "tev_multi_texmap=%llu efb_copy_ignored=%llu "
                      "efb_copies=%llu efb_copy_depth=%llu "
                      "efb_display_copies=%llu fog_ignored=%llu "
-                     "indirect_ignored=%llu logic_op_ignored=%llu\n",
+                     "indirect_active=%llu indirect_ignored=%llu "
+                     "logic_op_ignored=%llu\n",
                      gx_aurora::g_core_submitted, gx_aurora::g_core_rejected,
                      gx_aurora::g_shadow_frontend_failed ? 1 : 0,
                      gaps.draws_planned, gaps.draws_skipped,
@@ -446,7 +447,8 @@ void dol_aurora_shutdown(void) {
                      gaps.tev_stages_over, gaps.tev_multi_texmap,
                      gaps.efb_copy_ignored, gaps.efb_copies,
                      gaps.efb_copy_depth, gaps.efb_display_copies,
-                     gaps.fog_ignored, gaps.indirect_ignored,
+                     gaps.fog_ignored, gaps.indirect_active,
+                     gaps.indirect_ignored,
                      gaps.logic_op_ignored);
     }
 #endif

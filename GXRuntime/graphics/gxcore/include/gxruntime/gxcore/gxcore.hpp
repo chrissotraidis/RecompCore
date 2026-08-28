@@ -55,7 +55,8 @@ struct GapCounters {
   unsigned long long efb_copy_depth = 0;        // of which Z-source (PE Z24)
   unsigned long long efb_display_copies = 0;    // GXCopyDisp (clear-only, 0xF)
   unsigned long long fog_ignored = 0;           // fog enabled on a non-TEV draw
-  unsigned long long indirect_ignored = 0;      // genMode ind stages (nonscope)
+  unsigned long long indirect_active = 0;       // plans using an indirect stage
+  unsigned long long indirect_ignored = 0;      // invalid/undefined indirect state
   unsigned long long logic_op_ignored = 0;      // cmode0 logic-op enable
 };
 

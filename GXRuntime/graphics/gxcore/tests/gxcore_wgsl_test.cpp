@@ -479,6 +479,32 @@ void test_texgen_per_vertex_mtx() {
   CHECK(w2.find("in.texmtxidx") == std::string::npos);
 }
 
+void test_tev_indirect_matrix() {
+  gxc::ShaderKey key{};
+  key.textured = 1;
+  key.tev_valid = 1;
+  key.num_tex_gens = 1;
+  key.num_tev_stages = 1;
+  key.num_ind_stages = 1;
+  key.tex_gens[0].enabled = 1;
+  key.ind_stages[0].texmap = 1;
+  key.ind_stages[0].texcoord = 0;
+  key.tev_stages[0].tevorders_enable = 1;
+  key.tev_stages[0].tevorders_texmap = 0;
+  key.tev_stages[0].tevorders_texcoord = 0;
+  key.tev_stages[0].ind_stage = 0;
+  key.tev_stages[0].ind_matrix_index = 1;
+
+  CHECK(gxc::used_texmap_mask(key) == 0x3u);
+  const std::string w = gxc::generate_wgsl(key);
+  CHECK(w.find("indtexmtx: array<vec4i, 6>") != std::string::npos);
+  CHECK(w.find("textureSample(tex1, samp1, ind_uv0).abg") !=
+        std::string::npos);
+  CHECK(w.find("stage_uv0 = vec2f(tevcoord)") != std::string::npos);
+  CHECK(w.find("textureSample(tex0, samp0, stage_uv0)") !=
+        std::string::npos);
+}
+
 // Golden WGSL for the 1-stage modulate TEV key (tex * rasterized color0).
 // Regenerate with GXCORE_PRINT_WGSL=1.
 constexpr const char* kGoldenTevWgsl =
@@ -1439,6 +1465,7 @@ int main() {
   test_texgen_color();
   test_texgen_emboss();
   test_texgen_per_vertex_mtx();
+  test_tev_indirect_matrix();
   test_vertex_texmtxidx_and_nbt();
   test_tev_modulate();
   test_tev_konst_and_alpha();

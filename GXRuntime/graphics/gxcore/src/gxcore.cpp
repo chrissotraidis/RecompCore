@@ -16,6 +16,10 @@ std::uint32_t bits(std::uint32_t value, std::uint32_t count,
   return (value >> shift) & ((1u << count) - 1u);
 }
 
+std::int32_t sx11(std::uint32_t value) {
+  return static_cast<std::int32_t>(value << 21) >> 21;
+}
+
 // FogParam0/FogParam3 FloatValue (Dolphin BPMemory.cpp): mant(11)/exp(8)/sign(1)
 // re-expanded to an IEEE-754 f32 (mantissa scaled from 11 to 23 bits).
 float fog_param_float(std::uint32_t raw) {
@@ -515,8 +519,6 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
     ++counters.cull_all_draws;
     return skip("genMode culls all");
   }
-  if (bits(gen_mode, 3, 16) != 0u)
-    ++counters.indirect_ignored;
   // Alpha test is consumed by the TEV path (below); only count it as ignored
   // when no combiner was captured and we fall back to the passthrough fragment.
   if (!bp_valid_[0xC0] && bp_valid_[0xF3]) {
@@ -640,6 +642,25 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
         !walk.has_nbt)
       ++counters.unsupported_texgen;
   }
+  std::uint32_t num_ind_stages = bits(gen_mode, 3, 16);
+  if (num_ind_stages > kMaxIndirectStages) {
+    ++counters.indirect_ignored;
+    num_ind_stages = kMaxIndirectStages;
+  }
+  key.num_ind_stages = static_cast<std::uint8_t>(num_ind_stages);
+  if (num_ind_stages != 0u)
+    ++counters.indirect_active;
+  const std::uint32_t indref = bp_valid_[0x27] ? bp_regs_[0x27] : 0u;
+  for (std::uint32_t i = 0; i < num_ind_stages; ++i) {
+    IndirectStageKey& ind = key.ind_stages[i];
+    ind.texmap = static_cast<std::uint8_t>(bits(indref, 3, 6u * i));
+    ind.texcoord = static_cast<std::uint8_t>(bits(indref, 3, 6u * i + 3u));
+    const std::uint32_t scale =
+        bp_valid_[0x25u + i / 2u] ? bp_regs_[0x25u + i / 2u] : 0u;
+    const std::uint32_t shift = (i & 1u) != 0u ? 8u : 0u;
+    ind.scale_s = static_cast<std::uint8_t>(bits(scale, 4, shift));
+    ind.scale_t = static_cast<std::uint8_t>(bits(scale, 4, shift + 4u));
+  }
   const std::uint32_t tex_format = draw.texture.format;
   if (draw.texture.valid &&
       (tex_format == 0x8u || tex_format == 0x9u || tex_format == 0xAu))
@@ -702,6 +723,25 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
           static_cast<std::uint8_t>(odd ? bits(ord, 1, 18) : bits(ord, 1, 6));
       ts.tevorders_colorchan =
           static_cast<std::uint8_t>(odd ? bits(ord, 3, 19) : bits(ord, 3, 7));
+      const std::uint32_t indirect =
+          bp_valid_[0x10u + n] ? bp_regs_[0x10u + n] : 0u;
+      ts.ind_stage = static_cast<std::uint8_t>(bits(indirect, 2, 0));
+      ts.ind_format = static_cast<std::uint8_t>(bits(indirect, 2, 2));
+      ts.ind_bias = static_cast<std::uint8_t>(bits(indirect, 3, 4));
+      ts.ind_bump_alpha = static_cast<std::uint8_t>(bits(indirect, 2, 7));
+      ts.ind_matrix_index = static_cast<std::uint8_t>(bits(indirect, 2, 9));
+      ts.ind_matrix_id = static_cast<std::uint8_t>(bits(indirect, 2, 11));
+      ts.ind_wrap_s = static_cast<std::uint8_t>(bits(indirect, 3, 13));
+      ts.ind_wrap_t = static_cast<std::uint8_t>(bits(indirect, 3, 16));
+      ts.ind_use_original_lod =
+          static_cast<std::uint8_t>(bits(indirect, 1, 19));
+      ts.ind_add_prev = static_cast<std::uint8_t>(bits(indirect, 1, 20));
+      const bool samples_indirect =
+          ts.ind_matrix_index != 0u || ts.ind_bump_alpha != 0u;
+      if (samples_indirect && ts.ind_stage >= num_ind_stages)
+        ++counters.indirect_ignored;
+      if (ts.ind_matrix_id == 3u || ts.ind_use_original_lod != 0u)
+        ++counters.indirect_ignored;
       if (ts.tevorders_enable != 0u && ts.tevorders_texmap != 0u)
         ++counters.tev_multi_texmap;
       // Konst selectors (AllTevKSels ksel[n/2]).
@@ -1102,6 +1142,30 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
         static_cast<std::int32_t>(bits(bp_regs_[0xF3], 8, 0));
     plan.pixel_constants.alpha_ref[1] =
         static_cast<std::int32_t>(bits(bp_regs_[0xF3], 8, 8));
+  }
+
+  for (std::uint32_t m = 0; m < 3u; ++m) {
+    const std::uint32_t a = bp_valid_[0x06u + 3u * m]
+                                ? bp_regs_[0x06u + 3u * m]
+                                : 0u;
+    const std::uint32_t b = bp_valid_[0x07u + 3u * m]
+                                ? bp_regs_[0x07u + 3u * m]
+                                : 0u;
+    const std::uint32_t cword = bp_valid_[0x08u + 3u * m]
+                                    ? bp_regs_[0x08u + 3u * m]
+                                    : 0u;
+    const std::int32_t matrix_shift = 17 - static_cast<std::int32_t>(
+        bits(a, 2, 22) | (bits(b, 2, 22) << 2u) |
+        (bits(cword, 1, 22) << 4u));
+    plan.pixel_constants.indtexmtx[2u * m][0] = sx11(bits(a, 11, 0));
+    plan.pixel_constants.indtexmtx[2u * m][1] = sx11(bits(b, 11, 0));
+    plan.pixel_constants.indtexmtx[2u * m][2] = sx11(bits(cword, 11, 0));
+    plan.pixel_constants.indtexmtx[2u * m][3] = matrix_shift;
+    plan.pixel_constants.indtexmtx[2u * m + 1u][0] = sx11(bits(a, 11, 11));
+    plan.pixel_constants.indtexmtx[2u * m + 1u][1] = sx11(bits(b, 11, 11));
+    plan.pixel_constants.indtexmtx[2u * m + 1u][2] =
+        sx11(bits(cword, 11, 11));
+    plan.pixel_constants.indtexmtx[2u * m + 1u][3] = matrix_shift;
   }
 
   // Fog (S16, Dolphin PixelShaderManager fog constants). The fog uniform lives

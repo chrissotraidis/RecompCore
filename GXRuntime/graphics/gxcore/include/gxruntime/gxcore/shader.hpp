@@ -107,6 +107,17 @@ inline constexpr std::uint32_t kMaxTexGens = 4;
 // Slice cap: the S9 gameplay histogram shows numtevstages <= 6.
 inline constexpr std::uint32_t kMaxTevStages = 8;
 
+// Hardware exposes four indirect lookups, referenced by each TEV stage.
+inline constexpr std::uint32_t kMaxIndirectStages = 4;
+
+struct IndirectStageKey {
+  std::uint8_t texmap = 0;
+  std::uint8_t texcoord = 0;
+  std::uint8_t scale_s = 0;
+  std::uint8_t scale_t = 0;
+};
+static_assert(std::has_unique_object_representations_v<IndirectStageKey>);
+
 // One TEV stage's structural config (Dolphin PixelShaderGen stagehash shape).
 // All fields are raw BP register subfields (BPMemory.h TevStageCombiner /
 // TwoTevStageOrders / AllTevKSels); resolved swap tables and konst selectors
@@ -138,6 +149,17 @@ struct TevStageKey {
   std::uint8_t tevorders_texmap = 0;
   std::uint8_t tevorders_colorchan = 0; // RasColorChan
   std::uint8_t tevorders_enable = 0;    // reads texture when set
+  // TevStageIndirect (BP 0x10+n).
+  std::uint8_t ind_stage = 0;
+  std::uint8_t ind_format = 0;
+  std::uint8_t ind_bias = 0;
+  std::uint8_t ind_bump_alpha = 0;
+  std::uint8_t ind_matrix_index = 0;
+  std::uint8_t ind_matrix_id = 0;
+  std::uint8_t ind_wrap_s = 0;
+  std::uint8_t ind_wrap_t = 0;
+  std::uint8_t ind_use_original_lod = 0;
+  std::uint8_t ind_add_prev = 0;
   std::uint8_t pad0 = 0;
   std::uint8_t pad1 = 0;
 };
@@ -184,6 +206,7 @@ struct ShaderKey {
   // (used when combiner regs were never seen, e.g. synthetic slices).
   std::uint8_t tev_valid = 0;
   std::uint8_t num_tev_stages = 0; // 1..kMaxTevStages when tev_valid
+  std::uint8_t num_ind_stages = 0; // BP genMode numindstages, capped at 4
   // Alpha test (BP 0xF3 AlphaTest): comp0/comp1 CompareMode, logic AlphaTestOp.
   std::uint8_t alpha_comp0 = 7; // default Always
   std::uint8_t alpha_comp1 = 7;
@@ -225,9 +248,9 @@ struct ShaderKey {
   // Re-pad the scalar block to a multiple of 4, keeping ShaderKey a
   // unique-object-representation (memcmp identity) type.
   std::uint8_t pad2 = 0;
-  std::uint8_t pad3 = 0;
   LightChanKey litchan[4]{}; // color0, color1, alpha0, alpha1
   TexGenKey tex_gens[kMaxTexGens]{};
+  IndirectStageKey ind_stages[kMaxIndirectStages]{};
   TevStageKey tev_stages[kMaxTevStages]{};
 };
 static_assert(std::has_unique_object_representations_v<ShaderKey>);
@@ -309,8 +332,12 @@ struct PixelShaderConstants {
   std::int32_t fogi[4]{};       // .y = b_magnitude, .w = b_shift
   float fogf[4]{};              // .x=A .y=C .z=center .w=width
   float fogrange[3][4]{};       // Dolphin I_FOGRANGE K table (indices 0..9)
+  // Dolphin I_INDTEXMTX: two signed integer rows per matrix. xyz are the BP
+  // coefficients; w is the post-dot shift (17 - the BP matrix scale).
+  std::int32_t indtexmtx[6][4]{};
 };
-static_assert(sizeof(PixelShaderConstants) == (4 + 4 + 1 + 1 + 1 + 1 + 3) * 16);
+static_assert(sizeof(PixelShaderConstants) ==
+              (4 + 4 + 1 + 1 + 1 + 1 + 3 + 6) * 16);
 
 // --- Fixed decoded-vertex layout (slice) ------------------------------------
 //
@@ -361,6 +388,9 @@ inline std::uint32_t used_texmap_mask(const ShaderKey& key) {
     const TevStageKey& s = key.tev_stages[n];
     if (s.tevorders_enable != 0u)
       mask |= (1u << (s.tevorders_texmap & 7u));
+    if (s.ind_stage < key.num_ind_stages &&
+        (s.ind_matrix_index != 0u || s.ind_bump_alpha != 0u))
+      mask |= (1u << (key.ind_stages[s.ind_stage].texmap & 7u));
   }
   return mask != 0u ? mask : 1u;
 }

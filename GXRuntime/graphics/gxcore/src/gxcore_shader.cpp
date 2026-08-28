@@ -250,6 +250,7 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
   // Single-texmap (<=1 distinct texmap) samples tex0 exactly as before; a
   // multi-texmap TEV (e.g. THP YUV Y/U/V on texmap 0/1/2) samples tex{texmap}.
   const bool multi_texmap = texmap_popcount(used_texmap_mask(key)) > 1u;
+  const bool indirect_enabled = key.num_ind_stages != 0u;
   emit(out, "@fragment\nfn fs_main(in: VertexOut) -> @location(0) vec4f {\n");
   emit(out, "    var prev = psc.colors[0];\n"
             "    var c0 = psc.colors[1];\n"
@@ -262,7 +263,11 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
             "    var tevin_a = vec4i(0,0,0,0);\n"
             "    var tevin_b = vec4i(0,0,0,0);\n"
             "    var tevin_c = vec4i(0,0,0,0);\n"
-            "    var tevin_d = vec4i(0,0,0,0);\n"
+            "    var tevin_d = vec4i(0,0,0,0);\n");
+  if (indirect_enabled)
+    emit(out, "    var alphabump = 0;\n"
+              "    var tevcoord = vec2i(0,0);\n");
+  emit(out,
             "    let col0i = vec4i(round(in.color0 * 255.0));\n"
             "    let col1i = vec4i(round(in.color1 * 255.0));\n");
 
@@ -273,7 +278,9 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
     // Rasterized color, if referenced (RASC=10/RASA=11 color; RASA=5 alpha).
     const bool uses_ras =
         cc_uses(s, 10) || cc_uses(s, 11) || ac_uses(s, 5);
-    if (uses_ras) {
+    const bool uses_bump_ras = indirect_enabled && uses_ras &&
+        (s.tevorders_colorchan == 5u || s.tevorders_colorchan == 6u);
+    if (uses_ras && !uses_bump_ras) {
       const char* src = s.tevorders_colorchan == 0
                             ? "col0i"
                             : s.tevorders_colorchan == 1 ? "col1i"
@@ -289,20 +296,151 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
     if (texcoord >= key.num_tex_gens)
       texcoord = 0;
     const std::uint32_t texunit = multi_texmap ? (s.tevorders_texmap & 7u) : 0u;
-    if (s.tevorders_enable != 0 && key.num_tex_gens > 0 && key.textured != 0) {
-      const bool proj =
-          texcoord < kMaxTexGens && key.tex_gens[texcoord].projection != 0u;
+    const bool direct_sample =
+        s.tevorders_enable != 0 && key.num_tex_gens > 0 && key.textured != 0;
+    const bool proj =
+        texcoord < kMaxTexGens && key.tex_gens[texcoord].projection != 0u;
+    if (direct_sample && indirect_enabled) {
       if (proj)
+        emitf(out, "    var stage_uv%u = in.uv%u.xy / max(in.uv%u.z, 1e-6);\n",
+              n, texcoord, texcoord);
+      else
+        emitf(out, "    var stage_uv%u = in.uv%u.xy;\n", n, texcoord);
+      emitf(out,
+            "    let stage_dims%u = vec2i(textureDimensions(tex%u));\n"
+            "    let base_coord%u = vec2i(round(stage_uv%u * "
+            "vec2f(stage_dims%u) * 128.0));\n",
+            n, texunit, n, n, n);
+    }
+
+    const bool valid_indirect = s.ind_stage < key.num_ind_stages;
+    const bool sample_indirect = valid_indirect &&
+        (s.ind_matrix_index != 0u || s.ind_bump_alpha != 0u);
+    if (sample_indirect) {
+      const IndirectStageKey& ind = key.ind_stages[s.ind_stage];
+      std::uint32_t indcoord = ind.texcoord;
+      if (indcoord >= key.num_tex_gens)
+        indcoord = 0u;
+      const std::uint32_t indunit = multi_texmap ? (ind.texmap & 7u) : 0u;
+      const bool indproj = indcoord < kMaxTexGens &&
+                           key.tex_gens[indcoord].projection != 0u;
+      if (indproj)
+        emitf(out,
+              "    let ind_uv%u = (in.uv%u.xy / max(in.uv%u.z, 1e-6)) / "
+              "vec2f(%u.0, %u.0);\n",
+              n, indcoord, indcoord, 1u << ind.scale_s,
+              1u << ind.scale_t);
+      else
+        emitf(out,
+              "    let ind_uv%u = in.uv%u.xy / vec2f(%u.0, %u.0);\n",
+              n, indcoord, 1u << ind.scale_s, 1u << ind.scale_t);
+      emitf(out,
+            "    let ind_raw%u = vec3i(round(textureSample(tex%u, samp%u, "
+            "ind_uv%u).abg * 255.0));\n",
+            n, indunit, indunit, n);
+      if (s.ind_bump_alpha != 0u) {
+        constexpr std::uint32_t alpha_shift[4] = {0u, 5u, 4u, 3u};
+        const std::uint32_t shift = alpha_shift[s.ind_format];
+        const char component = " xyz"[s.ind_bump_alpha];
+        emitf(out, "    alphabump = (ind_raw%u.%c << %uu) & 248;\n",
+              n, component, shift);
+      }
+      if (s.ind_matrix_index != 0u && direct_sample) {
+        constexpr std::uint32_t format_shift[4] = {0u, 3u, 4u, 5u};
+        emitf(out, "    var ind_coord%u = ind_raw%u >> vec3u(%uu);\n",
+              n, n, format_shift[s.ind_format]);
+        const int bias = s.ind_format == 0u ? -128 : 1;
+        if ((s.ind_bias & 1u) != 0u)
+          emitf(out, "    ind_coord%u.x += %d;\n", n, bias);
+        if ((s.ind_bias & 2u) != 0u)
+          emitf(out, "    ind_coord%u.y += %d;\n", n, bias);
+        if ((s.ind_bias & 4u) != 0u)
+          emitf(out, "    ind_coord%u.z += %d;\n", n, bias);
+        const std::uint32_t matrix = 2u * (s.ind_matrix_index - 1u);
+        if (s.ind_matrix_id == 0u) {
+          emitf(out,
+                "    var ind_trans%u = vec2i("
+                "psc.indtexmtx[%u].x * ind_coord%u.x + "
+                "psc.indtexmtx[%u].y * ind_coord%u.y + "
+                "psc.indtexmtx[%u].z * ind_coord%u.z, "
+                "psc.indtexmtx[%u].x * ind_coord%u.x + "
+                "psc.indtexmtx[%u].y * ind_coord%u.y + "
+                "psc.indtexmtx[%u].z * ind_coord%u.z) >> vec2u(3u);\n",
+                n, matrix, n, matrix, n, matrix, n, matrix + 1u, n,
+                matrix + 1u, n, matrix + 1u, n);
+        } else if (s.ind_matrix_id == 1u) {
+          emitf(out,
+                "    var ind_trans%u = (base_coord%u * "
+                "vec2i(ind_coord%u.x)) >> vec2u(8u);\n",
+                n, n, n);
+        } else if (s.ind_matrix_id == 2u) {
+          emitf(out,
+                "    var ind_trans%u = (base_coord%u * "
+                "vec2i(ind_coord%u.y)) >> vec2u(8u);\n",
+                n, n, n);
+        } else {
+          emitf(out, "    var ind_trans%u = vec2i(0,0);\n", n);
+        }
+        emitf(out,
+              "    if (psc.indtexmtx[%u].w >= 0) { ind_trans%u = "
+              "ind_trans%u >> vec2u(u32(psc.indtexmtx[%u].w)); } "
+              "else { ind_trans%u = ind_trans%u << "
+              "vec2u(u32(-psc.indtexmtx[%u].w)); }\n",
+              matrix, n, n, matrix, n, n, matrix);
+      }
+    }
+
+    if (direct_sample && indirect_enabled) {
+      auto wrap_expr = [](std::uint8_t wrap, const std::string& coord) {
+        if (wrap == 0u)
+          return coord;
+        if (wrap >= 6u)
+          return std::string("0");
+        const std::uint32_t period = (256u >> (wrap - 1u)) << 7u;
+        return "(" + coord + " & " + std::to_string(period - 1u) + ")";
+      };
+      const std::string sx = wrap_expr(s.ind_wrap_s,
+                                       "base_coord" + std::to_string(n) + ".x");
+      const std::string sy = wrap_expr(s.ind_wrap_t,
+                                       "base_coord" + std::to_string(n) + ".y");
+      emitf(out, "    let wrapped%u = vec2i(%s, %s);\n", n, sx.c_str(),
+            sy.c_str());
+      const bool has_translation =
+          sample_indirect && s.ind_matrix_index != 0u;
+      const std::string translation = has_translation
+                                          ? "ind_trans" + std::to_string(n)
+                                          : "vec2i(0,0)";
+      if (s.ind_add_prev != 0u)
+        emitf(out, "    tevcoord += wrapped%u + %s;\n", n,
+              translation.c_str());
+      else
+        emitf(out, "    tevcoord = wrapped%u + %s;\n", n,
+              translation.c_str());
+      emit(out, "    tevcoord = (tevcoord << vec2u(8u)) >> vec2u(8u);\n");
+      emitf(out,
+            "    stage_uv%u = vec2f(tevcoord) / "
+            "(vec2f(stage_dims%u) * 128.0);\n",
+            n, n);
+    }
+
+    if (direct_sample) {
+      if (indirect_enabled) {
+        emitf(out,
+              "    rawtextemp = vec4i(round(textureSample(tex%u, samp%u, "
+              "stage_uv%u) * 255.0));\n",
+              texunit, texunit, n);
+      } else if (proj) {
         emitf(out,
               "    { let uv = in.uv%u.xy / max(in.uv%u.z, 1e-6); "
               "rawtextemp = vec4i(round(textureSample(tex%u, samp%u, uv) * "
               "255.0)); }\n",
               texcoord, texcoord, texunit, texunit);
-      else
+      } else {
         emitf(out,
               "    { let uv = in.uv%u.xy; rawtextemp = "
               "vec4i(round(textureSample(tex%u, samp%u, uv) * 255.0)); }\n",
               texcoord, texunit, texunit);
+      }
       emitf(out, "    textemp = rawtextemp.%c%c%c%c;\n",
             kRgbaSwizzle[s.tex_swap[0]], kRgbaSwizzle[s.tex_swap[1]],
             kRgbaSwizzle[s.tex_swap[2]], kRgbaSwizzle[s.tex_swap[3]]);
@@ -310,6 +448,17 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
       emit(out, "    textemp = vec4i(0,0,0,0);\n");
     } else {
       emit(out, "    textemp = vec4i(255,255,255,255);\n");
+    }
+
+    if (uses_bump_ras) {
+      const char* bump = s.tevorders_colorchan == 5u
+                             ? "alphabump"
+                             : "(alphabump | (alphabump >> 5))";
+      emitf(out,
+            "    rastemp = vec4i(%s,%s,%s,%s).%c%c%c%c;\n",
+            bump, bump, bump, bump, kRgbaSwizzle[s.ras_swap[0]],
+            kRgbaSwizzle[s.ras_swap[1]], kRgbaSwizzle[s.ras_swap[2]],
+            kRgbaSwizzle[s.ras_swap[3]]);
     }
 
     // Konst, if referenced (KONST=14 color / 6 alpha).
@@ -611,8 +760,10 @@ std::string generate_wgsl(const ShaderKey& key) {
               "    fogcolor: vec4i,\n"
               "    fogi: vec4i,\n"
               "    fogf: vec4f,\n"
-              "    fogrange: array<vec4f, 3>,\n"
-              "};\n"
+              "    fogrange: array<vec4f, 3>,\n");
+    if (key.num_ind_stages != 0u)
+      emit(out, "    indtexmtx: array<vec4i, 6>,\n");
+    emit(out, "};\n"
               "@group(2) @binding(0) var<uniform> psc: PixelShaderConstants;\n");
   }
   if (key.textured != 0) {
