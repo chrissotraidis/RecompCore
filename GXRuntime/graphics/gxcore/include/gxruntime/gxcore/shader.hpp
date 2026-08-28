@@ -345,12 +345,15 @@ struct PixelShaderConstants {
   std::int32_t fogi[4]{};       // .y = b_magnitude, .w = b_shift
   float fogf[4]{};              // .x=A .y=C .z=center .w=width
   float fogrange[3][4]{};       // Dolphin I_FOGRANGE K table (indices 0..9)
+  // Dolphin I_TEXDIMS: .zw are BP SU_SSIZE/SU_TSIZE scale_minus_1 + 1.
+  // They describe rasterized texcoords independently of image dimensions.
+  std::int32_t texdims[8][4]{};
   // Dolphin I_INDTEXMTX: two signed integer rows per matrix. xyz are the BP
   // coefficients; w is the post-dot shift (17 - the BP matrix scale).
   std::int32_t indtexmtx[6][4]{};
 };
 static_assert(sizeof(PixelShaderConstants) ==
-              (4 + 4 + 1 + 1 + 1 + 1 + 3 + 6) * 16);
+              (4 + 4 + 1 + 1 + 1 + 1 + 3 + 8 + 6) * 16);
 
 // --- Fixed decoded-vertex layout (slice) ------------------------------------
 //

@@ -230,6 +230,20 @@ void test_state_to_plan_and_wgsl() {
     CHECK(sampler_plan.samplers[0].mipmap_filter == 2u);
   }
 
+  // J3D writes BP SU_SSIZE/SU_TSIZE for every active texcoord. Dolphin turns
+  // scale_minus_1 back into the rasterized fixed-point S/T scale; it is not a
+  // texture-unit sampler property and can differ from the sampled image size.
+  {
+    gxc::GxCoreState scale_state = state;
+    scale_state.apply(bp(0x30u, 15u)); // S scale 16
+    scale_state.apply(bp(0x31u, 7u));  // T scale 8
+    gxc::GapCounters gaps;
+    const gxc::DrawPlan scale_plan = scale_state.build_draw_plan(draw, gaps);
+    CHECK(scale_plan.ok);
+    CHECK(scale_plan.pixel_constants.texdims[0][2] == 16);
+    CHECK(scale_plan.pixel_constants.texdims[0][3] == 8);
+  }
+
   // BP 0x42 only overrides stored alpha for an alpha-writing RGBA6 target.
   // The fragment keeps TEV alpha in blend source 1 so color blending still
   // observes the unmodified source alpha, matching Dolphin's dual-source path.
@@ -654,7 +668,11 @@ void test_five_texgens() {
         std::string::npos);
   CHECK(w.find("let ti4 = (in.texmtxidx_hi >> (8u * 0u)) & 0xFFu") !=
         std::string::npos);
-  CHECK(w.find("let uv = in.uv4.xy; rawtextemp") != std::string::npos);
+  CHECK(w.find("let fixpoint_uv4 = vec2i(in.uv4.xy * "
+               "vec2f(psc.texdims[4].zw * 128))") != std::string::npos);
+  CHECK(w.find("let uv = vec2f(fixpoint_uv4) / "
+               "(vec2f(textureDimensions(tex0)) * 128.0)") !=
+        std::string::npos);
 }
 
 void test_fifth_texgen_plan_decode() {
@@ -827,6 +845,25 @@ void test_tev_indirect_matrix() {
         std::string::npos);
 }
 
+void test_tev_texcoord_scale() {
+  gxc::ShaderKey key{};
+  key.textured = 1;
+  key.tev_valid = 1;
+  key.num_tex_gens = 1;
+  key.num_tev_stages = 1;
+  key.tex_gens[0].enabled = 1;
+  key.tev_stages[0].tevorders_enable = 1;
+  key.tev_stages[0].tevorders_texmap = 0;
+  key.tev_stages[0].tevorders_texcoord = 0;
+
+  const std::string w = gxc::generate_wgsl(key);
+  CHECK(w.find("texdims: array<vec4i, 8>") != std::string::npos);
+  CHECK(w.find("vec2i(in.uv0.xy * vec2f(psc.texdims[0].zw * 128))") !=
+        std::string::npos);
+  CHECK(w.find("vec2f(fixpoint_uv0) / (vec2f(textureDimensions(tex0)) * "
+               "128.0)") != std::string::npos);
+}
+
 // Golden WGSL for the 1-stage modulate TEV key (tex * rasterized color0).
 // Regenerate with GXCORE_PRINT_WGSL=1.
 constexpr const char* kGoldenTevWgsl =
@@ -846,6 +883,7 @@ struct PixelShaderConstants {
     fogi: vec4i,
     fogf: vec4f,
     fogrange: array<vec4f, 3>,
+    texdims: array<vec4i, 8>,
 };
 @group(2) @binding(0) var<uniform> psc: PixelShaderConstants;
 @group(3) @binding(0) var tex0: texture_2d<f32>;
@@ -907,9 +945,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4f {
     var tevin_d = vec4i(0,0,0,0);
     let col0i = vec4i(round(in.color0 * 255.0));
     let col1i = vec4i(round(in.color1 * 255.0));
+    let fixpoint_uv0 = vec2i(in.uv0.xy * vec2f(psc.texdims[0].zw * 128));
     // TEV stage 0
     rastemp = col0i.rgba;
-    { let uv = in.uv0.xy; rawtextemp = vec4i(round(textureSample(tex0, samp0, uv) * 255.0)); }
+    { let uv = vec2f(fixpoint_uv0) / (vec2f(textureDimensions(tex0)) * 128.0); rawtextemp = vec4i(round(textureSample(tex0, samp0, uv) * 255.0)); }
     textemp = rawtextemp.rgba;
     tevin_a = vec4i(vec3i(0,0,0), 0) & vec4i(255,255,255,255);
     tevin_b = vec4i(textemp.rgb, textemp.a) & vec4i(255,255,255,255);
@@ -1814,6 +1853,7 @@ int main() {
   test_texgen_emboss();
   test_texgen_per_vertex_mtx();
   test_tev_indirect_matrix();
+  test_tev_texcoord_scale();
   test_vertex_texmtxidx_and_nbt();
   test_tev_modulate();
   test_tev_konst_and_alpha();

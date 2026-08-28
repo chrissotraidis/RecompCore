@@ -63,6 +63,8 @@ struct GapCounters {
   unsigned long long alpha_compare_ignored = 0; // BP 0xF3 non-always, no TEV
   unsigned long long tev_stages_over = 0;        // numtevstages > kMaxTevStages
   unsigned long long tev_multi_texmap = 0;       // stage reads texmap != 0
+  unsigned long long texcoord_scale_active = 0;  // textured TEV uses BP SU scale
+  unsigned long long texcoord_scale_mismatch = 0; // SU scale != sampled image
   unsigned long long efb_copy_ignored = 0;      // BP 0x52 copies, no observer
   unsigned long long efb_copies = 0;            // EFB copies performed (S16)
   unsigned long long efb_copy_depth = 0;        // of which Z-source (PE Z24)

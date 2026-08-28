@@ -284,6 +284,21 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
   emit(out,
             "    let col0i = vec4i(round(in.color0 * 255.0));\n"
             "    let col1i = vec4i(round(in.color1 * 255.0));\n");
+  // GX quantizes perspective-correct texcoords to seven fractional bits.
+  // SU scale is indexed by texcoord; normalization later uses the sampled
+  // texmap's actual dimensions, exactly as Dolphin's sample wrapper does.
+  for (std::uint32_t i = 0; i < key.num_tex_gens; ++i) {
+    if (key.tex_gens[i].projection != 0u)
+      emitf(out,
+            "    let fixpoint_uv%u = vec2i((in.uv%u.xy / "
+            "max(in.uv%u.z, 1e-6)) * vec2f(psc.texdims[%u].zw * 128));\n",
+            i, i, i, i);
+    else
+      emitf(out,
+            "    let fixpoint_uv%u = vec2i(in.uv%u.xy * "
+            "vec2f(psc.texdims[%u].zw * 128));\n",
+            i, i, i);
+  }
 
   for (std::uint32_t n = 0; n < key.num_tev_stages; ++n) {
     const TevStageKey& s = key.tev_stages[n];
@@ -315,16 +330,12 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
     const bool proj =
         texcoord < kMaxTexGens && key.tex_gens[texcoord].projection != 0u;
     if (direct_sample && indirect_enabled) {
-      if (proj)
-        emitf(out, "    var stage_uv%u = in.uv%u.xy / max(in.uv%u.z, 1e-6);\n",
-              n, texcoord, texcoord);
-      else
-        emitf(out, "    var stage_uv%u = in.uv%u.xy;\n", n, texcoord);
       emitf(out,
             "    let stage_dims%u = vec2i(textureDimensions(tex%u));\n"
-            "    let base_coord%u = vec2i(round(stage_uv%u * "
-            "vec2f(stage_dims%u) * 128.0));\n",
-            n, texunit, n, n, n);
+            "    let base_coord%u = fixpoint_uv%u;\n"
+            "    var stage_uv%u = vec2f(base_coord%u) / "
+            "(vec2f(stage_dims%u) * 128.0);\n",
+            n, texunit, n, texcoord, n, n, n);
     }
 
     const bool valid_indirect = s.ind_stage < key.num_ind_stages;
@@ -336,18 +347,13 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
       if (indcoord >= key.num_tex_gens)
         indcoord = 0u;
       const std::uint32_t indunit = multi_texmap ? (ind.texmap & 7u) : 0u;
-      const bool indproj = indcoord < kMaxTexGens &&
-                           key.tex_gens[indcoord].projection != 0u;
-      if (indproj)
-        emitf(out,
-              "    let ind_uv%u = (in.uv%u.xy / max(in.uv%u.z, 1e-6)) / "
-              "vec2f(%u.0, %u.0);\n",
-              n, indcoord, indcoord, 1u << ind.scale_s,
-              1u << ind.scale_t);
-      else
-        emitf(out,
-              "    let ind_uv%u = in.uv%u.xy / vec2f(%u.0, %u.0);\n",
-              n, indcoord, 1u << ind.scale_s, 1u << ind.scale_t);
+      emitf(out,
+            "    let ind_coord_scaled%u = fixpoint_uv%u >> "
+            "vec2u(%uu, %uu);\n"
+            "    let ind_uv%u = vec2f(ind_coord_scaled%u) / "
+            "(vec2f(textureDimensions(tex%u)) * 128.0);\n",
+            n, indcoord, static_cast<unsigned>(ind.scale_s),
+            static_cast<unsigned>(ind.scale_t), n, n, indunit);
       emitf(out,
             "    let ind_raw%u = vec3i(round(textureSample(tex%u, samp%u, "
             "ind_uv%u).abg * 255.0));\n",
@@ -445,15 +451,17 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
               texunit, texunit, n);
       } else if (proj) {
         emitf(out,
-              "    { let uv = in.uv%u.xy / max(in.uv%u.z, 1e-6); "
+              "    { let uv = vec2f(fixpoint_uv%u) / "
+              "(vec2f(textureDimensions(tex%u)) * 128.0); "
               "rawtextemp = vec4i(round(textureSample(tex%u, samp%u, uv) * "
               "255.0)); }\n",
-              texcoord, texcoord, texunit, texunit);
+              texcoord, texunit, texunit, texunit);
       } else {
         emitf(out,
-              "    { let uv = in.uv%u.xy; rawtextemp = "
+              "    { let uv = vec2f(fixpoint_uv%u) / "
+              "(vec2f(textureDimensions(tex%u)) * 128.0); rawtextemp = "
               "vec4i(round(textureSample(tex%u, samp%u, uv) * 255.0)); }\n",
-              texcoord, texunit, texunit);
+              texcoord, texunit, texunit, texunit);
       }
       emitf(out, "    textemp = rawtextemp.%c%c%c%c;\n",
             kRgbaSwizzle[s.tex_swap[0]], kRgbaSwizzle[s.tex_swap[1]],
@@ -796,7 +804,8 @@ std::string generate_wgsl(const ShaderKey& key) {
               "    fogcolor: vec4i,\n"
               "    fogi: vec4i,\n"
               "    fogf: vec4f,\n"
-              "    fogrange: array<vec4f, 3>,\n");
+              "    fogrange: array<vec4f, 3>,\n"
+              "    texdims: array<vec4i, 8>,\n");
     if (key.num_ind_stages != 0u)
       emit(out, "    indtexmtx: array<vec4i, 6>,\n");
     emit(out, "};\n"

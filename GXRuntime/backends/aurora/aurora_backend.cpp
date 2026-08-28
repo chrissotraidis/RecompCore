@@ -421,7 +421,8 @@ void dol_aurora_shutdown(void) {
                      "unresolved_tex_matrix=%llu normals_ignored=%llu "
                      "lighting_ignored=%llu tlut_texture=%llu "
                      "alpha_compare_ignored=%llu tev_stages_over=%llu "
-                     "tev_multi_texmap=%llu efb_copy_ignored=%llu "
+                     "tev_multi_texmap=%llu texcoord_scale_active=%llu "
+                     "texcoord_scale_mismatch=%llu efb_copy_ignored=%llu "
                      "efb_copies=%llu efb_copy_depth=%llu "
                      "efb_display_copies=%llu fog_ignored=%llu "
                      "indirect_active=%llu indirect_ignored=%llu "
@@ -466,6 +467,8 @@ void dol_aurora_shutdown(void) {
                      gaps.normals_ignored, gaps.lighting_ignored,
                      gaps.tlut_texture, gaps.alpha_compare_ignored,
                      gaps.tev_stages_over, gaps.tev_multi_texmap,
+                     gaps.texcoord_scale_active,
+                     gaps.texcoord_scale_mismatch,
                      gaps.efb_copy_ignored, gaps.efb_copies,
                      gaps.efb_copy_depth, gaps.efb_display_copies,
                      gaps.fog_ignored, gaps.indirect_active,

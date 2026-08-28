@@ -37,8 +37,9 @@ struct DrawData {
 // v7: fifth texgen adds UV4 and a high per-vertex matrix-index word. v8:
 // destination-alpha override adds a dual-source fragment output/blend state.
 // v9: GXSetZCompLoc early depth adds a depth-only pipeline variant. v10:
-// RGB and alpha blending carry donor-exact independent factors.
-constexpr uint32_t GXCorePipelineConfigVersion = 10;
+// RGB and alpha blending carry donor-exact independent factors. v11: BP SU
+// texture-coordinate scales enlarge pixel constants and alter TEV WGSL.
+constexpr uint32_t GXCorePipelineConfigVersion = 11;
 
 struct PipelineConfig {
   uint32_t version = GXCorePipelineConfigVersion;

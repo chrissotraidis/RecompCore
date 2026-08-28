@@ -892,6 +892,45 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
     }
   }
 
+  if (key.tev_valid != 0u && key.textured != 0u &&
+      key.num_tex_gens != 0u) {
+    ++counters.texcoord_scale_active;
+    bool scale_mismatch = false;
+    auto compare_scale = [&](std::uint32_t coord, std::uint32_t texmap) {
+      if (coord >= key.num_tex_gens)
+        coord = 0u;
+      texmap &= 7u;
+      const ar::ConsumedTexture* texture = &draw.textures[texmap];
+      if (!texture->valid || !texture->resolved || texture->width == 0u ||
+          texture->height == 0u) {
+        if (!draw.texture.valid || !draw.texture.resolved ||
+            (draw.texture.slot & 7u) != texmap)
+          return;
+        texture = &draw.texture;
+      }
+      const std::uint32_t sreg = 0x30u + 2u * coord;
+      const std::uint32_t treg = sreg + 1u;
+      const std::uint32_t scale_s =
+          (bp_valid_[sreg] ? bits(bp_regs_[sreg], 16, 0) : 0u) + 1u;
+      const std::uint32_t scale_t =
+          (bp_valid_[treg] ? bits(bp_regs_[treg], 16, 0) : 0u) + 1u;
+      scale_mismatch |=
+          scale_s != texture->width || scale_t != texture->height;
+    };
+    for (std::uint32_t n = 0; n < key.num_tev_stages; ++n) {
+      const TevStageKey& ts = key.tev_stages[n];
+      if (ts.tevorders_enable != 0u)
+        compare_scale(ts.tevorders_texcoord, ts.tevorders_texmap);
+      if (ts.ind_stage < key.num_ind_stages &&
+          (ts.ind_matrix_index != 0u || ts.ind_bump_alpha != 0u)) {
+        const IndirectStageKey& ind = key.ind_stages[ts.ind_stage];
+        compare_scale(ind.texcoord, ind.texmap);
+      }
+    }
+    if (scale_mismatch)
+      ++counters.texcoord_scale_mismatch;
+  }
+
   PipelineKey& pipe = plan.pipeline;
   pipe.cull_mode = static_cast<std::uint8_t>(cull);
   const std::uint32_t zmode = bp_valid_[0x40] ? bp_regs_[0x40] : 0x17u;
@@ -1374,6 +1413,18 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
         static_cast<std::int32_t>(bits(bp_regs_[0xF3], 8, 0));
     plan.pixel_constants.alpha_ref[1] =
         static_cast<std::int32_t>(bits(bp_regs_[0xF3], 8, 8));
+  }
+
+  // BP SU_SSIZE/SU_TSIZE own rasterized texcoord scale. J3D normally writes
+  // image width/height, but the hardware pairing is texcoord rather than
+  // texmap and the two values may legitimately differ.
+  for (std::uint32_t i = 0; i < 8u; ++i) {
+    const std::uint32_t sreg = 0x30u + 2u * i;
+    const std::uint32_t treg = sreg + 1u;
+    plan.pixel_constants.texdims[i][2] = static_cast<std::int32_t>(
+        (bp_valid_[sreg] ? bits(bp_regs_[sreg], 16, 0) : 0u) + 1u);
+    plan.pixel_constants.texdims[i][3] = static_cast<std::int32_t>(
+        (bp_valid_[treg] ? bits(bp_regs_[treg], 16, 0) : 0u) + 1u);
   }
 
   for (std::uint32_t m = 0; m < 3u; ++m) {
