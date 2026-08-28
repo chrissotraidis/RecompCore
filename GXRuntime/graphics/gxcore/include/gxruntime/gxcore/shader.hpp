@@ -315,9 +315,14 @@ struct VertexShaderConstants {
   float cached_normal[4]{0.f, 0.f, 0.f, 0.f};
   float cached_tangent[4]{0.f, 0.f, 0.f, 0.f};
   float cached_binormal[4]{0.f, 0.f, 0.f, 0.f};
+  // Dolphin I_NORMALMATRICES: 32 vec4-aligned rows containing the packed XF
+  // 3x3 normal-matrix bank. Per-vertex PNMTXIDX addresses this with
+  // (posidx & 31), independently of the draw-wide current matrix above.
+  float normalmatrices[32][4]{};
 };
 static_assert(sizeof(VertexShaderConstants) ==
-              (6 + 4 + 24 + 64) * 16 + 8 * (5 * 16) + 4 * 16 + 3 * 16);
+              (6 + 4 + 24 + 64) * 16 + 8 * (5 * 16) + 4 * 16 + 3 * 16 +
+                  32 * 16);
 
 // Pixel-shader uniforms (Dolphin PixelShaderConstants subset): the four TEV
 // color registers (I_COLORS: [0] prev seed, [1..3] c0/c1/c2), the four konst

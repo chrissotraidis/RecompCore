@@ -620,6 +620,8 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
                     key.litchan[2].enablelighting || key.litchan[3].enablelighting)
                       ? 1u
                       : 0u;
+  if (key.has_pos_mtx_idx != 0u && key.lit_valid != 0u)
+    ++counters.per_vertex_normal_matrix;
   // Only count normals/lighting as ignored when we fall back to passthrough.
   if (walk.has_normal && key.lit_valid == 0u)
     ++counters.normals_ignored;
@@ -1045,6 +1047,22 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
         (void)load_matrix_row(draw, pn_row + k, c.posnormalmatrix[3u + k]);
       }
     }
+  }
+  // Dolphin uploads the complete packed normal-matrix row bank for vertex
+  // formats carrying PNMTXIDX. XF stores 96 floats as 32 rows of three; the
+  // C/WGSL uniform pads each row to vec4 alignment.
+  for (std::uint32_t row = 0; row < 32u; ++row) {
+    const std::uint32_t matrix = row / 3u;
+    const std::uint32_t matrix_row = row % 3u;
+    if (matrix >= DOL_GX_RECOMP_NORMAL_MATRIX_COUNT)
+      continue;
+    const std::uint16_t row_mask =
+        static_cast<std::uint16_t>(0x7u << (3u * matrix_row));
+    if ((draw.normal_matrix_word_mask[matrix] & row_mask) != row_mask)
+      continue;
+    for (std::uint32_t col = 0; col < 3u; ++col)
+      c.normalmatrices[row][col] =
+          draw.normal_matrices[matrix][3u * matrix_row + col];
   }
 
   // Lighting uniforms (S15): 8 XF lights + 4 material/ambient registers. Light

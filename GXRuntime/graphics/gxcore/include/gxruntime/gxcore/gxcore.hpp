@@ -48,6 +48,7 @@ struct GapCounters {
   unsigned long long texgen_count_7 = 0;
   unsigned long long texgen_count_8plus = 0;
   unsigned long long texgen_emboss_cached_nbt = 0; // supported cached N/B/T fallback
+  unsigned long long per_vertex_normal_matrix = 0; // PNMTXIDX selects normal bank
   unsigned long long texgen_source_normal = 0;  // supported regular normal source
   unsigned long long texgen_source_normal_default = 0; // no normal attribute
   unsigned long long texgen_source_colors = 0;  // regular source row not emitted

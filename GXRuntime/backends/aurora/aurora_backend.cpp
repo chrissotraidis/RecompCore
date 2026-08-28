@@ -417,7 +417,7 @@ void dol_aurora_shutdown(void) {
                      "texgen_source_normal_default=%llu "
                      "texgen_source_colors=%llu texgen_source_binormal=%llu "
                      "texgen_source_tex47=%llu texgen_source_unknown=%llu "
-                     "per_vertex_tex_mtx=%llu "
+                     "per_vertex_tex_mtx=%llu per_vertex_normal_matrix=%llu "
                      "unresolved_tex_matrix=%llu normals_ignored=%llu "
                      "lighting_ignored=%llu tlut_texture=%llu "
                      "alpha_compare_ignored=%llu tev_stages_over=%llu "
@@ -460,7 +460,8 @@ void dol_aurora_shutdown(void) {
                      gaps.texgen_source_binormal,
                      gaps.texgen_source_tex47,
                      gaps.texgen_source_unknown,
-                     gaps.per_vertex_tex_mtx, gaps.unresolved_tex_matrix,
+                     gaps.per_vertex_tex_mtx, gaps.per_vertex_normal_matrix,
+                     gaps.unresolved_tex_matrix,
                      gaps.normals_ignored, gaps.lighting_ignored,
                      gaps.tlut_texture, gaps.alpha_compare_ignored,
                      gaps.tev_stages_over, gaps.tev_multi_texmap,

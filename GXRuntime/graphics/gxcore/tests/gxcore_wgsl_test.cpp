@@ -1147,6 +1147,11 @@ void test_lighting() {
   for (int i = 0; i < 9; ++i)
     draw.normal_matrices[0][i] = nm[i];
   draw.normal_matrix_word_mask[0] = (1u << 9) - 1u;
+  const float nm2[9] = {20.f, 21.f, 22.f, 23.f, 24.f,
+                        25.f, 26.f, 27.f, 28.f};
+  for (int i = 0; i < 9; ++i)
+    draw.normal_matrices[2][i] = nm2[i];
+  draw.normal_matrix_word_mask[2] = (1u << 9) - 1u;
 
   gxc::GapCounters counters;
   const gxc::DrawPlan plan = state.build_draw_plan(draw, counters);
@@ -1192,6 +1197,12 @@ void test_lighting() {
   CHECK(plan.constants.posnormalmatrix[3][3] == 0.f);
   CHECK(plan.constants.posnormalmatrix[4][1] == 3.f);
   CHECK(plan.constants.posnormalmatrix[5][2] == 4.f);
+  // Full normal bank preserves XF row addressing: matrix 2 occupies rows 6-8.
+  CHECK(plan.constants.normalmatrices[6][0] == 20.f);
+  CHECK(plan.constants.normalmatrices[6][2] == 22.f);
+  CHECK(plan.constants.normalmatrices[7][1] == 24.f);
+  CHECK(plan.constants.normalmatrices[8][2] == 28.f);
+  CHECK(plan.constants.normalmatrices[8][3] == 0.f);
 
   const std::string wgsl = gxc::generate_wgsl(key);
   if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
@@ -1346,6 +1357,18 @@ void test_cached_normal() {
     CHECK(wgsl2.find("@location(8) rawnormal: vec3f,") != std::string::npos);
     CHECK(wgsl2.find("cached_normal: vec4f,") == std::string::npos);
     CHECK(wgsl2.find("dot(vsc.posnormalmatrix[3].xyz, in.rawnormal)") !=
+          std::string::npos);
+
+    // A per-vertex PNMTXIDX selects both position and normal matrices. Dolphin
+    // uses (posidx & 31) to address I_NORMALMATRICES; the draw-wide current
+    // normal matrix is only valid when PNMTXIDX is absent.
+    key2.has_pos_mtx_idx = 1;
+    const std::string per_vertex_wgsl = gxc::generate_wgsl(key2);
+    CHECK(per_vertex_wgsl.find("normalmatrices: array<vec4f, 32>,") !=
+          std::string::npos);
+    CHECK(per_vertex_wgsl.find("let normidx = posidx & 31;") !=
+          std::string::npos);
+    CHECK(per_vertex_wgsl.find("dot(vsc.normalmatrices[normidx].xyz, in.rawnormal)") !=
           std::string::npos);
   }
 

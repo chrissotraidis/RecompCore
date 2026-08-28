@@ -722,11 +722,14 @@ std::string generate_wgsl(const ShaderKey& key) {
   // passthrough). Channel 1 only matters when its varying is emitted.
   const bool chan0_lit = channel_lit_path(key, 0u);
   const bool chan1_lit = emit_color1 && channel_lit_path(key, 1u);
+  const bool needs_normal_bank =
+      key.has_pos_mtx_idx != 0 && (lit || has_emboss);
   // The lit path reads vsc.materials (register material/ambient) and, when a
   // light is enabled, vsc.lights. Whenever either the light path or a
   // register-material channel is active we must expose the full uniform view
   // (both fields, in the fixed C struct order) so offsets line up.
-  const bool needs_uniform_full = emit_lights || chan0_lit || chan1_lit;
+  const bool needs_uniform_full =
+      emit_lights || chan0_lit || chan1_lit || needs_normal_bank;
   // Vertex-format N/B/T presence. A lit/emboss draw whose format omits an
   // attribute substitutes the cross-draw cached value from the uniform
   // (Dolphin I_CACHED_NORMAL fallback, VertexShaderGen.cpp:607-632) instead of
@@ -749,6 +752,9 @@ std::string generate_wgsl(const ShaderKey& key) {
   // attribute keep byte-identical goldens.
   const bool uses_cached =
       uses_cached_normal || uses_cached_tangent || uses_cached_binormal;
+  // normalmatrices is the final C-uniform field. A shader that declares it
+  // must also retain every preceding field so its WGSL offset stays identical.
+  const bool declare_cached_fields = uses_cached || needs_normal_bank;
 
   emit(out, "// gxcore generated shader (Dolphin VertexShaderGen shape)\n");
   if (needs_uniform_full)
@@ -771,10 +777,12 @@ std::string generate_wgsl(const ShaderKey& key) {
   if (needs_uniform_full)
     emit(out, "    lights: array<Light, 8>,\n"
               "    materials: array<vec4i, 4>,\n");
-  if (uses_cached)
+  if (declare_cached_fields)
     emit(out, "    cached_normal: vec4f,\n"
               "    cached_tangent: vec4f,\n"
               "    cached_binormal: vec4f,\n");
+  if (needs_normal_bank)
+    emit(out, "    normalmatrices: array<vec4f, 32>,\n");
   emit(out, "};\n"
             "@group(1) @binding(0) var<uniform> vsc: VertexShaderConstants;\n");
   if (tev) {
@@ -863,6 +871,8 @@ std::string generate_wgsl(const ShaderKey& key) {
               "    let p0 = vsc.transformmatrices[posidx];\n"
               "    let p1 = vsc.transformmatrices[posidx + 1];\n"
               "    let p2 = vsc.transformmatrices[posidx + 2];\n");
+    if (needs_normal_bank)
+      emit(out, "    let normidx = posidx & 31;\n");
   } else {
     emit(out, "    let p0 = vsc.posnormalmatrix[0];\n"
               "    let p1 = vsc.posnormalmatrix[1];\n"
@@ -896,7 +906,13 @@ std::string generate_wgsl(const ShaderKey& key) {
     // light the input carries no normal (register-material-only path), so seed a
     // constant — dolphin_calculate_lighting_chn only reads it inside a light and
     // there are none, leaving the material term intact.
-    if (lit)
+    if (lit && needs_normal_bank)
+      emitf(out, "    let _normal = normalize(vec3f("
+                 "dot(vsc.normalmatrices[normidx].xyz, %s), "
+                 "dot(vsc.normalmatrices[normidx + 1].xyz, %s), "
+                 "dot(vsc.normalmatrices[normidx + 2].xyz, %s)));\n",
+            normal_in, normal_in, normal_in);
+    else if (lit)
       emitf(out, "    let _normal = normalize(vec3f("
                  "dot(vsc.posnormalmatrix[3].xyz, %s), "
                  "dot(vsc.posnormalmatrix[4].xyz, %s), "
@@ -1008,16 +1024,29 @@ std::string generate_wgsl(const ShaderKey& key) {
       // Dolphin VertexShaderGen: add the light dir (view space) projected onto
       // the view-space tangent/binormal to the emboss-source texgen's coords.
       // Tangent/binormal go to view space via the normal matrix (rows 3-5).
-      emitf(out, "        let tn%u = vec3f("
-                 "dot(vsc.posnormalmatrix[3].xyz, %s), "
-                 "dot(vsc.posnormalmatrix[4].xyz, %s), "
-                 "dot(vsc.posnormalmatrix[5].xyz, %s));\n",
-            i, tangent_in, tangent_in, tangent_in);
-      emitf(out, "        let bn%u = vec3f("
-                 "dot(vsc.posnormalmatrix[3].xyz, %s), "
-                 "dot(vsc.posnormalmatrix[4].xyz, %s), "
-                 "dot(vsc.posnormalmatrix[5].xyz, %s));\n",
-            i, binormal_in, binormal_in, binormal_in);
+      if (needs_normal_bank) {
+        emitf(out, "        let tn%u = vec3f("
+                   "dot(vsc.normalmatrices[normidx].xyz, %s), "
+                   "dot(vsc.normalmatrices[normidx + 1].xyz, %s), "
+                   "dot(vsc.normalmatrices[normidx + 2].xyz, %s));\n",
+              i, tangent_in, tangent_in, tangent_in);
+        emitf(out, "        let bn%u = vec3f("
+                   "dot(vsc.normalmatrices[normidx].xyz, %s), "
+                   "dot(vsc.normalmatrices[normidx + 1].xyz, %s), "
+                   "dot(vsc.normalmatrices[normidx + 2].xyz, %s));\n",
+              i, binormal_in, binormal_in, binormal_in);
+      } else {
+        emitf(out, "        let tn%u = vec3f("
+                   "dot(vsc.posnormalmatrix[3].xyz, %s), "
+                   "dot(vsc.posnormalmatrix[4].xyz, %s), "
+                   "dot(vsc.posnormalmatrix[5].xyz, %s));\n",
+              i, tangent_in, tangent_in, tangent_in);
+        emitf(out, "        let bn%u = vec3f("
+                   "dot(vsc.posnormalmatrix[3].xyz, %s), "
+                   "dot(vsc.posnormalmatrix[4].xyz, %s), "
+                   "dot(vsc.posnormalmatrix[5].xyz, %s));\n",
+              i, binormal_in, binormal_in, binormal_in);
+      }
       emitf(out, "        let ld%u = normalize(vsc.lights[%uu].pos.xyz - "
                  "viewpos.xyz);\n",
             i, static_cast<unsigned>(tg.embosslightshift));
