@@ -15,6 +15,7 @@
 #endif
 #include "pipeline_cache.hpp"
 #include "render_worker.hpp"
+#include "staging_budget.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
 #include "texture_replacement.hpp"
@@ -1177,7 +1178,7 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
   }
 }
 
-bool begin_frame() {
+bool begin_frame(bool preserveEfb) {
   ZoneScoped;
   // pace_frame_start();
   const size_t frameSlot = acquire_frame_slot();
@@ -1222,6 +1223,12 @@ bool begin_frame() {
   set_efb_targets(pass);
   pass.clearColorValue = gx::g_gxState.clearColor;
   pass.clearDepthValue = gx::clear_depth_value();
+  if (preserveEfb) {
+    pass.clearColor = false;
+    pass.clearDepth = false;
+    pass.colorLoadOp = wgpu::LoadOp::Load;
+    pass.depthLoadOp = wgpu::LoadOp::Load;
+  }
   g_currentRenderPass = 0;
   // Refresh render viewport/scissor from logical in case FB size changed
   g_cachedViewport = gx::map_logical_viewport(gx::g_gxState.logicalViewport);
@@ -1236,6 +1243,52 @@ bool begin_frame() {
   });
   g_cpuFrameStart = PresentClock::now();
   return true;
+}
+
+bool segment_frame() {
+  const auto& frame = current_frame_packet();
+  Log.info("Segmenting frame {} staging: verts={} uniforms={} indices={} storage={}",
+           frame.frameId, frame.verts.size(), frame.uniforms.size(),
+           frame.indices.size(), frame.storage.size());
+  finish();
+  end_frame([](wgpu::CommandEncoder& encoder) {
+    webgpu::gpu_prof::frame_end(encoder);
+    const wgpu::CommandBufferDescriptor descriptor{
+        .label = "Aurora staging segment command buffer"};
+    const auto buffer = encoder.Finish(&descriptor);
+    g_queue.Submit(1, &buffer);
+    webgpu::gpu_prof::after_submit();
+    after_submit();
+  });
+  return begin_frame(true);
+}
+
+bool staging_has_capacity(size_t vertLength, size_t indexLength,
+                          size_t uniformLength, size_t secondUniformLength,
+                          size_t storageLength) {
+  if (g_recordingFrame == nullptr)
+    return false;
+  const auto& frame = current_frame_packet();
+  return staging_fits(
+      StagingUse{.verts = frame.verts.size(),
+                 .indices = frame.indices.size(),
+                 .uniforms = frame.uniforms.size(),
+                 .storage = frame.storage.size()},
+      StagingRequest{.verts = vertLength,
+                     .indices = indexLength,
+                     .uniforms = uniformLength,
+                     .secondUniforms = secondUniformLength,
+                     .storage = storageLength},
+      StagingLimits{
+          .capacity = StagingUse{.verts = VertexBufferSize,
+                                 .indices = IndexBufferSize,
+                                 .uniforms = UniformBufferSize,
+                                 .storage = StorageBufferSize},
+          .uniformAlignment =
+              g_cachedLimits.minUniformBufferOffsetAlignment,
+          .storageAlignment =
+              g_cachedLimits.minStorageBufferOffsetAlignment,
+          .finishUniformHeadroom = gx::MaxUniformSize});
 }
 
 void finish() {

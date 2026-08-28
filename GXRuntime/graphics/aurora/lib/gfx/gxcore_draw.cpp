@@ -671,16 +671,29 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     }
   }
 
+  const bool tev = plan.pipeline.shader.tev_valid != 0;
+  const size_t vertBytes = plan.vertices.size() * sizeof(float);
+  const size_t indexBytes = plan.indices.size() * sizeof(uint16_t);
+  const size_t pixelUniformBytes = tev ? sizeof(plan.pixel_constants) : 0;
+  if (!staging_has_capacity(vertBytes, indexBytes, sizeof(plan.constants),
+                            pixelUniformBytes)) {
+    if (!segment_frame() ||
+        !staging_has_capacity(vertBytes, indexBytes, sizeof(plan.constants),
+                              pixelUniformBytes)) {
+      Log.error("GXCore draw exceeds an empty Aurora staging segment");
+      return false;
+    }
+  }
+
   const auto vertRange = push_verts(
       reinterpret_cast<const uint8_t*>(plan.vertices.data()),
-      plan.vertices.size() * sizeof(float), 4);
+      vertBytes, 4);
   const auto idxRange = push_indices(
       reinterpret_cast<const uint8_t*>(plan.indices.data()),
-      plan.indices.size() * sizeof(uint16_t), 4);
+      indexBytes, 4);
   const auto uniformRange = push_uniform(
       reinterpret_cast<const uint8_t*>(&plan.constants),
       sizeof(plan.constants));
-  const bool tev = plan.pipeline.shader.tev_valid != 0;
   Range pixelUniformRange{};
   if (tev) {
     pixelUniformRange = push_uniform(

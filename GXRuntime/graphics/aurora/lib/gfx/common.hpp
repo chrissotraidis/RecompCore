@@ -172,16 +172,13 @@ private:
 
 namespace aurora::gfx {
 inline constexpr bool UseTextureBuffer = true;
-// Full gameplay through gxcore --core (Dolphin-ported core, triangle-list
-// expansion) exceeds the menu-scale sizes the live SDK path used. Wind
-// Waker's opening-to-Outset transition batches more than 24mb of uniform
-// constants before the next display copy, so keep the fixed frame slices
-// proportionally sized for that burst. Per-frame staging costs roughly
-// staging_count * delta RAM.
-inline constexpr uint64_t UniformBufferSize = 50331648;  // 48mb
-inline constexpr uint64_t VertexBufferSize = 25165824;   // 24mb
-inline constexpr uint64_t IndexBufferSize = 16777216;    // 16mb
-inline constexpr uint64_t StorageBufferSize = 16777216;  // 16mb
+// GXCore triangle-list expansion needs more staging than the live SDK path.
+// Keep these slices bounded and segment long command intervals before they
+// overflow; fixed growth cannot cover an interval with no display copy.
+inline constexpr uint64_t UniformBufferSize = 25165824;  // 24mb
+inline constexpr uint64_t VertexBufferSize = 12582912;   // 12mb
+inline constexpr uint64_t IndexBufferSize = 8388608;     // 8mb
+inline constexpr uint64_t StorageBufferSize = 8388608;   // 8mb
 inline constexpr uint64_t TextureUploadSize = 25165824;  // 24mb
 
 extern AuroraStats g_stats;
@@ -234,7 +231,11 @@ enum class ShaderType : uint8_t {
 void initialize();
 void shutdown();
 
-bool begin_frame();
+bool begin_frame(bool preserveEfb = false);
+bool segment_frame();
+bool staging_has_capacity(size_t vertLength, size_t indexLength,
+                          size_t uniformLength, size_t secondUniformLength = 0,
+                          size_t storageLength = 0);
 void finish();
 void end_frame(EndFrameCallback callback);
 uint32_t current_frame() noexcept;
