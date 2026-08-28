@@ -816,15 +816,46 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
   pipe.dst_factor = static_cast<std::uint8_t>(bits(cmode0, 3, 5));
   pipe.src_factor = static_cast<std::uint8_t>(bits(cmode0, 3, 8));
   pipe.color_update = static_cast<std::uint8_t>(bits(cmode0, 1, 3));
-  pipe.alpha_update = static_cast<std::uint8_t>(bits(cmode0, 1, 4));
   const std::uint32_t dst_alpha = bp_valid_[0x42] ? bp_regs_[0x42] : 0u;
   const std::uint32_t pe_control = bp_valid_[0x43] ? bp_regs_[0x43] : 0u;
+  const bool target_has_alpha = bits(pe_control, 3, 0) == 1u;
+  pipe.alpha_update = static_cast<std::uint8_t>(
+      bits(cmode0, 1, 4) != 0u && target_has_alpha);
+
+  // Dolphin BlendingState keeps RGB and alpha factors separate. EFB formats
+  // without alpha read destination alpha as one, and color factors collapse to
+  // their alpha equivalents when operating on the alpha channel.
+  if (!target_has_alpha) {
+    if (pipe.src_factor == 6u)
+      pipe.src_factor = 1u;
+    else if (pipe.src_factor == 7u)
+      pipe.src_factor = 0u;
+    if (pipe.dst_factor == 6u)
+      pipe.dst_factor = 1u;
+    else if (pipe.dst_factor == 7u)
+      pipe.dst_factor = 0u;
+  }
+  pipe.src_factor_alpha = pipe.src_factor;
+  pipe.dst_factor_alpha = pipe.dst_factor;
+  if (pipe.src_factor_alpha == 2u)
+    pipe.src_factor_alpha = 6u;
+  else if (pipe.src_factor_alpha == 3u)
+    pipe.src_factor_alpha = 7u;
+  if (pipe.dst_factor_alpha == 2u)
+    pipe.dst_factor_alpha = 4u;
+  else if (pipe.dst_factor_alpha == 3u)
+    pipe.dst_factor_alpha = 5u;
+
   pipe.early_depth_test = static_cast<std::uint8_t>(bits(pe_control, 1, 6));
   if (pipe.depth_test != 0u && pipe.early_depth_test != 0u)
     ++counters.early_depth_active;
   const bool use_dst_alpha = bits(dst_alpha, 1, 8) != 0u &&
                              pipe.alpha_update != 0u &&
-                             bits(pe_control, 3, 0) == 1u;
+                             target_has_alpha;
+  if (use_dst_alpha) {
+    pipe.src_factor_alpha = 1u;
+    pipe.dst_factor_alpha = 0u;
+  }
   key.use_dst_alpha = use_dst_alpha ? 1u : 0u;
   key.dst_alpha = static_cast<std::uint8_t>(bits(dst_alpha, 8, 0));
   if (use_dst_alpha)

@@ -272,11 +272,14 @@ struct PipelineKey {
   std::uint8_t blend_subtract = 0; // cmode0 bit 11
   std::uint8_t src_factor = 0;     // SrcBlendFactor (cmode0 bits 8-10)
   std::uint8_t dst_factor = 0;     // DstBlendFactor (cmode0 bits 5-7)
+  std::uint8_t src_factor_alpha = 0; // color factors mapped for alpha blending
+  std::uint8_t dst_factor_alpha = 0;
   std::uint8_t color_update = 0;   // cmode0 bit 3
   std::uint8_t alpha_update = 0;   // cmode0 bit 4
   // 0 triangle list, 1 line list, 2 point list. Line strips are expanded to
   // line-list pairs by build_topology_indices.
   std::uint8_t primitive_topology = 0;
+  std::uint8_t pad1[2]{};
 };
 static_assert(std::has_unique_object_representations_v<PipelineKey>);
 

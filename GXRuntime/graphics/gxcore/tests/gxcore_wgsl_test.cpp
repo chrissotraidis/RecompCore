@@ -347,8 +347,43 @@ void test_state_to_plan_and_wgsl() {
   CHECK(plan.pipeline.blend_enable == 1);
   CHECK(plan.pipeline.src_factor == 4);
   CHECK(plan.pipeline.dst_factor == 5);
+  CHECK(plan.pipeline.src_factor_alpha == 4);
+  CHECK(plan.pipeline.dst_factor_alpha == 5);
   CHECK(plan.pipeline.color_update == 1);
-  CHECK(plan.pipeline.alpha_update == 1);
+  // Default PEControl is RGB8_Z24, whose destination alpha is fixed at one.
+  CHECK(plan.pipeline.alpha_update == 0);
+
+  // RGBA6 preserves alpha writes and maps color factors to their alpha-channel
+  // equivalents exactly as Dolphin BlendingState::Generate.
+  {
+    gxc::GxCoreState alpha_blend_state = state;
+    alpha_blend_state.apply(bp(0x41u, 1u | (2u << 5u) | (2u << 8u) |
+                                         (1u << 3u) | (1u << 4u)));
+    alpha_blend_state.apply(bp(0x43u, 1u));
+    gxc::GapCounters gaps;
+    const gxc::DrawPlan alpha_blend_plan =
+        alpha_blend_state.build_draw_plan(draw, gaps);
+    CHECK(alpha_blend_plan.ok);
+    CHECK(alpha_blend_plan.pipeline.alpha_update == 1u);
+    CHECK(alpha_blend_plan.pipeline.src_factor == 2u);
+    CHECK(alpha_blend_plan.pipeline.dst_factor == 2u);
+    CHECK(alpha_blend_plan.pipeline.src_factor_alpha == 6u);
+    CHECK(alpha_blend_plan.pipeline.dst_factor_alpha == 4u);
+  }
+
+  // RGB8 treats destination alpha as one for color blending and never writes
+  // the host surface's emulated alpha channel.
+  {
+    gxc::GxCoreState rgb_state = state;
+    rgb_state.apply(bp(0x41u, 1u | (7u << 5u) | (6u << 8u) |
+                                 (1u << 3u) | (1u << 4u)));
+    gxc::GapCounters gaps;
+    const gxc::DrawPlan rgb_plan = rgb_state.build_draw_plan(draw, gaps);
+    CHECK(rgb_plan.ok);
+    CHECK(rgb_plan.pipeline.src_factor == 1u);
+    CHECK(rgb_plan.pipeline.dst_factor == 0u);
+    CHECK(rgb_plan.pipeline.alpha_update == 0u);
+  }
 
   // Decoded vertices: fixed 20-float layout.
   CHECK(plan.vertex_count == 4);

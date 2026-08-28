@@ -421,13 +421,15 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
         .dstFactor = to_blend_factor_dst(
             static_cast<gxc::DstBlendFactor>(key.dst_factor), dual_source),
     };
-    blendState.alpha = dual_source
-                           ? wgpu::BlendComponent{
-                                 .operation = wgpu::BlendOperation::Add,
-                                 .srcFactor = wgpu::BlendFactor::One,
-                                 .dstFactor = wgpu::BlendFactor::Zero,
-                             }
-                           : blendState.color;
+    blendState.alpha = {
+        .operation = wgpu::BlendOperation::Add,
+        .srcFactor = to_blend_factor_src(
+            static_cast<gxc::SrcBlendFactor>(key.src_factor_alpha),
+            dual_source),
+        .dstFactor = to_blend_factor_dst(
+            static_cast<gxc::DstBlendFactor>(key.dst_factor_alpha),
+            dual_source),
+    };
   }
   auto writeMask = wgpu::ColorWriteMask::None;
   if (key.color_update != 0) {
