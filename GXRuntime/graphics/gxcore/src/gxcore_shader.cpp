@@ -900,6 +900,12 @@ std::string generate_wgsl(const ShaderKey& key) {
     const auto row = static_cast<TexSourceRow>(tg.sourcerow);
     if (row == TexSourceRow::Geom) {
       emit(out, "        coord = vec4f(in.rawpos, 1.0);\n");
+    } else if (row == TexSourceRow::Normal) {
+      // Dolphin VertexShaderGen: a regular normal-source texgen consumes the
+      // raw vertex normal when present; without that component coord remains
+      // at the hardware-compatible default initialized above.
+      if (has_normal)
+        emit(out, "        coord = vec4f(in.rawnormal, 1.0);\n");
     } else if (tg.sourcerow >= static_cast<std::uint8_t>(TexSourceRow::Tex0) &&
                tg.sourcerow <
                    static_cast<std::uint8_t>(TexSourceRow::Tex0) + 4u) {

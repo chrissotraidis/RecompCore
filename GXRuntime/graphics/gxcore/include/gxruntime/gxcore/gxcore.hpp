@@ -43,8 +43,13 @@ struct GapCounters {
   unsigned long long vertex_array_out_of_bounds = 0;
   unsigned long long unsupported_texgen = 0;    // sum of actual texgen gaps below
   unsigned long long texgen_count_overflow = 0; // XF count > captured shader cap
+  unsigned long long texgen_count_5 = 0;
+  unsigned long long texgen_count_6 = 0;
+  unsigned long long texgen_count_7 = 0;
+  unsigned long long texgen_count_8plus = 0;
   unsigned long long texgen_emboss_cached_nbt = 0; // supported cached N/B/T fallback
-  unsigned long long texgen_source_normal = 0;  // regular source row not emitted
+  unsigned long long texgen_source_normal = 0;  // supported regular normal source
+  unsigned long long texgen_source_normal_default = 0; // no normal attribute
   unsigned long long texgen_source_colors = 0;  // regular source row not emitted
   unsigned long long texgen_source_binormal = 0; // regular T/B source not emitted
   unsigned long long texgen_source_tex47 = 0;   // regular Tex4..Tex7 not captured

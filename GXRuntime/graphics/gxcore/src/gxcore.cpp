@@ -551,6 +551,14 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
   if (num_tex_gens > kMaxTexGens) {
     ++counters.unsupported_texgen;
     ++counters.texgen_count_overflow;
+    if (num_tex_gens == 5u)
+      ++counters.texgen_count_5;
+    else if (num_tex_gens == 6u)
+      ++counters.texgen_count_6;
+    else if (num_tex_gens == 7u)
+      ++counters.texgen_count_7;
+    else
+      ++counters.texgen_count_8plus;
     num_tex_gens = kMaxTexGens;
   }
   key.num_tex_gens = static_cast<std::uint8_t>(num_tex_gens);
@@ -656,6 +664,9 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
         unsupported_source = false;
       } else if (source == TexSourceRow::Normal) {
         ++counters.texgen_source_normal;
+        if (!walk.has_normal)
+          ++counters.texgen_source_normal_default;
+        unsupported_source = false;
       } else if (source == TexSourceRow::Colors) {
         ++counters.texgen_source_colors;
       } else if (source == TexSourceRow::BinormalT ||

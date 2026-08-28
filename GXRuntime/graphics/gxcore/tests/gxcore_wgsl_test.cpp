@@ -213,8 +213,9 @@ void test_state_to_plan_and_wgsl() {
   {
     gxc::GapCounters gaps;
     CHECK(classify_texgen(1u << 7u, gaps).ok); // Normal
-    CHECK(gaps.unsupported_texgen == 1u);
+    CHECK(gaps.unsupported_texgen == 0u);
     CHECK(gaps.texgen_source_normal == 1u);
+    CHECK(gaps.texgen_source_normal_default == 1u);
   }
   {
     gxc::GapCounters gaps;
@@ -254,6 +255,7 @@ void test_state_to_plan_and_wgsl() {
     CHECK(state.build_draw_plan(overflow, gaps).ok);
     CHECK(gaps.unsupported_texgen == 1u);
     CHECK(gaps.texgen_count_overflow == 1u);
+    CHECK(gaps.texgen_count_5 == 1u);
   }
 
   // Topology admission is distinct from the shared zero-index exit: valid
@@ -476,6 +478,25 @@ void test_texgen_color() {
   // color1 lives at @location(1); the two texcoords shift to 2 and 3.
   CHECK(w.find("@location(2) uv0: vec3f,") != std::string::npos);
   CHECK(w.find("@location(3) uv1: vec3f,") != std::string::npos);
+}
+
+// Dolphin VertexShaderGen SourceRow::Normal: use the raw normal only when the
+// vertex format provides one; otherwise preserve the initialized coordinate.
+void test_texgen_normal_source() {
+  gxc::ShaderKey key{};
+  key.num_tex_gens = 1;
+  key.tex_gens[0].enabled = 1;
+  key.tex_gens[0].texgentype = static_cast<std::uint8_t>(gxc::TexGenType::Regular);
+  key.tex_gens[0].sourcerow = static_cast<std::uint8_t>(gxc::TexSourceRow::Normal);
+  key.has_vertex_normal = 1;
+  const std::string with_normal = gxc::generate_wgsl(key);
+  CHECK(with_normal.find("coord = vec4f(in.rawnormal, 1.0);") !=
+        std::string::npos);
+
+  key.has_vertex_normal = 0;
+  const std::string without_normal = gxc::generate_wgsl(key);
+  CHECK(without_normal.find("coord = vec4f(in.rawnormal, 1.0);") ==
+        std::string::npos);
 }
 
 // Item 5: Emboss texgen (Dolphin VertexShaderGen) adds the view-space light dir
@@ -1516,6 +1537,7 @@ int main() {
   test_state_to_plan_and_wgsl();
   test_untextured_defaults();
   test_texgen_color();
+  test_texgen_normal_source();
   test_texgen_emboss();
   test_texgen_per_vertex_mtx();
   test_tev_indirect_matrix();
