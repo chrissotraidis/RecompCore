@@ -173,11 +173,13 @@ private:
 namespace aurora::gfx {
 inline constexpr bool UseTextureBuffer = true;
 inline constexpr uint64_t UniformBufferSize = 25165824;  // 24mb
-// Vertex/index raised from 3mb/1mb: a full gameplay scene through gxcore --core
+// Vertex/index raised from 3mb/1mb: full gameplay through gxcore --core
 // (Dolphin-ported core, triangle-list expansion) exceeds the menu-scale sizes
-// the live SDK path used. Per-frame staging; costs ~staging_count * delta RAM.
+// the live SDK path used. Wind Waker's opening-to-Outset transition crosses
+// 8mb of indices before the next display copy. Per-frame staging; costs
+// ~staging_count * delta RAM.
 inline constexpr uint64_t VertexBufferSize = 12582912;   // 12mb
-inline constexpr uint64_t IndexBufferSize = 8388608;     // 8mb
+inline constexpr uint64_t IndexBufferSize = 16777216;    // 16mb
 inline constexpr uint64_t StorageBufferSize = 8388608;   // 8mb
 inline constexpr uint64_t TextureUploadSize = 25165824;  // 24mb
 
