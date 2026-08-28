@@ -449,6 +449,12 @@ struct DrawPlan {
   // logical-viewport scaling.
   bool viewport_valid = false;
   float viewport[6]{};
+  // Best donor-equivalent BP scissor rectangle in logical EFB pixels.
+  bool scissor_valid = false;
+  std::int32_t scissor_x = 0;
+  std::int32_t scissor_y = 0;
+  std::int32_t scissor_width = 0;
+  std::int32_t scissor_height = 0;
   bool has_texture = false;
   std::uint32_t tex_address = 0;
   std::uint32_t tex_size = 0;

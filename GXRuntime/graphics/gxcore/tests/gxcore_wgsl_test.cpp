@@ -241,6 +241,24 @@ void test_state_to_plan_and_wgsl() {
     CHECK(gaps.early_depth_active == 1u);
   }
 
+  // GXSetScissor(0, 0, 320, 480) with the default box offset. BP coordinates
+  // are inclusive and carry the SDK's 342-pixel bias.
+  {
+    gxc::GxCoreState scissor_state = state;
+    scissor_state.apply(bp(0x20u, (342u << 12u) | 342u));
+    scissor_state.apply(bp(0x21u, (661u << 12u) | 821u));
+    scissor_state.apply(bp(0x59u, 171u | (171u << 10u)));
+    gxc::GapCounters gaps;
+    const gxc::DrawPlan scissor_plan =
+        scissor_state.build_draw_plan(draw, gaps);
+    CHECK(scissor_plan.ok);
+    CHECK(scissor_plan.scissor_valid);
+    CHECK(scissor_plan.scissor_x == 0);
+    CHECK(scissor_plan.scissor_y == 0);
+    CHECK(scissor_plan.scissor_width == 320);
+    CHECK(scissor_plan.scissor_height == 480);
+  }
+
   // Texgen residuals are classified by the unsupported source row. Emboss
   // without per-vertex NBT is not a gap: it uses the cached N/B/T uniform.
   auto classify_texgen = [&](std::uint32_t info, gxc::GapCounters& gaps) {

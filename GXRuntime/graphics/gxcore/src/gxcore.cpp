@@ -2,6 +2,8 @@
 #include "gxruntime/gxcore/gxcore.hpp"
 #include "gxruntime/gxcore/shader.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
 
@@ -28,6 +30,92 @@ float fog_param_float(std::uint32_t raw) {
   float f;
   std::memcpy(&f, &integral, sizeof f);
   return f;
+}
+
+void decode_scissor(DrawPlan& plan, std::uint32_t tl, std::uint32_t br,
+                    std::uint32_t offset) {
+  // Dolphin BPFunctions::ScissorResult: coordinates are inclusive, offsets
+  // wrap every 1024 pixels, and hardware chooses the rectangle with the most
+  // viewport overlap (then the largest area).
+  const int left = static_cast<int>(bits(tl, 11, 12));
+  const int top = static_cast<int>(bits(tl, 11, 0));
+  const int right = static_cast<int>(bits(br, 11, 12));
+  const int bottom = static_cast<int>(bits(br, 11, 0));
+  const int x_offset = static_cast<int>(bits(offset, 9, 0)) << 1;
+  const int y_offset = static_cast<int>(bits(offset, 9, 10)) << 1;
+  plan.scissor_valid = true;
+  if (left > right || top > bottom) {
+    return;
+  }
+
+  struct Range {
+    int offset;
+    int start;
+    int end;
+  };
+  auto ranges = [](int start, int end, int base_offset, int dimension) {
+    std::array<Range, 9> result{};
+    std::size_t count = 0;
+    for (int extra = -4096; extra <= 4096; extra += 1024) {
+      const int wrapped_offset = base_offset + extra;
+      const int clipped_start =
+          std::clamp(start - wrapped_offset, 0, dimension);
+      const int clipped_end =
+          std::clamp(end - wrapped_offset + 1, 0, dimension);
+      if (clipped_start < clipped_end)
+        result[count++] = {wrapped_offset, clipped_start, clipped_end};
+    }
+    return std::pair{result, count};
+  };
+
+  const auto [x_ranges, x_count] = ranges(left, right, x_offset, 640);
+  const auto [y_ranges, y_count] = ranges(top, bottom, y_offset, 528);
+  if (x_count == 0 || y_count == 0)
+    return;
+
+  int viewport_left = 0;
+  int viewport_right = 640;
+  int viewport_top = 0;
+  int viewport_bottom = 528;
+  if (plan.viewport_valid) {
+    const float x0 = plan.viewport[3] - plan.viewport[0];
+    const float x1 = plan.viewport[3] + plan.viewport[0];
+    const float y0 = plan.viewport[4] - plan.viewport[1];
+    const float y1 = plan.viewport[4] + plan.viewport[1];
+    viewport_left = static_cast<int>(std::min(x0, x1));
+    viewport_right = static_cast<int>(std::max(x0, x1));
+    viewport_top = static_cast<int>(std::min(y0, y1));
+    viewport_bottom = static_cast<int>(std::max(y0, y1));
+  }
+
+  int best_viewport_area = -1;
+  int best_area = -1;
+  for (std::size_t xi = 0; xi < x_count; ++xi) {
+    for (std::size_t yi = 0; yi < y_count; ++yi) {
+      const Range& xr = x_ranges[xi];
+      const Range& yr = y_ranges[yi];
+      const int vx0 =
+          std::clamp(xr.start + xr.offset, viewport_left, viewport_right);
+      const int vx1 =
+          std::clamp(xr.end + xr.offset, viewport_left, viewport_right);
+      const int vy0 =
+          std::clamp(yr.start + yr.offset, viewport_top, viewport_bottom);
+      const int vy1 =
+          std::clamp(yr.end + yr.offset, viewport_top, viewport_bottom);
+      const int viewport_area = (vx1 - vx0) * (vy1 - vy0);
+      const int area = (xr.end - xr.start) * (yr.end - yr.start);
+      if (viewport_area < best_viewport_area ||
+          (viewport_area == best_viewport_area && area <= best_area)) {
+        continue;
+      }
+      best_viewport_area = viewport_area;
+      best_area = area;
+      plan.scissor_x = xr.start;
+      plan.scissor_y = yr.start;
+      plan.scissor_width = xr.end - xr.start;
+      plan.scissor_height = yr.end - yr.start;
+    }
+  }
 }
 
 } // namespace
@@ -1193,6 +1281,11 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
   if ((draw.transform_flags & ar::kDrawTransformViewportValid) != 0u) {
     plan.viewport_valid = true;
     std::memcpy(plan.viewport, draw.viewport, sizeof plan.viewport);
+  }
+  if (bp_valid_[0x20u] && bp_valid_[0x21u]) {
+    const std::uint32_t offset =
+        bp_valid_[0x59u] ? bp_regs_[0x59u] : (171u | (171u << 10u));
+    decode_scissor(plan, bp_regs_[0x20u], bp_regs_[0x21u], offset);
   }
   if (key.textured != 0u) {
     plan.has_texture = true;

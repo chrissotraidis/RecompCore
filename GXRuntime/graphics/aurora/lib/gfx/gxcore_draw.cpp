@@ -639,6 +639,14 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         .zfar = oz / 1.6777215e7f,
     });
   }
+  if (plan.scissor_valid) {
+    gx::set_logical_scissor({
+        .x = plan.scissor_x,
+        .y = plan.scissor_y,
+        .width = plan.scissor_width,
+        .height = plan.scissor_height,
+    });
+  }
 
   // Resolve one texmap's texture to a GPU handle: EFB-copy shadow first, else the
   // guest-identity + content-hash decode cache. Shared by the single-texmap fast
