@@ -64,6 +64,7 @@ extern "C" {
 #define DOL_GX_BP_REG_TX_SETIMAGE0_4 0xA8u
 #define DOL_GX_BP_REG_TX_SETIMAGE3_4 0xB4u
 #define DOL_GX_BP_REG_TX_SETTLUT_4 0xB8u
+#define DOL_GX_BP_REG_MASK 0xFEu
 
 typedef enum DolGxRecompEventKind {
     DOL_GX_RECOMP_EVENT_FIFO_BYTES = 1,

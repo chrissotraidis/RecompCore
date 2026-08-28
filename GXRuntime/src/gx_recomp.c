@@ -456,6 +456,8 @@ void dol_gx_recomp_init(DolGxRecompState* gx,
     if (gx == NULL)
         return;
     memset(gx, 0, sizeof(*gx));
+    gx->bp_regs[DOL_GX_BP_REG_MASK] = 0x00FFFFFFu;
+    gx->bp_valid[DOL_GX_BP_REG_MASK] = true;
     if (resolver != NULL)
         gx->resolver = *resolver;
 }
@@ -837,6 +839,24 @@ bool dol_gx_recomp_note_display_copy(DolGxRecompState* gx, u32 clear) {
 bool dol_gx_recomp_note_bp_reg(DolGxRecompState* gx, u8 reg, u32 value) {
     if (gx == NULL)
         return false;
+    value &= 0x00FFFFFFu;
+    if (reg == DOL_GX_BP_REG_MASK) {
+        gx->bp_regs[reg] = value;
+        gx->bp_valid[reg] = true;
+        dol_gx_recomp_trace_event(gx, DOL_GX_RECOMP_EVENT_BP_REG, reg, value,
+                                  0, 0);
+        return true;
+    }
+
+    /* BP mask is a one-shot write mask. J3D relies on this when its material
+     * display lists update blend factors without changing color/alpha writes. */
+    const u32 mask = gx->bp_valid[DOL_GX_BP_REG_MASK]
+                         ? gx->bp_regs[DOL_GX_BP_REG_MASK]
+                         : 0x00FFFFFFu;
+    const u32 old = gx->bp_valid[reg] ? gx->bp_regs[reg] : 0u;
+    value = (old & ~mask) | (value & mask);
+    gx->bp_regs[DOL_GX_BP_REG_MASK] = 0x00FFFFFFu;
+    gx->bp_valid[DOL_GX_BP_REG_MASK] = true;
     gx->bp_regs[reg] = value;
     gx->bp_valid[reg] = true;
     dol_gx_recomp_trace_event(gx, DOL_GX_RECOMP_EVENT_BP_REG, reg, value, 0, 0);

@@ -622,6 +622,14 @@ static void test_gx_recomp_modules(void) {
     assert(gx.cull_all);
     assert(dol_gx_recomp_note_bp_reg(&gx, DOL_GX_BP_REG_GENMODE, 0u));
     assert(!gx.cull_all);
+
+    /* J3D material display lists update blend factors through a one-shot BP
+     * mask while preserving dither/color/alpha writes from J3DSys::drawInit. */
+    assert(dol_gx_recomp_note_bp_reg(&gx, 0x41u, 0x00001Cu));
+    assert(dol_gx_recomp_note_bp_reg(&gx, DOL_GX_BP_REG_MASK, 0x001FE3u));
+    assert(dol_gx_recomp_note_bp_reg(&gx, 0x41u, 0x003104u));
+    assert(gx.bp_regs[0x41u] == 0x00111Cu);
+    assert(gx.bp_regs[DOL_GX_BP_REG_MASK] == 0x00FFFFFFu);
     assert(dol_gx_recomp_note_xf_load(&gx, 0x0040u, 4u));
     assert(gx.last_xf_base == 0x0040u);
     assert(gx.last_xf_count == 4u);
@@ -637,6 +645,7 @@ static void test_gx_recomp_modules(void) {
     bool saw_tlut = false;
     bool saw_copy = false;
     bool saw_cull = false;
+    bool saw_masked_cmode = false;
     bool saw_xf = false;
     for (u32 i = 0; i < trace_count; ++i) {
         saw_fifo |= trace[i].kind == DOL_GX_RECOMP_EVENT_FIFO_BYTES;
@@ -645,6 +654,8 @@ static void test_gx_recomp_modules(void) {
         saw_tlut |= trace[i].kind == DOL_GX_RECOMP_EVENT_TLUT;
         saw_copy |= trace[i].kind == DOL_GX_RECOMP_EVENT_COPY_DESTINATION;
         saw_cull |= trace[i].kind == DOL_GX_RECOMP_EVENT_CULL_ALL;
+        saw_masked_cmode |= trace[i].kind == DOL_GX_RECOMP_EVENT_BP_REG &&
+                            trace[i].a == 0x41u && trace[i].b == 0x00111Cu;
         saw_xf |= trace[i].kind == DOL_GX_RECOMP_EVENT_XF_LOAD;
     }
     assert(saw_fifo);
@@ -653,6 +664,7 @@ static void test_gx_recomp_modules(void) {
     assert(saw_tlut);
     assert(saw_copy);
     assert(saw_cull);
+    assert(saw_masked_cmode);
     assert(saw_xf);
 
     dol_guest_memory_shutdown(&memory);

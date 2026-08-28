@@ -73,9 +73,10 @@ static bool replay_handle_bp(DolGxRecompState* gx, u32 raw) {
     if (gx == NULL)
         return false;
     const u8 reg = (u8)(raw >> 24);
-    const u32 value = raw & 0x00FFFFFFu;
+    u32 value = raw & 0x00FFFFFFu;
     if (!dol_gx_recomp_note_bp_reg(gx, reg, value))
         return false;
+    value = gx->bp_regs[reg];
 
     u8 slot = 0;
     if (dol_gx_recomp_map_image0_reg(reg, &slot) || dol_gx_recomp_map_image3_reg(reg, &slot))

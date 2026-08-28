@@ -690,9 +690,10 @@ bool RetailGxFrontend::parse_stream(std::span<const std::uint8_t> bytes,
 
 bool RetailGxFrontend::handle_bp(std::uint32_t raw) {
   const std::uint8_t reg = static_cast<std::uint8_t>(raw >> 24u);
-  const std::uint32_t value = raw & 0x00FFFFFFu;
+  std::uint32_t value = raw & 0x00FFFFFFu;
   if (!dol_gx_recomp_note_bp_reg(&state_, reg, value))
     return false;
+  value = state_.bp_regs[reg];
 
   std::uint8_t slot = 0;
   if (map_image0_reg(reg, &slot) || map_image3_reg(reg, &slot))
