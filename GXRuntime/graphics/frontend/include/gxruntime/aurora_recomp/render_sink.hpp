@@ -482,12 +482,13 @@ enum class GxPrimitive : std::uint32_t {
   Points = 0xB8,
 };
 
-// Build the triangle-list topology index buffer for `primitive` over
+// Build the topology index buffer for `primitive` over
 // [vtx_start, vtx_start+vtx_count), mirroring Aurora's prepare_idx_buffer
 // (command_processor.cpp:27). Aurora issues every primitive as an indexed
 // triangle list; this is the idxRange a cutover draw must supply. Appends u16
-// indices to `out` and returns the number appended. Returns 0 for line/point
-// primitives (Aurora handles those separately) and unknown opcodes.
+// indices to `out` and returns the number appended. Triangle primitives become
+// triangle lists; line strips become explicit line-list pairs; lines and points
+// retain their source order. Returns 0 for unknown opcodes.
 std::uint32_t build_topology_indices(GxPrimitive primitive,
                                      std::uint16_t vtx_start,
                                      std::uint16_t vtx_count,

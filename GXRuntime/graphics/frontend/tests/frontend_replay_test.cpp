@@ -897,8 +897,19 @@ int main() {
 
       // Count-only (out == nullptr) must agree.
       assert(build_topology_indices(GxPrimitive::Quads, 0u, 8u, nullptr) == 12u);
-      // Lines/points have no triangle topology.
-      assert(build_topology_indices(GxPrimitive::Lines, 0u, 4u, nullptr) == 0u);
+      idx.clear();
+      assert(build_topology_indices(GxPrimitive::Lines, 3u, 5u, &idx) == 4u);
+      const std::uint16_t expect_lines[] = {3, 4, 5, 6};
+      for (std::size_t i = 0; i < 4u; ++i)
+        assert(idx[i] == expect_lines[i]);
+      idx.clear();
+      assert(build_topology_indices(GxPrimitive::LineStrip, 2u, 4u, &idx) == 6u);
+      const std::uint16_t expect_strip[] = {2, 3, 3, 4, 4, 5};
+      for (std::size_t i = 0; i < 6u; ++i)
+        assert(idx[i] == expect_strip[i]);
+      idx.clear();
+      assert(build_topology_indices(GxPrimitive::Points, 7u, 3u, &idx) == 3u);
+      assert(idx[0] == 7u && idx[1] == 8u && idx[2] == 9u);
     }
 
     // arraySizes for the cutover draw map directly from the resolved spans: the

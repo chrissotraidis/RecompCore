@@ -734,13 +734,19 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
   // Topology.
   const auto primitive =
       static_cast<ar::GxPrimitive>(draw.primitive & 0xF8u);
+  if (primitive == ar::GxPrimitive::Lines ||
+      primitive == ar::GxPrimitive::LineStrip) {
+    pipe.primitive_topology = 1u;
+  } else if (primitive == ar::GxPrimitive::Points) {
+    pipe.primitive_topology = 2u;
+  }
   const std::uint32_t index_count = ar::build_topology_indices(
       primitive, 0u, static_cast<std::uint16_t>(draw.vertex_count),
       &plan.indices);
   if (index_count == 0u) {
     ++counters.vertex_decode_failures;
     ++counters.vertex_topology_unsupported;
-    return skip("line/point primitive (outside slice)");
+    return skip("unsupported or empty primitive");
   }
 
   // Vertex decode to the fixed layout.

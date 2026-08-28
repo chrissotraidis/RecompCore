@@ -373,6 +373,14 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   default:
     break; // None here; All was skipped at plan time
   }
+  auto topology = wgpu::PrimitiveTopology::TriangleList;
+  if (key.primitive_topology == 1u) {
+    topology = wgpu::PrimitiveTopology::LineList;
+    cullMode = wgpu::CullMode::None;
+  } else if (key.primitive_topology == 2u) {
+    topology = wgpu::PrimitiveTopology::PointList;
+    cullMode = wgpu::CullMode::None;
+  }
 
   const wgpu::RenderPipelineDescriptor descriptor{
       .label = "GXCore Pipeline",
@@ -386,7 +394,7 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
           },
       .primitive =
           wgpu::PrimitiveState{
-              .topology = wgpu::PrimitiveTopology::TriangleList,
+              .topology = topology,
               // Substrate winding convention (gx/gx.cpp to_primitive_state).
               .frontFace = wgpu::FrontFace::CW,
               .cullMode = cullMode,

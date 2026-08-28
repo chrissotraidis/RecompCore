@@ -486,8 +486,23 @@ std::uint32_t build_topology_indices(GxPrimitive primitive,
       }
     }
     break;
+  case GxPrimitive::Lines:
+    for (std::uint16_t v = 0; v + 2u <= vtx_count; v += 2u) {
+      push(static_cast<std::uint16_t>(vtx_start + v));
+      push(static_cast<std::uint16_t>(vtx_start + v + 1u));
+    }
+    break;
+  case GxPrimitive::LineStrip:
+    for (std::uint16_t v = 0; v + 1u < vtx_count; ++v) {
+      push(static_cast<std::uint16_t>(vtx_start + v));
+      push(static_cast<std::uint16_t>(vtx_start + v + 1u));
+    }
+    break;
+  case GxPrimitive::Points:
+    for (std::uint16_t v = 0; v < vtx_count; ++v)
+      push(static_cast<std::uint16_t>(vtx_start + v));
+    break;
   default:
-    // Lines/points/unknown: Aurora handles separately; no triangle topology.
     break;
   }
   return num;
