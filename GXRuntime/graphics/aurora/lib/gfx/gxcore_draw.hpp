@@ -73,12 +73,15 @@ void reset_texture_cache();
 // re-decode) — on a static replay scene `uploads` must go to 0 after warm-up.
 // `ci_uploads` = CI textures decoded through a TLUT; `raw_fallback` = decode
 // produced nothing (CI without a resolved palette / unsupported) so the raw GX
-// bytes were uploaded under the original format instead.
+// bytes were uploaded under the original format instead. Hash counters expose
+// live cache-key work separately from decode/upload work.
 struct TextureCacheStats {
   unsigned long long uploads = 0;
   unsigned long long hits = 0;
   unsigned long long ci_uploads = 0;
   unsigned long long raw_fallback = 0;
+  unsigned long long hashed_lookups = 0;
+  unsigned long long palette_hashes = 0;
 };
 const TextureCacheStats& texture_cache_stats();
 

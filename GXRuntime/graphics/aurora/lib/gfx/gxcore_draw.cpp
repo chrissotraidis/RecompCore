@@ -731,12 +731,16 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       return TextureHandle{};
     const auto* bytes = static_cast<const uint8_t*>(data);
     const uint32_t size = std::min(tsize, available);
-    // Hash the actual source texels (+ TLUT for CI) so a content change under an
-    // unchanged guest identity is a distinct cache entry — see TextureKey.
+    ++g_textureCacheStats.hashed_lookups;
     uint64_t content_hash = XXH3_64bits(bytes, size);
-    if (gxc::is_ci_format(format) && has_tlut && tlut_data != nullptr)
-      content_hash =
-          XXH3_64bits_withSeed(tlut_data, tlut_available, content_hash);
+    if (gxc::is_ci_format(format) && has_tlut && tlut_data != nullptr) {
+      ++g_textureCacheStats.palette_hashes;
+      // Resolvers report bytes available to the end of their mapped range. Only
+      // the declared GX palette belongs to this texture cache identity.
+      const uint32_t tlut_size =
+          std::min(tlut_available, tlut_entries * 2u);
+      content_hash = XXH3_64bits_withSeed(tlut_data, tlut_size, content_hash);
+    }
     const TextureKey key{address,     tsize,        format,      width,
                          height,      tlut_address, tlut_format, tlut_entries,
                          content_hash};

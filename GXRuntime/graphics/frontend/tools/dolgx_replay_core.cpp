@@ -371,8 +371,10 @@ int dolgx_replay_core_main(const char* trace_path,
   const auto& tex = aurora::gfx::gxcore::texture_cache_stats();
   std::fprintf(stderr,
                "dolgx_replay: gxcore texture uploads=%llu hits=%llu "
-               "ci_uploads=%llu raw_fallback=%llu\n",
-               tex.uploads, tex.hits, tex.ci_uploads, tex.raw_fallback);
+               "ci_uploads=%llu raw_fallback=%llu hashed=%llu "
+               "palette_hashed=%llu\n",
+               tex.uploads, tex.hits, tex.ci_uploads, tex.raw_fallback,
+               tex.hashed_lookups, tex.palette_hashes);
   if (sink.failure_reason() != nullptr) {
     std::fprintf(stderr, "dolgx_replay: consumer failure: %s\n",
                  sink.failure_reason());

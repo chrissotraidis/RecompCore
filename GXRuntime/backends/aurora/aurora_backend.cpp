@@ -3,6 +3,9 @@
 #include <aurora/aurora.h>
 #include <aurora/event.h>
 #include <aurora/gfx.h>
+#if GXRUNTIME_HAS_AURORA_RECOMP
+#include <gfx/gxcore_draw.hpp>
+#endif
 #include <SDL3/SDL_init.h>
 #include <cstdio>
 #include <cstdlib>
@@ -477,6 +480,16 @@ void dol_aurora_shutdown(void) {
                      gaps.logic_op_ignored, gaps.dst_alpha_active,
                      gaps.early_depth_active, gaps.ztexture_active,
                      gaps.ztexture_ignored);
+        const auto& texture_stats =
+            aurora::gfx::gxcore::texture_cache_stats();
+        std::fprintf(stderr,
+                     "[gx-core] texture-cache: uploads=%llu hits=%llu "
+                     "ci_uploads=%llu raw_fallback=%llu hashed=%llu "
+                     "palette_hashed=%llu\n",
+                     texture_stats.uploads, texture_stats.hits,
+                     texture_stats.ci_uploads, texture_stats.raw_fallback,
+                     texture_stats.hashed_lookups,
+                     texture_stats.palette_hashes);
     }
 #endif
     if (gx_aurora::g_audio_stream != nullptr) {
