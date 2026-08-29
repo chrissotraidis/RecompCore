@@ -69,7 +69,11 @@ void Interpreter::Step()
 {
   auto& state = m_dsp_core.DSPState();
 
-  m_dsp_core.CheckExceptions();
+  constexpr u8 external_exception =
+      1u << static_cast<u8>(ExceptionType::ExternalInterrupt);
+  if ((state.exceptions & external_exception) != 0 ||
+      (state.exceptions != 0 && state.IsSRFlagSet(SR_INT_ENABLE)))
+    m_dsp_core.CheckExceptions();
   state.AdvanceStepCounter();
 
   const u16 opc = state.FetchInstruction();
