@@ -257,6 +257,24 @@ InterpreterFunction GetExtOp(UDSPInstruction inst)
   return s_ext_op_table[inst & 0xFF];
 }
 
+const DecodedInterpreterOp& GetDecodedOp(UDSPInstruction inst)
+{
+  static const std::array<DecodedInterpreterOp, 65536> decoded_ops = [] {
+    std::array<DecodedInterpreterOp, 65536> table;
+    for (size_t i = 0; i < table.size(); ++i)
+    {
+      const auto instruction = static_cast<UDSPInstruction>(i);
+      table[i] = {
+          .main = GetOp(instruction),
+          .extension = GetExtOp(instruction),
+          .extended = GetOpTemplate(instruction)->extended,
+      };
+    }
+    return table;
+  }();
+  return decoded_ops[inst];
+}
+
 void InitInstructionTables()
 {
   if (s_tables_initialized)
