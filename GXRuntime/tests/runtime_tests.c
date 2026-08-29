@@ -1078,10 +1078,20 @@ static void test_boot_globals(void) {
 static void test_guest_data_alias(void) {
     CPUState cpu;
     assert(cpu_init(&cpu));
+    assert(ppc_dispatch_poll_read_stable(&cpu, GC_RAM_BASE, 4u));
+    assert(ppc_dispatch_poll_read_stable(
+        &cpu, GC_RAM_BASE + cpu.ram_size - 4u, 4u));
+    assert(!ppc_dispatch_poll_read_stable(&cpu, GC_RAM_BASE, 0u));
+    assert(!ppc_dispatch_poll_read_stable(&cpu, GC_RAM_BASE - 4u, 4u));
+    assert(!ppc_dispatch_poll_read_stable(
+        &cpu, GC_RAM_BASE + cpu.ram_size - 3u, 4u));
+    assert(!ppc_dispatch_poll_read_stable(
+        &cpu, GC_RAM_BASE | 0x40000000u, 4u));
     const u8 initial[4] = {0x12u, 0x34u, 0x56u, 0x78u};
     const u32 linked = 0x815581A0u;
     ppc_guest_alias_clear();
     assert(ppc_guest_alias_add(linked, sizeof(initial), initial));
+    assert(!ppc_dispatch_poll_read_stable(&cpu, GC_RAM_BASE, 4u));
     u8* resolved = NULL;
     assert(!ppc_guest_alias_resolve(0x80000000u, 4u, &resolved, NULL));
     assert(!ppc_guest_alias_resolve(0x817FFFFCu, 4u, &resolved, NULL));
@@ -1109,10 +1119,12 @@ static void test_guest_data_alias(void) {
     assert(ppc_guest_alias_remove(second_linked, sizeof(initial)));
     assert(!ppc_guest_alias_resolve(second_linked, 4u, &resolved, NULL));
     ppc_guest_alias_clear();
+    assert(ppc_dispatch_poll_read_stable(&cpu, GC_RAM_BASE, 4u));
 
     u8 shared_storage[4] = {0x01u, 0x23u, 0x45u, 0x67u};
     assert(ppc_guest_alias_add_shared(linked, sizeof(shared_storage),
                                       shared_storage));
+    assert(!ppc_dispatch_poll_read_stable(&cpu, GC_RAM_BASE, 4u));
     resolved = NULL;
     assert(ppc_guest_alias_get_storage(linked, sizeof(shared_storage),
                                        &resolved));

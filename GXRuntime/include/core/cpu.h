@@ -228,6 +228,22 @@ static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size
     return NULL;
 }
 
+// Device and guest-thread work is delivered between translated dispatches.
+// An unaliased physical MEM1 read therefore cannot change while one generated
+// block is polling it; MMIO, aliases, uncached mirrors, and MEM2 remain on the
+// ordinary per-iteration path.
+static GXRUNTIME_ALWAYS_INLINE bool ppc_dispatch_poll_read_stable(
+    CPUState* cpu, u32 addr, u32 size) {
+    if (g_ppc_guest_aliases_overlap_mem1 || (addr & 0x40000000u) != 0u ||
+        size == 0u || size > cpu->ram_size)
+        return false;
+    u32 offset = addr - GC_RAM_BASE;
+    return offset <= cpu->ram_size - size;
+}
+
+#define DOLRECOMP_POLL_READ_STABLE(cpu, addr, size) \
+    ppc_dispatch_poll_read_stable((cpu), (addr), (size))
+
 static GXRUNTIME_ALWAYS_INLINE void clear_matching_reservation(CPUState* cpu, u32 addr) {
     u32 reserve_addr = cpu->reserve_addr & ~0x40000000u;
     u32 store_addr = addr & ~0x40000000u;
