@@ -355,7 +355,18 @@ struct SDSP
   void WriteMailboxHigh(Mailbox mailbox, u16 value);
 
   // Reads from instruction memory.
-  u16 ReadIMEM(u16 address) const;
+  u16 ReadIMEM(u16 address) const
+  {
+    switch (address >> 12)
+    {
+    case 0:
+      return iram[address & DSP_IRAM_MASK];
+    case 8:
+      return irom[address & DSP_IROM_MASK];
+    default:
+      return ReadIMEMFallback(address);
+    }
+  }
 
   // Reads from data memory.
   u16 ReadDMEM(u16 address);
@@ -364,13 +375,20 @@ struct SDSP
   void WriteDMEM(u16 address, u16 value);
 
   // Fetches the next instruction and increments the PC.
-  u16 FetchInstruction();
+  u16 FetchInstruction()
+  {
+    const u16 opcode = ReadIMEM(pc);
+    ++pc;
+    return opcode;
+  }
 
   // Fetches the instruction at the PC address, but doesn't increment the PC.
-  u16 PeekInstruction() const;
+  u16 PeekInstruction() const { return ReadIMEM(pc); }
 
   // Skips over the next instruction in memory.
   void SkipInstruction();
+
+  u16 ReadIMEMFallback(u16 address) const;
 
   // Sets the given flags in the SR register.
   void SetSRFlag(u16 flag) { r.sr |= flag; }
