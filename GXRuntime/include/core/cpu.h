@@ -114,6 +114,7 @@ bool ppc_guest_alias_remove(u32 linked_start, u32 size);
 void ppc_guest_alias_clear(void);
 bool ppc_guest_alias_resolve(u32 address, u32 size, u8** pointer,
                              u32* journal_offset);
+extern bool g_ppc_guest_aliases_overlap_mem1;
 
 enum {
     PPC_CACHE_DCBST,
@@ -183,6 +184,15 @@ extern PPCMemWriteJournal g_mem_write_journal;
 extern void* g_mem_write_journal_user;
 
 static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size, u32* out_offset) {
+    if (!g_ppc_guest_aliases_overlap_mem1 &&
+        (addr & 0x40000000u) == 0u) {
+        u32 offset = addr - GC_RAM_BASE;
+        if (offset <= cpu->ram_size - size) {
+            if (out_offset) *out_offset = offset;
+            return cpu->ram + offset;
+        }
+    }
+
     u8* alias = NULL;
     u32 alias_offset = 0u;
     if (ppc_guest_alias_resolve(addr, size, &alias, &alias_offset)) {

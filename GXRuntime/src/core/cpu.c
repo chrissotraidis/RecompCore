@@ -48,10 +48,12 @@ static PPCGuestAlias g_guest_aliases[PPC_GUEST_ALIAS_MAX];
 static u32 g_guest_alias_count;
 static u32 g_guest_alias_min_start = UINT32_MAX;
 static u64 g_guest_alias_max_end;
+bool g_ppc_guest_aliases_overlap_mem1;
 
 static void ppc_guest_alias_recompute_bounds(void) {
     g_guest_alias_min_start = UINT32_MAX;
     g_guest_alias_max_end = 0u;
+    g_ppc_guest_aliases_overlap_mem1 = false;
     for (u32 i = 0u; i < g_guest_alias_count; ++i) {
         const PPCGuestAlias* alias = &g_guest_aliases[i];
         if (alias->linked_start < g_guest_alias_min_start)
@@ -59,6 +61,9 @@ static void ppc_guest_alias_recompute_bounds(void) {
         const u64 alias_end = (u64)alias->linked_start + alias->size;
         if (alias_end > g_guest_alias_max_end)
             g_guest_alias_max_end = alias_end;
+        if (alias->linked_start < GC_RAM_BASE + GC_MAIN_RAM_SIZE &&
+            alias_end > GC_RAM_BASE)
+            g_ppc_guest_aliases_overlap_mem1 = true;
     }
 }
 
@@ -71,6 +76,7 @@ GXRUNTIME_EXPORT void ppc_guest_alias_clear(void) {
     g_guest_alias_count = 0u;
     g_guest_alias_min_start = UINT32_MAX;
     g_guest_alias_max_end = 0u;
+    g_ppc_guest_aliases_overlap_mem1 = false;
 }
 
 static bool ppc_guest_alias_add_storage(u32 linked_start, u32 size,
@@ -89,6 +95,9 @@ static bool ppc_guest_alias_add_storage(u32 linked_start, u32 size,
     const u64 alias_end = (u64)alias->linked_start + alias->size;
     if (alias_end > g_guest_alias_max_end)
         g_guest_alias_max_end = alias_end;
+    if (alias->linked_start < GC_RAM_BASE + GC_MAIN_RAM_SIZE &&
+        alias_end > GC_RAM_BASE)
+        g_ppc_guest_aliases_overlap_mem1 = true;
     if (getenv("BLUEWAKE_TRACE_GUEST_ALIASES") != NULL &&
         alias->linked_start < 0x81516E20u &&
         (u64)alias->linked_start + alias->size > 0x81512AC0u) {
