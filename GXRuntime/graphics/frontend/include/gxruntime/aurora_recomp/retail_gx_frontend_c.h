@@ -103,7 +103,7 @@ typedef struct DolAuroraRecompRenderDrawPacket {
 
 typedef struct DolAuroraRecompRenderPacket {
     u32 kind;
-    u32 sequence;
+    u64 sequence;
     DolGxRecompTraceEvent event;
     DolAuroraRecompRenderStreamPacket stream;
     DolAuroraRecompRenderStatePacket state;

@@ -146,7 +146,7 @@ struct RenderDrawPacket {
 
 struct RenderPacket {
   RenderPacketKind kind = RenderPacketKind::TraceEvent;
-  std::uint32_t sequence = 0;
+  std::uint64_t sequence = 0;
   DolGxRecompTraceEvent event{};
   RenderStreamPacket stream{};
   RenderStatePacket state{};
@@ -234,7 +234,7 @@ struct ConsumedArrayInput {
 struct ConsumedDraw {
   static constexpr std::uint32_t kMaxArrays = 16u;
 
-  std::uint32_t sequence = 0;
+  std::uint64_t sequence = 0;
   std::uint32_t primitive = 0;
   std::uint32_t vtx_fmt = 0;
   std::uint32_t vertex_count = 0;
@@ -429,7 +429,7 @@ private:
   unsigned long long topology_index_bytes_ = 0;
   unsigned long long storage_bytes_ = 0;
   bool back_assembled_ = false;
-  std::uint32_t last_sequence_ = 0;
+  std::uint64_t last_sequence_ = 0;
   bool has_last_sequence_ = false;
   const char* failure_reason_ = nullptr;
   RenderPacket failed_packet_{};
@@ -507,7 +507,7 @@ std::uint32_t build_topology_indices(GxPrimitive primitive,
 std::uint32_t build_array_sizes(const ConsumedDraw& draw, std::uint32_t* out,
                                 std::size_t count);
 
-RenderPacket make_render_packet(std::uint32_t sequence,
+RenderPacket make_render_packet(std::uint64_t sequence,
                                 const DolGxRecompTraceEvent& event);
 const char* trace_event_name(DolGxRecompEventKind kind);
 

@@ -591,6 +591,23 @@ void test_xf_projection_capture() {
 } // namespace
 
 int main() {
+  {
+    using gxruntime::aurora_recomp::ConsumingAuroraRenderSink;
+    using gxruntime::aurora_recomp::RenderPacket;
+
+    ConsumingAuroraRenderSink sink;
+    RenderPacket before_wrap{};
+    before_wrap.kind = RenderPacketKind::State;
+    before_wrap.sequence = UINT32_MAX;
+    assert(sink.submit_packet(before_wrap));
+
+    RenderPacket after_wrap{};
+    after_wrap.kind = RenderPacketKind::State;
+    after_wrap.sequence = static_cast<std::uint64_t>(UINT32_MAX) + 1u;
+    assert(sink.submit_packet(after_wrap));
+    assert(sink.failure_reason() == nullptr);
+  }
+
   test_c_frontend_abi_byte_fragmentation();
   test_c_frontend_guest_array_bridge();
   test_fragmented_fifo_display_list_frontend();

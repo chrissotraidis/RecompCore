@@ -529,7 +529,7 @@ std::uint32_t build_array_sizes(const ConsumedDraw& draw, std::uint32_t* out,
   return non_zero;
 }
 
-RenderPacket make_render_packet(std::uint32_t sequence,
+RenderPacket make_render_packet(std::uint64_t sequence,
                                 const DolGxRecompTraceEvent& event) {
   RenderPacket packet{
       .kind = RenderPacketKind::TraceEvent,

@@ -402,7 +402,7 @@ void shadow_frontend_write(u64 value, u8 size) {
                      "parse_error=%s parse_opcode=0x%02X "
                      "parse_offset=%llu pending=%llu "
                      "detail=(%u,%u,%u,%u); "
-                     "reason=%s seq=%u event=%s(%u) "
+                     "reason=%s seq=%llu event=%s(%u) "
                      "a=%u b=%u c=%u d=%u; "
                      "live Aurora path remains active\n",
                      g_fifo_bytes, g_shadow_packet_sink.packets(),
@@ -428,7 +428,7 @@ void shadow_frontend_write(u64 value, u8 size) {
                      g_shadow_packet_sink.failure_reason() != nullptr
                          ? g_shadow_packet_sink.failure_reason()
                          : "frontend-parse",
-                     failed.sequence,
+                     static_cast<unsigned long long>(failed.sequence),
                      gxruntime::aurora_recomp::trace_event_name(
                          failed.event.kind),
                      static_cast<unsigned>(failed.event.kind), failed.event.a,
@@ -497,12 +497,13 @@ void shadow_transform_observer(
     const std::uint32_t pn_valid_used =
         pn_used_mask & draw.position_matrix_valid_mask;
     std::fprintf(stderr,
-                 "[gfx] draw-transform frame=%llu draw=%zu seq=%u "
+                 "[gfx] draw-transform frame=%llu draw=%zu seq=%llu "
                  "total=%llu prim=0x%02X fmt=%u count=%u vsize=%u "
                  "payload=%zu cull=%d tex=%u:0x%08X flags=0x%X "
                  "current_pn=%u payload_pn_mask=0x%03X pn_used=0x%03X "
                  "pn_valid=0x%03X pos_valid=0x%03X arrays=%u active=0x%04X\n",
-                 frame, frame_draw, draw.sequence, cumulative_draw,
+                 frame, frame_draw,
+                 static_cast<unsigned long long>(draw.sequence), cumulative_draw,
                  draw.primitive, draw.vtx_fmt, draw.vertex_count,
                  draw.vertex_size, draw.vertex_payload.size(),
                  draw.cull_all ? 1 : 0, draw.texture.slot,
