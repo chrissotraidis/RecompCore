@@ -19,6 +19,7 @@ add_library(gxruntime STATIC
     src/dvd.c
     src/event_clock.c
     src/guest_memory.c
+    src/guest_memory_dirty.c
     src/gx_recomp.c
     src/gx_recomp_parser.c
     src/interrupts.c

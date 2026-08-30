@@ -89,6 +89,8 @@ extern bool g_display_copy_pending;
 
 void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*);
 void core_copy_observer(const gxruntime::gxcore::EfbCopyCommand& cmd, void*);
+bool core_texture_dirty_epoch(uint32_t address, uint32_t size,
+                              uint64_t* epoch);
 
 extern unsigned long long g_shadow_last_draw_total;
 extern unsigned long long g_shadow_last_vertex_total;

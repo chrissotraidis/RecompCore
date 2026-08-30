@@ -14,6 +14,7 @@
 #include "gxruntime/event_clock.h"
 #include "gxruntime/exi.h"
 #include "gxruntime/guest_memory.h"
+#include "gxruntime/guest_memory_dirty.h"
 #include "gxruntime/gx_recomp.h"
 #include "gxruntime/headless_backend.h"
 #include "gxruntime/interrupts.h"
@@ -2520,8 +2521,28 @@ static void test_native_system_helpers(void) {
     cpu_free(&cpu);
 }
 
+static void test_guest_memory_dirty_epochs(void) {
+    u64 epoch = 99u;
+    dol_guest_memory_dirty_reset();
+    assert(dol_guest_memory_dirty_epoch(0x80001000u, 0x20u, &epoch));
+    assert(epoch == 0u);
+
+    dol_guest_memory_dirty_mark(0xC0001FF0u, 0x40u);
+    assert(dol_guest_memory_dirty_epoch(0x00001000u, 0x1000u, &epoch));
+    assert(epoch == 1u);
+    assert(dol_guest_memory_dirty_epoch(0x80002000u, 0x1000u, &epoch));
+    assert(epoch == 1u);
+
+    dol_guest_memory_dirty_mark(0x80001020u, 0x20u);
+    assert(dol_guest_memory_dirty_epoch(0x00001000u, 0x2000u, &epoch));
+    assert(epoch == 2u);
+    assert(!dol_guest_memory_dirty_epoch(0x82000000u, 1u, &epoch));
+    assert(!dol_guest_memory_dirty_epoch(0u, 0u, &epoch));
+}
+
 int main(void) {
     test_guest_memory();
+    test_guest_memory_dirty_epochs();
     test_store_reservation();
     test_native_system_helpers();
     test_savestate_roundtrip();

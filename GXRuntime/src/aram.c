@@ -2,6 +2,7 @@
 // ARAM model: a flat 16 MB buffer mapped into a synthetic CPU-addressable
 // window [ARAM_BASE, ARAM_BASE + ARAM_SIZE). See aram.h.
 #include "gxruntime/aram.h"
+#include "gxruntime/guest_memory_dirty.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -64,4 +65,5 @@ void aram_dma_to_ram(u8* ram, u32 ram_addr, u32 aram_addr, u32 length) {
     u32 r = ram_addr - 0x80000000u;
     for (u32 i = 0; i < length; i++)
         ram[r + i] = g_aram[(off + i) & (ARAM_SIZE - 1u)];
+    dol_guest_memory_dirty_mark(ram_addr, length);
 }

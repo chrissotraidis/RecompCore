@@ -68,6 +68,10 @@ bool submit_draw_plan(const gxruntime::gxcore::DrawPlan& plan);
 // Drop the texture cache + reset its stats (start of a replay run).
 void reset_texture_cache();
 
+using TextureDirtyEpochObserver =
+    bool (*)(uint32_t address, uint32_t size, uint64_t* epoch);
+void set_texture_dirty_epoch_observer(TextureDirtyEpochObserver observer);
+
 // Texture-cache telemetry (S13 A3): proves the no-reconvert property. `uploads`
 // counts actual decode+upload (cache miss); `hits` counts cache reuse (no
 // re-decode) — on a static replay scene `uploads` must go to 0 after warm-up.
@@ -82,6 +86,8 @@ struct TextureCacheStats {
   unsigned long long raw_fallback = 0;
   unsigned long long hashed_lookups = 0;
   unsigned long long palette_hashes = 0;
+  unsigned long long generation_hits = 0;
+  unsigned long long generation_fallbacks = 0;
 };
 const TextureCacheStats& texture_cache_stats();
 

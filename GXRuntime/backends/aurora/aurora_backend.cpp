@@ -3,6 +3,7 @@
 #include <aurora/aurora.h>
 #include <aurora/event.h>
 #include <aurora/gfx.h>
+#include <gxruntime/guest_memory_dirty.h>
 #if GXRUNTIME_HAS_AURORA_RECOMP
 #include <gfx/gxcore_draw.hpp>
 #endif
@@ -309,6 +310,9 @@ bool dol_aurora_initialize(int argc, char** argv,
         std::getenv("DOL_AURORA_RECOMP_FRONTEND_SHADOW") != nullptr ||
         gx_aurora::g_shadow_transform_log_enabled || gx_aurora::g_trace_armed || gx_aurora::g_gx_core_enabled;
     if (gx_aurora::g_gx_core_enabled) {
+        dol_guest_memory_dirty_reset();
+        aurora::gfx::gxcore::set_texture_dirty_epoch_observer(
+            gx_aurora::core_texture_dirty_epoch);
         gx_aurora::g_core_sink.set_plan_observer(gx_aurora::core_plan_observer, nullptr);
         gx_aurora::g_core_sink.set_copy_observer(gx_aurora::core_copy_observer, nullptr);
         gx_aurora::g_core_submitted = 0;
@@ -485,11 +489,14 @@ void dol_aurora_shutdown(void) {
         std::fprintf(stderr,
                      "[gx-core] texture-cache: uploads=%llu hits=%llu "
                      "ci_uploads=%llu raw_fallback=%llu hashed=%llu "
-                     "palette_hashed=%llu\n",
+                     "palette_hashed=%llu generation_hits=%llu "
+                     "generation_fallbacks=%llu\n",
                      texture_stats.uploads, texture_stats.hits,
                      texture_stats.ci_uploads, texture_stats.raw_fallback,
                      texture_stats.hashed_lookups,
-                     texture_stats.palette_hashes);
+                     texture_stats.palette_hashes,
+                     texture_stats.generation_hits,
+                     texture_stats.generation_fallbacks);
     }
 #endif
     if (gx_aurora::g_audio_stream != nullptr) {

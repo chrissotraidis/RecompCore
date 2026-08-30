@@ -225,8 +225,16 @@ absl::flat_hash_map<TextureKey, TextureHandle> g_textureCache;
 // arrives at an address (movie streaming, screen transitions), the prior entry
 // for that address is evicted so the content-hashed cache stays bounded to one
 // live entry per buffer instead of accumulating every historical frame.
-absl::flat_hash_map<uint32_t, TextureKey> g_textureAddrKey;
+struct TextureAddressState {
+  TextureKey key;
+  uint64_t texel_epoch = 0;
+  uint64_t tlut_epoch = 0;
+  bool texel_epoch_valid = false;
+  bool tlut_epoch_valid = false;
+};
+absl::flat_hash_map<uint32_t, TextureAddressState> g_textureAddrKey;
 TextureCacheStats g_textureCacheStats;
+TextureDirtyEpochObserver g_textureDirtyEpochObserver = nullptr;
 
 // EFB copy allocations mirror GXState::copyTextureCache: one guest destination
 // may be reused with different dimensions or formats, which require distinct GPU
@@ -245,7 +253,13 @@ struct EfbCopyKey {
   }
 };
 absl::flat_hash_map<EfbCopyKey, TextureHandle> g_efbCopyCache;
-absl::flat_hash_map<uint32_t, TextureHandle> g_efbCopyTextures;
+struct EfbCopyBinding {
+  TextureHandle handle;
+  uint32_t byte_size = 0;
+  uint64_t memory_epoch = 0;
+  bool memory_epoch_valid = false;
+};
+absl::flat_hash_map<uint32_t, EfbCopyBinding> g_efbCopyTextures;
 
 } // namespace
 
@@ -609,6 +623,10 @@ void reset_texture_cache() {
   g_textureCacheStats = {};
 }
 
+void set_texture_dirty_epoch_observer(TextureDirtyEpochObserver observer) {
+  g_textureDirtyEpochObserver = observer;
+}
+
 const TextureCacheStats& texture_cache_stats() { return g_textureCacheStats; }
 
 // Resolve the current EFB region into a texture the guest-identity path can bind
@@ -665,7 +683,13 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
   if (!it->second) {
     return;
   }
-  g_efbCopyTextures.insert_or_assign(cmd.dest_address, it->second);
+  uint64_t memoryEpoch = 0;
+  const bool memoryEpochValid =
+      g_textureDirtyEpochObserver != nullptr && cmd.byte_size != 0u &&
+      g_textureDirtyEpochObserver(cmd.dest_address, cmd.byte_size, &memoryEpoch);
+  g_efbCopyTextures.insert_or_assign(
+      cmd.dest_address,
+      EfbCopyBinding{it->second, cmd.byte_size, memoryEpoch, memoryEpochValid});
   float clearDepthValue = static_cast<float>(cmd.clear_z) / 16777215.f;
   if (gx::UseReversedZ) {
     clearDepthValue = 1.f - clearDepthValue;
@@ -723,23 +747,67 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
           uint32_t tlut_address, uint32_t tlut_format, uint32_t tlut_entries,
           const void* tlut_data, uint32_t tlut_available) -> TextureHandle {
     auto efbIt = g_efbCopyTextures.find(address);
-    if (efbIt != g_efbCopyTextures.end() && efbIt->second) {
-      ++g_textureCacheStats.hits;
-      return efbIt->second;
+    if (efbIt != g_efbCopyTextures.end() && efbIt->second.handle) {
+      uint64_t memoryEpoch = 0;
+      const bool memoryUnchanged =
+          !efbIt->second.memory_epoch_valid ||
+          (g_textureDirtyEpochObserver != nullptr &&
+           g_textureDirtyEpochObserver(address, efbIt->second.byte_size,
+                                       &memoryEpoch) &&
+           memoryEpoch == efbIt->second.memory_epoch);
+      if (memoryUnchanged) {
+        ++g_textureCacheStats.hits;
+        return efbIt->second.handle;
+      }
+      g_efbCopyTextures.erase(efbIt);
     }
     if (data == nullptr)
       return TextureHandle{};
     const auto* bytes = static_cast<const uint8_t*>(data);
     const uint32_t size = std::min(tsize, available);
+    uint64_t texelEpoch = 0;
+    uint64_t tlutEpoch = 0;
+    const bool texelEpochValid =
+        g_textureDirtyEpochObserver != nullptr &&
+        g_textureDirtyEpochObserver(address, size, &texelEpoch);
+    const uint32_t tlutSize =
+        gxc::is_ci_format(format) && has_tlut && tlut_data != nullptr
+            ? std::min(tlut_available, tlut_entries * 2u)
+            : 0u;
+    const bool tlutEpochValid =
+        tlutSize == 0u ||
+        (g_textureDirtyEpochObserver != nullptr &&
+         g_textureDirtyEpochObserver(tlut_address, tlutSize, &tlutEpoch));
+    auto addrIt = g_textureAddrKey.find(address);
+    if (texelEpochValid && tlutEpochValid && addrIt != g_textureAddrKey.end()) {
+      const TextureAddressState& previous = addrIt->second;
+      const TextureKey& priorKey = previous.key;
+      const bool sameIdentity =
+          priorKey.address == address && priorKey.size == tsize &&
+          priorKey.format == format && priorKey.width == width &&
+          priorKey.height == height && priorKey.tlut_address == tlut_address &&
+          priorKey.tlut_format == tlut_format &&
+          priorKey.tlut_entries == tlut_entries;
+      if (sameIdentity && previous.texel_epoch_valid &&
+          previous.tlut_epoch_valid && previous.texel_epoch == texelEpoch &&
+          previous.tlut_epoch == tlutEpoch) {
+        auto cached = g_textureCache.find(priorKey);
+        if (cached != g_textureCache.end()) {
+          ++g_textureCacheStats.hits;
+          ++g_textureCacheStats.generation_hits;
+          return cached->second;
+        }
+      }
+    } else if (!texelEpochValid || !tlutEpochValid) {
+      ++g_textureCacheStats.generation_fallbacks;
+    }
     ++g_textureCacheStats.hashed_lookups;
     uint64_t content_hash = XXH3_64bits(bytes, size);
     if (gxc::is_ci_format(format) && has_tlut && tlut_data != nullptr) {
       ++g_textureCacheStats.palette_hashes;
       // Resolvers report bytes available to the end of their mapped range. Only
       // the declared GX palette belongs to this texture cache identity.
-      const uint32_t tlut_size =
-          std::min(tlut_available, tlut_entries * 2u);
-      content_hash = XXH3_64bits_withSeed(tlut_data, tlut_size, content_hash);
+      content_hash = XXH3_64bits_withSeed(tlut_data, tlutSize, content_hash);
     }
     const TextureKey key{address,     tsize,        format,      width,
                          height,      tlut_address, tlut_format, tlut_entries,
@@ -747,13 +815,15 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     auto it = g_textureCache.find(key);
     if (it != g_textureCache.end()) {
       ++g_textureCacheStats.hits;
+      g_textureAddrKey[address] = TextureAddressState{
+          key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid};
       return it->second;
     }
     // New content for this identity: evict any prior entry cached at the same
     // guest address (its buffer was overwritten) to keep the cache bounded.
-    auto addrIt = g_textureAddrKey.find(address);
+    addrIt = g_textureAddrKey.find(address);
     if (addrIt != g_textureAddrKey.end())
-      g_textureCache.erase(addrIt->second);
+      g_textureCache.erase(addrIt->second.key);
     // gxcore owns the decode for every format: produce tightly-packed RGBA8 and
     // upload it as a pre-decoded PC texture (no substrate re-conversion).
     std::vector<uint8_t> decoded;
@@ -785,7 +855,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       ++g_textureCacheStats.raw_fallback;
     }
     g_textureCache.emplace(key, handle);
-    g_textureAddrKey[address] = key;
+    g_textureAddrKey[address] = TextureAddressState{
+        key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid};
     return handle;
   };
 

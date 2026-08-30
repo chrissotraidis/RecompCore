@@ -9,6 +9,7 @@
 #include <gx/fifo.hpp>
 #include <gx/gx.hpp>
 #include <gx/recomp.hpp>
+#include <gxruntime/guest_memory_dirty.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,12 +22,19 @@ namespace aurora::gfx::gxcore {
 bool submit_draw_plan(const gxruntime::gxcore::DrawPlan& plan);
 void copy_efb_to_texture(const gxruntime::gxcore::EfbCopyCommand& cmd);
 void reset_texture_cache();
+void set_texture_dirty_epoch_observer(
+    bool (*observer)(uint32_t, uint32_t, uint64_t*));
 } // namespace aurora::gfx::gxcore
 #endif
 
 namespace gx_aurora {
 
 #if GXRUNTIME_HAS_AURORA_RECOMP
+bool core_texture_dirty_epoch(uint32_t address, uint32_t size,
+                              uint64_t* epoch) {
+    return dol_guest_memory_dirty_epoch(address, size, epoch);
+}
+
 void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
     if (!plan.ok)
         return; // skip reasons are tallied in the sink gap counters

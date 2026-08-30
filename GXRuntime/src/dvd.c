@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Host-backed GameCube DVD layer. See dvd.h.
 #include "gxruntime/dvd.h"
+#include "gxruntime/guest_memory_dirty.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -265,6 +266,7 @@ void dvd_read_to_guest(CPUState* cpu, u32 guest_addr, u32 disc_off, u32 length) 
             got = fread(dst, 1, length, g_iso);
         if (got < length)
             memset(dst + got, 0, length - got);  // zero-fill past image end
+        dol_guest_memory_dirty_mark(guest_addr, length);
         if (g_materialization_trace && guest_addr == 0x814DE360u &&
             length == 0x52060u) {
             const u32 target_offset = 0x81512AC0u - guest_addr;

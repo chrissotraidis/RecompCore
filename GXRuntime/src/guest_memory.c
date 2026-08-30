@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gxruntime/guest_memory.h"
+#include "gxruntime/guest_memory_dirty.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -378,6 +379,7 @@ void dol_guest_memory_copy(DolGuestMemory* memory, CPUState* cpu, u32 dest,
             trace_reports++;
         }
         memmove(dest_ptr, src_ptr, bytes);
+        dol_guest_memory_dirty_mark(dest, bytes);
         return;
     }
 
