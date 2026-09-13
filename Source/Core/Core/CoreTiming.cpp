@@ -580,10 +580,9 @@ void CoreTimingManager::Idle()
     // the VI will be desynchronized. So, We are waiting until the FIFO finish and
     // while we process only the events required by the FIFO.
     m_system.GetPerfMetrics().GetCPUIdleWaitTiming().Measure(
-        [this] {
-          galaxypad::completion_recorder.RecordCPU(galaxypad::CompletionRecorder::Kind::WaitBegin);
-          m_system.GetFifo().FlushGpu();
-          galaxypad::completion_recorder.RecordCPU(galaxypad::CompletionRecorder::Kind::WaitEnd);
+        [this] { m_system.GetFifo().FlushGpu(); },
+        [](std::uint64_t start, std::uint64_t end) {
+          galaxypad::completion_recorder.CPUWait(start, end);
         });
   }
 

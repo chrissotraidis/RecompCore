@@ -15,8 +15,11 @@ public:
     elapsed_ns_ = 0;
   }
 
-  template<class Wait, class Clock>
-  void MeasureWithClock(Wait&& wait, Clock&& clock) {
+  struct NoObservation {
+    void operator()(std::uint64_t, std::uint64_t) const noexcept {}
+  };
+  template<class Wait, class Clock, class Observer = NoObservation>
+  void MeasureWithClock(Wait&& wait, Clock&& clock, Observer observer = {}) {
     if (!enabled_) {
       wait();
       return;
@@ -24,6 +27,7 @@ public:
     const std::uint64_t start = clock();
     wait();
     const std::uint64_t end = clock();
+    observer(start, end);
     if (end >= start) {
       const auto elapsed = end - start;
       const auto remaining = std::numeric_limits<std::uint64_t>::max() - elapsed_ns_;
@@ -31,12 +35,12 @@ public:
     }
   }
 
-  template<class Wait>
-  void Measure(Wait&& wait) {
+  template<class Wait, class Observer = NoObservation>
+  void Measure(Wait&& wait, Observer observer = {}) {
     MeasureWithClock(wait, [] {
       return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now().time_since_epoch()).count());
-    });
+    }, observer);
   }
 
   std::uint64_t ElapsedNs() const noexcept { return elapsed_ns_; }
