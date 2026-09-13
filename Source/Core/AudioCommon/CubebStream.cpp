@@ -3,10 +3,12 @@
 
 #include "AudioCommon/CubebStream.h"
 
+#include <cmath>
 #include <cubeb/cubeb.h>
 
 #include "AudioCommon/CubebUtils.h"
 #include "Common/CommonTypes.h"
+#include "Common/GalaxyPadDiagnostics.h"
 #include "Common/Logging/Log.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/System.h"
@@ -24,15 +26,45 @@ long CubebStream::DataCallback(cubeb_stream* stream, void* user_data, const void
   const auto* const self = static_cast<CubebStream*>(user_data);
 
   if (self->m_stereo)
+  {
     self->m_mixer->Mix(static_cast<short*>(output_buffer), num_frames);
+    const auto* samples = static_cast<const short*>(output_buffer);
+    std::uint64_t nonzero_frames = 0;
+    std::uint32_t peak = 0;
+    for (long frame = 0; frame < num_frames; ++frame)
+    {
+      const std::uint32_t left = static_cast<std::uint32_t>(std::abs(static_cast<int>(samples[2 * frame])));
+      const std::uint32_t right =
+          static_cast<std::uint32_t>(std::abs(static_cast<int>(samples[2 * frame + 1])));
+      const std::uint32_t frame_peak = std::max(left, right);
+      nonzero_frames += frame_peak != 0;
+      peak = std::max(peak, frame_peak);
+    }
+    GalaxyPadDiagnostics::RecordAudio(num_frames, nonzero_frames, peak);
+  }
   else
+  {
     self->m_mixer->MixSurround(static_cast<float*>(output_buffer), num_frames);
+    const auto* samples = static_cast<const float*>(output_buffer);
+    std::uint64_t nonzero_frames = 0;
+    std::uint32_t peak = 0;
+    for (long frame = 0; frame < num_frames; ++frame)
+    {
+      float frame_peak = 0.0f;
+      for (std::size_t channel = 0; channel < 6; ++channel)
+        frame_peak = std::max(frame_peak, std::abs(samples[6 * frame + channel]));
+      nonzero_frames += frame_peak > 0.0f;
+      peak = std::max(peak, static_cast<std::uint32_t>(std::min(frame_peak, 1.0f) * 32767.0f));
+    }
+    GalaxyPadDiagnostics::RecordAudio(num_frames, nonzero_frames, peak);
+  }
 
   return num_frames;
 }
 
 void CubebStream::StateCallback(cubeb_stream* stream, void* user_data, cubeb_state state)
 {
+  GalaxyPadDiagnostics::RecordAudioState(static_cast<std::size_t>(state));
 }
 
 long CubebStream::WiimoteDataCallback(cubeb_stream* stream, void* user_data,

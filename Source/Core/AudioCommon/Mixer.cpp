@@ -4,6 +4,7 @@
 #include "AudioCommon/Mixer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <span>
@@ -11,6 +12,7 @@
 #include "AudioCommon/Enums.h"
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
+#include "Common/GalaxyPadDiagnostics.h"
 #include "Common/Logging/Log.h"
 #include "Common/MathUtil.h"
 #include "Common/Swap.h"
@@ -556,11 +558,14 @@ void Mixer::MixerFifo::Enqueue()
       0.0000216492f, 0.0000113187f, 0.0000050749f, 0.0000016272f};
 
   const std::size_t head = m_queue_head.load(std::memory_order_acquire);
+  const std::size_t tail = m_queue_tail.load(std::memory_order_acquire);
 
   // Check if we run out of space in the circular queue. (rare)
   const std::size_t next_head = (head + 1) & GRANULE_QUEUE_MASK;
-  if (next_head == m_queue_tail.load(std::memory_order_acquire))
+  if (next_head == tail)
   {
+    if (this == &m_mixer->m_dma_mixer)
+      GalaxyPadDiagnostics::RecordDmaQueueFullDrop();
     WARN_LOG_FMT(AUDIO,
                  "Granule Queue has completely filled and audio samples are being dropped. "
                  "This should not happen unless the audio backend has stopped requesting audio.");
@@ -574,6 +579,13 @@ void Mixer::MixerFifo::Enqueue()
     m_queue[head][i] = m_next_buffer[(i + start_index) & GRANULE_MASK] * GRANULE_WINDOW[i];
 
   m_queue_head.store(next_head, std::memory_order_release);
+  if (this == &m_mixer->m_dma_mixer)
+  {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    GalaxyPadDiagnostics::RecordDmaEnqueue(
+        (next_head - tail) & GRANULE_QUEUE_MASK,
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+  }
   m_queue_fading.store(false, std::memory_order_relaxed);
   m_queue_looping.store(false, std::memory_order_relaxed);
 }
@@ -587,6 +599,8 @@ bool Mixer::MixerFifo::Dequeue(Granule* granule)
   // Checks to see if the queue has gotten too long.
   if (granule_queue_size < ((head - tail) & GRANULE_QUEUE_MASK))
   {
+    if (this == &m_mixer->m_dma_mixer)
+      GalaxyPadDiagnostics::RecordDmaBacklogDrop();
     // Jump the playhead to half the queue size behind the head.
     const std::size_t gap = (granule_queue_size >> 1) + 1;
     tail = (head - gap) & GRANULE_QUEUE_MASK;
@@ -596,6 +610,9 @@ bool Mixer::MixerFifo::Dequeue(Granule* granule)
   std::size_t next_tail = (tail + 1) & GRANULE_QUEUE_MASK;
   if (next_tail == head)
   {
+    const bool is_running = Core::GetState(Core::System::GetInstance()) == Core::State::Running;
+    if (this == &m_mixer->m_dma_mixer && is_running)
+      GalaxyPadDiagnostics::RecordDmaUnderrun();
 #if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
     // Preserve the true queue position on iOS so the adaptive rate above can
     // recover. Rewinding into old granules makes music sound selectively
@@ -611,7 +628,6 @@ bool Mixer::MixerFifo::Dequeue(Granule* granule)
 #endif
 
     // Only fill gaps when running to prevent stutter on pause.
-    const bool is_running = Core::GetState(Core::System::GetInstance()) == Core::State::Running;
     if (m_mixer->m_config_fill_audio_gaps && is_running)
     {
       // Jump the playhead to half the queue size behind the head.

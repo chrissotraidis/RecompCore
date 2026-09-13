@@ -16,6 +16,7 @@
 #include "Common/CommonTypes.h"
 #include "Common/Config/Config.h"
 #include "Common/FileUtil.h"
+#include "Common/GalaxyPadDiagnostics.h"
 #include "Common/Logging/Log.h"
 #include "Common/MathUtil.h"
 
@@ -435,6 +436,14 @@ void Wiimote::BuildDesiredWiimoteState(DesiredWiimoteState* target_state,
   static_cast<Extension*>(
       m_attachments->GetAttachmentList()[m_attachments->GetSelectedAttachment()].get())
       ->BuildDesiredExtensionState(&target_state->extension);
+
+  if (m_bt_device_index == 0)
+  {
+    const CameraPoint& point = target_state->camera_points[0];
+    const bool visible = point.position.x != 0xffff && point.position.y != 0xffff;
+    GalaxyPadDiagnostics::RecordInput(target_state->buttons.hex, visible, point.position.x,
+                                      point.position.y);
+  }
 }
 
 u8 Wiimote::GetWiimoteDeviceIndex() const

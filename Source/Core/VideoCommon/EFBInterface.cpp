@@ -4,9 +4,11 @@
 #include "VideoCommon/EFBInterface.h"
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
 
 #include "Common/MsgHandler.h"
+#include "Common/GalaxyPadDiagnostics.h"
 
 #include "Core/Config/ConfigManager.h"
 #include "Core/System.h"
@@ -64,7 +66,12 @@ u32 EFBInterfaceBase::PeekColor(u16 x, u16 y)
   if (ShouldSkipAccess(x, y))
     return 0;
 
+  const auto start = std::chrono::steady_clock::now();
   u32 color = PeekColorInternal(x, y);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  GalaxyPadDiagnostics::RecordEFB(
+      false, x, y, color,
+      std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
 
   // check what to do with the alpha channel (GX_PokeAlphaRead)
   PixelEngine::AlphaReadMode alpha_read_mode =
@@ -124,7 +131,13 @@ u32 EFBInterfaceBase::PeekDepth(u16 x, u16 y)
   if (ShouldSkipAccess(x, y))
     return 0;
 
-  return PeekDepthInternal(x, y);
+  const auto start = std::chrono::steady_clock::now();
+  const u32 depth = PeekDepthInternal(x, y);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  GalaxyPadDiagnostics::RecordEFB(
+      true, x, y, depth,
+      std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+  return depth;
 }
 
 void HardwareEFBInterface::PokeColor(u16 x, u16 y, u32 poke_data)
