@@ -11,9 +11,11 @@
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/ConfigManager.h"
 #include "Core/HW/SystemTimers.h"
+#include "Core/PowerPC/StaticRecomp/RunCost.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 
 namespace
@@ -137,9 +139,26 @@ void StaticRecompCore::Run()
     return;
   }
 
+  // Opt-in phase-selected CPU-time attribution, not per-instruction timing.
+  std::unique_ptr<galaxypad::diagnostics::RunCost> run_cost;
+  const char* cost_enabled = std::getenv("GALAXYPAD_RUN_COST");
+  const char* cost_marker = std::getenv("GALAXYPAD_RUN_COST_START_FILE");
+  std::string cost_start_file = cost_enabled && std::strcmp(cost_enabled, "1") == 0 &&
+      cost_marker && *cost_marker ? cost_marker : "";
+  u32 cost_poll = 0;
   while (*state_ptr == CPU::State::Running)
   {
     core_timing.Advance();
+    if (!cost_start_file.empty() && (++cost_poll & 1023u) == 0)
+    {
+      if (std::FILE* marker = std::fopen(cost_start_file.c_str(), "rb"))
+      {
+        std::fclose(marker);
+        run_cost = std::make_unique<galaxypad::diagnostics::RunCost>();
+        cost_start_file.clear();
+        std::fprintf(stderr, "[galaxypad-run-cost] capture-start pc=%08x\n", ppc.pc);
+      }
+    }
     // Diagnostic only: poll at timing-slice boundaries, never per guest step.
     // Caller supplies a fresh absent path, then creates it after visual scene
     // verification. Do not delete caller files or include startup in the census.
@@ -165,6 +184,8 @@ void StaticRecompCore::Run()
       if (m_module_active && DispatchableAt(ppc.pc) &&
           !(m_guest.host_call && IsHostCallAddress(ppc.pc)))
       {
+        galaxypad::diagnostics::RunCost::Scope cost_span(
+            run_cost.get(), galaxypad::diagnostics::RunLane::Native);
         SyncIn();
         ++m_bursts;
         do
@@ -258,6 +279,10 @@ void StaticRecompCore::Run()
       }
       else
       {
+        // Includes host-call routing, forced fallback and interpreter/JIT work.
+        // It is deliberately NOT labeled pure interpreter or vector execution.
+        galaxypad::diagnostics::RunCost::Scope cost_span(
+            run_cost.get(), galaxypad::diagnostics::RunLane::NonNativeRouting);
         if (m_guest.host_call && IsHostCallAddress(ppc.pc))
         {
           SyncIn();
@@ -311,6 +336,8 @@ void StaticRecompCore::Run()
       }
     } while (ppc.downcount > 0 && *state_ptr == CPU::State::Running);
   }
+  if (run_cost)
+    run_cost->Report(stderr); // Still on CPU thread; all branch scopes have ended.
 }
 
 void StaticRecompCore::SingleStep()
