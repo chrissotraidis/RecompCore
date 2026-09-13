@@ -217,7 +217,8 @@ void* StaticRecompCore::HookExternalPointer(CPUState* cpu, u32 ea, u32 size)
         cpu->msr != core->m_system.GetPPCState().msr.Hex)
       return nullptr;
     // Do not bypass relocation lookup. A relocated pair uses the old path.
-    if (core->TranslateRelAddress(ea) != ea || core->TranslateRelAddress(ea + 1) != ea + 1)
+    if (!core->m_active_rel_sections.empty() &&
+        (core->TranslateRelAddress(ea) != ea || core->TranslateRelAddress(ea + 1) != ea + 1))
       return nullptr;
     return core->m_system.GetMMU().TryGetLockedCachePair(ea);
   }
