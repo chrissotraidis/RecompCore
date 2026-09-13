@@ -11,6 +11,7 @@
 #include "Common/GalaxyPadDiagnostics.h"
 
 #include "Core/Config/ConfigManager.h"
+#include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
 #include "VideoCommon/AsyncRequests.h"
@@ -71,7 +72,9 @@ u32 EFBInterfaceBase::PeekColor(u16 x, u16 y)
   const auto elapsed = std::chrono::steady_clock::now() - start;
   GalaxyPadDiagnostics::RecordEFB(
       false, x, y, color,
-      std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
+      Core::System::GetInstance().GetPPCState().pc,
+      Core::System::GetInstance().GetPPCState().spr[SPR_LR]);
 
   // check what to do with the alpha channel (GX_PokeAlphaRead)
   PixelEngine::AlphaReadMode alpha_read_mode =
@@ -136,7 +139,9 @@ u32 EFBInterfaceBase::PeekDepth(u16 x, u16 y)
   const auto elapsed = std::chrono::steady_clock::now() - start;
   GalaxyPadDiagnostics::RecordEFB(
       true, x, y, depth,
-      std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
+      std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
+      Core::System::GetInstance().GetPPCState().pc,
+      Core::System::GetInstance().GetPPCState().spr[SPR_LR]);
   return depth;
 }
 
