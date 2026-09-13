@@ -1,9 +1,16 @@
+# Preserve the deployed GalaxyPad iOS 32 kHz DMA tempo policy. Desktop keeps
+# its existing mixer. The public header selects the same layout from the SDK.
+set(MIXER_SOURCE Mixer.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  set(MIXER_SOURCE IOS/Mixer.cpp)
+endif()
+
 add_library(audiocommon
   AudioCommon.cpp
   AudioCommon.h
   CubebStream.h
   Enums.h
-  Mixer.cpp
+  ${MIXER_SOURCE}
   Mixer.h
   SurroundDecoder.cpp
   SurroundDecoder.h

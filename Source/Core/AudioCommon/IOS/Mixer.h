@@ -3,19 +3,11 @@
 
 #pragma once
 
-#if defined(__APPLE__)
-#include <TargetConditionals.h>
-#endif
-
-// Match the iOS source selected by CMake in every core and app consumer.
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-#include "AudioCommon/IOS/Mixer.h"
-#else
-
 #include <array>
 #include <atomic>
 #include <bit>
 
+#include "AudioCommon/AudioTempo.h"
 #include "AudioCommon/SurroundDecoder.h"
 #include "AudioCommon/WaveFile.h"
 #include "Common/CommonTypes.h"
@@ -152,7 +144,7 @@ private:
     std::size_t m_next_buffer_index = 0;
 
     u32 m_current_index = 0;
-    Granule m_front, m_back;
+    Granule m_front{}, m_back{};
 
     std::atomic<std::size_t> m_granule_queue_size{20};
     std::array<Granule, MAX_GRANULE_QUEUE_SIZE> m_queue;
@@ -164,6 +156,8 @@ private:
     double m_dynamic_rate = 1.0;
     bool m_prebuffering = true;
 
+    static void ApplyGranuleWindow(Granule* output, const Granule& input, std::size_t start);
+    void FlushTempoOnConsumer();
     void Enqueue();
     bool Dequeue(Granule* granule);
 
@@ -175,6 +169,16 @@ private:
   };
 
   void RefreshConfig();
+
+  // DMA only: no second queued granule FIFO and no eleven unused tempo rings.
+  galaxypad::experiment::AudioTempo m_dma_tempo;
+  std::array<galaxypad::experiment::AudioTempo::Frame, 128> m_dma_tempo_previous{};
+  std::array<galaxypad::experiment::AudioTempo::Frame, 1536> m_dma_tempo_callback{};
+  std::size_t m_dma_tempo_callback_index = 0;
+  std::atomic<bool> m_dma_tempo_failed{false};
+  std::atomic<bool> m_dma_tempo_flush_requested{false};
+  bool m_dma_tempo_was_running = true;  // consumer only; first startup retains input
+  std::size_t m_dma_tempo_real_input_remainder = 0;  // producer only
 
   MixerFifo m_dma_mixer{this, FIXED_SAMPLE_RATE_DIVIDEND / 32000};
   MixerFifo m_streaming_mixer{this, FIXED_SAMPLE_RATE_DIVIDEND / 48000};
@@ -214,5 +218,3 @@ private:
 
   Config::ConfigChangedCallbackID m_config_changed_callback_id;
 };
-
-#endif  // iOS Mixer selection
