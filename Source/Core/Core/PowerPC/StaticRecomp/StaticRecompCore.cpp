@@ -185,6 +185,18 @@ void StaticRecompCore::Init()
   m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
   m_lockstep_verifier->Init();
 
+  const char* direct_calls = std::getenv("GALAXYPAD_GUARDED_DIRECT_CALLS");
+  if (direct_calls && std::strcmp(direct_calls, "1") == 0 && m_module &&
+      m_library.IsOpen() && !m_has_rel_modules && !m_collect_dispatch_samples &&
+      !m_lockstep_verifier->IsEnabled() && !std::getenv("STATICRECOMP_TRACE_FILE"))
+  {
+    m_direct_binding_setter = reinterpret_cast<DirectBindingSetter>(
+        m_library.GetSymbolAddress("galaxypad_bind_direct_calls_v1"));
+    if (m_direct_binding_setter)
+      m_direct_boundary_enabled = m_direct_binding_setter(1, HookDirectCallBoundary) != 0;
+    std::fprintf(stderr, "[galaxypad-direct-calls] bound=%d\n", m_direct_boundary_enabled);
+  }
+
   // STATICRECOMP_NO_FALLBACK_JIT reproduces the iOS execution contract
   // (module + interpreter only) on desktop for parity testing.
   if (!std::getenv("STATICRECOMP_NO_FALLBACK_JIT"))
@@ -205,6 +217,15 @@ void StaticRecompCore::Init()
 
 void StaticRecompCore::Shutdown()
 {
+  // CPU execution has stopped; detach before destroying the core or dlclosing.
+  if (m_direct_binding_setter)
+    m_direct_binding_setter(1, nullptr);
+  m_direct_binding_setter = nullptr;
+  m_direct_boundary_enabled = false;
+  if (m_direct_boundary_checks)
+    std::fprintf(stderr, "[galaxypad-direct-calls] checks=%llu transfers=%llu\n",
+                 static_cast<unsigned long long>(m_direct_boundary_checks),
+                 static_cast<unsigned long long>(m_direct_transfers));
   g_static_recomp_core = nullptr;
   std::fprintf(stderr,
                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "

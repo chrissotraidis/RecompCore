@@ -51,6 +51,46 @@ FilePtr OpenDispatchTrace()
 }
 }
 
+int StaticRecompCore::HookDirectCallBoundary(CPUState* cpu, u32 address)
+{
+  if (!cpu || !cpu->external_user_data)
+    return 0;
+  auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
+  if (cpu != &core->m_guest || !core->m_direct_boundary_enabled ||
+      !core->m_in_native_dispatch || core->m_direct_must_yield)
+    return 0;
+
+  auto& ppc = core->m_system.GetPowerPC().GetPPCState();
+  const s64 charge = -cpu->downcount;
+  cpu->downcount = 0;
+  const u64 effective_charge = charge > 0 ? static_cast<u64>(charge) :
+                                             (core->m_direct_segment_committed ? 0 : 1);
+  ppc.downcount -= static_cast<int>(effective_charge);
+  core->m_charged_cycles += effective_charge;
+  core->AdvanceGuestTimebase(effective_charge);
+  core->m_direct_segment_committed = true;
+  ++core->m_direct_boundary_checks;
+
+  // A failed check returns through all native callers. Do not let a matching
+  // outer continuation accidentally resume after an inner transfer was denied.
+  core->m_direct_must_yield = true;
+  if (!core->m_module_active || core->m_has_rel_modules ||
+      core->m_lockstep_verifier->IsEnabled() || cpu->pc != address ||
+      *core->m_system.GetCPU().GetStatePtr() != CPU::State::Running ||
+      ppc.downcount <= 0 || cpu->exception ||
+      (ppc.Exceptions & SYNC_EXCEPTION_MASK) != 0 ||
+      ((ppc.Exceptions & ASYNC_EXCEPTION_MASK) != 0 && (cpu->msr & MSR_EE) != 0) ||
+      (core->m_idle_pc != 0 && address == core->m_idle_pc) ||
+      !core->FastDispatchableAt(address) || core->IsHostCallAddress(address))
+    return 0;
+
+  // The target (callee or caller continuation) starts a new charged segment.
+  core->m_direct_must_yield = false;
+  core->m_direct_segment_committed = false;
+  ++core->m_direct_transfers;
+  return 1;
+}
+
 void StaticRecompCore::Run()
 {
   auto& core_timing = m_system.GetCoreTiming();
@@ -135,7 +175,14 @@ void StaticRecompCore::Run()
           if (m_has_rel_modules)
             ResolveNativeAddress(runtime_dispatch_address, &linked_dispatch_address, nullptr);
           m_guest.pc = linked_dispatch_address;
+          if (m_direct_boundary_enabled)
+          {
+            m_direct_segment_committed = false;
+            m_direct_must_yield = false;
+            m_in_native_dispatch = true;
+          }
           m_module->dispatch(&m_guest, linked_dispatch_address);
+          m_in_native_dispatch = false;
           if (m_has_rel_modules)
             m_guest.pc = TranslateRelAddress(m_guest.pc);
           ++m_native_dispatches;
@@ -154,7 +201,10 @@ void StaticRecompCore::Run()
           // external-interrupt latency matches stock.
           const s64 charge = -m_guest.downcount;
           m_guest.downcount = 0;
-          const u64 effective_charge = static_cast<u64>(charge > 0 ? charge : 1);
+          // A rejected direct boundary has already charged its last segment.
+          // Its glue-only unwind must not add the ordinary empty-dispatch cycle.
+          const u64 effective_charge = charge > 0 ? static_cast<u64>(charge) :
+                                                     (m_direct_segment_committed ? 0 : 1);
           ppc.downcount -= static_cast<int>(effective_charge);
           m_charged_cycles += effective_charge;
           const u64 total_cycles = m_timebase_cycle_remainder + effective_charge;

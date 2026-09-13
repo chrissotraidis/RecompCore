@@ -140,6 +140,18 @@ private:
   static void HookCacheControl(CPUState* cpu, u8 operation, u32 ea, u32 cia);
   static void HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia);
   static bool HookHostCall(CPUState* cpu, u32 address);
+  static int HookDirectCallBoundary(CPUState* cpu, u32 address);
+
+  // Optional diagnostic module extension; does not change CPUState/module ABI.
+  using DirectBoundary = int (*)(CPUState*, u32);
+  using DirectBindingSetter = int (*)(u32, DirectBoundary);
+  DirectBindingSetter m_direct_binding_setter = nullptr;
+  bool m_direct_boundary_enabled = false;
+  bool m_in_native_dispatch = false;
+  bool m_direct_segment_committed = false;
+  bool m_direct_must_yield = false;
+  u64 m_direct_boundary_checks = 0;
+  u64 m_direct_transfers = 0;
 
   // Keep Dolphin's MSR-derived state (translation mode, feature flags) in step
   // with the guest MSR before any MMU access or exception delivery.
