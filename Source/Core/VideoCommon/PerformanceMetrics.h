@@ -37,6 +37,7 @@ public:
   // CPU-thread only, like CountThrottleSleep; not an any-thread metric.
   DT GetCPUThrottleElapsed() const { return m_time_sleeping; }
   galaxypad::IdleWaitTiming& GetCPUIdleWaitTiming() { return m_idle_wait_timing; }
+  galaxypad::IdleWaitTiming& GetCPUDVDWaitTiming() { return m_dvd_wait_timing; }
   void AdjustClockSpeed(s64 ticks, u32 new_ppc_clock, u32 old_ppc_clock);
   void CountPerformanceMarker(s64 ticks, u32 ticks_per_second);
 
@@ -55,6 +56,7 @@ public:
 
 private:
   galaxypad::IdleWaitTiming m_idle_wait_timing;
+  galaxypad::IdleWaitTiming m_dvd_wait_timing;
   PerformanceTracker m_fps_counter{"render_times.txt"};
   PerformanceTracker m_vps_counter{"vblank_times.txt"};
 

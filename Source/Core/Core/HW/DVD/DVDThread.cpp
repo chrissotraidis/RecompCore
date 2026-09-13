@@ -3,6 +3,8 @@
 
 #include "Core/HW/DVD/DVDThread.h"
 
+#include "VideoCommon/PerformanceMetrics.h"
+
 #include <map>
 #include <memory>
 #include <optional>
@@ -246,7 +248,8 @@ void DVDThread::FinishRead(u64 id, s64 cycles_late)
   {
     while (true)
     {
-      m_result_queue.WaitForData();
+      m_system.GetPerfMetrics().GetCPUDVDWaitTiming().Measure(
+          [this] { m_result_queue.WaitForData(); });
       m_result_queue.Pop(result);
       if (result.first.id == id)
         break;
