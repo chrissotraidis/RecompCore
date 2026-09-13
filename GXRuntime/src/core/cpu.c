@@ -215,7 +215,11 @@ static f64 psq_load_value(CPUState* cpu, u32 ea, u8 type, s32 scale) {
 }
 
 static s64 psq_quantize_int(f64 value, s64 min_value, s64 max_value, s32 scale) {
-    f32 conv = (f32)value * ldexpf(1.0f, scale);
+    // GQR scales are signed six-bit integers. These powers are normal,
+    // exactly representable floats; keep libm for any other caller range.
+    f32 factor = (scale >= -32 && scale <= 31)
+        ? f32_value((u32)(scale + 127) << 23) : ldexpf(1.0f, scale);
+    f32 conv = (f32)value * factor;
     if (isnan(conv))
         return 0;
     if (conv <= (f32)min_value)
