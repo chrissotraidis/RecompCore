@@ -31,8 +31,15 @@ public:
   BlockingLoop() { m_stopped.Set(); }
   ~BlockingLoop() { Stop(StopMode::BlockAndGiveUp); }
   // Triggers to rerun the payload of the Run() function at least once again.
-  // This function will never block and is designed to finish as fast as possible.
+  // Notifying a sleeping worker may acquire the event mutex.
   void Wakeup()
+  {
+    WakeupWithNotification([](Event& event) { event.Set(); });
+  }
+
+  // Observer must perform exactly one notification, synchronously.
+  template <class Notify>
+  void WakeupWithNotification(Notify&& notify)
   {
     // Already running, so no need for a wakeup.
     // This is the common case, so try to get this as fast as possible.
@@ -45,7 +52,7 @@ public:
       return;
 
     // Else as the worker thread may sleep now, we have to set the event.
-    m_new_work_event.Set();
+    notify(m_new_work_event);
   }
 
   // Wait for a complete payload run after the last Wakeup() call.

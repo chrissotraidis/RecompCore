@@ -18,6 +18,7 @@
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/ConfigManager.h"
 #include "Core/CoreTiming.h"
+#include "Core/Core.h"
 #include "Core/HW/GPFifo.h"
 #include "Core/HW/Memmap.h"
 #include "Core/Host.h"
@@ -29,6 +30,7 @@
 #include "VideoCommon/DataReader.h"
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/OpcodeDecoding.h"
+#include "VideoCommon/PerformanceMetrics.h"
 #include "VideoCommon/VertexLoaderManager.h"
 #include "VideoCommon/VertexManagerBase.h"
 #include "VideoCommon/VideoBackendBase.h"
@@ -419,7 +421,12 @@ void FifoManager::RunGpu()
   // wake up GPU thread
   if (is_dual_core && !m_use_deterministic_gpu_thread)
   {
-    m_gpu_mainloop.Wakeup();
+    m_gpu_mainloop.WakeupWithNotification([this](Common::Event& event) {
+      if (Core::IsCPUThread())
+        m_system.GetPerfMetrics().GetCPUWakeupTiming().Measure([&event] { event.Set(); });
+      else
+        event.Set();
+    });
   }
 
   // if the sync GPU callback is suspended, wake it up.
