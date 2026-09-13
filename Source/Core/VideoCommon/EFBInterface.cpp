@@ -9,6 +9,7 @@
 
 #include "Common/MsgHandler.h"
 #include "Common/GalaxyPadDiagnostics.h"
+#include "Common/GalaxyPadEFBReadContext.h"
 
 #include "Core/Config/ConfigManager.h"
 #include "Core/PowerPC/PowerPC.h"
@@ -73,8 +74,8 @@ u32 EFBInterfaceBase::PeekColor(u16 x, u16 y)
   GalaxyPadDiagnostics::RecordEFB(
       false, x, y, color,
       std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
-      Core::System::GetInstance().GetPPCState().pc,
-      Core::System::GetInstance().GetPPCState().spr[SPR_LR]);
+      GalaxyPadDiagnostics::CurrentEFBReadContext().pc,
+      GalaxyPadDiagnostics::CurrentEFBReadContext().lr);
 
   // check what to do with the alpha channel (GX_PokeAlphaRead)
   PixelEngine::AlphaReadMode alpha_read_mode =
@@ -140,8 +141,8 @@ u32 EFBInterfaceBase::PeekDepth(u16 x, u16 y)
   GalaxyPadDiagnostics::RecordEFB(
       true, x, y, depth,
       std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
-      Core::System::GetInstance().GetPPCState().pc,
-      Core::System::GetInstance().GetPPCState().spr[SPR_LR]);
+      GalaxyPadDiagnostics::CurrentEFBReadContext().pc,
+      GalaxyPadDiagnostics::CurrentEFBReadContext().lr);
   return depth;
 }
 

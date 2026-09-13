@@ -11,6 +11,7 @@
 #include "Core/HW/GPFifo.h"
 #include "Core/HW/SystemTimers.h"
 #include "Common/Logging/Log.h"
+#include "Common/GalaxyPadEFBReadContext.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +49,7 @@ bool StaticRecompCore::HookHostCall(CPUState* cpu, u32 address)
 
 u64 StaticRecompCore::HookExternalRead(CPUState* cpu, u32 ea, u8 size)
 {
+  const GalaxyPadDiagnostics::ScopedEFBReadContext read_context(cpu->pc, cpu->lr);
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   ea = core->TranslateRelAddress(ea);
   if (ea == 0)
@@ -168,6 +170,7 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
 
 u32 StaticRecompCore::HookExternalRead32(CPUState* cpu, u32 ea, u8 rid)
 {
+  const GalaxyPadDiagnostics::ScopedEFBReadContext read_context(cpu->pc, cpu->lr);
   // eciwx external-control read. EAR-enable and alignment were checked by the
   // generated helper; Dolphin's interpreter services the access as a plain
   // MMU read (the rid is carried in EAR only).
