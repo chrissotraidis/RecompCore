@@ -19,6 +19,7 @@
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 #include "VideoCommon/Fifo.h"
+#include "VideoCommon/PerformanceMetrics.h"
 
 namespace CommandProcessor
 {
@@ -353,7 +354,8 @@ void CommandProcessorManager::GatherPipeBursted()
           (processor_interface.m_fifo_cpu_base == m_fifo.CPBase.load(std::memory_order_relaxed)) &&
           m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) > 0)
       {
-        m_system.GetFifo().FlushGpu();
+        m_system.GetPerfMetrics().GetCPUGatherWaitTiming().Measure(
+            [this] { m_system.GetFifo().FlushGpu(); });
       }
     }
     m_system.GetFifo().RunGpu();
