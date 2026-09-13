@@ -85,6 +85,13 @@ enum class LogLevel : int
   LDEBUG = 5,    // Detailed debugging - might make things slow.
 };
 
+// Optional embedding hook for warnings and errors. It is independent of
+// Dolphin's user-configured log categories and listeners so a frontend can
+// retain failure evidence without enabling verbose logging.
+using EmbedderLogCallback = void (*)(LogLevel level, LogType type,
+                                     const char* message, void* user_data);
+void SetEmbedderLogCallback(EmbedderLogCallback callback, void* user_data);
+
 #if defined(_DEBUG) || defined(DEBUGFAST)
 constexpr auto MAX_EFFECTIVE_LOGLEVEL = Common::Log::LogLevel::LDEBUG;
 #else

@@ -532,8 +532,6 @@ add_library(core
   IOS/WFS/WFSI.h
   IOS/WFS/WFSSRV.cpp
   IOS/WFS/WFSSRV.h
-  USB/LibusbUtils.cpp
-  USB/LibusbUtils.h
   MemTools.cpp
   MemTools.h
   Movie.cpp
@@ -660,6 +658,18 @@ add_library(core
   Wii/WiiUtils.cpp
   Wii/WiiUtils.h
 )
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  target_sources(core PRIVATE
+    USB/LibusbUtils.cpp
+    USB/LibusbUtils.h
+  )
+else()
+  # No USB host access on iOS; provide linkable no-ops for the LibusbUtils API.
+  target_sources(core PRIVATE
+    USB/LibusbUtils_iOS.cpp
+  )
+endif()
 
 if(_M_X86_64)
   target_sources(core PRIVATE

@@ -676,6 +676,8 @@ std::string GetTempFilenameForAtomicWrite(std::string path)
 std::string GetBundleDirectory()
 {
   CFURLRef bundle_ref = CFBundleCopyBundleURL(CFBundleGetMainBundle());
+  if (!bundle_ref)
+    return {};
 
   // Starting in macOS Sierra, apps downloaded from the Internet may be
   // "translocated" to a read-only DMG and executed from there. This is
@@ -692,6 +694,7 @@ std::string GetBundleDirectory()
   //
   // The headers can be found under "Security" on opensource.apple.com:
   // Security/OSX/libsecurity_translocate/lib/SecTranslocate.h
+#if !defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
   if (!s_security_framework.IsOpen())
   {
     s_security_framework.Open("/System/Library/Frameworks/Security.framework/Security");
@@ -708,6 +711,7 @@ std::string GetBundleDirectory()
     CFRelease(bundle_ref);
     bundle_ref = untranslocated_ref;
   }
+#endif
 
   char app_bundle_path[MAXPATHLEN];
   CFStringRef bundle_path = CFURLCopyFileSystemPath(bundle_ref, kCFURLPOSIXPathStyle);
@@ -761,6 +765,8 @@ std::string GetExeDirectory()
 static std::string CreateSysDirectoryPath()
 {
 #if defined(_WIN32) || defined(LINUX_LOCAL_DEV)
+#define SYSDATA_DIR "Sys"
+#elif defined(__APPLE__) && defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
 #define SYSDATA_DIR "Sys"
 #elif defined __APPLE__
 #define SYSDATA_DIR "Contents/Resources/Sys"

@@ -23,6 +23,18 @@
 
 namespace Common::Log
 {
+namespace
+{
+std::atomic<EmbedderLogCallback> s_embedder_log_callback{nullptr};
+std::atomic<void*> s_embedder_log_user_data{nullptr};
+}
+
+void SetEmbedderLogCallback(EmbedderLogCallback callback, void* user_data)
+{
+  s_embedder_log_user_data.store(user_data, std::memory_order_relaxed);
+  s_embedder_log_callback.store(callback, std::memory_order_release);
+}
+
 const Config::Info<bool> LOGGER_WRITE_TO_FILE{{Config::System::Logger, "Options", "WriteToFile"},
                                               false};
 const Config::Info<bool> LOGGER_WRITE_TO_CONSOLE{
@@ -63,15 +75,23 @@ private:
 void GenericLogFmtImpl(LogLevel level, LogType type, const char* file, int line,
                        fmt::string_view format, const fmt::format_args& args)
 {
+  const EmbedderLogCallback embedder_callback =
+      s_embedder_log_callback.load(std::memory_order_acquire);
   auto* instance = LogManager::GetInstance();
-  if (instance == nullptr)
-    return;
-
-  if (!instance->IsEnabled(type, level))
+  const bool forward_to_embedder = embedder_callback != nullptr &&
+      (level == LogLevel::LERROR || level == LogLevel::LWARNING);
+  const bool forward_to_dolphin = instance != nullptr && instance->IsEnabled(type, level);
+  if (!forward_to_embedder && !forward_to_dolphin)
     return;
 
   const auto message = fmt::vformat(format, args);
-  instance->Log(level, type, file, line, message.c_str());
+  if (forward_to_embedder)
+  {
+    embedder_callback(level, type, message.c_str(),
+                      s_embedder_log_user_data.load(std::memory_order_relaxed));
+  }
+  if (forward_to_dolphin)
+    instance->Log(level, type, file, line, message.c_str());
 }
 
 static size_t DeterminePathCutOffPoint()

@@ -167,6 +167,13 @@ private:
   u64 m_bursts = 0;          // SyncIn..SyncOut native runs (diagnostic)
   u64 m_charged_cycles = 0;  // cycles flushed from module charges (diagnostic)
 
+  // ctx->timebase is in TB ticks (1 tick per SystemTimers::TIMER_RATIO CPU
+  // cycles), while module charges are CPU cycles. Deriving in-burst TB from a
+  // SyncIn snapshot plus accumulated cycles keeps guest mftb monotonic and in
+  // agreement with GetFakeTimeBase() at burst boundaries.
+  u64 m_burst_tb_base = 0;    // GetFakeTimeBase() at the last SyncIn
+  u64 m_burst_tb_cycles = 0;  // CPU cycles charged since that snapshot
+
   // D4 guard state: parallel to m_module->chunk_ranges.
   std::vector<u8> m_chunk_state;
   mutable std::vector<u8> m_chunk_host_call_state;

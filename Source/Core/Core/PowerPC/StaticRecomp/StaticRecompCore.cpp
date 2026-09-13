@@ -185,11 +185,16 @@ void StaticRecompCore::Init()
   m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
   m_lockstep_verifier->Init();
 
-#ifdef _M_ARM_64
-  m_fallback_jit = std::make_unique<JitArm64>(m_system);
+  // STATICRECOMP_NO_FALLBACK_JIT reproduces the iOS execution contract
+  // (module + interpreter only) on desktop for parity testing.
+  if (!std::getenv("STATICRECOMP_NO_FALLBACK_JIT"))
+  {
+#if defined(_M_ARM_64) && !defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+    m_fallback_jit = std::make_unique<JitArm64>(m_system);
 #elif defined(_M_X86_64)
-  m_fallback_jit = std::make_unique<Jit64>(m_system);
+    m_fallback_jit = std::make_unique<Jit64>(m_system);
 #endif
+  }
   if (m_fallback_jit)
   {
     m_fallback_jit->SetStaticRecompFallback(true);
