@@ -313,6 +313,7 @@ public:
   // it's safe to optimize a read or write to this address to an unguarded
   // memory access.  Does not consider page tables.
   bool IsOptimizableRAMAddress(u32 address, u32 access_size) const;
+  u8* TryGetLockedCachePair(u32 address);
   bool TryWriteLockedCacheByte(u32 address, u8 value);
   u32 IsOptimizableMMIOAccess(u32 address, u32 access_size) const;
   bool IsOptimizableGatherPipeWrite(u32 address) const;
