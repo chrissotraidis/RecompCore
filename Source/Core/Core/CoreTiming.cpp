@@ -13,6 +13,7 @@
 
 #include "Common/Assert.h"
 #include "Common/ChunkFile.h"
+#include "Common/completion-session.h"
 #include "Common/Logging/Log.h"
 #include "Common/SPSCQueue.h"
 #include "Common/ScopeGuard.h"
@@ -579,7 +580,11 @@ void CoreTimingManager::Idle()
     // the VI will be desynchronized. So, We are waiting until the FIFO finish and
     // while we process only the events required by the FIFO.
     m_system.GetPerfMetrics().GetCPUIdleWaitTiming().Measure(
-        [this] { m_system.GetFifo().FlushGpu(); });
+        [this] {
+          galaxypad::completion_recorder.RecordCPU(galaxypad::CompletionRecorder::Kind::WaitBegin);
+          m_system.GetFifo().FlushGpu();
+          galaxypad::completion_recorder.RecordCPU(galaxypad::CompletionRecorder::Kind::WaitEnd);
+        });
   }
 
   auto& ppc_state = m_system.GetPPCState();

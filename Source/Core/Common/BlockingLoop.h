@@ -123,8 +123,12 @@ public:
   // The optional timeout parameter is a timeout for how periodically the payload should be called.
   // Use timeout = 0 to run without a timeout at all.
   template <class F>
-  void Run(F payload, int64_t timeout = 0)
+  void Run(F payload, int64_t timeout = 0,
+           void (*notification_observer)(void*, bool) noexcept = nullptr,
+           void* observer_context = nullptr)
   {
+    // Worker-thread observations only; true=before Set, false=after Set.
+    // DONE may already be visible to a waiter. No exact publication-time claim.
     // Asserts that Prepare is called at least once before we enter the loop.
     // But a good implementation should call this before already.
     Prepare();
@@ -156,7 +160,11 @@ public:
         // Else we're likely in the STATE_DONE state now, so wakeup the waiting threads right now.
         // However, if we're not in the STATE_DONE state any more, the event should also be
         // triggered so that we'll skip the next waiting call quite fast.
+        if (notification_observer)
+          notification_observer(observer_context, true);
         m_done_event.Set();
+        if (notification_observer)
+          notification_observer(observer_context, false);
         [[fallthrough]];
 
       case STATE_DONE:

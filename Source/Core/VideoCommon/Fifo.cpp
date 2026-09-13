@@ -9,6 +9,7 @@
 #include "Common/Assert.h"
 #include "Common/BlockingLoop.h"
 #include "Common/ChunkFile.h"
+#include "Common/completion-session.h"
 #include "Common/Event.h"
 #include "Common/FPURoundMode.h"
 #include "Common/MemoryUtil.h"
@@ -385,7 +386,8 @@ void FifoManager::RunGpuLoop()
           g_framebuffer_manager->RefreshPeekCache();
         }
       },
-      100);
+      100, galaxypad::completion_recorder.Enabled() ? &galaxypad::ObserveCompletion : nullptr,
+      nullptr);
 }
 
 void FifoManager::FlushGpu()
