@@ -39,6 +39,30 @@
 
 namespace PowerPC
 {
+bool MMU::TryWriteLockedCacheByte(u32 address, u8 value)
+{
+  // Keep debugging, shadow replay and cache emulation on the canonical path.
+  if (m_power_pc.GetMemChecks().HasAny() || m_ppc_state.m_enable_dcache ||
+      StaticRecompLockstep::g_lc_write_journal || StaticRecompLockstep::g_hw_write_sink)
+    return false;
+  if (m_ppc_state.msr.DR)
+  {
+    // Consult the live BAT table each time. Page-table mappings and faults
+    // remain with WriteToHardware; no translation or pointer is cached here.
+    const u32 bat = m_dbat_table[address >> BAT_INDEX_SHIFT];
+    if ((bat & (BAT_MAPPED_BIT | BAT_PHYSICAL_BIT)) != (BAT_MAPPED_BIT | BAT_PHYSICAL_BIT))
+      return false;
+    address = (bat & BAT_RESULT_MASK) | (address & (BAT_PAGE_SIZE - 1));
+  }
+  constexpr u32 base = 0xE0000000u;
+  if (!m_memory.GetL1Cache() || address < base || address - base >= m_memory.GetL1CacheSize())
+    return false;
+  // Matches WriteToHardware's byte memcpy after translation. Locked-cache
+  // stores precede write-through duplication and do not touch reservations.
+  m_memory.GetL1Cache()[address - base] = value;
+  return true;
+}
+
 template <XCheckTLBFlag flag, std::unsigned_integral T, bool never_translate>
 T MMU::ReadFromHardware(u32 em_address)
 {

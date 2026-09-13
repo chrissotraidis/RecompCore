@@ -124,6 +124,23 @@ void StaticRecompCore::HookExternalWrite(CPUState* cpu, u32 ea, u64 value, u8 si
 
   core->PropagateGuestMSR();
   auto& mmu = core->m_system.GetMMU();
+  if (size == 1 && (ea >> 28) == 0xE && !core->m_lockstep_verifier->m_ls_journaling)
+  {
+    static const bool enabled = [] {
+      const char* setting = std::getenv("GALAXYPAD_LC_BYTE_FAST");
+      return setting && setting[0] == '1' && setting[1] == '\0';
+    }();
+    if (enabled && mmu.TryWriteLockedCacheByte(ea, static_cast<u8>(value)))
+    {
+      static bool reported = false;
+      if (!reported)
+      {
+        std::fprintf(stderr, "[galaxypad-lc-byte-fast] active pc=%08x ea=%08x\n", cpu->pc, ea);
+        reported = true;
+      }
+      return;
+    }
+  }
   if (core->m_lockstep_verifier->m_ls_journaling &&
       StaticRecompLockstep::LsHwAccessInScope(mmu, ea))
   {
