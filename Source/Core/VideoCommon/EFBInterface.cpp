@@ -6,10 +6,12 @@
 #include <algorithm>
 #include <chrono>
 #include <memory>
+#include <utility>
 
 #include "Common/MsgHandler.h"
 #include "Common/GalaxyPadDiagnostics.h"
 #include "Common/GalaxyPadEFBReadContext.h"
+#include "Common/GalaxyPadEFBDispatchTiming.h"
 
 #include "Core/Config/ConfigManager.h"
 #include "Core/PowerPC/PowerPC.h"
@@ -101,10 +103,15 @@ u32 EFBInterfaceBase::PeekColor(u16 x, u16 y)
 
 u32 HardwareEFBInterface::PeekDepthInternal(u16 x, u16 y)
 {
-  float depth = AsyncRequests::GetInstance()->PushBlockingEvent([&] {
-    INCSTAT(g_stats.this_frame.num_efb_peeks);
-    return g_framebuffer_manager->PeekEFBDepth(x, y);
-  });
+  const auto context = GalaxyPadDiagnostics::CurrentEFBReadContext();
+  float depth = GalaxyPadDiagnostics::TraceEFBDispatch(
+      [&](auto&& read) {
+        return AsyncRequests::GetInstance()->PushBlockingEvent(std::forward<decltype(read)>(read));
+      },
+      [&] {
+        INCSTAT(g_stats.this_frame.num_efb_peeks);
+        return g_framebuffer_manager->PeekEFBDepth(x, y);
+      }, x, y, context.pc, context.lr);
 
   // Depth buffer is inverted for improved precision near far plane
   if (!g_backend_info.bSupportsReversedDepthRange)
