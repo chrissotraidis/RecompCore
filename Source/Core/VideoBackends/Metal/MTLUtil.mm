@@ -316,7 +316,13 @@ void Metal::Util::PopulateBackendInfoFeatures(const VideoConfig& config, Backend
     }
   }
 
+#if TARGET_OS_SIMULATOR
+  // Simulator reports an Apple GPU family but rejects fragment color inputs
+  // that read the render target. Use the existing non-fetch rendering path.
+  backend_info->bSupportsFramebufferFetch = false;
+#else
   backend_info->bSupportsFramebufferFetch = [device supportsFamily:MTLGPUFamilyApple1];
+#endif
 #if TARGET_OS_OSX
   if (vendor == DriverDetails::VENDOR_INTEL)
     backend_info->bSupportsFramebufferFetch |= DetectIntelGPUFBFetch(device);
