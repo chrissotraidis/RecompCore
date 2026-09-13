@@ -152,6 +152,14 @@
   }
 }
 
+- (BOOL)windowShouldClose:(NSWindow*)sender
+{
+  // The runtime pumps AppKit events itself. End that loop through the same
+  // path as Quit, retaining the surface until Core::Shutdown has completed.
+  [(Application*)NSApp shutdown];
+  return NO;
+}
+
 - (void)windowWillClose:(NSNotification*)notification
 {
   if (m_cursor_hidden)
