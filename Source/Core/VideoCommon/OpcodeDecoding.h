@@ -125,6 +125,17 @@ namespace detail
 // Failure-only, bounded context. run_begin belongs to the same Run input span.
 std::string DescribeCommandWindow(const u8* data, u32 available, const u8* run_begin);
 
+// Called only when the assertion fails. Other decoder clients need not expose
+// runtime source information and must not be mislabeled as main FIFO input.
+template <typename T>
+std::string DescribeCommandSource(const T& callback)
+{
+  if constexpr (requires { callback.DescribeSource(); })
+    return callback.DescribeSource();
+  else
+    return "source=unspecified";
+}
+
 // Main logic; split so that the main RunCommand can call OnCommand with the returned size.
 static DOLPHIN_FORCE_INLINE u32 RunCommand(const u8* data, u32 available,
                                            std::derived_from<Callback> auto& callback,
@@ -168,8 +179,8 @@ static DOLPHIN_FORCE_INLINE u32 RunCommand(const u8* data, u32 available,
     const u16 base_address = cmd2 & 0xffff;
 
     const u16 stream_size_temp = cmd2 >> 16;
-    ASSERT_MSG(VIDEO, stream_size_temp < 16, "cmd2 = 0x{:08X}; {}", cmd2,
-               DescribeCommandWindow(data, available, run_begin));
+    ASSERT_MSG(VIDEO, stream_size_temp < 16, "cmd2 = 0x{:08X}; {}; {}", cmd2,
+               DescribeCommandWindow(data, available, run_begin), DescribeCommandSource(callback));
     const u8 stream_size = (stream_size_temp & 0xf) + 1;
 
     if (available < u32(5 + stream_size * 4))

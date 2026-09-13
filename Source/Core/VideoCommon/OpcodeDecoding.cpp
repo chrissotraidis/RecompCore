@@ -51,6 +51,13 @@ template <bool is_preprocess>
 class RunCallback final : public Callback
 {
 public:
+  std::string DescribeSource() const
+  {
+    return fmt::format("source={} preprocess={} dl_address={:08x} dl_size={}",
+                       m_in_display_list ? "display-list" : "main-fifo", is_preprocess,
+                       m_in_display_list ? m_display_list_address : 0,
+                       m_in_display_list ? m_display_list_size : 0);
+  }
   OPCODE_CALLBACK(void OnXF(u16 address, u8 count, const u8* data))
   {
     m_cycles += 18 + 6 * count;
@@ -164,6 +171,8 @@ public:
     else
     {
       m_in_display_list = true;
+      m_display_list_address = address;
+      m_display_list_size = size;
 
       auto& system = Core::System::GetInstance();
 
@@ -267,6 +276,8 @@ public:
 
   u32 m_cycles = 0;
   bool m_in_display_list = false;
+  u32 m_display_list_address = 0;
+  u32 m_display_list_size = 0;
 };
 
 template <bool is_preprocess>
