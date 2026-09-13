@@ -14,8 +14,11 @@
 
 #include "VideoCommon/OpcodeDecoding.h"
 
+#include <algorithm>
+
 #include "Common/Assert.h"
 #include "Common/Logging/Log.h"
+#include "Common/StringUtil.h"
 #include "Core/FifoPlayer/FifoRecorder.h"
 #include "Core/HW/Memmap.h"
 #include "Core/System.h"
@@ -33,6 +36,16 @@
 namespace OpcodeDecoder
 {
 bool g_record_fifo_data = false;
+
+std::string detail::DescribeCommandWindow(const u8* data, u32 available, const u8* run_begin)
+{
+  const auto offset = static_cast<size_t>(data - run_begin);
+  const auto before = static_cast<u32>(std::min<size_t>(offset, 32));
+  const auto after = std::min<u32>(available, 32);
+  return fmt::format("run_offset={} available={} preceding_bytes=[{}] command_bytes=[{}]",
+                     offset, available, ArrayToString(data - before, before, 64),
+                     ArrayToString(data, after, 64));
+}
 
 template <bool is_preprocess>
 class RunCallback final : public Callback

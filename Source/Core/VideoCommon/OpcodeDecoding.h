@@ -4,6 +4,7 @@
 #pragma once
 
 #include <concepts>
+#include <string>
 
 #include "Common/Assert.h"
 #include "Common/CommonTypes.h"
@@ -121,9 +122,13 @@ public:
 
 namespace detail
 {
+// Failure-only, bounded context. run_begin belongs to the same Run input span.
+std::string DescribeCommandWindow(const u8* data, u32 available, const u8* run_begin);
+
 // Main logic; split so that the main RunCommand can call OnCommand with the returned size.
 static DOLPHIN_FORCE_INLINE u32 RunCommand(const u8* data, u32 available,
-                                           std::derived_from<Callback> auto& callback)
+                                           std::derived_from<Callback> auto& callback,
+                                           const u8* run_begin)
 {
   if (available < 1)
     return 0;
@@ -163,7 +168,8 @@ static DOLPHIN_FORCE_INLINE u32 RunCommand(const u8* data, u32 available,
     const u16 base_address = cmd2 & 0xffff;
 
     const u16 stream_size_temp = cmd2 >> 16;
-    ASSERT_MSG(VIDEO, stream_size_temp < 16, "cmd2 = 0x{:08X}", cmd2);
+    ASSERT_MSG(VIDEO, stream_size_temp < 16, "cmd2 = 0x{:08X}; {}", cmd2,
+               DescribeCommandWindow(data, available, run_begin));
     const u8 stream_size = (stream_size_temp & 0xf) + 1;
 
     if (available < u32(5 + stream_size * 4))
@@ -254,9 +260,10 @@ static DOLPHIN_FORCE_INLINE u32 RunCommand(const u8* data, u32 available,
 }  // namespace detail
 
 DOLPHIN_FORCE_INLINE u32 RunCommand(const u8* data, u32 available,
-                                    std::derived_from<Callback> auto& callback)
+                                    std::derived_from<Callback> auto& callback,
+                                    const u8* run_begin = nullptr)
 {
-  const u32 size = detail::RunCommand(data, available, callback);
+  const u32 size = detail::RunCommand(data, available, callback, run_begin ? run_begin : data);
   if (size > 0)
   {
     callback.OnCommand(data, size);
@@ -270,7 +277,7 @@ DOLPHIN_FORCE_INLINE u32 Run(const u8* data, u32 available,
   u32 size = 0;
   while (size < available)
   {
-    const u32 command_size = RunCommand(&data[size], available - size, callback);
+    const u32 command_size = RunCommand(&data[size], available - size, callback, data);
     if (command_size == 0)
       break;
     size += command_size;
