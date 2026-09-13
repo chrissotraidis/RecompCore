@@ -270,6 +270,7 @@ inline void RecordDmaUnderrun()
   s_dma_first_underrun_enqueue.compare_exchange_strong(unset, ordinal,
                                                        std::memory_order_relaxed);
   s_dma_last_underrun_enqueue.store(ordinal, std::memory_order_relaxed);
+  RecordPhase("dma_underrun", ordinal);
 }
 
 inline void RecordDmaBacklogDrop()
@@ -280,11 +281,13 @@ inline void RecordDmaBacklogDrop()
   s_dma_first_backlog_enqueue.compare_exchange_strong(unset, ordinal,
                                                       std::memory_order_relaxed);
   s_dma_last_backlog_enqueue.store(ordinal, std::memory_order_relaxed);
+  RecordPhase("dma_backlog_drop", ordinal);
 }
 
 inline void RecordDmaQueueFullDrop()
 {
   s_dma_queue_full_drops.fetch_add(1, std::memory_order_relaxed);
+  RecordPhase("dma_queue_full_drop", s_dma_enqueues.load(std::memory_order_relaxed));
 }
 
 inline void RecordPresentedFrame()
