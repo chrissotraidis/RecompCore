@@ -246,6 +246,9 @@ void EmulatePoint(MotionState* state, ControllerEmu::Cursor* ir_group,
   const float yaw_scale = ir_group->GetTotalYaw() / 2;
   const float pitch_scale = ir_group->GetTotalPitch() / 2;
 
+  // Preserve visibility before replacing the old hidden position below.
+  const bool was_hidden = state->position.y < 0;
+
   // Just jump to the target position.
   state->position = {0, NEUTRAL_DISTANCE, -height};
   state->velocity = {};
@@ -254,7 +257,7 @@ void EmulatePoint(MotionState* state, ControllerEmu::Cursor* ir_group,
   const auto target_angle = Common::Vec3(pitch_scale * -cursor.y, 0, yaw_scale * -cursor.x);
 
   // If cursor was hidden, jump to the target angle immediately.
-  if (state->position.y < 0)
+  if (was_hidden)
   {
     state->angle = target_angle;
     state->angular_velocity = {};
