@@ -8,6 +8,7 @@
 
 #include "Common/CommonTypes.h"
 #include "Common/HookableEvent.h"
+#include "Common/GalaxyPadIdleWaitTiming.h"
 #include "VideoCommon/PerformanceTracker.h"
 
 namespace Core
@@ -35,6 +36,7 @@ public:
   void CountThrottleSleep(DT sleep);
   // CPU-thread only, like CountThrottleSleep; not an any-thread metric.
   DT GetCPUThrottleElapsed() const { return m_time_sleeping; }
+  galaxypad::IdleWaitTiming& GetCPUIdleWaitTiming() { return m_idle_wait_timing; }
   void AdjustClockSpeed(s64 ticks, u32 new_ppc_clock, u32 old_ppc_clock);
   void CountPerformanceMarker(s64 ticks, u32 ticks_per_second);
 
@@ -52,6 +54,7 @@ public:
   void DrawImGuiStats(const float backbuffer_scale);
 
 private:
+  galaxypad::IdleWaitTiming m_idle_wait_timing;
   PerformanceTracker m_fps_counter{"render_times.txt"};
   PerformanceTracker m_vps_counter{"vblank_times.txt"};
 

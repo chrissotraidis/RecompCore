@@ -578,7 +578,8 @@ void CoreTimingManager::Idle()
     // When the FIFO is processing data we must not advance because in this way
     // the VI will be desynchronized. So, We are waiting until the FIFO finish and
     // while we process only the events required by the FIFO.
-    m_system.GetFifo().FlushGpu();
+    m_system.GetPerfMetrics().GetCPUIdleWaitTiming().Measure(
+        [this] { m_system.GetFifo().FlushGpu(); });
   }
 
   auto& ppc_state = m_system.GetPPCState();
