@@ -283,6 +283,19 @@ bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index, bool ind
     if (size == 0) /* invalid GQR type: nothing is stored */
         return true;
 
+    // Optional type-4 pair only. Size zero is a capability request, not a
+    // memory range: old HookExternalPointer explicitly rejects it. The new
+    // host must return null unless all pair-write safety conditions hold.
+    // Rejection must be side-effect-free; an unsynchronized guest MSR must
+    // reject rather than changing host state ahead of the first quantization.
+    if (type == 4 && !w && !g_mem_write_journal && cpu->external_pointer) {
+        u8* pair = (u8*)cpu->external_pointer(cpu, ea, 0);
+        if (pair) {
+            pair[0] = (u8)psq_quantize_int(cpu->fpr[frS], 0, 255, scale);
+            pair[1] = (u8)psq_quantize_int(cpu->ps1[frS], 0, 255, scale);
+            return true;
+        }
+    }
     psq_store_value(cpu, ea, type, scale, cpu->fpr[frS]);
     if (!w)
         psq_store_value(cpu, ea + size, type, scale, cpu->ps1[frS]);
