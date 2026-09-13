@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include "Common/GalaxyPadAudioOutputCounters.h"
 
 #include "Common/Logging/Log.h"
 
@@ -25,6 +28,8 @@ OSStatus CoreAudioSound::OutputCallback(void* ref_con, AudioUnitRenderActionFlag
   const UInt32 frames = std::min(number_frames, available_frames);
   if (buffer.mData && frames > 0)
     sound->GetMixer()->Mix(static_cast<s16*>(buffer.mData), frames);
+  galaxypad::audio::outputCounters.Record(static_cast<const s16*>(buffer.mData),
+                                         number_frames, frames);
 
   static std::atomic<bool> logged_callback = false;
   if (!logged_callback.exchange(true))
@@ -46,6 +51,8 @@ CoreAudioSound::~CoreAudioSound()
 
 bool CoreAudioSound::Init()
 {
+  const char* diagnostic = std::getenv("GALAXYPAD_AUDIO_OUTPUT_DIAGNOSTICS");
+  galaxypad::audio::outputCounters.Start(diagnostic && std::strcmp(diagnostic, "1") == 0);
   AudioComponentDescription description{};
   description.componentType = kAudioUnitType_Output;
   description.componentSubType = kAudioUnitSubType_RemoteIO;
