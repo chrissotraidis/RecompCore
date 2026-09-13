@@ -148,6 +148,21 @@ void StaticRecompCore::Init()
   g_static_recomp_core = this;
   RefreshConfig();
   m_collect_dispatch_samples = std::getenv("STATICRECOMP_DISPATCH_SAMPLES") != nullptr;
+  const char* fallback_pcs = std::getenv("GALAXYPAD_FALLBACK_PCS");
+  m_fallback_histogram.reset();
+  m_fallback_start_file.clear();
+  m_fallback_start_poll = 0;
+  if (fallback_pcs && std::strcmp(fallback_pcs, "1") == 0)
+  {
+    const char* start_file = std::getenv("GALAXYPAD_FALLBACK_START_FILE");
+    if (start_file && *start_file)
+    {
+      m_fallback_start_file = start_file;
+      std::fprintf(stderr, "[galaxypad-fallback-pcs] waiting-for-start-marker\n");
+    }
+    else
+      m_fallback_histogram = std::make_unique<galaxypad::diagnostics::FallbackHistogram<>>();
+  }
   const char* fallback_override = std::getenv("STATICRECOMP_FALLBACK_RANGES");
   std::istringstream fallback_ranges(fallback_override ? fallback_override :
                                                          Config::Get(Config::MAIN_STATICRECOMP_FALLBACK_RANGES));
@@ -227,6 +242,18 @@ void StaticRecompCore::Shutdown()
                  static_cast<unsigned long long>(m_direct_boundary_checks),
                  static_cast<unsigned long long>(m_direct_transfers));
   g_static_recomp_core = nullptr;
+  if (m_fallback_histogram)
+  {
+    std::fprintf(stderr, "[galaxypad-fallback-pcs] total=%llu dropped=%llu\n",
+                 static_cast<unsigned long long>(m_fallback_histogram->total),
+                 static_cast<unsigned long long>(m_fallback_histogram->dropped));
+    for (const auto& entry : m_fallback_histogram->entries)
+      if (entry.count)
+        std::fprintf(stderr, "[galaxypad-fallback-pc] pc=%08x path=%u count=%llu\n",
+                     entry.pc, static_cast<unsigned>(entry.path),
+                     static_cast<unsigned long long>(entry.count));
+    m_fallback_histogram.reset();
+  }
   std::fprintf(stderr,
                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
                "smc_failed=%u verifications=%llu reverify_events=%llu bursts=%llu cycles=%llu\n",

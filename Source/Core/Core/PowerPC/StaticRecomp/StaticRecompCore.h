@@ -13,6 +13,7 @@
 #include "Core/PowerPC/JitCommon/JitBase.h"
 #include "Core/PowerPC/JitCommon/JitCache.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompABI.h"
+#include "Core/PowerPC/StaticRecomp/FallbackHistogram.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompModuleSource.h"
 
 namespace Core
@@ -172,6 +173,9 @@ private:
 
   u64 m_native_dispatches = 0;
   u64 m_fallback_steps = 0;
+  std::unique_ptr<galaxypad::diagnostics::FallbackHistogram<>> m_fallback_histogram;
+  std::string m_fallback_start_file;
+  u32 m_fallback_start_poll = 0;
   u64 m_native_exceptions = 0;
   u64 m_hook_fallback_instructions = 0;
   u64 m_timebase_cycle_remainder = 0;

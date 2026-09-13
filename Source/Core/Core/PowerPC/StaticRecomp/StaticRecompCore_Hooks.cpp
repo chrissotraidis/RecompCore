@@ -483,6 +483,8 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
   core->SyncOut();
   ppc.pc = cia;
   ppc.npc = cia + 4;
+  if (core->m_fallback_histogram)
+    core->m_fallback_histogram->Record(cia, galaxypad::diagnostics::FallbackPath::InstructionHook);
   ppc.downcount -= system.GetInterpreter().SingleStepInner();
   core->SyncIn();
 }

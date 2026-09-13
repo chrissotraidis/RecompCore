@@ -140,6 +140,21 @@ void StaticRecompCore::Run()
   while (*state_ptr == CPU::State::Running)
   {
     core_timing.Advance();
+    // Diagnostic only: poll at timing-slice boundaries, never per guest step.
+    // Caller supplies a fresh absent path, then creates it after visual scene
+    // verification. Do not delete caller files or include startup in the census.
+    if (!m_fallback_start_file.empty() && (++m_fallback_start_poll & 1023u) == 0)
+    {
+      if (std::FILE* marker = std::fopen(m_fallback_start_file.c_str(), "rb"))
+      {
+        std::fclose(marker);
+        m_fallback_histogram = std::make_unique<galaxypad::diagnostics::FallbackHistogram<>>();
+        m_fallback_start_file.clear();
+        galaxypad::diagnostics::DumpExceptionVectors(stderr, memory.GetRAM(), memory.GetRamSizeReal());
+        std::fprintf(stderr, "[galaxypad-fallback-pcs] capture-start pc=%08x native=%llu\n",
+                     ppc.pc, static_cast<unsigned long long>(m_native_dispatches));
+      }
+    }
     const std::string current_game_id = SConfig::GetInstance().GetGameID();
     m_module_active = m_module && (current_game_id.empty() || current_game_id == m_module->game_id);
 
@@ -272,6 +287,8 @@ void StaticRecompCore::Run()
         // interrupts are delivered at slice start, as in Interpreter::Run.
         if (m_module_active && IsForcedFallbackAddress(ppc.pc))
         {
+          if (m_fallback_histogram)
+            m_fallback_histogram->Record(ppc.pc, galaxypad::diagnostics::FallbackPath::Forced);
           ppc.downcount -= interpreter.SingleStepInner();
           ++m_fallback_steps;
         }
@@ -283,6 +300,8 @@ void StaticRecompCore::Run()
         {
           do
           {
+            if (m_fallback_histogram)
+              m_fallback_histogram->Record(ppc.pc, galaxypad::diagnostics::FallbackPath::Uncovered);
             ppc.downcount -= interpreter.SingleStepInner();
             ++m_fallback_steps;
           } while (!(m_module_active && DispatchableAt(ppc.pc)) &&
