@@ -33,6 +33,8 @@ public:
 
   // Call from CPU thread.
   void CountThrottleSleep(DT sleep);
+  // CPU-thread only, like CountThrottleSleep; not an any-thread metric.
+  DT GetCPUThrottleElapsed() const { return m_time_sleeping; }
   void AdjustClockSpeed(s64 ticks, u32 new_ppc_clock, u32 old_ppc_clock);
   void CountPerformanceMarker(s64 ticks, u32 ticks_per_second);
 
