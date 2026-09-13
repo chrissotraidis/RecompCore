@@ -44,6 +44,7 @@
 #endif
 
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
 #include <CoreFoundation/CFBundle.h>
 #include <CoreFoundation/CFString.h>
 #include <CoreFoundation/CFURL.h>
@@ -764,9 +765,9 @@ std::string GetExeDirectory()
 
 static std::string CreateSysDirectoryPath()
 {
-#if defined(_WIN32) || defined(LINUX_LOCAL_DEV)
+#if defined(_WIN32) || (defined(LINUX_LOCAL_DEV) && !defined(__APPLE__))
 #define SYSDATA_DIR "Sys"
-#elif defined(__APPLE__) && defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
 #define SYSDATA_DIR "Sys"
 #elif defined __APPLE__
 #define SYSDATA_DIR "Contents/Resources/Sys"
