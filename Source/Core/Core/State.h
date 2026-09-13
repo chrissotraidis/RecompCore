@@ -97,6 +97,9 @@ void Load(Core::System& system, int slot);
 
 void SaveAs(Core::System& system, std::string filename);
 void LoadAs(Core::System& system, std::string filename);
+// Development checkpoints keep rollback during loading, but need no user-facing
+// Undo Load after success. Recording/playback retains the normal undo behavior.
+void LoadAsWithoutRetainingUndo(Core::System& system, std::string filename);
 
 void LoadLastSaved(Core::System& system, int i = 1);
 void SaveFirstSaved(Core::System& system);

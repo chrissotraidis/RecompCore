@@ -5,6 +5,7 @@
 #include "Core/StateFile.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <locale>
 #include <map>
@@ -318,11 +319,14 @@ void SaveAs(Core::System& system, std::string filename)
       });
 }
 
-static void LoadAsFromCore(Core::System& system, std::string filename)
+static void LoadAsFromCore(Core::System& system, std::string filename, bool retain_undo = true)
 {
   s_compress_and_dump_thread.WaitForCompletion();
 
   auto& movie = system.GetMovie();
+  const bool may_release_undo = !retain_undo && !movie.IsMovieActive() &&
+                               !movie.IsJustStartingRecordingInputFromSaveState() &&
+                               !movie.IsJustStartingPlayingInputFromSaveState();
   if (!movie.IsJustStartingRecordingInputFromSaveState())
   {
     SaveToBuffer(system, s_undo_load_buffer);
@@ -370,6 +374,17 @@ static void LoadAsFromCore(Core::System& system, std::string filename)
     }
   }
 
+  // Never discard rollback for a failed load, or while input recording/playback
+  // may need it. Finish this load's cleanup before a callback can start another.
+  if (loaded_successfully && may_release_undo && !movie.IsMovieActive() &&
+      !movie.IsJustStartingRecordingInputFromSaveState() &&
+      !movie.IsJustStartingPlayingInputFromSaveState())
+  {
+    std::fprintf(stderr, "[galaxypad-checkpoint] released_undo_bytes=%zu\n",
+                 s_undo_load_buffer.size());
+    s_undo_load_buffer.reset();
+  }
+
   if (s_on_after_load_callback)
     s_on_after_load_callback();
 }
@@ -381,6 +396,16 @@ void LoadAs(Core::System& system, std::string filename)
 
   Core::RunOnCPUThread(system, [&system, filename = std::move(filename)]() mutable {
     LoadAsFromCore(system, std::move(filename));
+  });
+}
+
+void LoadAsWithoutRetainingUndo(Core::System& system, std::string filename)
+{
+  if (!CheckIfStateLoadIsAllowed(system))
+    return;
+
+  Core::RunOnCPUThread(system, [&system, filename = std::move(filename)]() mutable {
+    LoadAsFromCore(system, std::move(filename), false);
   });
 }
 
