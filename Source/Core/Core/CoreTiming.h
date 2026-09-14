@@ -84,6 +84,12 @@ enum class FromThread
   ANY
 };
 
+enum class SleepReason
+{
+  Throttle,
+  Presentation,
+};
+
 // helpers until the JIT is updated to use the instance
 void GlobalAdvance();
 void GlobalIdle();
@@ -163,7 +169,7 @@ public:
   void Throttle(const s64 target_cycle);
 
   // May be used from CPU or GPU thread.
-  void SleepUntil(TimePoint time_point);
+  void SleepUntil(TimePoint time_point, SleepReason reason = SleepReason::Throttle);
 
   // Used by VideoInterface
   bool GetVISkip() const;

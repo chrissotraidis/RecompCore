@@ -12,6 +12,9 @@
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace HLE_Misc
 {
 // If you just want to kill a function, one of the three following are usually appropriate.
@@ -66,6 +69,16 @@ void GeckoReturnTrampoline(const Core::CPUThreadGuard& guard)
   auto& system = guard.GetSystem();
   auto& ppc_state = system.GetPPCState();
 
+  if (std::getenv("STATICRECOMP_REGISTER_TRACE"))
+  {
+    std::fprintf(stderr,
+                 "[staticrecomp] gecko-return-before pc=%08x npc=%08x r1=%08x r3=%08x "
+                 "r4=%08x r5=%08x r7=%08x r8=%08x r9=%08x lr=%08x cr=%08x\n",
+                 ppc_state.pc, ppc_state.npc, ppc_state.gpr[1], ppc_state.gpr[3],
+                 ppc_state.gpr[4], ppc_state.gpr[5], ppc_state.gpr[7], ppc_state.gpr[8],
+                 ppc_state.gpr[9], LR(ppc_state), ppc_state.cr.Get());
+  }
+
   // Stack frame is built in GeckoCode.cpp, Gecko::RunCodeHandler.
   const u32 SP = ppc_state.gpr[1];
   ppc_state.gpr[1] = PowerPC::MMU::HostRead<u32>(guard, SP + 8);
@@ -77,6 +90,15 @@ void GeckoReturnTrampoline(const Core::CPUThreadGuard& guard)
     ppc_state.ps[i].SetBoth(
         PowerPC::MMU::HostRead<u64>(guard, SP + 24 + 2 * i * sizeof(u64)),
         PowerPC::MMU::HostRead<u64>(guard, SP + 24 + (2 * i + 1) * sizeof(u64)));
+  }
+  if (std::getenv("STATICRECOMP_REGISTER_TRACE"))
+  {
+    std::fprintf(stderr,
+                 "[staticrecomp] gecko-return-after pc=%08x npc=%08x r1=%08x r3=%08x "
+                 "r4=%08x r5=%08x r7=%08x r8=%08x r9=%08x lr=%08x cr=%08x\n",
+                 ppc_state.pc, ppc_state.npc, ppc_state.gpr[1], ppc_state.gpr[3],
+                 ppc_state.gpr[4], ppc_state.gpr[5], ppc_state.gpr[7], ppc_state.gpr[8],
+                 ppc_state.gpr[9], LR(ppc_state), ppc_state.cr.Get());
   }
 }
 }  // namespace HLE_Misc

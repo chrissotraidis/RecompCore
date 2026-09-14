@@ -152,10 +152,11 @@ PrecisionTimer::~PrecisionTimer()
 #endif
 }
 
-void PrecisionTimer::SleepUntil(Clock::time_point target)
+PrecisionTimer::Result PrecisionTimer::SleepUntil(Clock::time_point target)
 {
   constexpr auto SPIN_TIME =
       std::chrono::milliseconds{TIMER_RESOLUTION_MS} + std::chrono::microseconds{20};
+  const auto start = Clock::now();
 
 #if defined(_WIN32)
   while (true)
@@ -182,6 +183,8 @@ void PrecisionTimer::SleepUntil(Clock::time_point target)
   std::this_thread::sleep_until(target - SPIN_TIME);
 #endif
 
+  const auto coarse_end = Clock::now();
+
   // Spin for the remaining time.
   while (Clock::now() < target)
   {
@@ -191,6 +194,8 @@ void PrecisionTimer::SleepUntil(Clock::time_point target)
     std::this_thread::yield();
 #endif
   }
+  const auto final_end = Clock::now();
+  return {.coarse_sleep = coarse_end - start, .final_spin = final_end - coarse_end};
 }
 
 // Results are appropriately slewed on Linux, but not on Windows, macOS, or FreeBSD.

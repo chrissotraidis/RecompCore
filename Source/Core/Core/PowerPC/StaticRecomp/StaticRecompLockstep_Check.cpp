@@ -163,6 +163,7 @@ void StaticRecompLockstepVerifier::LockstepCheck(u32 entry_pc, u32 end_pc, const
   int steps = 0;
   s64 interp_cycles = 0;
   const bool end_is_loop_header = LsIsLoopHeader(ram, ram_size, end_pc);
+  const bool replay_full_interval = m_ls_repeat_pcs.find(entry_pc) != m_ls_repeat_pcs.end();
   while (steps < m_ls_step_cap)
   {
     const u32 before = ppc.pc;
@@ -175,7 +176,7 @@ void StaticRecompLockstepVerifier::LockstepCheck(u32 entry_pc, u32 end_pc, const
                    steps, before, ppc.gpr[3], ppc.gpr[4], ppc.gpr[5], ppc.msr.Hex,
                    ppc.GetXER().Hex, ppc.cr.Get(), ppc.spr[SPR_LR], ppc.spr[SPR_CTR]);
     }
-    if (ppc.pc == end_pc)
+    if (ppc.pc == end_pc && (!replay_full_interval || interp_cycles >= native_charge))
       break;
     if (ppc.Exceptions != 0)
       break;

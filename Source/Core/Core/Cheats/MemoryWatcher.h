@@ -6,6 +6,7 @@
 #include "Common/CommonTypes.h"
 
 #include <map>
+#include <optional>
 #include <string>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -47,5 +48,5 @@ private:
   // Address as stored in the file -> list of offsets to follow
   std::map<std::string, std::vector<u32>> m_addresses;
   // Address as stored in the file -> current value
-  std::map<std::string, u32> m_values;
+  std::map<std::string, std::optional<u32>> m_values;
 };

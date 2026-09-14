@@ -423,6 +423,8 @@ private:
   std::array<RcTcacheEntry, 8> m_bound_textures{};
 
   TexPool m_texture_pool;
+  std::unordered_map<TextureConfig, std::pair<int, u64>> m_recently_expired_texture_configs;
+  int m_texture_pool_diagnostic_frame = 0;
   u64 m_last_entry_id = 0;
 
   // Backup configuration values

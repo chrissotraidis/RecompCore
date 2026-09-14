@@ -36,7 +36,8 @@
 #define MC_HDR_SIZE 0xA000
 
 MemoryCard::MemoryCard(std::string filename, ExpansionInterface::Slot card_slot, u16 size_mbits)
-    : MemoryCardBase(card_slot, size_mbits), m_filename(std::move(filename))
+    : MemoryCardBase(card_slot, size_mbits), m_filename(std::move(filename)),
+      m_save_data_writable(Config::Get(Config::SESSION_SAVE_DATA_WRITABLE))
 {
   File::IOFile file(m_filename, "rb");
   if (file)
@@ -77,8 +78,11 @@ MemoryCard::MemoryCard(std::string filename, ExpansionInterface::Slot card_slot,
 
   // Class members (including inherited ones) have now been initialized, so
   // it's safe to startup the flush thread (which reads them).
-  m_flush_buffer = std::make_unique<u8[]>(m_memory_card_size);
-  m_flush_thread = std::thread(&MemoryCard::FlushThread, this);
+  if (m_save_data_writable)
+  {
+    m_flush_buffer = std::make_unique<u8[]>(m_memory_card_size);
+    m_flush_thread = std::thread(&MemoryCard::FlushThread, this);
+  }
 }
 
 MemoryCard::~MemoryCard()
@@ -93,11 +97,6 @@ MemoryCard::~MemoryCard()
 
 void MemoryCard::FlushThread()
 {
-  if (!Config::Get(Config::SESSION_SAVE_DATA_WRITABLE))
-  {
-    return;
-  }
-
   Common::SetCurrentThreadName(fmt::format("Memcard {} flushing thread", m_card_slot).c_str());
 
   const auto flush_interval = std::chrono::seconds(15);

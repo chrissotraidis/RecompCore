@@ -29,8 +29,14 @@ enum class CPUCore;
 
 namespace NetPlay
 {
-inline constexpr char MODERNGEKKO_NETPLAY_VERSION_SUFFIX[] = "|moderngekko-netplay-6";
+inline constexpr char MODERNGEKKO_NETPLAY_VERSION_SUFFIX[] = "|moderngekko-netplay-8";
 inline constexpr u32 MODERNGEKKO_START_GAME_SENTINEL = 0x4d475336;
+
+enum class ControllerFamily
+{
+  GameCube,
+  WiiRemote,
+};
 
 struct NetSettings
 {

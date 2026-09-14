@@ -54,6 +54,7 @@ public:
 
 #ifdef __APPLE__
   static std::unique_ptr<Platform> CreateMacOSPlatform();
+  static std::unique_ptr<Platform> CreateIOSPlatform();
 #endif
 
 protected:

@@ -5,6 +5,7 @@
 
 #include <cstdio>
 
+#include "Core/Core.h"
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/IOS/IOS.h"
 #include "Core/IOS/STM/STM.h"
@@ -24,19 +25,23 @@ void Platform::SetTitle(const std::string& title)
 
 void Platform::UpdateRunningFlag()
 {
-  if (m_save_state_requested.TestAndClear())
+  auto& system = Core::System::GetInstance();
+  const Core::State core_state = Core::GetState(system);
+  const bool can_process_state_request =
+      core_state == Core::State::Running || core_state == Core::State::Paused;
+
+  if (can_process_state_request && m_save_state_requested.TestAndClear())
   {
     std::fprintf(stderr, "[nogui] SIGUSR1: saving state to slot 1\n");
-    State::Save(Core::System::GetInstance(), 1);
+    State::Save(system, 1);
   }
-  if (m_load_state_requested.TestAndClear())
+  if (can_process_state_request && m_load_state_requested.TestAndClear())
   {
     std::fprintf(stderr, "[nogui] SIGUSR2: loading state from slot 1\n");
-    State::Load(Core::System::GetInstance(), 1);
+    State::Load(system, 1);
   }
   if (m_shutdown_requested.TestAndClear())
   {
-    const auto& system = Core::System::GetInstance();
     const auto ios = system.GetIOS();
     const auto stm = ios ? ios->GetDeviceByName("/dev/stm/eventhook") : nullptr;
     if (!m_tried_graceful_shutdown.IsSet() && stm &&

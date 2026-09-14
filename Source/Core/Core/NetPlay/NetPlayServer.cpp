@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -481,8 +482,9 @@ ConnectionError NetPlayServer::OnConnect(ENetPeer* incoming_connection, sf::Pack
   if (compatibility_fingerprint != m_compatibility_fingerprint)
     return ConnectionError::CompatibilityMismatch;
 
+  PadMappingArray& controller_mapping = GetControllerMapping();
   const std::size_t occupied_controllers =
-      std::ranges::count_if(m_wiimote_map, [](PlayerId pid) { return pid != 0; });
+      std::ranges::count_if(controller_mapping, [](PlayerId pid) { return pid != 0; });
   const std::size_t available_controllers = 4 - occupied_controllers;
   if (requested_controllers == 0 || requested_controllers > 4 || available_controllers == 0)
     return ConnectionError::RoomFull;
@@ -501,7 +503,7 @@ ConnectionError NetPlayServer::OnConnect(ENetPeer* incoming_connection, sf::Pack
   // force a ping on first netplay loop
   m_update_pings = true;
 
-  for (PlayerId& mapping : m_wiimote_map)
+  for (PlayerId& mapping : controller_mapping)
   {
     if (mapping == 0 && requested_controllers > 0)
     {
@@ -678,17 +680,18 @@ void NetPlayServer::SetControllerCount(Client& player, u8 requested_count)
     return;
 
   std::lock_guard lkp(m_crit.players);
-  for (PlayerId& mapping : m_wiimote_map)
+  PadMappingArray& controller_mapping = GetControllerMapping();
+  for (PlayerId& mapping : controller_mapping)
   {
     if (mapping == player.pid)
       mapping = 0;
   }
 
   const u8 available =
-      static_cast<u8>(std::ranges::count_if(m_wiimote_map, [](PlayerId pid) { return pid == 0; }));
+      static_cast<u8>(std::ranges::count_if(controller_mapping, [](PlayerId pid) { return pid == 0; }));
   const u8 assigned = std::min<u8>({requested_count, available, 4});
   u8 remaining = assigned;
-  for (PlayerId& mapping : m_wiimote_map)
+  for (PlayerId& mapping : controller_mapping)
   {
     if (mapping == 0 && remaining > 0)
     {
@@ -699,7 +702,7 @@ void NetPlayServer::SetControllerCount(Client& player, u8 requested_count)
 
   player.controller_count = assigned;
   player.ready = false;
-  UpdateWiimoteMapping();
+  UpdateControllerMapping();
   SendPlayerState(player);
 }
 
@@ -716,8 +719,9 @@ void NetPlayServer::SetReady(Client& player, bool ready)
 bool NetPlayServer::CanStart()
 {
   std::lock_guard lkp(m_crit.players);
+  const PadMappingArray& controller_mapping = GetControllerMapping();
   const std::size_t occupied =
-      std::ranges::count_if(m_wiimote_map, [](PlayerId pid) { return pid != 0; });
+      std::ranges::count_if(controller_mapping, [](PlayerId pid) { return pid != 0; });
   return occupied >= 2 && !m_players.empty() &&
          std::ranges::all_of(m_players, [](const auto& entry) {
            return entry.second.ready && entry.second.controller_count > 0 &&
@@ -1116,34 +1120,134 @@ unsigned int NetPlayServer::OnData(sf::Packet& packet, Client& player)
     u64 timebase = Common::PacketReadU64(packet);
     u32 frame;
     packet >> frame;
+    u32 guest_pc;
+    packet >> guest_pc;
+    const u64 state_hash = Common::PacketReadU64(packet);
+    const u64 integer_state_hash = Common::PacketReadU64(packet);
+    const u64 fpr_state_hash = Common::PacketReadU64(packet);
+    const u64 paired_state_hash = Common::PacketReadU64(packet);
+    const u64 core_ticks = Common::PacketReadU64(packet);
+    const u64 tb_start_ticks = Common::PacketReadU64(packet);
+    const u64 tb_start_value = Common::PacketReadU64(packet);
+    const u64 native_dispatches = Common::PacketReadU64(packet);
+    const u64 charged_cycles = Common::PacketReadU64(packet);
+    const u64 bursts = Common::PacketReadU64(packet);
+    CanonicalStateSnapshot canonical;
+    canonical.sequence = Common::PacketReadU64(packet);
+    packet >> canonical.guest_pc;
+    canonical.timebase = Common::PacketReadU64(packet);
+    canonical.state_hash = Common::PacketReadU64(packet);
+    canonical.integer_state_hash = Common::PacketReadU64(packet);
+    canonical.fpr_state_hash = Common::PacketReadU64(packet);
+    canonical.paired_state_hash = Common::PacketReadU64(packet);
+    canonical.ram_hash = Common::PacketReadU64(packet);
+    for (u64& region_hash : canonical.ram_region_hashes)
+      region_hash = Common::PacketReadU64(packet);
 
-    if (m_desync_detected)
+    // Opt-in acceptance trace: silence must not be mistaken for matched peers.
+    const bool trace_canonical = std::getenv("MELEEPAD_NETPLAY_TRACE_CANONICAL") != nullptr;
+    if (trace_canonical)
+      std::fprintf(stderr, "[netplay] canonical-report pid=%u callback_frame=%u sequence=%llu\n",
+                   static_cast<unsigned>(player.pid), frame,
+                   static_cast<unsigned long long>(canonical.sequence));
+
+    if (m_desync_detected || canonical.sequence == 0)
       break;
 
-    std::vector<std::pair<PlayerId, u64>>& timebases = m_timebase_by_frame[frame];
-    timebases.emplace_back(player.pid, timebase);
+    std::vector<TimeBaseRecord>& timebases = m_canonical_by_sequence[canonical.sequence];
+    if (std::ranges::any_of(timebases,
+                            [&](const TimeBaseRecord& record) { return record.pid == player.pid; }))
+      break;
+    timebases.push_back({player.pid, frame, timebase, guest_pc, state_hash, integer_state_hash,
+                         fpr_state_hash, paired_state_hash, core_ticks, tb_start_ticks,
+                         tb_start_value, native_dispatches, charged_cycles, bursts, canonical});
     if (timebases.size() >= m_players.size())
     {
-      // we have all records for this frame
+      // We have all records for this exact emulated boundary sequence. The
+      // callback frame and live PC above are context only; neither participates
+      // in the canonical decision.
 
-      if (!std::ranges::all_of(timebases, [&](std::pair<PlayerId, u64> pair) {
-            return pair.second == timebases[0].second;
+      if (!std::ranges::all_of(timebases, [&](const TimeBaseRecord& record) {
+            return CanonicalStateMatches(record.canonical, timebases[0].canonical);
           }))
       {
+        // This replaces the legacy "netplay-timebase frame=" decision, whose
+        // host-callback sample was not a shared emulated boundary.
+        const CanonicalStateSnapshot& reference = timebases[0].canonical;
+        std::string differences;
+        const auto add_difference = [&](std::string_view name, bool differs) {
+          if (!differs)
+            return;
+          if (!differences.empty())
+            differences += ',';
+          differences += name;
+        };
+        add_difference("pc", canonical.guest_pc != reference.guest_pc);
+        add_difference("timebase", canonical.timebase != reference.timebase);
+        add_difference("state", canonical.state_hash != reference.state_hash);
+        add_difference("integer", canonical.integer_state_hash != reference.integer_state_hash);
+        add_difference("fpr", canonical.fpr_state_hash != reference.fpr_state_hash);
+        add_difference("paired", canonical.paired_state_hash != reference.paired_state_hash);
+        add_difference("ram", canonical.ram_hash != reference.ram_hash);
+        const s64 timebase_delta = canonical.timebase >= reference.timebase ?
+                                       static_cast<s64>(canonical.timebase - reference.timebase) :
+                                       -static_cast<s64>(reference.timebase - canonical.timebase);
+        const size_t first_ram_region = CanonicalRamFirstDifferingRegion(reference, canonical);
+        std::string mismatch = "netplay-canonical sequence=" +
+                               std::to_string(canonical.sequence) +
+                               " differences=" + differences +
+                               " timebase_delta=" + std::to_string(timebase_delta);
+        if (first_ram_region != CANONICAL_RAM_REGION_COUNT)
+        {
+          mismatch += " ram_first_region=" + std::to_string(first_ram_region) +
+                      " ram_first_address=" +
+                      fmt::format("{:#010x}", 0x80000000u +
+                                                   first_ram_region * CANONICAL_RAM_REGION_SIZE);
+        }
+        for (const TimeBaseRecord& record : timebases)
+        {
+          mismatch += " pid=" + std::to_string(record.pid) +
+                      " callback_frame=" + std::to_string(record.callback_frame) +
+                      " value=" + std::to_string(record.timebase) +
+                      " guest_pc=" + fmt::format("{:#010x}", record.guest_pc) +
+                      " state_hash=" + fmt::format("{:#018x}", record.state_hash) +
+                      " integer_hash=" + fmt::format("{:#018x}", record.integer_state_hash) +
+                      " fpr_hash=" + fmt::format("{:#018x}", record.fpr_state_hash) +
+                      " paired_hash=" + fmt::format("{:#018x}", record.paired_state_hash) +
+                      " core_ticks=" + std::to_string(record.core_ticks) +
+                      " tb_start_ticks=" + std::to_string(record.tb_start_ticks) +
+                      " tb_start_value=" + std::to_string(record.tb_start_value) +
+                      " native_dispatches=" + std::to_string(record.native_dispatches) +
+                      " charged_cycles=" + std::to_string(record.charged_cycles) +
+                      " bursts=" + std::to_string(record.bursts) +
+                      " canonical_sequence=" + std::to_string(record.canonical.sequence) +
+                      " canonical_pc=" + fmt::format("{:#010x}", record.canonical.guest_pc) +
+                      " canonical_timebase=" + std::to_string(record.canonical.timebase) +
+                      " canonical_state_hash=" +
+                          fmt::format("{:#018x}", record.canonical.state_hash) +
+                      " canonical_integer_hash=" +
+                          fmt::format("{:#018x}", record.canonical.integer_state_hash) +
+                      " canonical_fpr_hash=" +
+                          fmt::format("{:#018x}", record.canonical.fpr_state_hash) +
+                      " canonical_paired_hash=" +
+                          fmt::format("{:#018x}", record.canonical.paired_state_hash) +
+                      " canonical_ram_hash=" +
+                          fmt::format("{:#018x}", record.canonical.ram_hash);
+          if (first_ram_region != CANONICAL_RAM_REGION_COUNT)
+          {
+            mismatch += " canonical_ram_region_hash=" +
+                        fmt::format("{:#018x}",
+                                    record.canonical.ram_region_hashes[first_ram_region]);
+          }
+        }
+        m_dialog->AppendChat(mismatch);
+        std::fprintf(stderr, "[netplay] %s\n", mismatch.c_str());
         ++m_desync_mismatch_count;
         if (m_desync_mismatch_count >= 2)
         {
-          int pid_to_blame = 0;
-          for (auto pair : timebases)
-          {
-            if (std::ranges::all_of(timebases, [&](std::pair<PlayerId, u64> other) {
-                  return other.first == pair.first || other.second != pair.second;
-                }))
-            {
-              pid_to_blame = pair.first;
-              break;
-            }
-          }
+          // With two peers a mismatch proves divergence but cannot identify
+          // which endpoint is wrong. Do not falsely blame either player.
+          const int pid_to_blame = 0;
 
           sf::Packet spac;
           spac << MessageID::DesyncDetected;
@@ -1157,8 +1261,23 @@ unsigned int NetPlayServer::OnData(sf::Packet& packet, Client& player)
       else
       {
         m_desync_mismatch_count = 0;
+        if (trace_canonical || canonical.sequence % 600 == 0)
+        {
+          std::fprintf(stderr,
+                       "[netplay] canonical-match sequence=%llu state_hash=%#018llx "
+                       "ram_hash=%#018llx\n",
+                       static_cast<unsigned long long>(canonical.sequence),
+                       static_cast<unsigned long long>(canonical.state_hash),
+                       static_cast<unsigned long long>(canonical.ram_hash));
+        }
       }
-      m_timebase_by_frame.erase(frame);
+      m_canonical_by_sequence.erase(canonical.sequence);
+    }
+    while (m_canonical_by_sequence.size() > 8)
+    {
+      std::fprintf(stderr, "[netplay] canonical-unpaired sequence=%llu\n",
+                   static_cast<unsigned long long>(m_canonical_by_sequence.begin()->first));
+      m_canonical_by_sequence.erase(m_canonical_by_sequence.begin());
     }
   }
   break;
@@ -1636,7 +1755,7 @@ bool NetPlayServer::StartGame()
 {
   INFO_LOG_FMT(NETPLAY, "Starting game.");
 
-  m_timebase_by_frame.clear();
+  m_canonical_by_sequence.clear();
   m_desync_detected = false;
   m_desync_mismatch_count = 0;
   std::lock_guard lkg(m_crit.game);

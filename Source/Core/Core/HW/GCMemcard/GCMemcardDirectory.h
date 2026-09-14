@@ -61,6 +61,7 @@ private:
   std::vector<Memcard::GCIFile> m_saves;
 
   std::string m_save_directory;
+  const bool m_save_data_writable;
   Common::Event m_flush_trigger;
   std::mutex m_write_mutex;
   Common::Flag m_exiting;

@@ -10,6 +10,8 @@
 
 #include "Common/CommonTypes.h"
 #include "Common/SPSCQueue.h"
+#include "VideoCommon/LightweightFrameTimingRecorder.h"
+#include "VideoCommon/FrameIntervalSummary.h"
 
 class PerformanceTracker
 {
@@ -40,8 +42,10 @@ public:
   DT GetDtStd() const;
   DT GetLastRawDt() const;
   void InvalidateLastTime();
+  FrameIntervalSummary::Snapshot TakeFrameIntervalSummary() { return m_frame_intervals.Take(); }
 
 private:
+  FrameIntervalSummary m_frame_intervals;
   void LogRenderTimeToFile(DT val);
 
   void HandleRawDt(DT value);
@@ -51,6 +55,7 @@ private:
   // Name of log file and file stream
   std::optional<std::string> m_log_name;
   std::ofstream m_bench_file;
+  std::optional<LightweightFrameTimingRecorder> m_lightweight_frame_timing;
 
   // Last time Count() was called
   TimePoint m_last_time;

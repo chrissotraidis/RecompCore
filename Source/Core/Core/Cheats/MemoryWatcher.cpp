@@ -3,6 +3,8 @@
 
 #include "Core/Cheats/MemoryWatcher.h"
 
+#include "Core/Cheats/MemoryWatcherUtils.h"
+
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -10,7 +12,10 @@
 #include <unistd.h>
 
 #include "Common/FileUtil.h"
+#include "Core/HW/Memmap.h"
 #include "Core/PowerPC/MMU.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
+#include "Core/System.h"
 
 MemoryWatcher::MemoryWatcher()
 {
@@ -47,7 +52,7 @@ bool MemoryWatcher::LoadAddresses(const std::string& path)
 
 void MemoryWatcher::ParseLine(const std::string& line)
 {
-  m_values[line] = 0;
+  m_values[line] = std::nullopt;
   m_addresses[line] = std::vector<u32>();
 
   std::istringstream offsets(line);
@@ -69,11 +74,30 @@ bool MemoryWatcher::OpenSocket(const std::string& path)
 u32 MemoryWatcher::ChasePointer(const Core::CPUThreadGuard& guard, const std::string& line)
 {
   u32 value = 0;
+  const bool use_static_recomp_memory =
+      g_static_recomp_core && g_static_recomp_core->IsModuleActive();
+  auto& memory = guard.GetSystem().GetMemory();
+  const std::span<const u8> mem1{memory.GetRAM(), memory.GetRamSizeReal()};
+  const std::span<const u8> mem2{memory.GetEXRAM(), memory.GetExRamSizeReal()};
+
   for (u32 offset : m_addresses[line])
   {
-    value = PowerPC::MMU::HostRead<u32>(guard, value + offset);
-    if (!PowerPC::MMU::HostIsRAMAddress(guard, value))
-      break;
+    if (use_static_recomp_memory)
+    {
+      const auto new_value =
+          MemoryWatcherUtils::ReadStaticRecompU32(mem1, mem2, value + offset);
+      if (!new_value)
+        return 0;
+      value = *new_value;
+      if (!MemoryWatcherUtils::IsStaticRecompRAMAddress(mem1, mem2, value))
+        break;
+    }
+    else
+    {
+      value = PowerPC::MMU::HostRead<u32>(guard, value + offset);
+      if (!PowerPC::MMU::HostIsRAMAddress(guard, value))
+        break;
+    }
   }
   return value;
 }
@@ -86,10 +110,10 @@ std::string MemoryWatcher::ComposeMessages(const Core::CPUThreadGuard& guard)
   for (auto& entry : m_values)
   {
     std::string address = entry.first;
-    u32& current_value = entry.second;
+    std::optional<u32>& current_value = entry.second;
 
     u32 new_value = ChasePointer(guard, address);
-    if (new_value != current_value)
+    if (MemoryWatcherUtils::ShouldPublish(current_value, new_value))
     {
       // Update the value
       current_value = new_value;

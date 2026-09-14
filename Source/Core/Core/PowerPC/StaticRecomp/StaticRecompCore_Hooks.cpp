@@ -10,6 +10,7 @@
 #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
 #include "Core/HW/GPFifo.h"
 #include "Core/HW/SystemTimers.h"
+#include "Common/FramePhaseTiming.h"
 #include "Common/Logging/Log.h"
 
 #include <cstdio>
@@ -210,6 +211,17 @@ u32 StaticRecompCore::HookSPRRead(CPUState* cpu, u16 spr, u32 cia)
     return ppc.spr[SPR_PMC4];
   case SPR_IABR:
     return ppc.spr[SPR_IABR] & ~1u;
+  case SPR_TL:
+  case SPR_TU:
+  {
+    // spr[TL/TU] is a stale cache; materialize the live timebase the same way
+    // the interpreter's mfspr does (honoring the lockstep TB pin).
+    const u64 time_base = StaticRecompLockstep::g_tb_override_active ?
+                              StaticRecompLockstep::g_tb_override_value :
+                              core->m_system.GetSystemTimers().GetFakeTimeBase();
+    core->m_system.GetPowerPC().WriteFullTimeBaseValue(time_base);
+    break;
+  }
   default:
     break;
   }
@@ -328,7 +340,13 @@ void StaticRecompCore::HookSPRWrite(CPUState* cpu, u16 spr, u32 value, u32 cia)
 void StaticRecompCore::HookCacheControl(CPUState* cpu, u8 operation, u32 ea, u32 cia)
 {
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
-  ea = core->TranslateRelAddress(ea);
+  // Cache-control hooks mutate cache state that the lockstep journal cannot replay.
+  // Treat the containing native block like an instruction-fallback block so the
+  // verifier does not compare it against a shadow execution with different cache state.
+  if (core->m_lockstep_verifier->m_ls_journaling)
+    core->m_lockstep_verifier->m_ls_fallback_seen = true;
+  if (Common::FramePhaseTiming::IsEnabled())
+    Common::FramePhaseTiming::AddStaticRecompCacheControl(operation);
   core->PropagateGuestMSR();
   auto& ppc = core->m_system.GetPPCState();
   auto& mmu = core->m_system.GetMMU();
@@ -367,6 +385,8 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
   auto* core = static_cast<StaticRecompCore*>(cpu->external_user_data);
   cia = core->TranslateRelAddress(cia);
   ++core->m_hook_fallback_instructions;
+  if (Common::FramePhaseTiming::IsEnabled())
+    Common::FramePhaseTiming::AddStaticRecompFallback(raw);
 
   // Lockstep: a block that fell back to the interpreter for an unmodeled
   // instruction (DMA mtspr, cache op, ...) performed side effects not captured
@@ -377,33 +397,6 @@ void StaticRecompCore::HookInstructionFallback(CPUState* cpu, u32 raw, u32 cia)
 
   auto& system = core->m_system;
   auto& ppc = system.GetPPCState();
-
-  // Fast path for dcbf/dcbst/dcbi/icbi: streaming code flushes caches in
-  // 32-byte loops (thousands per frame), and these ops read two GPRs and
-  // change no CPU state, so they run straight off ctx without the full
-  // SyncOut/interpreter/SyncIn round trip. This mirrors Dolphin's
-  // interpreter with dcache emulation off: every one funnels into
-  // InvalidateICacheLine (keeping the SMC guard exact). dcbi's PR!=0
-  // privilege trap and dcache-on configs take the slow path.
-  if ((raw >> 26) == 31u && !ppc.m_enable_dcache)
-  {
-    const u32 xo = (raw >> 1) & 0x3FFu;
-    if (xo == 86u || xo == 54u || xo == 982u || (xo == 470u && (cpu->msr & 0x4000u) == 0))
-    {
-      const u32 ra = (raw >> 16) & 31u;
-      const u32 rb = (raw >> 11) & 31u;
-      const u32 ea = (ra ? cpu->gpr[ra] : 0u) + cpu->gpr[rb];
-      if (xo == 982u)
-      {
-        system.GetJitInterface().InvalidateICacheLine(ea);
-      }
-      // These bypass SingleStepInner, so charge Dolphin's PPCTables cost
-      // here (icbi 4, dcbf/dcbst/dcbi 5); their emitted block cost is zero.
-      ppc.downcount -= (xo == 982u) ? 4 : 5;
-      cpu->pc = cia + 4u;
-      return;
-    }
-  }
 
   // The recompiled segment resumes via the dispatcher at the PC this leaves
   // behind, so this must execute exactly the instruction at cia via

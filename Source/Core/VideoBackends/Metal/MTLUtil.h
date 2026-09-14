@@ -3,7 +3,9 @@
 
 #pragma once
 
+#if TARGET_OS_OSX
 #include <AppKit/NSScreen.h>
+#endif
 #include <Metal/Metal.h>
 
 #include <vector>

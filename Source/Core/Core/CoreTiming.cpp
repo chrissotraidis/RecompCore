@@ -13,6 +13,7 @@
 
 #include "Common/Assert.h"
 #include "Common/ChunkFile.h"
+#include "Common/FramePhaseTiming.h"
 #include "Common/Logging/Log.h"
 #include "Common/SPSCQueue.h"
 #include "Common/ScopeGuard.h"
@@ -407,22 +408,38 @@ TimePoint CoreTimingManager::GetTargetHostTime(s64 target_cycle)
   return CalculateTargetHostTimeInternal(target_cycle);
 }
 
-void CoreTimingManager::SleepUntil(TimePoint time_point)
+void CoreTimingManager::SleepUntil(TimePoint time_point, SleepReason reason)
 {
   const bool use_precision_timer = m_use_precision_timer.load(std::memory_order_relaxed);
 
   if (Core::IsCPUThread())
   {
     const TimePoint time = Clock::now();
+    const bool log_phase = Common::FramePhaseTiming::IsEnabled();
+    if (log_phase && time_point > time)
+      Common::FramePhaseTiming::AddCpuThrottleRequested(time_point - time);
 
+    Common::PrecisionTimer::Result precision_result{};
     if (use_precision_timer)
-      m_precision_cpu_timer.SleepUntil(time_point);
+      precision_result = m_precision_cpu_timer.SleepUntil(time_point);
     else
       std::this_thread::sleep_until(time_point);
 
     // Count amount of time sleeping for analytics
     const TimePoint time_after_sleep = Clock::now();
     m_system.GetPerfMetrics().CountThrottleSleep(time_after_sleep - time);
+    if (log_phase)
+    {
+      if (use_precision_timer)
+      {
+        Common::FramePhaseTiming::AddCpuPrecisionTimer(
+            reason == SleepReason::Presentation, precision_result.coarse_sleep,
+            precision_result.final_spin);
+      }
+      Common::FramePhaseTiming::AddCpuThrottleSleep(time_after_sleep - time);
+      if (time_point > time && time_after_sleep > time_point)
+        Common::FramePhaseTiming::AddCpuThrottleLateness(time_after_sleep - time_point);
+    }
   }
   else
   {

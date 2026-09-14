@@ -4,6 +4,8 @@
 #include "Core/Cheats/GeckoCode.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <mutex>
 #include <tuple>
@@ -205,6 +207,7 @@ static Installation InstallCodeHandlerLocked(const Core::CPUThreadGuard& guard)
 
   // Invalidate the icache and any asm codes
   auto& ppc_state = guard.GetSystem().GetPPCState();
+
   auto& memory = guard.GetSystem().GetMemory();
   auto& jit_interface = guard.GetSystem().GetJitInterface();
   for (u32 j = 0; j < (INSTALLER_END_ADDRESS - INSTALLER_BASE_ADDRESS); j += 32)
@@ -257,6 +260,16 @@ void RunCodeHandler(const Core::CPUThreadGuard& guard)
   }
 
   auto& ppc_state = guard.GetSystem().GetPPCState();
+
+  if (std::getenv("STATICRECOMP_REGISTER_TRACE"))
+  {
+    std::fprintf(stderr,
+                 "[staticrecomp] gecko-before pc=%08x npc=%08x r1=%08x r3=%08x r4=%08x "
+                 "r5=%08x r7=%08x r8=%08x r9=%08x lr=%08x cr=%08x\n",
+                 ppc_state.pc, ppc_state.npc, ppc_state.gpr[1], ppc_state.gpr[3],
+                 ppc_state.gpr[4], ppc_state.gpr[5], ppc_state.gpr[7], ppc_state.gpr[8],
+                 ppc_state.gpr[9], LR(ppc_state), ppc_state.cr.Get());
+  }
 
   // We always do this to avoid problems with the stack since we're branching in random locations.
   // Even with function call return hooks (PC == LR), hand coded assembler won't necessarily

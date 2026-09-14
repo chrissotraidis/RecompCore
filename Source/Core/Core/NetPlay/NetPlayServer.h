@@ -19,6 +19,7 @@
 #include "Common/SPSCQueue.h"
 #include "Common/Timer.h"
 #include "Common/TraversalClient.h"
+#include "Core/NetPlay/NetPlayCommon.h"
 #include "Core/NetPlay/NetPlayProto.h"
 #include "Core/SyncIdentifier.h"
 #include "UICommon/NetPlayIndex.h"
@@ -62,6 +63,7 @@ public:
 
   PadMappingArray GetWiimoteMapping() const;
   void SetWiimoteMapping(const PadMappingArray& mappings);
+  void SetControllerFamily(ControllerFamily family);
 
   void AdjustPadBufferSize(unsigned int size);
   void SetAdaptiveBuffer(bool enable);
@@ -160,6 +162,9 @@ private:
   void SetupIndex();
   bool PlayerHasControllerMapped(PlayerId pid) const;
   void SetControllerCount(Client& player, u8 requested_count);
+  PadMappingArray& GetControllerMapping();
+  const PadMappingArray& GetControllerMapping() const;
+  void UpdateControllerMapping();
   void SetReady(Client& player, bool ready);
   void SendPlayerState(const Client& player, PlayerId target_pid = 0);
 
@@ -187,6 +192,7 @@ private:
   PadMappingArray m_pad_map;
   GBAConfigArray m_gba_config;
   PadMappingArray m_wiimote_map;
+  ControllerFamily m_controller_family = ControllerFamily::GameCube;
   unsigned int m_save_data_synced_players = 0;
   unsigned int m_codes_synced_players = 0;
   bool m_saves_synced = true;
@@ -198,7 +204,25 @@ private:
 
   std::map<PlayerId, Client> m_players;
 
-  std::unordered_map<u32, std::vector<std::pair<PlayerId, u64>>> m_timebase_by_frame;
+  struct TimeBaseRecord
+  {
+    PlayerId pid;
+    u32 callback_frame;
+    u64 timebase;
+    u32 guest_pc;
+    u64 state_hash;
+    u64 integer_state_hash;
+    u64 fpr_state_hash;
+    u64 paired_state_hash;
+    u64 core_ticks;
+    u64 tb_start_ticks;
+    u64 tb_start_value;
+    u64 native_dispatches;
+    u64 charged_cycles;
+    u64 bursts;
+    CanonicalStateSnapshot canonical;
+  };
+  std::map<u64, std::vector<TimeBaseRecord>> m_canonical_by_sequence;
   bool m_desync_detected = false;
   unsigned int m_desync_mismatch_count = 0;
 

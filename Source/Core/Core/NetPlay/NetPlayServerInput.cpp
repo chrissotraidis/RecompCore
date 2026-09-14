@@ -17,6 +17,35 @@
 namespace NetPlay
 {
 
+void NetPlayServer::SetControllerFamily(const ControllerFamily family)
+{
+  std::lock_guard lkp(m_crit.players);
+  if (!m_players.empty() || m_is_running || m_start_pending)
+    return;
+
+  m_controller_family = family;
+  m_pad_map.fill(0);
+  m_wiimote_map.fill(0);
+}
+
+PadMappingArray& NetPlayServer::GetControllerMapping()
+{
+  return m_controller_family == ControllerFamily::GameCube ? m_pad_map : m_wiimote_map;
+}
+
+const PadMappingArray& NetPlayServer::GetControllerMapping() const
+{
+  return m_controller_family == ControllerFamily::GameCube ? m_pad_map : m_wiimote_map;
+}
+
+void NetPlayServer::UpdateControllerMapping()
+{
+  if (m_controller_family == ControllerFamily::GameCube)
+    UpdatePadMapping();
+  else
+    UpdateWiimoteMapping();
+}
+
 PadMappingArray NetPlayServer::GetPadMapping() const
 {
   return m_pad_map;

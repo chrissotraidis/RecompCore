@@ -78,8 +78,12 @@ void Metal::Util::PopulateBackendInfo(BackendInfo* backend_info)
   backend_info->bSupportsPartialMultisampleResolve = false;
   backend_info->bSupportsDynamicVertexLoader = true;
   backend_info->bSupportsVSLinePointExpand = true;
+#if TARGET_OS_OSX
   backend_info->bSupportsHDROutput =
       1.0 < [[NSScreen deepestScreen] maximumPotentialExtendedDynamicRangeColorComponentValue];
+#else
+  backend_info->bSupportsHDROutput = false;
+#endif
 }
 
 void Metal::Util::PopulateBackendInfoAdapters(BackendInfo* backend_info,
@@ -312,7 +316,14 @@ void Metal::Util::PopulateBackendInfoFeatures(const VideoConfig& config, Backend
     }
   }
 
+  // The Simulator reports an Apple GPU family but its Metal compiler rejects
+  // framebuffer-fetch shaders with "reading from a rendertarget is not
+  // supported". Let VideoCommon select its non-fetch blending path there.
+#if TARGET_OS_SIMULATOR
+  backend_info->bSupportsFramebufferFetch = false;
+#else
   backend_info->bSupportsFramebufferFetch = [device supportsFamily:MTLGPUFamilyApple1];
+#endif
 #if TARGET_OS_OSX
   if (vendor == DriverDetails::VENDOR_INTEL)
     backend_info->bSupportsFramebufferFetch |= DetectIntelGPUFBFetch(device);

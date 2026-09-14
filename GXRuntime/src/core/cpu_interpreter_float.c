@@ -1,6 +1,12 @@
 #include "cpu_interpreter_private.h"
 #include <string.h>
 
+#if defined(__clang__) || defined(__GNUC__)
+#define GXRUNTIME_ALWAYS_INLINE __attribute__((always_inline))
+#else
+#define GXRUNTIME_ALWAYS_INLINE
+#endif
+
 f64 ppc_approx_rsqrt(f64 value) {
     u64 bits = f64_bits(value);
     u64 mantissa = bits & 0x000FFFFFFFFFFFFFull;
@@ -159,7 +165,7 @@ u32 classify_f64(f64 value) {
     return sign ? 0x08u : 0x04u;
 }
 
-u32 classify_f32(f32 value) {
+GXRUNTIME_ALWAYS_INLINE u32 classify_f32(f32 value) {
     u32 bits;
     memcpy(&bits, &value, sizeof(bits));
     u32 sign = bits >> 31;
@@ -172,7 +178,7 @@ u32 classify_f32(f32 value) {
     return sign ? 0x08u : 0x04u;
 }
 
-void set_fprf(CPUState* cpu, u32 value) {
+GXRUNTIME_ALWAYS_INLINE void set_fprf(CPUState* cpu, u32 value) {
     cpu->fpscr = (cpu->fpscr & ~(0x1Fu << 12)) | ((value & 0x1Fu) << 12);
 }
 
@@ -346,7 +352,7 @@ f64 make_quiet(f64 value) {
     return f64_value(f64_bits(value) | 0x0008000000000000ull);
 }
 
-f32 force_single(const CPUState* cpu, f64 value) {
+GXRUNTIME_ALWAYS_INLINE f32 force_single(const CPUState* cpu, f64 value) {
     if (cpu->fpscr & FPSCR_NI_BIT) {
         u64 no_sign = f64_bits(value) & 0x7FFFFFFFFFFFFFFFull;
         if (no_sign < 0x3810000000000000ull) {
@@ -362,7 +368,7 @@ f64 force_double(const CPUState* cpu, f64 d) {
     return d;
 }
 
-f64 force_25bit_c(f64 d) {
+GXRUNTIME_ALWAYS_INLINE f64 force_25bit_c(f64 d) {
     u64 integral = f64_bits(d);
     u64 exponent = integral & 0x7FF0000000000000ull;
     u64 fraction = integral & 0x000FFFFFFFFFFFFFull;
@@ -380,7 +386,7 @@ f64 force_25bit_c(f64 d) {
     return f64_value(integral);
 }
 
-FPRes ni_add(CPUState* cpu, f64 a, f64 b) {
+GXRUNTIME_ALWAYS_INLINE FPRes ni_add(CPUState* cpu, f64 a, f64 b) {
     FPRes result = {a + b, 0};
 
     if (isnan(result.value)) {
@@ -402,7 +408,7 @@ FPRes ni_add(CPUState* cpu, f64 a, f64 b) {
     return result;
 }
 
-FPRes ni_sub(CPUState* cpu, f64 a, f64 b) {
+GXRUNTIME_ALWAYS_INLINE FPRes ni_sub(CPUState* cpu, f64 a, f64 b) {
     FPRes result = {a - b, 0};
 
     if (isnan(result.value)) {
@@ -424,7 +430,7 @@ FPRes ni_sub(CPUState* cpu, f64 a, f64 b) {
     return result;
 }
 
-FPRes ni_mul(CPUState* cpu, f64 a, f64 b) {
+GXRUNTIME_ALWAYS_INLINE FPRes ni_mul(CPUState* cpu, f64 a, f64 b) {
     FPRes result = {a * b, 0};
 
     if (isnan(result.value)) {
@@ -444,7 +450,7 @@ FPRes ni_mul(CPUState* cpu, f64 a, f64 b) {
     return result;
 }
 
-FPRes ni_div(CPUState* cpu, f64 a, f64 b) {
+GXRUNTIME_ALWAYS_INLINE FPRes ni_div(CPUState* cpu, f64 a, f64 b) {
     FPRes result = {a / b, 0};
 
     if (isinf(result.value)) {
@@ -523,11 +529,11 @@ FPRes ni_madd_msub(CPUState* cpu, f64 a, f64 c, f64 b, bool sub, bool single) {
     return result;
 }
 
-bool fp_invalid_gated(const CPUState* cpu, const FPRes* res) {
+GXRUNTIME_ALWAYS_INLINE bool fp_invalid_gated(const CPUState* cpu, const FPRes* res) {
     return (cpu->fpscr & FPSCR_VE_BIT) != 0 && (res->exception & FPSCR_VX_ANY_MASK) != 0;
 }
 
-void fp_write_single(CPUState* cpu, u8 d, f32 rounded) {
+GXRUNTIME_ALWAYS_INLINE void fp_write_single(CPUState* cpu, u8 d, f32 rounded) {
     cpu->fpr[d] = (f64)rounded;
     cpu->ps1[d] = (f64)rounded;
     set_fprf(cpu, classify_f32(rounded));

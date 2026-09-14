@@ -22,6 +22,7 @@
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
 #include "Common/FileUtil.h"
+#include "Common/FramePhaseTiming.h"
 #include "Common/Hash.h"
 #include "Common/Logging/Log.h"
 #include "Common/MathUtil.h"
@@ -62,6 +63,7 @@ static const u64 TEXHASH_INVALID = 0;
 // Sonic the Fighters (inside Sonic Gems Collection) loops a 64 frames animation
 static const int TEXTURE_KILL_THRESHOLD = 64;
 static const int TEXTURE_POOL_KILL_THRESHOLD = 3;
+static const int TEXTURE_POOL_RECENT_EXPIRY_THRESHOLD = 30;
 
 static int xfb_count = 0;
 
@@ -176,6 +178,15 @@ void TextureCacheBase::OnConfigChanged(const VideoConfig& config)
 
 void TextureCacheBase::Cleanup(int _frameCount)
 {
+  const bool log_phase = Common::FramePhaseTiming::IsEnabled();
+  if (log_phase)
+  {
+    m_texture_pool_diagnostic_frame = _frameCount;
+    std::erase_if(m_recently_expired_texture_configs, [_frameCount](const auto& entry) {
+      return _frameCount > entry.second.first + TEXTURE_POOL_RECENT_EXPIRY_THRESHOLD;
+    });
+  }
+
   TexAddrCache::iterator iter = m_textures_by_address.begin();
   TexAddrCache::iterator tcend = m_textures_by_address.end();
   while (iter != tcend)
@@ -216,6 +227,7 @@ void TextureCacheBase::Cleanup(int _frameCount)
 
   TexPool::iterator iter2 = m_texture_pool.begin();
   TexPool::iterator tcend2 = m_texture_pool.end();
+  u64 expired_pool_entries = 0;
   while (iter2 != tcend2)
   {
     if (iter2->second.frameCount == FRAMECOUNT_INVALID)
@@ -224,13 +236,21 @@ void TextureCacheBase::Cleanup(int _frameCount)
     }
     if (_frameCount > TEXTURE_POOL_KILL_THRESHOLD + iter2->second.frameCount)
     {
+      if (log_phase)
+      {
+        auto& [last_expiry_frame, count] = m_recently_expired_texture_configs[iter2->first];
+        last_expiry_frame = _frameCount;
+        ++count;
+      }
       iter2 = m_texture_pool.erase(iter2);
+      ++expired_pool_entries;
     }
     else
     {
       ++iter2;
     }
   }
+  Common::FramePhaseTiming::AddTexturePoolExpirations(expired_pool_entries);
 }
 
 bool TCacheEntry::OverlapsMemoryRange(u32 range_address, u32 range_size) const
@@ -2682,7 +2702,25 @@ TextureCacheBase::AllocateTexture(const TextureConfig& config)
     return std::move(entry);
   }
 
+  const bool log_phase = Common::FramePhaseTiming::IsEnabled();
+  if (log_phase)
+  {
+    auto expired = m_recently_expired_texture_configs.find(config);
+    if (expired != m_recently_expired_texture_configs.end() &&
+        m_texture_pool_diagnostic_frame <=
+            expired->second.first + TEXTURE_POOL_RECENT_EXPIRY_THRESHOLD &&
+        expired->second.second != 0)
+    {
+      Common::FramePhaseTiming::AddTexturePoolRecentExpiryMiss();
+      if (--expired->second.second == 0)
+        m_recently_expired_texture_configs.erase(expired);
+    }
+  }
+
+  const TimePoint texture_create_start = log_phase ? Clock::now() : TimePoint{};
   std::unique_ptr<AbstractTexture> texture = g_gfx->CreateTexture(config);
+  if (log_phase)
+    Common::FramePhaseTiming::AddTextureCreate(Clock::now() - texture_create_start);
   if (!texture)
   {
     WARN_LOG_FMT(VIDEO, "Failed to allocate a {}x{}x{} texture", config.width, config.height,
@@ -2693,7 +2731,10 @@ TextureCacheBase::AllocateTexture(const TextureConfig& config)
   std::unique_ptr<AbstractFramebuffer> framebuffer;
   if (config.IsRenderTarget())
   {
+    const TimePoint framebuffer_create_start = log_phase ? Clock::now() : TimePoint{};
     framebuffer = g_gfx->CreateFramebuffer(texture.get(), nullptr);
+    if (log_phase)
+      Common::FramePhaseTiming::AddFramebufferCreate(Clock::now() - framebuffer_create_start);
     if (!framebuffer)
     {
       WARN_LOG_FMT(VIDEO, "Failed to allocate a {}x{}x{} framebuffer", config.width, config.height,
@@ -2718,6 +2759,8 @@ TextureCacheBase::FindMatchingTextureFromPool(const TextureConfig& config)
   auto matching_iter = std::find_if(range.first, range.second, [](const auto& iter) {
     return iter.first.IsRenderTarget() || iter.second.frameCount != FRAMECOUNT_INVALID;
   });
+  Common::FramePhaseTiming::AddTexturePoolLookup(matching_iter != range.second,
+                                                 range.first != range.second);
   return matching_iter != range.second ? matching_iter : m_texture_pool.end();
 }
 

@@ -12,16 +12,26 @@
 #include "VideoBackends/Metal/MTLVertexFormat.h"
 #include "VideoBackends/Metal/MTLVertexManager.h"
 
+#include "Common/FramePhaseTiming.h"
+
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/Present.h"
 #include "VideoCommon/VideoBackendBase.h"
 
+#include <cstdio>
 #include <fstream>
 
 Metal::Gfx::Gfx(MRCOwned<CAMetalLayer*> layer) : m_layer(std::move(layer))
 {
   UpdateActiveConfig();
+#if TARGET_OS_OSX
+#if defined(MODERNGEKKO_MACOS_METAL_DISPLAY_SYNC)
+  [m_layer setDisplaySyncEnabled:YES];
+  std::fprintf(stderr, "metal layer display sync: product policy enabled\n");
+#else
   [m_layer setDisplaySyncEnabled:g_ActiveConfig.bVSyncActive];
+#endif
+#endif
 
   SetupSurface();
   g_state_tracker->FlushEncoders();
@@ -288,8 +298,15 @@ void Metal::Gfx::OnConfigChanged(u32 bits)
 {
   AbstractGfx::OnConfigChanged(bits);
 
-  if (bits & CONFIG_CHANGE_BIT_VSYNC)
+  if (bits & CONFIG_CHANGE_BIT_VSYNC) {
+#if TARGET_OS_OSX
+#if defined(MODERNGEKKO_MACOS_METAL_DISPLAY_SYNC)
+    [m_layer setDisplaySyncEnabled:YES];
+#else
     [m_layer setDisplaySyncEnabled:g_ActiveConfig.bVSyncActive];
+#endif
+#endif
+  }
 
   if (bits & CONFIG_CHANGE_BIT_ANISOTROPY)
   {
@@ -452,11 +469,19 @@ bool Metal::Gfx::BindBackbuffer(const ClearColor& clear_color)
 {
   @autoreleasepool
   {
+    const TimePoint bind_start = Clock::now();
     CheckForSurfaceChange();
     CheckForSurfaceResize();
+    const TimePoint surface_end = Clock::now();
     m_drawable = MRCRetain([m_layer nextDrawable]);
+    const TimePoint drawable_end = Clock::now();
     m_backbuffer->UpdateBackbufferTexture([m_drawable texture]);
+    const TimePoint update_end = Clock::now();
     SetAndClearFramebuffer(m_backbuffer.get(), clear_color);
+    const TimePoint framebuffer_end = Clock::now();
+    Common::FramePhaseTiming::AddMetalBindBackbuffer(
+        surface_end - bind_start, drawable_end - surface_end, update_end - drawable_end,
+        framebuffer_end - update_end);
     return m_drawable != nullptr;
   }
 }

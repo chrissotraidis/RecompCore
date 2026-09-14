@@ -8,6 +8,7 @@
 #include <optional>
 
 #include "Common/Assert.h"
+#include "Common/FramePhaseTiming.h"
 #include "Common/MsgHandler.h"
 
 #include "VideoBackends/Metal/MTLPipeline.h"
@@ -429,11 +430,15 @@ public:
         [desc setStencilAttachmentPixelFormat:Util::FromAbstract(fs.depth_texture_format)];
       NSError* err = nullptr;
       MTLRenderPipelineReflection* reflection = nullptr;
+      const bool log_phase = Common::FramePhaseTiming::IsEnabled();
+      const TimePoint pipeline_start = log_phase ? Clock::now() : TimePoint{};
       id<MTLRenderPipelineState> pipe =
           [g_device newRenderPipelineStateWithDescriptor:desc
                                                  options:MTLPipelineOptionArgumentInfo
                                               reflection:&reflection
                                                    error:&err];
+      if (log_phase)
+        Common::FramePhaseTiming::AddMetalPipelineCreate(Clock::now() - pipeline_start);
       if (err)
       {
         static int counter;

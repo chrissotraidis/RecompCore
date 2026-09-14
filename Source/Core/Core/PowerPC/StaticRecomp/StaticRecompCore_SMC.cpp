@@ -206,7 +206,11 @@ int StaticRecompCore::ChunkIndexOf(u32 address)
     return -1;
 
   u32 linked_address = address;
-  if (!ResolveNativeAddress(address, &linked_address, nullptr))
+  // A DOL-only module has no runtime-to-linked REL translation to perform.
+  // Avoid the resolver on this per-block hot path while retaining the exact
+  // existing path for modules that declare relocatable sections.
+  if (m_module->num_rel_modules != 0 &&
+      !ResolveNativeAddress(address, &linked_address, nullptr))
     return -1;
   int idx = GetAddressLookupIndex(linked_address);
   if (idx < 0 || idx >= static_cast<int>(m_chunk_lookup_table.size()))

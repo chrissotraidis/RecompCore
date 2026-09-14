@@ -28,6 +28,7 @@
 #include "Common/CommonTypes.h"
 #include "Common/FatFsUtil.h"
 #include "Common/FileUtil.h"
+#include "Common/GameplaySceneSnapshot.h"
 #include "Common/Logging/Log.h"
 #include "Common/MsgHandler.h"
 #include "Common/OneShotEvent.h"
@@ -45,6 +46,8 @@
 #include "Core/Config/WiiSettings.h"
 #include "Core/Config/ConfigManager.h"
 #include "Core/CoreTiming.h"
+#include "Core/Cheats/MemoryWatcherUtils.h"
+#include "Core/HW/Memmap.h"
 #include "Core/DSPEmulator.h"
 #include "Core/DolphinAnalytics.h"
 #include "Core/FifoPlayer/FifoPlayer.h"
@@ -140,6 +143,13 @@ void FrameUpdateOnCPUThread()
 
 void OnFrameEnd(Core::System& system)
 {
+  Common::GameplayScene::recorder.RecordFrame([&system](u32 address) -> std::optional<u32> {
+    auto& memory = system.GetMemory();
+    if (!memory.IsInitialized())
+      return std::nullopt;
+    return MemoryWatcherUtils::ReadStaticRecompU32(
+        std::span<const u8>{memory.GetRAM(), memory.GetRamSizeReal()}, {}, address);
+  });
 #ifdef USE_MEMORYWATCHER
   if (s_memory_watcher)
   {

@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 #include "Common/Assert.h"
 #include "Common/FloatUtils.h"
@@ -26,6 +28,12 @@ namespace PowerPC
 void PowerPCManager::CheckExceptions()
 {
   u32 exceptions = m_ppc_state.Exceptions;
+  if (std::getenv("STATICRECOMP_REGISTER_TRACE") && exceptions != 0)
+    std::fprintf(stderr,
+                 "[staticrecomp] host-check-exceptions-before pc=%08x npc=%08x "
+                 "exceptions=%08x srr0=%08x srr1=%08x msr=%08x\n",
+                 m_ppc_state.pc, m_ppc_state.npc, exceptions, SRR0(m_ppc_state),
+                 SRR1(m_ppc_state), m_ppc_state.msr.Hex);
 
   // Example procedure:
   // Set SRR0 to either PC or NPC
@@ -131,6 +139,12 @@ void PowerPCManager::CheckExceptions()
     return;
   }
 
+  if (std::getenv("STATICRECOMP_REGISTER_TRACE") && exceptions != 0)
+    std::fprintf(stderr,
+                 "[staticrecomp] host-check-exceptions-after  pc=%08x npc=%08x "
+                 "exceptions=%08x srr0=%08x srr1=%08x msr=%08x\n",
+                 m_ppc_state.pc, m_ppc_state.npc, m_ppc_state.Exceptions,
+                 SRR0(m_ppc_state), SRR1(m_ppc_state), m_ppc_state.msr.Hex);
   MSRUpdated();
 }
 

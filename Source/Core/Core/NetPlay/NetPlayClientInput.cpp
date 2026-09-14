@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 namespace NetPlay
 {
@@ -108,6 +110,18 @@ bool NetPlayClient::GetNetPads(const int pad_nb, const bool batching, GCPadStatu
   }
 
   m_pad_buffer[pad_nb].Pop(*pad_status);
+
+  if (std::getenv("MELEEPAD_NETPLAY_TRACE_INPUT"))
+  {
+    static u32 last[4] = {~0u, ~0u, ~0u, ~0u};
+    const u32 state = pad_status->button | (u32(pad_status->isConnected) << 16);
+    if (pad_nb >= 0 && pad_nb < 4 && last[pad_nb] != state)
+    {
+      std::fprintf(stderr, "[netplay] delivered-input ingame=%d connected=%u buttons=%04x\n",
+                   pad_nb, unsigned(pad_status->isConnected), unsigned(pad_status->button));
+      last[pad_nb] = state;
+    }
+  }
 
   auto& movie = Core::System::GetInstance().GetMovie();
   if (movie.IsRecordingInput())
@@ -237,6 +251,18 @@ bool NetPlayClient::PollLocalPad(const int local_pad, sf::Packet& packet)
   else
   {
     pad_status = Pad::GetStatus(local_pad);
+  }
+
+  if (std::getenv("MELEEPAD_NETPLAY_TRACE_INPUT"))
+  {
+    static u32 last[4] = {~0u, ~0u, ~0u, ~0u};
+    const u32 state = pad_status.button | (u32(pad_status.isConnected) << 16);
+    if (local_pad >= 0 && local_pad < 4 && last[local_pad] != state)
+    {
+      std::fprintf(stderr, "[netplay] local-input local=%d ingame=%d connected=%u buttons=%04x\n",
+                   local_pad, ingame_pad, unsigned(pad_status.isConnected), unsigned(pad_status.button));
+      last[local_pad] = state;
+    }
   }
 
   if (m_host_input_authority)

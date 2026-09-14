@@ -104,6 +104,23 @@ set_source_files_properties("${MODULE_TABLES}" PROPERTIES HEADER_FILE_ONLY TRUE 
 
 target_compile_definitions(${MODULE_NAME} PRIVATE MODULE_GAME_ID="${GAME_ID}")
 
+option(RECOMPCORE_MODULE_DISPATCH_COUNTS
+       "Count generic dispatch branches and expose diagnostic reset/dump hooks" OFF)
+if(RECOMPCORE_MODULE_DISPATCH_COUNTS)
+  set_property(SOURCE module_export.c APPEND PROPERTY COMPILE_DEFINITIONS
+    RECOMPCORE_MODULE_DISPATCH_COUNTS=1)
+endif()
+
+set(RECOMPCORE_MODULE_TUNE_CPU "" CACHE STRING
+    "Optional CPU scheduling model for the generated module (for example apple-a15)")
+if(RECOMPCORE_MODULE_TUNE_CPU)
+  if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "RECOMPCORE_MODULE_TUNE_CPU requires Clang")
+  endif()
+  target_compile_options(${MODULE_NAME} PRIVATE
+    "-mtune=${RECOMPCORE_MODULE_TUNE_CPU}")
+endif()
+
 target_include_directories(${MODULE_NAME} PRIVATE
   "${GENERATED_DIR}"
   "${GXRUNTIME_DIR}/include"

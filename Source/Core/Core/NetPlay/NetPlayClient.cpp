@@ -65,6 +65,8 @@
 #include "Core/IOS/Uids.h"
 #include "Core/Movie.h"
 #include "Core/NetPlay/NetPlayCommon.h"
+#include "Core/PowerPC/PowerPC.h"
+#include "Core/PowerPC/StaticRecomp/StaticRecompCore.h"
 #include "Core/SyncIdentifier.h"
 #include "Core/System.h"
 #include "DiscIO/Blob.h"
@@ -565,7 +567,7 @@ void NetPlayClient::OnChatMessage(sf::Packet& packet)
   // don't need lock to read in this thread
   const Player& player = m_players[pid];
 
-  INFO_LOG_FMT(NETPLAY, "Player {} ({}) wrote: {}", player.name, player.pid, msg);
+  INFO_LOG_FMT(NETPLAY, "Received a chat message from player {}", pid);
 
   // add to gui
   m_dialog->AppendChat(fmt::format("{}[{}]: {}", player.name, pid, msg));
@@ -1246,6 +1248,12 @@ PadMappingArray NetPlayClient::GetWiimoteMappingSnapshot()
   return m_wiimote_map;
 }
 
+PadMappingArray NetPlayClient::GetPadMappingSnapshot()
+{
+  std::lock_guard lkg(m_crit.game);
+  return m_pad_map;
+}
+
 const NetSettings& NetPlayClient::GetNetSettings() const
 {
   return m_net_settings;
@@ -1353,6 +1361,7 @@ bool NetPlayClient::StartGame(const std::string& path)
   }
 
   m_timebase_frame = 0;
+  m_last_boundary_sequence_sent = 0;
   m_current_golfer = 1;
   m_wait_on_input = false;
 
@@ -1742,12 +1751,62 @@ void NetPlayClient::SendTimeBase()
 
   if (netplay_client->m_timebase_frame % 60 == 0)
   {
-    const u64 timebase = Core::System::GetInstance().GetSystemTimers().GetFakeTimeBase();
+    auto& system = Core::System::GetInstance();
+    const auto& core_timing = system.GetCoreTiming();
+    const u64 timebase = system.GetSystemTimers().GetFakeTimeBase();
+    const u32 guest_pc = g_static_recomp_core ?
+                             g_static_recomp_core->GetDiagnosticGuestPC() :
+                             system.GetPowerPC().GetPPCState().pc;
+    const u64 state_hash =
+        g_static_recomp_core ? g_static_recomp_core->GetDiagnosticStateHash() : 0;
+    const u64 integer_state_hash =
+        g_static_recomp_core ? g_static_recomp_core->GetDiagnosticIntegerStateHash() : 0;
+    const u64 fpr_state_hash =
+        g_static_recomp_core ? g_static_recomp_core->GetDiagnosticFprStateHash() : 0;
+    const u64 paired_state_hash =
+        g_static_recomp_core ? g_static_recomp_core->GetDiagnosticPairedStateHash() : 0;
+    const u64 native_dispatches = g_static_recomp_core ?
+                                      g_static_recomp_core->GetDiagnosticNativeDispatches() :
+                                      0;
+    const u64 charged_cycles = g_static_recomp_core ?
+                                   g_static_recomp_core->GetDiagnosticChargedCycles() :
+                                   0;
+    const u64 bursts = g_static_recomp_core ?
+                           g_static_recomp_core->GetDiagnosticBursts() :
+                           0;
+    auto canonical = g_static_recomp_core ?
+                         g_static_recomp_core->GetNetplayBoundarySnapshot() :
+                         StaticRecompCore::NetplayBoundarySnapshot{};
+    if (canonical.sequence == netplay_client->m_last_boundary_sequence_sent)
+      canonical = {};
+    else
+      netplay_client->m_last_boundary_sequence_sent = canonical.sequence;
 
     sf::Packet packet;
     packet << MessageID::TimeBase;
     packet << timebase;
     packet << netplay_client->m_timebase_frame;
+    packet << guest_pc;
+    packet << state_hash;
+    packet << integer_state_hash;
+    packet << fpr_state_hash;
+    packet << paired_state_hash;
+    packet << static_cast<u64>(core_timing.GetTicks());
+    packet << core_timing.GetFakeTBStartTicks();
+    packet << core_timing.GetFakeTBStartValue();
+    packet << native_dispatches;
+    packet << charged_cycles;
+    packet << bursts;
+    packet << canonical.sequence;
+    packet << canonical.guest_pc;
+    packet << canonical.timebase;
+    packet << canonical.state_hash;
+    packet << canonical.integer_state_hash;
+    packet << canonical.fpr_state_hash;
+    packet << canonical.paired_state_hash;
+    packet << canonical.ram_hash;
+    for (const u64 region_hash : canonical.ram_region_hashes)
+      packet << region_hash;
 
     netplay_client->SendAsync(std::move(packet));
   }

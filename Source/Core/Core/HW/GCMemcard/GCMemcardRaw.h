@@ -37,6 +37,7 @@ private:
   }
 
   std::string m_filename;
+  const bool m_save_data_writable;
   std::unique_ptr<u8[]> m_memcard_data;
   std::unique_ptr<u8[]> m_flush_buffer;
   std::thread m_flush_thread;

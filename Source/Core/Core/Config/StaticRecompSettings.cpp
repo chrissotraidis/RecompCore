@@ -6,6 +6,12 @@ namespace Config
 {
 const Info<bool> MAIN_STATICRECOMP_MODULE{{System::Main, "Core", "StaticRecompModule"}, true};
 const Info<u32> MAIN_STATICRECOMP_IDLE_PC{{System::Main, "Core", "StaticRecompIdlePC"}, 0};
+const Info<u32> MAIN_STATICRECOMP_SECONDARY_IDLE_PC{
+    {System::Main, "Core", "StaticRecompSecondaryIdlePC"}, 0};
+const Info<u32> MAIN_STATICRECOMP_CALLER_IDLE_PC{
+    {System::Main, "Core", "StaticRecompCallerIdlePC"}, 0};
+const Info<u32> MAIN_STATICRECOMP_CALLER_IDLE_LR{
+    {System::Main, "Core", "StaticRecompCallerIdleLR"}, 0};
 const Info<std::string> MAIN_STATICRECOMP_FALLBACK_RANGES{
     {System::Main, "Core", "StaticRecompFallbackRanges"}, ""};
 }  // namespace Config

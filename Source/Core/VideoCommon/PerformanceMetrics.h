@@ -38,6 +38,10 @@ public:
 
   // Getter Functions. May be called from any thread.
   double GetFPS() const;
+  FrameIntervalSummary::Snapshot TakeFrameIntervalSummary()
+  {
+    return m_fps_counter.TakeFrameIntervalSummary();
+  }
   double GetVPS() const;
   double GetSpeed() const;
   double GetMaxSpeed() const;

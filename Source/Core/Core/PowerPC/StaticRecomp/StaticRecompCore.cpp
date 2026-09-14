@@ -18,6 +18,7 @@
 #include "Core/Config/ConfigManager.h"
 #include "Core/PowerPC/StaticRecomp/StaticRecompLockstep.h"
 #include "Core/System.h"
+#include "Core/NetPlay/NetPlayProto.h"
 
 #ifdef _M_X86_64
 #include "Core/PowerPC/Jit64/Jit.h"
@@ -57,6 +58,16 @@ bool AddressIsCovered(const StaticRecompRange* ranges, u32 count, u32 address)
       return true;
   }
   return false;
+}
+
+u64 ReadDispatchSampleValue(const char* name, u64 fallback)
+{
+  const char* text = std::getenv(name);
+  if (!text || text[0] == '\0')
+    return fallback;
+  char* end = nullptr;
+  const unsigned long long value = std::strtoull(text, &end, 0);
+  return end && *end == '\0' ? static_cast<u64>(value) : fallback;
 }
 
 bool ChunksTileCode(const StaticRecompModuleDesc& desc)
@@ -177,18 +188,72 @@ void StaticRecompCore::Init()
   m_guest.host_call = m_module_source.host_call ? HookHostCall : nullptr;
   m_guest.external_user_data = this;
 
+  if (const char* path = std::getenv("STATICRECOMP_DISPATCH_FRAME_LOG"); path && path[0] != '\0')
+  {
+    m_dispatch_frame_log_path = path;
+    m_dispatch_frame_samples.reserve(262144);
+  }
+  if (const char* path = std::getenv("STATICRECOMP_DISPATCH_TIME_LOG"); path && path[0] != '\0')
+  {
+    m_dispatch_time_log_path = path;
+    m_dispatch_time_samples.reserve(65536);
+  }
+  if (!m_dispatch_frame_log_path.empty() || !m_dispatch_time_log_path.empty())
+  {
+    m_dispatch_sample_interval =
+        std::clamp<u64>(ReadDispatchSampleValue("STATICRECOMP_DISPATCH_SAMPLE_INTERVAL", 4096),
+                        2, 1u << 20);
+    m_dispatch_sample_offset =
+        ReadDispatchSampleValue("STATICRECOMP_DISPATCH_SAMPLE_OFFSET", 0) %
+        m_dispatch_sample_interval;
+    std::fprintf(stderr, "[staticrecomp] dispatch sample interval=%llu offset=%llu\n",
+                 static_cast<unsigned long long>(m_dispatch_sample_interval),
+                 static_cast<unsigned long long>(m_dispatch_sample_offset));
+  }
+
+  if (const char* path = std::getenv("STATICRECOMP_DISPATCH_BURST_LOG"); path && path[0] != '\0')
+  {
+    m_dispatch_burst_log_path = path;
+    m_dispatch_burst_samples.reserve(16384);
+  }
+
   std::fprintf(stderr, "[staticrecomp] core init\n");
 
   LoadModule();
   m_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_IDLE_PC);
+  m_secondary_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_SECONDARY_IDLE_PC);
+  if (const char* pc = std::getenv("STATICRECOMP_SECONDARY_IDLE_PC"); pc && pc[0] != '\0')
+    m_secondary_idle_pc = static_cast<u32>(std::strtoul(pc, nullptr, 0));
+  if (m_secondary_idle_pc != 0)
+    std::fprintf(stderr, "[staticrecomp] secondary idle pc=%08x\n", m_secondary_idle_pc);
+  m_caller_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_CALLER_IDLE_PC);
+  m_caller_idle_lr = Config::Get(Config::MAIN_STATICRECOMP_CALLER_IDLE_LR);
+  if (const char* pc = std::getenv("STATICRECOMP_CALLER_IDLE_PC"); pc && pc[0] != '\0')
+    m_caller_idle_pc = static_cast<u32>(std::strtoul(pc, nullptr, 0));
+  if (const char* lr = std::getenv("STATICRECOMP_CALLER_IDLE_LR"); lr && lr[0] != '\0')
+    m_caller_idle_lr = static_cast<u32>(std::strtoul(lr, nullptr, 0));
+  if (m_caller_idle_pc != 0 && m_caller_idle_lr != 0)
+    std::fprintf(stderr, "[staticrecomp] caller idle pc=%08x lr=%08x\n", m_caller_idle_pc,
+                 m_caller_idle_lr);
   m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
   m_lockstep_verifier->Init();
 
-#ifdef _M_ARM_64
-  m_fallback_jit = std::make_unique<JitArm64>(m_system);
+  // STATICRECOMP_NO_FALLBACK_JIT reproduces the iOS execution contract
+  // (module + interpreter only) on desktop for parity testing.
+  // All netplay peers must use the same fallback execution model. iOS has no
+  // fallback JIT; desktop JIT block timing can diverge from its interpreter.
+  // Keep the desktop offline path unchanged.
+  const bool netplay_interpreter_fallback = NetPlay::IsNetPlayRunning();
+  if (netplay_interpreter_fallback)
+    std::fprintf(stderr, "[staticrecomp] netplay fallback=interpreter\n");
+  if (!netplay_interpreter_fallback && !std::getenv("STATICRECOMP_NO_FALLBACK_JIT"))
+  {
+#if defined(_M_ARM_64) && !defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+    m_fallback_jit = std::make_unique<JitArm64>(m_system);
 #elif defined(_M_X86_64)
-  m_fallback_jit = std::make_unique<Jit64>(m_system);
+    m_fallback_jit = std::make_unique<Jit64>(m_system);
 #endif
+  }
   if (m_fallback_jit)
   {
     m_fallback_jit->SetStaticRecompFallback(true);
@@ -197,17 +262,116 @@ void StaticRecompCore::Init()
   }
 }
 
+void StaticRecompCore::FlushDispatchFrameSamples(bool final)
+{
+  if (m_dispatch_frame_log_path.empty() || m_dispatch_frame_samples.empty())
+    return;
+
+  const char* mode = m_dispatch_frame_log_started ? "a" : "w";
+  if (FILE* file = std::fopen(m_dispatch_frame_log_path.c_str(), mode))
+  {
+    if (!m_dispatch_frame_log_started)
+      std::fprintf(file, "frame,pc\n");
+    for (const DispatchFrameSample& sample : m_dispatch_frame_samples)
+      std::fprintf(file, "%llu,%08x\n", static_cast<unsigned long long>(sample.frame), sample.pc);
+    std::fclose(file);
+    m_dispatch_frame_log_started = true;
+    m_dispatch_frame_samples_written += m_dispatch_frame_samples.size();
+    m_dispatch_frame_samples.clear();
+    if (final)
+      std::fprintf(stderr, "[staticrecomp] dispatch-frame samples=%llu path=%s\n",
+                   static_cast<unsigned long long>(m_dispatch_frame_samples_written),
+                   m_dispatch_frame_log_path.c_str());
+  }
+  else
+  {
+    std::fprintf(stderr, "[staticrecomp] dispatch-frame open failed: %s\n",
+                 m_dispatch_frame_log_path.c_str());
+  }
+}
+
+void StaticRecompCore::FlushDispatchTimeSamples(bool final)
+{
+  if (m_dispatch_time_log_path.empty() || m_dispatch_time_samples.empty())
+    return;
+
+  const char* mode = m_dispatch_time_log_started ? "a" : "w";
+  if (FILE* file = std::fopen(m_dispatch_time_log_path.c_str(), mode))
+  {
+    if (!m_dispatch_time_log_started)
+      std::fprintf(file, "present_frame,emulated_frame,pc,host_ns,clock_ns\n");
+    for (const DispatchTimeSample& sample : m_dispatch_time_samples)
+      std::fprintf(file, "%llu,%llu,%08x,%llu,%llu\n",
+                   static_cast<unsigned long long>(sample.present_frame),
+                   static_cast<unsigned long long>(sample.emulated_frame), sample.pc,
+                   static_cast<unsigned long long>(sample.host_ns),
+                   static_cast<unsigned long long>(sample.clock_ns));
+    std::fclose(file);
+    m_dispatch_time_log_started = true;
+    m_dispatch_time_samples_written += m_dispatch_time_samples.size();
+    m_dispatch_time_samples.clear();
+    if (final)
+      std::fprintf(stderr, "[staticrecomp] dispatch-time samples=%llu path=%s\n",
+                   static_cast<unsigned long long>(m_dispatch_time_samples_written),
+                   m_dispatch_time_log_path.c_str());
+  }
+  else
+  {
+    std::fprintf(stderr, "[staticrecomp] dispatch-time open failed: %s\n",
+                 m_dispatch_time_log_path.c_str());
+    m_dispatch_time_log_path.clear();
+    m_dispatch_time_samples.clear();
+  }
+}
+
+void StaticRecompCore::FlushDispatchBurstSamples(bool final)
+{
+  if (m_dispatch_burst_log_path.empty() || m_dispatch_burst_samples.empty())
+    return;
+
+  const char* mode = m_dispatch_burst_log_started ? "a" : "w";
+  if (FILE* file = std::fopen(m_dispatch_burst_log_path.c_str(), mode))
+  {
+    if (!m_dispatch_burst_log_started)
+      std::fprintf(file, "present_frame,emulated_frame,burst,index,previous_pc,pc\n");
+    for (const DispatchBurstSample& sample : m_dispatch_burst_samples)
+      std::fprintf(file, "%llu,%llu,%llu,%u,%08x,%08x\n",
+                   static_cast<unsigned long long>(sample.present_frame),
+                   static_cast<unsigned long long>(sample.emulated_frame),
+                   static_cast<unsigned long long>(sample.burst), sample.index,
+                   sample.previous_pc, sample.pc);
+    std::fclose(file);
+    m_dispatch_burst_log_started = true;
+    m_dispatch_burst_samples_written += m_dispatch_burst_samples.size();
+    m_dispatch_burst_samples.clear();
+    if (final)
+      std::fprintf(stderr, "[staticrecomp] dispatch-burst samples=%llu path=%s\n",
+                   static_cast<unsigned long long>(m_dispatch_burst_samples_written),
+                   m_dispatch_burst_log_path.c_str());
+  }
+  else
+  {
+    std::fprintf(stderr, "[staticrecomp] dispatch-burst open failed: %s\n",
+                 m_dispatch_burst_log_path.c_str());
+    m_dispatch_burst_log_path.clear();
+    m_dispatch_burst_samples.clear();
+  }
+}
+
 void StaticRecompCore::Shutdown()
 {
   g_static_recomp_core = nullptr;
   std::fprintf(stderr,
                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
-               "smc_failed=%u verifications=%llu reverify_events=%llu bursts=%llu cycles=%llu\n",
+               "smc_failed=%u verifications=%llu reverify_events=%llu bursts=%llu cycles=%llu "
+               "caller_idle=%llu secondary_idle=%llu\n",
                (unsigned long long)m_native_dispatches, (unsigned long long)m_fallback_steps,
                (unsigned long long)m_native_exceptions,
                (unsigned long long)m_hook_fallback_instructions, m_failed_chunks,
                (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
-               (unsigned long long)m_bursts, (unsigned long long)m_charged_cycles);
+               (unsigned long long)m_bursts, (unsigned long long)m_charged_cycles,
+               (unsigned long long)m_caller_idle_hits,
+               (unsigned long long)m_secondary_idle_hits);
   std::vector<std::pair<u32, u64>> dispatch_samples(m_dispatch_samples.begin(),
                                                     m_dispatch_samples.end());
   std::sort(dispatch_samples.begin(), dispatch_samples.end(),
@@ -218,6 +382,9 @@ void StaticRecompCore::Shutdown()
                  dispatch_samples[i].first,
                  static_cast<unsigned long long>(dispatch_samples[i].second));
   }
+  FlushDispatchFrameSamples(true);
+  FlushDispatchTimeSamples(true);
+  FlushDispatchBurstSamples(true);
   NOTICE_LOG_FMT(POWERPC,
                  "StaticRecomp: shutdown. native_dispatches={} fallback_steps={} "
                  "native_exceptions={} hook_fallback_instructions={} smc_failed_chunks={} "
@@ -303,6 +470,27 @@ void StaticRecompCore::LoadModule()
 
   m_module = desc;
   m_module_active = (desc != nullptr);
+  if (m_library.IsOpen())
+  {
+    m_profile_reset = reinterpret_cast<ProfileResetFn>(
+        m_library.GetSymbolAddress("staticrecomp_profile_reset"));
+    m_profile_dump = reinterpret_cast<ProfileDumpFn>(
+        m_library.GetSymbolAddress("staticrecomp_profile_dump"));
+  }
+  const char* profile_trigger = std::getenv("STATICRECOMP_PROFILE_TRIGGER");
+  if (m_profile_reset && m_profile_dump && profile_trigger &&
+      std::sscanf(profile_trigger, "%x,%x,%x", &m_profile_trigger_address,
+                  &m_profile_trigger_mask, &m_profile_trigger_value) == 3 &&
+      m_profile_trigger_address != 0 && m_profile_trigger_mask != 0)
+  {
+    std::fprintf(stderr,
+                 "[staticrecomp] profile trigger armed: address=%08x mask=%08x value=%08x\n",
+                 m_profile_trigger_address, m_profile_trigger_mask, m_profile_trigger_value);
+  }
+  else
+  {
+    m_profile_trigger_address = 0;
+  }
   m_chunk_state.assign(desc->num_chunk_ranges, CHUNK_UNVERIFIED);
   m_chunk_host_call_state.assign(desc->num_chunk_ranges, 0);
   m_effective_chunk_hashes.assign(desc->chunk_hashes,

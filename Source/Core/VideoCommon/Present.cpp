@@ -4,6 +4,8 @@
 #include "VideoCommon/Present.h"
 
 #include "Common/ChunkFile.h"
+#include "Common/FileUtil.h"
+#include "Common/FramePhaseTiming.h"
 #include "Core/Config/GraphicsSettings.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/CoreTiming.h"
@@ -19,15 +21,332 @@
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/OnScreenUI.h"
 #include "VideoCommon/PostProcessing.h"
+#include "VideoCommon/Statistics.h"
 #include "VideoCommon/VertexManagerBase.h"
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/VideoEvents.h"
 #include "VideoCommon/Widescreen.h"
 
+#include <array>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
+
 std::unique_ptr<VideoCommon::Presenter> g_presenter;
 
 namespace VideoCommon
 {
+namespace
+{
+struct TaskEventCounts
+{
+  u64 context_switches;
+  u64 mach_syscalls;
+  u64 unix_syscalls;
+};
+
+TaskEventCounts GetTaskEventCounts()
+{
+#if defined(__APPLE__)
+  task_events_info_data_t events{};
+  mach_msg_type_number_t count = TASK_EVENTS_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_EVENTS_INFO, reinterpret_cast<task_info_t>(&events),
+                &count) != KERN_SUCCESS)
+    return {};
+  return {static_cast<u64>(events.csw), static_cast<u64>(events.syscalls_mach),
+          static_cast<u64>(events.syscalls_unix)};
+#else
+  return {};
+#endif
+}
+
+class FramePhaseLogger
+{
+public:
+  void Log(TimePoint frame_start, TimePoint present_start, TimePoint frame_end,
+           DT flush_and_rect, DT bind_backbuffer, DT xfb_blit, DT onscreen_ui)
+  {
+    if (!Common::FramePhaseTiming::IsEnabled())
+      return;
+
+    if (!m_file.is_open())
+    {
+      const char* path = std::getenv("MELEEPAD_FRAME_PHASE_LOG");
+      std::filesystem::path resolved_path(path);
+      if (resolved_path.is_relative())
+        resolved_path = std::filesystem::path(File::GetUserPath(D_LOGS_IDX)) / resolved_path;
+      m_file.open(resolved_path, std::ios_base::out);
+      if (!m_file.is_open())
+        return;
+      m_file << "frame,emulated_frame,host_frame_end_unix_ns,total_ms,cpu_wall_ms,cpu_thread_ms,task_context_switches,task_mach_syscalls,task_unix_syscalls,cpu_idle_ms,cpu_throttle_sleep_ms,"
+                "cpu_throttle_requested_ms,cpu_throttle_lateness_ms,"
+                "precision_throttle_calls,precision_throttle_coarse_ms,precision_throttle_spin_ms,"
+                "precision_present_calls,precision_present_coarse_ms,precision_present_spin_ms,"
+                "video_build_ms,present_ms,present_flush_rect_ms,present_bind_ms,"
+                "present_xfb_ms,present_ui_ms,metal_bind_surface_ms,metal_next_drawable_ms,"
+                "metal_update_backbuffer_ms,metal_set_framebuffer_ms,"
+                "audio_mix_ms,draw_calls,primitives,vertex_shaders_created,pixel_shaders_created,textures_created,metal_pipeline_creates,metal_pipeline_ms,"
+                "texture_pool_hits,texture_pool_empty_misses,texture_pool_same_frame_misses,texture_pool_expirations,texture_pool_recent_expiry_misses,texture_create_calls,texture_create_ms,framebuffer_create_calls,framebuffer_create_ms,"
+                "static_bursts,static_cycles,static_native_dispatches,"
+                "static_fallback_steps,static_hook_fallbacks,fallback_mfspr,fallback_mtspr,"
+                "fallback_cache,fallback_dcbst,fallback_dcbf,fallback_dcbi,fallback_icbi,"
+                "fallback_other,cache_controls,cache_control_dcbst,cache_control_dcbf,"
+                "cache_control_dcbi,cache_control_icbi,efb_vram_pipeline_misses,"
+                "efb_vram_shader_ms,efb_vram_pipeline_ms,efb_ram_pipeline_misses,"
+                "efb_ram_shader_ms,efb_ram_pipeline_ms,xfb_output_requests,"
+                "xfb_swap_queued,xfb_swap_executed,xfb_duplicates,xfb_presents\n";
+      if (const char* start_frame = std::getenv("MELEEPAD_FRAME_PHASE_SLOW_START_FRAME"))
+        m_slow_start_frame = std::strtoull(start_frame, nullptr, 10);
+      if (const char* arm_path = std::getenv("MELEEPAD_FRAME_PHASE_SLOW_ARM_FILE"))
+      {
+        m_slow_arm_path = arm_path;
+        m_slow_armed = false;
+      }
+      m_previous_frame_start = frame_start;
+      m_previous_totals = Common::FramePhaseTiming::GetTotals();
+      m_previous_task_events = GetTaskEventCounts();
+      m_previous_vertex_shaders_created = g_stats.num_vertex_shaders_created;
+      m_previous_pixel_shaders_created = g_stats.num_pixel_shaders_created;
+      m_previous_textures_created = g_stats.num_textures_created;
+    }
+
+    const Common::FramePhaseTiming::Totals totals = Common::FramePhaseTiming::GetTotals();
+    const TaskEventCounts task_events = GetTaskEventCounts();
+    const auto milliseconds = [](DT duration) { return DT_ms(duration).count(); };
+    const auto counter_ms = [](u64 current, u64 previous) {
+      return static_cast<double>(current - previous) / 1'000'000.0;
+    };
+    const auto stat_delta = [](int current, int previous) {
+      return current >= previous ? current - previous : current;
+    };
+
+    const double total_ms = milliseconds(frame_start - m_previous_frame_start);
+    const u64 frame = m_frame++;
+    const u64 emulated_frame = Common::FramePhaseTiming::GetEmulatedFrameIndex();
+    const TimePoint steady_now = Clock::now();
+    const auto system_now = std::chrono::system_clock::now();
+    const auto frame_end_unix_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(system_now.time_since_epoch()).count() -
+        std::chrono::duration_cast<std::chrono::nanoseconds>(steady_now - frame_end).count();
+    Common::FramePhaseTiming::SetPresentFrameIndex(m_frame);
+    m_file << frame << ',' << emulated_frame << ',' << frame_end_unix_ns << ','
+           << std::fixed << std::setprecision(6) << total_ms << ','
+           << counter_ms(totals.cpu_wall_ns, m_previous_totals.cpu_wall_ns) << ','
+           << counter_ms(totals.cpu_thread_ns, m_previous_totals.cpu_thread_ns) << ','
+           << task_events.context_switches - m_previous_task_events.context_switches << ','
+           << task_events.mach_syscalls - m_previous_task_events.mach_syscalls << ','
+           << task_events.unix_syscalls - m_previous_task_events.unix_syscalls << ','
+           << counter_ms(totals.cpu_idle_ns, m_previous_totals.cpu_idle_ns) << ','
+           << counter_ms(totals.cpu_throttle_sleep_ns,
+                         m_previous_totals.cpu_throttle_sleep_ns)
+           << ','
+           << counter_ms(totals.cpu_throttle_requested_ns,
+                         m_previous_totals.cpu_throttle_requested_ns)
+           << ','
+           << counter_ms(totals.cpu_throttle_lateness_ns,
+                         m_previous_totals.cpu_throttle_lateness_ns)
+           << ','
+           << totals.cpu_precision_throttle_calls -
+                  m_previous_totals.cpu_precision_throttle_calls
+           << ','
+           << counter_ms(totals.cpu_precision_throttle_coarse_ns,
+                         m_previous_totals.cpu_precision_throttle_coarse_ns)
+           << ','
+           << counter_ms(totals.cpu_precision_throttle_spin_ns,
+                         m_previous_totals.cpu_precision_throttle_spin_ns)
+           << ','
+           << totals.cpu_precision_present_calls - m_previous_totals.cpu_precision_present_calls
+           << ','
+           << counter_ms(totals.cpu_precision_present_coarse_ns,
+                         m_previous_totals.cpu_precision_present_coarse_ns)
+           << ','
+           << counter_ms(totals.cpu_precision_present_spin_ns,
+                         m_previous_totals.cpu_precision_present_spin_ns)
+           << ','
+           << milliseconds(present_start - frame_start) << ','
+           << milliseconds(frame_end - present_start) << ','
+           << milliseconds(flush_and_rect) << ',' << milliseconds(bind_backbuffer) << ','
+           << milliseconds(xfb_blit) << ',' << milliseconds(onscreen_ui) << ','
+           << counter_ms(totals.metal_bind_surface_ns, m_previous_totals.metal_bind_surface_ns)
+           << ','
+           << counter_ms(totals.metal_next_drawable_ns,
+                         m_previous_totals.metal_next_drawable_ns)
+           << ','
+           << counter_ms(totals.metal_update_backbuffer_ns,
+                         m_previous_totals.metal_update_backbuffer_ns)
+           << ','
+           << counter_ms(totals.metal_set_framebuffer_ns,
+                         m_previous_totals.metal_set_framebuffer_ns)
+           << ','
+           << counter_ms(totals.audio_mix_ns, m_previous_totals.audio_mix_ns) << ','
+           << g_stats.this_frame.num_draw_calls << ','
+           << g_stats.this_frame.num_prims + g_stats.this_frame.num_dl_prims << ','
+           << stat_delta(g_stats.num_vertex_shaders_created,
+                         m_previous_vertex_shaders_created)
+           << ','
+           << stat_delta(g_stats.num_pixel_shaders_created,
+                         m_previous_pixel_shaders_created)
+           << ',' << stat_delta(g_stats.num_textures_created, m_previous_textures_created) << ','
+           << totals.metal_pipeline_creates - m_previous_totals.metal_pipeline_creates << ','
+           << counter_ms(totals.metal_pipeline_create_ns,
+                         m_previous_totals.metal_pipeline_create_ns)
+           << ','
+           << totals.texture_pool_hits - m_previous_totals.texture_pool_hits << ','
+           << totals.texture_pool_empty_misses - m_previous_totals.texture_pool_empty_misses
+           << ','
+           << totals.texture_pool_same_frame_misses -
+                  m_previous_totals.texture_pool_same_frame_misses
+           << ','
+           << totals.texture_pool_expirations - m_previous_totals.texture_pool_expirations << ','
+           << totals.texture_pool_recent_expiry_misses -
+                  m_previous_totals.texture_pool_recent_expiry_misses
+           << ','
+           << totals.texture_create_calls - m_previous_totals.texture_create_calls << ','
+           << counter_ms(totals.texture_create_ns, m_previous_totals.texture_create_ns) << ','
+           << totals.framebuffer_create_calls - m_previous_totals.framebuffer_create_calls << ','
+           << counter_ms(totals.framebuffer_create_ns, m_previous_totals.framebuffer_create_ns)
+           << ','
+           << totals.static_recomp_bursts - m_previous_totals.static_recomp_bursts << ','
+           << totals.static_recomp_cycles - m_previous_totals.static_recomp_cycles << ','
+           << totals.static_recomp_native_dispatches -
+                  m_previous_totals.static_recomp_native_dispatches
+           << ','
+           << totals.static_recomp_fallback_steps - m_previous_totals.static_recomp_fallback_steps
+           << ','
+           << totals.static_recomp_hook_fallbacks -
+                  m_previous_totals.static_recomp_hook_fallbacks
+           << ','
+           << totals.static_recomp_fallback_mfspr -
+                  m_previous_totals.static_recomp_fallback_mfspr
+           << ','
+           << totals.static_recomp_fallback_mtspr -
+                  m_previous_totals.static_recomp_fallback_mtspr
+           << ','
+           << totals.static_recomp_fallback_cache -
+                  m_previous_totals.static_recomp_fallback_cache
+           << ','
+           << totals.static_recomp_fallback_dcbst -
+                  m_previous_totals.static_recomp_fallback_dcbst
+           << ','
+           << totals.static_recomp_fallback_dcbf -
+                  m_previous_totals.static_recomp_fallback_dcbf
+           << ','
+           << totals.static_recomp_fallback_dcbi -
+                  m_previous_totals.static_recomp_fallback_dcbi
+           << ','
+           << totals.static_recomp_fallback_icbi -
+                  m_previous_totals.static_recomp_fallback_icbi
+           << ','
+           << totals.static_recomp_fallback_other -
+                  m_previous_totals.static_recomp_fallback_other
+           << ','
+           << totals.static_recomp_cache_controls -
+                  m_previous_totals.static_recomp_cache_controls
+           << ','
+           << totals.static_recomp_cache_control_dcbst -
+                  m_previous_totals.static_recomp_cache_control_dcbst
+           << ','
+           << totals.static_recomp_cache_control_dcbf -
+                  m_previous_totals.static_recomp_cache_control_dcbf
+           << ','
+           << totals.static_recomp_cache_control_dcbi -
+                  m_previous_totals.static_recomp_cache_control_dcbi
+           << ','
+           << totals.static_recomp_cache_control_icbi -
+                  m_previous_totals.static_recomp_cache_control_icbi
+           << ','
+           << totals.efb_vram_pipeline_misses - m_previous_totals.efb_vram_pipeline_misses
+           << ',' << counter_ms(totals.efb_vram_shader_ns, m_previous_totals.efb_vram_shader_ns)
+           << ','
+           << counter_ms(totals.efb_vram_pipeline_ns, m_previous_totals.efb_vram_pipeline_ns)
+           << ',' << totals.efb_ram_pipeline_misses - m_previous_totals.efb_ram_pipeline_misses
+           << ',' << counter_ms(totals.efb_ram_shader_ns, m_previous_totals.efb_ram_shader_ns)
+           << ',' << counter_ms(totals.efb_ram_pipeline_ns, m_previous_totals.efb_ram_pipeline_ns)
+           << ',' << totals.xfb_output_requests - m_previous_totals.xfb_output_requests
+           << ',' << totals.xfb_swap_queued - m_previous_totals.xfb_swap_queued
+           << ',' << totals.xfb_swap_executed - m_previous_totals.xfb_swap_executed
+           << ',' << totals.xfb_duplicates - m_previous_totals.xfb_duplicates
+           << ',' << totals.xfb_presents - m_previous_totals.xfb_presents << '\n';
+
+    if (!m_spike_captured)
+    {
+      const char* marker_path = std::getenv("MELEEPAD_FRAME_PHASE_SPIKE_MARKER");
+      const char* threshold_text = std::getenv("MELEEPAD_FRAME_PHASE_SPIKE_MS");
+      const char* min_frame_text = std::getenv("MELEEPAD_FRAME_PHASE_SPIKE_MIN_EMULATED_FRAME");
+      const double threshold_ms = threshold_text ? std::strtod(threshold_text, nullptr) : 33.0;
+      const u64 min_emulated_frame = min_frame_text ? std::strtoull(min_frame_text, nullptr, 10) : 0;
+      if (marker_path && emulated_frame >= min_emulated_frame && total_ms > threshold_ms)
+      {
+        m_file.flush();
+        std::ofstream marker(marker_path, std::ios_base::out);
+        marker << frame << ',' << emulated_frame << ',' << total_ms << ",spike\n";
+        m_spike_captured = true;
+      }
+    }
+
+    if (!m_slow_armed && m_frame % m_rolling_frame_ms.size() == 0)
+    {
+      std::ifstream arm_file(m_slow_arm_path);
+      m_slow_armed = arm_file.good();
+    }
+
+    if (!m_slow_window_captured && m_slow_armed && m_frame > m_slow_start_frame)
+    {
+      m_rolling_total_ms -= m_rolling_frame_ms[m_rolling_index];
+      m_rolling_frame_ms[m_rolling_index] = total_ms;
+      m_rolling_total_ms += total_ms;
+      m_rolling_index = (m_rolling_index + 1) % m_rolling_frame_ms.size();
+      m_rolling_count = std::min(m_rolling_count + 1, m_rolling_frame_ms.size());
+
+      constexpr double slow_window_ms = 60.0 * 1000.0 / 55.0;
+      const char* marker_path = std::getenv("MELEEPAD_FRAME_PHASE_SLOW_MARKER");
+      if (marker_path && m_rolling_count == m_rolling_frame_ms.size() &&
+          m_rolling_total_ms > slow_window_ms)
+      {
+        m_file.flush();
+        std::ofstream marker(marker_path, std::ios_base::out);
+        marker << "frame=" << (m_frame - 1) << '\n'
+               << "rolling_total_ms=" << m_rolling_total_ms << '\n'
+               << "rolling_fps=" << 60000.0 / m_rolling_total_ms << '\n';
+        m_slow_window_captured = true;
+      }
+    }
+
+    m_previous_frame_start = frame_start;
+    m_previous_totals = totals;
+    m_previous_task_events = task_events;
+    m_previous_vertex_shaders_created = g_stats.num_vertex_shaders_created;
+    m_previous_pixel_shaders_created = g_stats.num_pixel_shaders_created;
+    m_previous_textures_created = g_stats.num_textures_created;
+  }
+
+private:
+  std::ofstream m_file;
+  TimePoint m_previous_frame_start{};
+  Common::FramePhaseTiming::Totals m_previous_totals{};
+  TaskEventCounts m_previous_task_events{};
+  int m_previous_vertex_shaders_created = 0;
+  int m_previous_pixel_shaders_created = 0;
+  int m_previous_textures_created = 0;
+  u64 m_frame = 0;
+  std::array<double, 60> m_rolling_frame_ms{};
+  std::size_t m_rolling_index = 0;
+  std::size_t m_rolling_count = 0;
+  double m_rolling_total_ms = 0.0;
+  bool m_slow_window_captured = false;
+  bool m_spike_captured = false;
+  u64 m_slow_start_frame = 0;
+  const char* m_slow_arm_path = nullptr;
+  bool m_slow_armed = true;
+};
+
+FramePhaseLogger s_frame_phase_logger;
+}  // namespace
+
 // Stretches the native/internal analog resolution aspect ratio from ~4:3 to ~16:9
 static float SourceAspectRatioToWidescreen(float source_aspect)
 {
@@ -169,6 +488,8 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
                        TimePoint presentation_time)
 {
   bool is_duplicate = FetchXFB(xfb_addr, fb_width, fb_stride, fb_height, ticks);
+  if (is_duplicate)
+    Common::FramePhaseTiming::AddXfbDuplicate();
 
   PresentInfo present_info{
       .present_count = m_present_count++,
@@ -212,6 +533,7 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
 
   if (!is_duplicate || !g_ActiveConfig.bSkipPresentingDuplicateXFBs)
   {
+    Common::FramePhaseTiming::AddXfbPresent();
     Present(&present_info);
     ProcessFrameDumping(ticks);
 
@@ -901,6 +1223,7 @@ void Presenter::RenderXFBToScreen(const MathUtil::Rectangle<int>& target_rc,
 
 void Presenter::Present(PresentInfo* present_info)
 {
+  const TimePoint frame_phase_start = Clock::now();
   m_present_count++;
 
   if (g_gfx->IsHeadless() || (!m_onscreen_ui && !m_xfb_entry))
@@ -928,9 +1251,11 @@ void Presenter::Present(PresentInfo* present_info)
   g_vertex_manager->Flush();
 
   UpdateDrawRectangle();
+  const TimePoint flush_and_rect_end = Clock::now();
 
   g_gfx->BeginUtilityDrawing();
   const bool backbuffer_bound = g_gfx->BindBackbuffer({{0.0f, 0.0f, 0.0f, 1.0f}});
+  const TimePoint bind_backbuffer_end = Clock::now();
 
   // Render the XFB to the screen.
   if (backbuffer_bound && m_xfb_entry)
@@ -942,6 +1267,7 @@ void Presenter::Present(PresentInfo* present_info)
                                 m_backbuffer_height);
     RenderXFBToScreen(render_target_rc, m_xfb_entry->texture.get(), render_source_rc);
   }
+  const TimePoint xfb_blit_end = Clock::now();
 
   if (m_onscreen_ui)
   {
@@ -949,8 +1275,10 @@ void Presenter::Present(PresentInfo* present_info)
     if (backbuffer_bound)
       m_onscreen_ui->DrawImGui();
   }
+  const TimePoint onscreen_ui_end = Clock::now();
 
   // Present to the window system.
+  const TimePoint present_phase_start = Clock::now();
   {
     std::lock_guard<std::mutex> guard(m_swap_mutex);
 
@@ -958,7 +1286,8 @@ void Presenter::Present(PresentInfo* present_info)
     {
       const auto present_time = GetUpdatedPresentationTime(present_info->intended_present_time);
 
-      Core::System::GetInstance().GetCoreTiming().SleepUntil(present_time);
+      Core::System::GetInstance().GetCoreTiming().SleepUntil(
+          present_time, CoreTiming::SleepReason::Presentation);
 
       // Perhaps in the future a more accurate time can be acquired from the various backends.
       present_info->actual_present_time = Clock::now();
@@ -967,6 +1296,12 @@ void Presenter::Present(PresentInfo* present_info)
 
     g_gfx->PresentBackbuffer();
   }
+  const TimePoint frame_phase_end = Clock::now();
+  s_frame_phase_logger.Log(frame_phase_start, present_phase_start, frame_phase_end,
+                           flush_and_rect_end - frame_phase_start,
+                           bind_backbuffer_end - flush_and_rect_end,
+                           xfb_blit_end - bind_backbuffer_end,
+                           onscreen_ui_end - xfb_blit_end);
 
   if (m_xfb_entry)
   {

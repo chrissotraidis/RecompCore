@@ -37,14 +37,54 @@ private:
   class PipeInput : public Input
   {
   public:
-    PipeInput(const std::string& name) : m_name(name), m_state(0.0) {}
+    PipeInput(const std::string& name, bool latch_short_press = false)
+        : m_name(name), m_latch_short_press(latch_short_press)
+    {
+    }
     std::string GetName() const override { return m_name; }
-    ControlState GetState() const override { return m_state; }
-    void SetState(ControlState state) { m_state = state; }
+    ControlState GetState() const override
+    {
+      const ControlState state = m_state;
+      if (m_latch_short_press && state > 0.0)
+      {
+        m_press_observed = true;
+        if (m_release_pending)
+        {
+          m_state = 0.0;
+          m_release_pending = false;
+        }
+      }
+      return state;
+    }
+    void SetState(ControlState state)
+    {
+      if (!m_latch_short_press)
+      {
+        m_state = state;
+        return;
+      }
+      if (state > 0.0)
+      {
+        if (m_state <= 0.0)
+          m_press_observed = false;
+        m_release_pending = false;
+        m_state = state;
+        return;
+      }
+      if (m_state > 0.0 && !m_press_observed)
+      {
+        m_release_pending = true;
+        return;
+      }
+      m_state = state;
+    }
 
   private:
     const std::string m_name;
-    ControlState m_state;
+    const bool m_latch_short_press;
+    mutable ControlState m_state = 0.0;
+    mutable bool m_press_observed = false;
+    mutable bool m_release_pending = false;
   };
 
   void AddAxis(const std::string& name, double value);

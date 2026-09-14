@@ -1,6 +1,8 @@
 {
   global:
     staticrecomp_get_module;
+    staticrecomp_profile_reset;
+    staticrecomp_profile_dump;
   local:
     *;
 };

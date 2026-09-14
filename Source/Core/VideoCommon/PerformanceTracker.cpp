@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <utility>
 
@@ -12,6 +13,7 @@
 
 #include "Common/CommonTypes.h"
 #include "Common/FileUtil.h"
+#include "Common/FramePhaseTiming.h"
 #include "Common/MathUtil.h"
 #include "VideoCommon/VideoConfig.h"
 
@@ -24,10 +26,18 @@ PerformanceTracker::PerformanceTracker(std::optional<std::string> log_name,
     : m_log_name{std::move(log_name)}, m_sample_window_duration{sample_window_duration}
 {
   Reset();
+
+  if (m_log_name == "render_times.txt")
+  {
+    const char* const output_path = std::getenv("MELEEPAD_LIGHTWEIGHT_FRAME_LOG");
+    if (output_path && output_path[0] != '\0')
+      m_lightweight_frame_timing.emplace(std::string{output_path});
+  }
 }
 
 void PerformanceTracker::Reset()
 {
+  m_frame_intervals.Take();
   m_raw_dts.Clear();
   m_dt_queue.clear();
 
@@ -53,6 +63,12 @@ void PerformanceTracker::Count()
     return;
   }
 
+  if (m_lightweight_frame_timing)
+    m_lightweight_frame_timing->Record(current_time,
+                                       Common::FramePhaseTiming::GetEmulatedFrameIndex());
+
+  if (m_log_name == "render_times.txt")
+    m_frame_intervals.Record(DT_ms(diff).count());
   m_last_raw_dt = diff;
   m_raw_dts.Push(diff);
 }
@@ -195,5 +211,8 @@ void PerformanceTracker::LogRenderTimeToFile(DT val)
                       std::ios_base::out);
   }
 
-  m_bench_file << std::fixed << std::setprecision(8) << DT_ms(val).count() << std::endl;
+  // Keep benchmark logging off the frame-critical path. std::endl flushes the
+  // stream on every frame, which can introduce large I/O stalls into the very
+  // timings this logger is meant to measure. The stream is flushed on close.
+  m_bench_file << std::fixed << std::setprecision(8) << DT_ms(val).count() << '\n';
 }

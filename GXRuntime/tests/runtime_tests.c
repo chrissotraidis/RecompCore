@@ -23,6 +23,7 @@
 #include "gxruntime/vi_clock.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -73,6 +74,9 @@ static DolPlatformGuestAddressResolverFn g_guest_resolver_fn;
 static void* g_guest_resolver_user;
 static u8 g_psq_external[16];
 static unsigned g_psq_external_writes;
+static u32 g_psq_external_last_ea;
+static u64 g_psq_external_last_value;
+static u8 g_psq_external_last_size;
 static unsigned g_mmio_read_hits;
 static unsigned g_mmio_write_hits;
 static CPUState* g_mmio_last_cpu;
@@ -128,6 +132,181 @@ static void put_be32(u8* p, u32 value) {
 static void put_be16(u8* p, u16 value) {
     p[0] = (u8)(value >> 8);
     p[1] = (u8)value;
+}
+
+static f64 test_f64_from_bits(u64 bits) {
+    f64 value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static u32 test_f32_bits(f32 value) {
+    u32 bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+static void test_scalar_single_semantics(void) {
+    enum {
+        FPSCR_FX = 0x80000000u,
+        FPSCR_ZX = 0x04000000u,
+        FPSCR_VXSNAN = 0x01000000u,
+        FPSCR_VXISI = 0x00800000u,
+        FPSCR_FR = 0x00040000u,
+        FPSCR_FI = 0x00020000u,
+        FPSCR_FPRF = 0x0001F000u,
+        FPSCR_VE = 0x00000080u,
+        FPSCR_ZE = 0x00000010u,
+        FPSCR_NI = 0x00000004u,
+    };
+
+    CPUState cpu;
+    assert(cpu_init(&cpu));
+
+    cpu.fpr[1] = 1.25;
+    cpu.fpr[2] = 2.5;
+    cpu.ps1[3] = -1234.0;
+    ppc_fadds(&cpu, 3, 1, 2);
+    assert(cpu.fpr[3] == 3.75 && cpu.ps1[3] == 3.75);
+    assert((cpu.fpscr & FPSCR_FPRF) == (0x04u << 12));
+
+    cpu_reset(&cpu);
+    cpu.fpr[1] = 1.1;
+    cpu.ps1[4] = -1234.0;
+    ppc_frsp(&cpu, 4, 1);
+    assert(test_f32_bits((f32)cpu.fpr[4]) == 0x3F8CCCCDu);
+    assert(cpu.fpr[4] == cpu.ps1[4]);
+    assert((cpu.fpscr & FPSCR_FPRF) == (0x04u << 12));
+
+    cpu_reset(&cpu);
+    cpu.fpscr = FPSCR_FI | FPSCR_FR;
+    cpu.fpr[1] = test_f64_from_bits(0xC12971EA801974D8ull);
+    cpu.fpr[2] = test_f64_from_bits(0x418694A6991D1100ull);
+    cpu.ps1[3] = -1234.0;
+    ppc_fmuls(&cpu, 3, 1, 2);
+    assert(test_f32_bits((f32)cpu.fpr[3]) == 0xD60FA425u);
+    assert(cpu.fpr[3] == cpu.ps1[3]);
+    assert((cpu.fpscr & (FPSCR_FI | FPSCR_FR)) == 0);
+
+    cpu_reset(&cpu);
+    cpu.fpr[1] = test_f64_from_bits(0x7FF0000000000001ull);
+    cpu.fpr[2] = 1.0;
+    cpu.ps1[3] = -1234.0;
+    ppc_fadds(&cpu, 3, 1, 2);
+    assert(isnan(cpu.fpr[3]) && isnan(cpu.ps1[3]));
+    assert((cpu.fpscr & (FPSCR_FX | FPSCR_VXSNAN)) ==
+           (FPSCR_FX | FPSCR_VXSNAN));
+
+    cpu_reset(&cpu);
+    cpu.fpr[1] = INFINITY;
+    cpu.fpr[2] = INFINITY;
+    ppc_fsubs(&cpu, 3, 1, 2);
+    assert(isnan(cpu.fpr[3]) && isnan(cpu.ps1[3]));
+    assert((cpu.fpscr & (FPSCR_FX | FPSCR_VXISI)) ==
+           (FPSCR_FX | FPSCR_VXISI));
+
+    cpu_reset(&cpu);
+    cpu.fpr[1] = 1.0;
+    cpu.fpr[2] = 0.0;
+    ppc_fdivs(&cpu, 3, 1, 2);
+    assert(isinf(cpu.fpr[3]) && cpu.fpr[3] > 0.0);
+    assert(cpu.fpr[3] == cpu.ps1[3]);
+    assert((cpu.fpscr & (FPSCR_FX | FPSCR_ZX)) ==
+           (FPSCR_FX | FPSCR_ZX));
+
+    cpu_reset(&cpu);
+    cpu.fpscr = FPSCR_ZE;
+    cpu.fpr[1] = 1.0;
+    cpu.fpr[2] = 0.0;
+    cpu.fpr[3] = 77.0;
+    cpu.ps1[3] = 88.0;
+    ppc_fdivs(&cpu, 3, 1, 2);
+    assert(cpu.fpr[3] == 77.0 && cpu.ps1[3] == 88.0);
+    assert((cpu.fpscr & (FPSCR_FX | FPSCR_ZX)) ==
+           (FPSCR_FX | FPSCR_ZX));
+
+    cpu_reset(&cpu);
+    cpu.fpscr = FPSCR_VE;
+    cpu.fpr[1] = test_f64_from_bits(0x7FF0000000000001ull);
+    cpu.fpr[2] = 1.0;
+    cpu.fpr[3] = 77.0;
+    cpu.ps1[3] = 88.0;
+    ppc_fadds(&cpu, 3, 1, 2);
+    assert(cpu.fpr[3] == 77.0 && cpu.ps1[3] == 88.0);
+    assert((cpu.fpscr & (FPSCR_FX | FPSCR_VXSNAN)) ==
+           (FPSCR_FX | FPSCR_VXSNAN));
+
+    cpu_reset(&cpu);
+    cpu.fpscr = FPSCR_NI;
+    cpu.fpr[1] = 1.0e-40;
+    cpu.ps1[3] = -1234.0;
+    ppc_frsp(&cpu, 3, 1);
+    assert(test_f32_bits((f32)cpu.fpr[3]) == 0u);
+    assert(cpu.fpr[3] == cpu.ps1[3]);
+
+    cpu_free(&cpu);
+}
+
+static void test_scalar_fma_semantics(void) {
+    enum {
+        FPSCR_FX = 0x80000000u,
+        FPSCR_VXSNAN = 0x01000000u,
+        FPSCR_FR = 0x00040000u,
+        FPSCR_FI = 0x00020000u,
+        FPSCR_VE = 0x00000080u,
+        FPSCR_NI = 0x00000004u,
+    };
+
+    CPUState cpu;
+    assert(cpu_init(&cpu));
+
+    cpu.fpr[1] = 1.0;
+    cpu.fpr[2] = 2.0;
+    cpu.fpr[3] = 3.0;
+    cpu.ps1[4] = -1234.0;
+    cpu.fpscr = FPSCR_FI | FPSCR_FR;
+    ppc_fmadd_op(&cpu, 4, 1, 2, 3, true, false, false);
+    assert(cpu.fpr[4] == 5.0 && cpu.ps1[4] == 5.0);
+    assert((cpu.fpscr & (FPSCR_FI | FPSCR_FR)) == 0);
+
+    ppc_fmadd_op(&cpu, 4, 1, 2, 3, true, true, false);
+    assert(cpu.fpr[4] == -1.0 && cpu.ps1[4] == -1.0);
+    ppc_fmadd_op(&cpu, 4, 1, 2, 3, true, false, true);
+    assert(cpu.fpr[4] == -5.0 && cpu.ps1[4] == -5.0);
+    ppc_fmadd_op(&cpu, 4, 1, 2, 3, true, true, true);
+    assert(cpu.fpr[4] == 1.0 && cpu.ps1[4] == 1.0);
+
+    cpu.ps1[4] = -1234.0;
+    ppc_fmadd_op(&cpu, 4, 1, 2, 3, false, false, false);
+    assert(cpu.fpr[4] == 5.0 && cpu.ps1[4] == -1234.0);
+    ppc_fmadd_op(&cpu, 4, 1, 2, 3, false, true, false);
+    assert(cpu.fpr[4] == -1.0 && cpu.ps1[4] == -1234.0);
+    ppc_fmadd_op(&cpu, 4, 1, 2, 3, false, false, true);
+    assert(cpu.fpr[4] == -5.0 && cpu.ps1[4] == -1234.0);
+    ppc_fmadd_op(&cpu, 4, 1, 2, 3, false, true, true);
+    assert(cpu.fpr[4] == 1.0 && cpu.ps1[4] == -1234.0);
+
+    cpu_reset(&cpu);
+    cpu.fpscr = FPSCR_NI;
+    cpu.fpr[1] = 0x1p-140;
+    cpu.fpr[2] = 1.0;
+    cpu.fpr[3] = 0.0;
+    ppc_fmadd_op(&cpu, 4, 1, 2, 3, true, false, false);
+    assert(cpu.fpr[4] == 0.0 && cpu.ps1[4] == 0.0);
+
+    cpu_reset(&cpu);
+    cpu.fpscr = FPSCR_VE;
+    cpu.fpr[1] = test_f64_from_bits(0x7FF0000000000001ull);
+    cpu.fpr[2] = 1.0;
+    cpu.fpr[3] = 0.0;
+    cpu.fpr[4] = 77.0;
+    cpu.ps1[4] = 88.0;
+    ppc_fmadd_op(&cpu, 4, 1, 2, 3, true, false, false);
+    assert(cpu.fpr[4] == 77.0 && cpu.ps1[4] == 88.0);
+    assert((cpu.fpscr & (FPSCR_FX | FPSCR_VXSNAN)) ==
+           (FPSCR_FX | FPSCR_VXSNAN));
+
+    cpu_free(&cpu);
 }
 
 static void test_gx_write(u64 value, u8 size) {
@@ -267,6 +446,9 @@ static void psq_external_write(CPUState* cpu, u32 ea, u64 value, u8 size) {
     (void)cpu;
     const u32 base = 0xE0000000u;
     g_psq_external_writes++;
+    g_psq_external_last_ea = ea;
+    g_psq_external_last_value = value;
+    g_psq_external_last_size = size;
     if (ea < base || (u64)(ea - base) + size > sizeof(g_psq_external))
         return;
     for (u8 i = 0; i < size; i++)
@@ -407,6 +589,60 @@ static void test_store_reservation(void) {
     cpu.reserve_valid = true;
     mem_write8(&cpu, GC_RAM_BASE + 0x120u, 0xABu);
     assert(cpu.reserve_valid);
+
+    cpu_free(&cpu);
+}
+
+static u32 g_multiword_journal_calls;
+static u32 g_multiword_journal_first_offset;
+
+static void test_multiword_journal(u32 offset, u32 size, void* user) {
+    assert(user == &g_multiword_journal_calls);
+    assert(size == 4u);
+    if (g_multiword_journal_calls == 0u)
+        g_multiword_journal_first_offset = offset;
+    ++g_multiword_journal_calls;
+}
+
+static void test_multiword_range_helpers(void) {
+    CPUState cpu;
+    assert(cpu_init(&cpu));
+
+    const u32 base = GC_RAM_BASE + 0x1000u;
+    for (u32 r = 0; r < 32; ++r)
+        mem_write32(&cpu, base + r * 4u, 0xA0000000u | r);
+    cpu.gpr[3] = base;
+    ppc_lmw_op(&cpu, cpu.gpr[3], 0);
+    for (u32 r = 0; r < 32; ++r)
+        assert(cpu.gpr[r] == (0xA0000000u | r));
+
+    for (u32 r = 20; r < 32; ++r)
+        cpu.gpr[r] = 0xB0000000u | r;
+    cpu.reserve_addr = base + 0x80u;
+    cpu.reserve_valid = true;
+    g_multiword_journal_calls = 0;
+    g_mem_write_journal = test_multiword_journal;
+    g_mem_write_journal_user = &g_multiword_journal_calls;
+    ppc_stmw_op(&cpu, GC_RAM_UNCACHED + 0x107Cu, 20);
+    g_mem_write_journal = NULL;
+    g_mem_write_journal_user = NULL;
+    assert(!cpu.reserve_valid);
+    assert(g_multiword_journal_calls == 12u);
+    assert(g_multiword_journal_first_offset == 0x107Cu);
+    for (u32 r = 20; r < 32; ++r)
+        assert(mem_read32(&cpu, base + 0x7Cu + (r - 20u) * 4u) ==
+               (0xB0000000u | r));
+
+    u8 exram[128] = {0};
+    cpu.exram = exram;
+    cpu.exram_size = sizeof(exram);
+    for (u32 r = 24; r < 32; ++r)
+        write_be32(exram + (r - 24u) * 4u, 0xC0000000u | r);
+    ppc_lmw_op(&cpu, 0x90000000u, 24);
+    for (u32 r = 24; r < 32; ++r)
+        assert(cpu.gpr[r] == (0xC0000000u | r));
+    cpu.exram = NULL;
+    cpu.exram_size = 0;
 
     cpu_free(&cpu);
 }
@@ -1358,11 +1594,11 @@ static void test_psq_quantized_paths(void) {
     assert(g_psq_external[5] == 0x10u);
     assert(g_psq_external[6] == 0x00u);
     assert(g_psq_external[7] == 0x00u);
-    /* Both PS lanes store through the external_write hook (2 word writes) -
-     * psq now uses the normal mem access path, matching how the runtime
-     * backs 0xE0000000 on the mmio bus (the old raw-pointer fast path that
-     * bypassed the hook is retired for Dolphin-exact lockstep). */
-    assert(g_psq_external_writes == 2);
+    /* Dolphin WritePair<u32> performs one 64-bit memory transaction. */
+    assert(g_psq_external_writes == 1);
+    assert(g_psq_external_last_ea == 0xE0000000u);
+    assert(g_psq_external_last_size == 8);
+    assert(g_psq_external_last_value == 0x3FC00000C0100000ull);
 
     cpu.gqr[6] = 0x3D043D04u;
     cpu.fpr[2] = 2040.0;
@@ -1379,7 +1615,35 @@ static void test_psq_quantized_paths(void) {
     ppc_psq_store(&cpu, 3, 0xE0000000u, false, 6, false, 0);
     assert(g_psq_external[0] == 2u);
     assert(g_psq_external[1] == 3u);
-    assert(g_psq_external_writes == 2);
+    /* Dolphin WritePair<u8> performs one 16-bit memory transaction. */
+    assert(g_psq_external_writes == 1);
+    assert(g_psq_external_last_size == 2);
+    assert(g_psq_external_last_value == 0x0203u);
+
+    cpu.gqr[6] = 5u;
+    cpu.fpr[3] = 1.0;
+    cpu.ps1[3] = 2.0;
+    ppc_psq_store(&cpu, 3, 0xE0000000u, false, 6, false, 0);
+    assert(g_psq_external_last_size == 4);
+    assert(g_psq_external_last_value == 0x00010002u);
+
+    cpu.gqr[6] = 6u;
+    cpu.fpr[3] = -1.0;
+    cpu.ps1[3] = -2.0;
+    ppc_psq_store(&cpu, 3, 0xE0000000u, false, 6, false, 0);
+    assert(g_psq_external_last_size == 2);
+    assert(g_psq_external_last_value == 0xFFFEu);
+
+    cpu.gqr[6] = 7u;
+    ppc_psq_store(&cpu, 3, 0xE0000000u, false, 6, false, 0);
+    assert(g_psq_external_last_size == 4);
+    assert(g_psq_external_last_value == 0xFFFFFFFEu);
+
+    cpu.gqr[6] = 4u;
+    cpu.fpr[3] = 3.0;
+    ppc_psq_store(&cpu, 3, 0xE0000000u, true, 6, false, 0);
+    assert(g_psq_external_last_size == 1);
+    assert(g_psq_external_last_value == 3u);
 
     cpu_free(&cpu);
 }
@@ -2299,8 +2563,11 @@ static void test_native_system_helpers(void) {
 }
 
 int main(void) {
+    test_scalar_single_semantics();
+    test_scalar_fma_semantics();
     test_guest_memory();
     test_store_reservation();
+    test_multiword_range_helpers();
     test_native_system_helpers();
     test_savestate_roundtrip();
     test_gx_recomp_modules();

@@ -11,6 +11,7 @@
 #include "AudioCommon/Enums.h"
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
+#include "Common/FramePhaseTiming.h"
 #include "Common/Logging/Log.h"
 #include "Common/MathUtil.h"
 #include "Common/Swap.h"
@@ -75,6 +76,45 @@ void Mixer::MixerFifo::Mix(s16* samples, std::size_t num_samples)
   if (!m_mixer->m_config_audio_preserve_pitch && 0 < emulation_speed && emulation_speed != 1.0)
     in_sample_rate *= emulation_speed;
 
+  // Calculate the ideal length of the granule queue before the iOS
+  // prebuffer check so the configured reserve is honored at startup.
+  const std::size_t buffer_size_ms = m_mixer->m_config_audio_buffer_ms;
+  const std::size_t buffer_size_samples = std::llround(buffer_size_ms * in_sample_rate / 1000.0);
+  const std::size_t buffer_size_granules =
+      std::clamp((buffer_size_samples) / (GRANULE_SIZE >> 1), static_cast<std::size_t>(4),
+                 static_cast<std::size_t>(MAX_GRANULE_QUEUE_SIZE));
+  m_granule_queue_size.store(buffer_size_granules, std::memory_order_relaxed);
+
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+  // Static-recompiled games can deliver DSP samples a fraction slower than
+  // wall clock during brief CPU/GPU contention. Keep the iOS DSP queue near
+  // half full by making a very small resampling correction instead of
+  // repeatedly draining it and fading whole parts of the mix away.
+  if (this == &m_mixer->m_dma_mixer)
+  {
+    const std::size_t queue_size = m_granule_queue_size.load(std::memory_order_relaxed);
+    const std::size_t head = m_queue_head.load(std::memory_order_acquire);
+    const std::size_t tail = m_queue_tail.load(std::memory_order_acquire);
+    const std::size_t queued = (head - tail) & GRANULE_QUEUE_MASK;
+    const double target = static_cast<double>(std::max<std::size_t>(2, queue_size / 2));
+
+    // Do not begin draining a one-granule queue. Waiting for half of the
+    // configured reserve costs roughly 60 ms at boot and gives the adaptive
+    // resampler enough headroom to absorb normal frame-time variation.
+    if (m_prebuffering)
+    {
+      if (queued < static_cast<std::size_t>(target))
+        return;
+      m_prebuffering = false;
+    }
+
+    const double error = (static_cast<double>(queued) - target) / target;
+    const double desired_rate = std::clamp(1.0 + 0.02 * error, 0.98, 1.02);
+    m_dynamic_rate += 0.1 * (desired_rate - m_dynamic_rate);
+    in_sample_rate *= m_dynamic_rate;
+  }
+#endif
+
   const double base = static_cast<double>(1 << GRANULE_FRAC_BITS);
   const u32 index_jump = std::lround(base * in_sample_rate / out_sample_rate);
 
@@ -85,18 +125,7 @@ void Mixer::MixerFifo::Mix(s16* samples, std::size_t num_samples)
 
   const StereoPair volume{m_LVolume.load() / 256.0f, m_RVolume.load() / 256.0f};
 
-  // Calculate the ideal length of the granule queue.
-  const std::size_t buffer_size_ms = m_mixer->m_config_audio_buffer_ms;
-  const std::size_t buffer_size_samples = std::llround(buffer_size_ms * in_sample_rate / 1000.0);
-
-  // Limit the possible queue sizes to any number between 4 and 64.
-  const std::size_t buffer_size_granules =
-      std::clamp((buffer_size_samples) / (GRANULE_SIZE >> 1), static_cast<std::size_t>(4),
-                 static_cast<std::size_t>(MAX_GRANULE_QUEUE_SIZE));
-
   bool fade_audio = m_queue_fading.load(std::memory_order_relaxed);
-
-  m_granule_queue_size.store(buffer_size_granules, std::memory_order_relaxed);
 
   while (num_samples-- > 0)
   {
@@ -166,6 +195,9 @@ std::size_t Mixer::Mix(s16* samples, std::size_t num_samples)
   if (!samples)
     return 0;
 
+  const bool log_phase = Common::FramePhaseTiming::IsEnabled();
+  const TimePoint phase_start = log_phase ? Clock::now() : TimePoint{};
+
   memset(samples, 0, num_samples * 2 * sizeof(s16));
 
   m_dma_mixer.Mix(samples, num_samples);
@@ -178,6 +210,9 @@ std::size_t Mixer::Mix(s16* samples, std::size_t num_samples)
   m_skylander_portal_mixer.Mix(samples, num_samples);
   for (auto& mixer : m_gba_mixers)
     mixer.Mix(samples, num_samples);
+
+  if (log_phase)
+    Common::FramePhaseTiming::AddAudioMix(Clock::now() - phase_start);
 
   return num_samples;
 }
@@ -568,6 +603,21 @@ bool Mixer::MixerFifo::Dequeue(Granule* granule)
   std::size_t next_tail = (tail + 1) & GRANULE_QUEUE_MASK;
   if (next_tail == head)
   {
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+    // Preserve the true queue position on iOS so the adaptive rate above can
+    // recover. Rewinding into old granules makes music sound selectively
+    // muted as Dolphin's gap filler repeatedly fades the replayed data.
+    if (this == &m_mixer->m_dma_mixer)
+    {
+      m_mixer->m_dma_underrun_count.fetch_add(1, std::memory_order_relaxed);
+      std::fill(granule->begin(), granule->end(), StereoPair{0.0f, 0.0f});
+      m_queue_fading.store(false, std::memory_order_relaxed);
+      m_queue_looping.store(false, std::memory_order_relaxed);
+      m_prebuffering = true;
+      return false;
+    }
+#endif
+
     // Only fill gaps when running to prevent stutter on pause.
     const bool is_running = Core::GetState(Core::System::GetInstance()) == Core::State::Running;
     if (m_mixer->m_config_fill_audio_gaps && is_running)

@@ -41,6 +41,29 @@ public:
   // Note: NullSoundStream sets the sample rate to 0.
   bool IsOutputSampleRateValid() const { return m_output_sample_rate != 0; }
 
+  void RecordOutputCallback(std::size_t num_frames)
+  {
+    m_output_callback_count.fetch_add(1, std::memory_order_relaxed);
+    m_output_frame_count.fetch_add(num_frames, std::memory_order_relaxed);
+  }
+  u64 GetOutputCallbackCount() const
+  {
+    return m_output_callback_count.load(std::memory_order_relaxed);
+  }
+  u64 GetOutputFrameCount() const
+  {
+    return m_output_frame_count.load(std::memory_order_relaxed);
+  }
+  u64 GetDMAUnderrunCount() const
+  {
+    return m_dma_underrun_count.load(std::memory_order_relaxed);
+  }
+  std::size_t GetDMAQueuedGranules() const { return m_dma_mixer.GetQueuedGranules(); }
+  std::size_t GetDMAQueueTargetGranules() const
+  {
+    return m_dma_mixer.GetQueueTargetGranules();
+  }
+
   void SetDMAInputSampleRateDivisor(u32 rate_divisor);
   void SetStreamInputSampleRateDivisor(u32 rate_divisor);
   void SetGBAInputSampleRate(std::size_t device_number, u32 sample_rate);
@@ -123,6 +146,18 @@ private:
 
     void Mix(s16* samples, std::size_t num_samples);
 
+    std::size_t GetQueuedGranules() const
+    {
+      const std::size_t head = m_queue_head.load(std::memory_order_acquire);
+      const std::size_t tail = m_queue_tail.load(std::memory_order_acquire);
+      return (head - tail) & GRANULE_QUEUE_MASK;
+    }
+    std::size_t GetQueueTargetGranules() const
+    {
+      return std::max<std::size_t>(2,
+          m_granule_queue_size.load(std::memory_order_relaxed) / 2);
+    }
+
     void SetInputSampleRateDividend(u32 rate_dividend);
     u32 GetInputSampleRateDividend() const;
 
@@ -152,6 +187,8 @@ private:
     std::atomic<bool> m_queue_fading{false};
     std::atomic<bool> m_queue_looping{false};
     float m_fade_volume = 1.0;
+    double m_dynamic_rate = 1.0;
+    bool m_prebuffering = true;
 
     void Enqueue();
     bool Dequeue(Granule* granule);
@@ -166,6 +203,9 @@ private:
   void RefreshConfig();
 
   MixerFifo m_dma_mixer{this, FIXED_SAMPLE_RATE_DIVIDEND / 32000};
+  std::atomic<u64> m_output_callback_count{0};
+  std::atomic<u64> m_output_frame_count{0};
+  std::atomic<u64> m_dma_underrun_count{0};
   MixerFifo m_streaming_mixer{this, FIXED_SAMPLE_RATE_DIVIDEND / 48000};
   std::array<MixerFifo, 4> m_wiimote_speaker_mixers{
       MixerFifo{this, FIXED_SAMPLE_RATE_DIVIDEND / 3000},

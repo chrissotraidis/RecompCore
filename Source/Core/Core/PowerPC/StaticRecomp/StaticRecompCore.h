@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -56,6 +57,37 @@ public:
   bool IsHostCallAddress(u32 address) const;
   bool ShouldYieldAt(u32 address);
 
+  // Read-only counters sampled by netplay desync diagnostics on the CPU thread.
+  u32 GetDiagnosticGuestPC() const { return m_guest.pc; }
+  u64 GetDiagnosticStateHash() const;
+  u64 GetDiagnosticIntegerStateHash() const;
+  u64 GetDiagnosticFprStateHash() const;
+  u64 GetDiagnosticPairedStateHash() const;
+  u64 GetDiagnosticNativeDispatches() const { return m_native_dispatches; }
+  u64 GetDiagnosticFallbackSteps() const { return m_fallback_steps; }
+  u32 GetDiagnosticFailedChunks() const { return m_failed_chunks; }
+  u64 GetDiagnosticVerifications() const { return m_verifications; }
+  u64 GetDiagnosticReverifyEvents() const { return m_reverify_events; }
+  u64 GetDiagnosticChargedCycles() const { return m_charged_cycles; }
+  u64 GetDiagnosticBursts() const { return m_bursts; }
+
+  struct NetplayBoundarySnapshot
+  {
+    u64 sequence = 0;
+    u32 guest_pc = 0;
+    u64 timebase = 0;
+    u64 state_hash = 0;
+    u64 integer_state_hash = 0;
+    u64 fpr_state_hash = 0;
+    u64 paired_state_hash = 0;
+    u64 ram_hash = 0;
+    std::array<u64, 32> ram_region_hashes{};
+  };
+  NetplayBoundarySnapshot GetNetplayBoundarySnapshot() const
+  {
+    return m_netplay_boundary_snapshot;
+  }
+
   void ClearCache() override;
   void Jit(u32 em_address) override {}
   bool HandleFault(uintptr_t access_address, SContext* ctx) override { return false; }
@@ -75,6 +107,8 @@ public:
   const char* GetName() const override { return "StaticRecomp"; }
 
 private:
+  template <bool Diagnostics>
+  void RunWithDiagnostics();
   // JitBaseBlockCache with no generated blocks; exists so generic
   // icache-invalidation plumbing in JitInterface has a real object to talk
   // to, and to feed every invalidation into the SMC demotion guard (D4).
@@ -96,6 +130,13 @@ private:
   };
 
   void LoadModule();
+  void UpdateProfileCapture();
+  void CaptureNetplayBoundarySnapshot();
+  u64 HashSelectedRamPages() const;
+  std::array<u64, 32> HashSelectedRamRegions() const;
+  void FlushDispatchFrameSamples(bool final);
+  void FlushDispatchTimeSamples(bool final);
+  void FlushDispatchBurstSamples(bool final);
 
   // D4 SMC guard, verify-on-entry model. Every chunk starts Unverified; the
   // first native dispatch into it hashes its guest RAM against the module's
@@ -150,6 +191,15 @@ private:
 
   CPUState m_guest{};
   Common::DynamicLibrary m_library;
+  using ProfileResetFn = void (*)();
+  using ProfileDumpFn = int (*)();
+  ProfileResetFn m_profile_reset = nullptr;
+  ProfileDumpFn m_profile_dump = nullptr;
+  u32 m_profile_trigger_address = 0;
+  u32 m_profile_trigger_mask = 0;
+  u32 m_profile_trigger_value = 0;
+  bool m_profile_capture_active = false;
+  bool m_profile_capture_complete = false;
   StaticRecompModuleSource m_module_source;
   const StaticRecompModuleDesc* m_module = nullptr;
   bool m_module_active = false;
@@ -162,8 +212,55 @@ private:
   u64 m_native_exceptions = 0;
   u64 m_hook_fallback_instructions = 0;
   std::unordered_map<u32, u64> m_dispatch_samples;
+  struct DispatchFrameSample
+  {
+    u64 frame;
+    u32 pc;
+  };
+  std::string m_dispatch_frame_log_path;
+  std::vector<DispatchFrameSample> m_dispatch_frame_samples;
+  bool m_dispatch_frame_log_started = false;
+  u64 m_dispatch_frame_samples_written = 0;
+  u64 m_dispatch_sample_interval = 4096;
+  u64 m_dispatch_sample_offset = 0;
+  struct DispatchTimeSample
+  {
+    u64 present_frame;
+    u64 emulated_frame;
+    u32 pc;
+    u64 host_ns;
+    u64 clock_ns;
+  };
+  std::string m_dispatch_time_log_path;
+  std::vector<DispatchTimeSample> m_dispatch_time_samples;
+  bool m_dispatch_time_log_started = false;
+  u64 m_dispatch_time_samples_written = 0;
+  struct DispatchBurstSample
+  {
+    u64 present_frame;
+    u64 emulated_frame;
+    u64 burst;
+    u32 index;
+    u32 previous_pc;
+    u32 pc;
+  };
+  std::string m_dispatch_burst_log_path;
+  std::vector<DispatchBurstSample> m_dispatch_burst_samples;
+  bool m_dispatch_burst_log_started = false;
+  u64 m_dispatch_burst_samples_written = 0;
+  u64 m_dispatch_burst_id = 0;
+  u32 m_dispatch_burst_index = 0;
+  u32 m_dispatch_burst_remaining = 0;
+  u32 m_dispatch_burst_previous_pc = 0;
   u64 m_bursts = 0;          // SyncIn..SyncOut native runs (diagnostic)
   u64 m_charged_cycles = 0;  // cycles flushed from module charges (diagnostic)
+
+  // ctx->timebase is in TB ticks (1 tick per SystemTimers::TIMER_RATIO CPU
+  // cycles), while module charges are CPU cycles. Deriving in-burst TB from a
+  // SyncIn snapshot plus accumulated cycles keeps guest mftb monotonic and in
+  // agreement with GetFakeTimeBase() at burst boundaries.
+  u64 m_burst_tb_base = 0;    // GetFakeTimeBase() at the last SyncIn
+  u64 m_burst_tb_cycles = 0;  // CPU cycles charged since that snapshot
 
   // D4 guard state: parallel to m_module->chunk_ranges.
   std::vector<u8> m_chunk_state;
@@ -197,6 +294,13 @@ private:
   mutable u32 m_last_chunk_index = 0;
 
   u32 m_idle_pc = 0;
+  u32 m_secondary_idle_pc = 0;
+  u64 m_secondary_idle_hits = 0;
+  u32 m_caller_idle_pc = 0;
+  u32 m_caller_idle_lr = 0;
+  u64 m_caller_idle_hits = 0;
+  u64 m_netplay_boundary_sequence = 0;
+  NetplayBoundarySnapshot m_netplay_boundary_snapshot{};
 };
 
 extern StaticRecompCore* g_static_recomp_core;

@@ -28,8 +28,10 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstddef>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -521,6 +523,15 @@ void MMU::GenerateDSIException(u32 effective_address, bool write)
 void MMU::GenerateISIException(u32 effective_address)
 {
   // Address of instruction could not be translated
+  if (std::getenv("STATICRECOMP_REGISTER_TRACE"))
+  {
+    const auto& ppc = m_ppc_state;
+    std::fprintf(stderr,
+                 "[staticrecomp] isi-before fetch=%08x pc=%08x npc=%08x r1=%08x r3=%08x "
+                 "r4=%08x lr=%08x msr=%08x\n",
+                 effective_address, ppc.pc, ppc.npc, ppc.gpr[1], ppc.gpr[3], ppc.gpr[4],
+                 LR(ppc), ppc.msr.Hex);
+  }
   m_ppc_state.npc = effective_address;
 
   m_ppc_state.Exceptions |= EXCEPTION_ISI;

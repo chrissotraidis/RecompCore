@@ -87,6 +87,42 @@ void cpu_reset(CPUState* cpu) {
         memset(cpu->ram, 0, cpu->ram_size);
 }
 
+void ppc_lmw_op(CPUState* cpu, u32 addr, u8 first) {
+    const u32 count = 32u - first;
+    u8* ptr = get_ram_ptr(cpu, addr, count * 4u, NULL);
+    if (ptr == NULL) {
+        for (u32 r = first; r < 32u; ++r, addr += 4u)
+            cpu->gpr[r] = mem_read32(cpu, addr);
+        return;
+    }
+    for (u32 r = first; r < 32u; ++r, ptr += 4u)
+        cpu->gpr[r] = read_be32(ptr);
+}
+
+void ppc_stmw_op(CPUState* cpu, u32 addr, u8 first) {
+    const u32 count = 32u - first;
+    u32 offset;
+    u8* ptr = get_ram_ptr(cpu, addr, count * 4u, &offset);
+    if (ptr == NULL) {
+        for (u32 r = first; r < 32u; ++r, addr += 4u)
+            mem_write32(cpu, addr, cpu->gpr[r]);
+        return;
+    }
+    if (cpu->reserve_valid) {
+        const u32 reserve_line = (cpu->reserve_addr & ~0x40000000u) & ~31u;
+        const u32 first_line = (addr & ~0x40000000u) & ~31u;
+        const u32 last_line = ((addr + count * 4u - 4u) & ~0x40000000u) & ~31u;
+        if (reserve_line >= first_line && reserve_line <= last_line)
+            cpu->reserve_valid = false;
+    }
+    for (u32 r = first; r < 32u; ++r, ptr += 4u) {
+        if (g_mem_write_journal && offset != (u32)-1)
+            g_mem_write_journal(offset + (r - first) * 4u, 4,
+                                g_mem_write_journal_user);
+        write_be32(ptr, cpu->gpr[r]);
+    }
+}
+
 bool ppc_add_overflowed(u32 a, u32 b, u32 result) {
     return (((a ^ result) & (b ^ result)) >> 31) != 0;
 }
@@ -228,6 +264,42 @@ static void psq_store_value(CPUState* cpu, u32 ea, u8 type, s32 scale, f64 value
     }
 }
 
+static void psq_store_pair(CPUState* cpu, u32 ea, u8 type, s32 scale,
+                           f64 ps0, f64 ps1) {
+    switch (type) {
+    case 0: {
+        u32 value0 = convert_to_single_ftz(f64_bits(ps0));
+        u32 value1 = convert_to_single_ftz(f64_bits(ps1));
+        mem_write64(cpu, ea, ((u64)value0 << 32) | value1);
+        break;
+    }
+    case 4: {
+        u8 value0 = (u8)psq_quantize_int(ps0, 0, 255, scale);
+        u8 value1 = (u8)psq_quantize_int(ps1, 0, 255, scale);
+        mem_write16(cpu, ea, ((u16)value0 << 8) | value1);
+        break;
+    }
+    case 5: {
+        u16 value0 = (u16)psq_quantize_int(ps0, 0, 65535, scale);
+        u16 value1 = (u16)psq_quantize_int(ps1, 0, 65535, scale);
+        mem_write32(cpu, ea, ((u32)value0 << 16) | value1);
+        break;
+    }
+    case 6: {
+        u8 value0 = (u8)(s8)psq_quantize_int(ps0, -128, 127, scale);
+        u8 value1 = (u8)(s8)psq_quantize_int(ps1, -128, 127, scale);
+        mem_write16(cpu, ea, ((u16)value0 << 8) | value1);
+        break;
+    }
+    case 7: {
+        u16 value0 = (u16)(s16)psq_quantize_int(ps0, -32768, 32767, scale);
+        u16 value1 = (u16)(s16)psq_quantize_int(ps1, -32768, 32767, scale);
+        mem_write32(cpu, ea, ((u32)value0 << 16) | value1);
+        break;
+    }
+    }
+}
+
 static bool psq_check_enabled(CPUState* cpu, bool indexed, u32 cia) {
     if (!indexed && (cpu->hid2 & PPC_HID2_LSQE) == 0) {
         ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
@@ -266,13 +338,22 @@ bool ppc_psq_store(CPUState* cpu, u8 frS, u32 ea, bool w, u8 gqr_index, bool ind
     if (size == 0) /* invalid GQR type: nothing is stored */
         return true;
 
-    psq_store_value(cpu, ea, type, scale, cpu->fpr[frS]);
-    if (!w)
-        psq_store_value(cpu, ea + size, type, scale, cpu->ps1[frS]);
+    if (w)
+        psq_store_value(cpu, ea, type, scale, cpu->fpr[frS]);
+    else
+        psq_store_pair(cpu, ea, type, scale, cpu->fpr[frS], cpu->ps1[frS]);
     return true;
 }
 
 void ppc_rfi(CPUState* cpu, u32 cia) {
+    const char* trace = getenv("STATICRECOMP_REGISTER_TRACE");
+    if (trace) {
+        fprintf(stderr,
+                "[staticrecomp] module-rfi-before cia=%08X pc=%08X srr0=%08X srr1=%08X "
+                "r1=%08X r3=%08X r4=%08X r7=%08X lr=%08X msr=%08X\n",
+                cia, cpu->pc, cpu->srr0, cpu->srr1, cpu->gpr[1], cpu->gpr[3],
+                cpu->gpr[4], cpu->gpr[7], cpu->lr, cpu->msr);
+    }
     if (cpu->msr & PPC_MSR_PR) {
         ppc_program_exception(cpu, PPC_PROGRAM_PRIV, cia);
         return;
@@ -281,6 +362,13 @@ void ppc_rfi(CPUState* cpu, u32 cia) {
     cpu->msr = (cpu->msr & ~PPC_MSR_RFI_MASK) | (cpu->srr1 & PPC_MSR_RFI_MASK);
     cpu->msr &= ~PPC_MSR_POW;
     cpu->pc = cpu->srr0 & ~3u;
+    if (trace) {
+        fprintf(stderr,
+                "[staticrecomp] module-rfi-after  cia=%08X pc=%08X srr0=%08X srr1=%08X "
+                "r1=%08X r3=%08X r4=%08X r7=%08X lr=%08X msr=%08X\n",
+                cia, cpu->pc, cpu->srr0, cpu->srr1, cpu->gpr[1], cpu->gpr[3],
+                cpu->gpr[4], cpu->gpr[7], cpu->lr, cpu->msr);
+    }
 }
 
 void ppc_dcbz_l(CPUState* cpu, u32 ea, u32 cia) {

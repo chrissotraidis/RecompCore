@@ -243,6 +243,9 @@ static GXRUNTIME_ALWAYS_INLINE void mem_write32(CPUState* cpu, u32 addr, u32 val
     write_be32(ptr, value);
 }
 
+void ppc_lmw_op(CPUState* cpu, u32 addr, u8 first);
+void ppc_stmw_op(CPUState* cpu, u32 addr, u8 first);
+
 static GXRUNTIME_ALWAYS_INLINE u16 mem_read16(CPUState* cpu, u32 addr) {
     u8* ptr = get_ram_ptr(cpu, addr, 2, NULL);
     if (ptr == NULL) {

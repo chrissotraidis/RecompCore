@@ -74,10 +74,7 @@ void StaticRecompLockstepVerifier::Init()
     m_ls_step_cap = std::atoi(s);
   if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_TRACE"))
     m_ls_trace_pc = static_cast<u32>(std::strtoull(s, nullptr, 0));
-  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_REPEAT"))
-    m_ls_repeat_pc = static_cast<u32>(std::strtoull(s, nullptr, 0));
-  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_WHITELIST"))
-  {
+  const auto parse_pc_set = [](const char* s, std::unordered_set<u32>& pcs) {
     const char* p = s;
     while (*p)
     {
@@ -85,18 +82,23 @@ void StaticRecompLockstepVerifier::Init()
       const unsigned long long pc = std::strtoull(p, &end, 0);
       if (end == p)
         break;
-      m_ls_whitelist.insert(static_cast<u32>(pc));
+      pcs.insert(static_cast<u32>(pc));
       p = end;
       while (*p == ',' || *p == ' ')
         ++p;
     }
-  }
+  };
+  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_REPEAT"))
+    parse_pc_set(s, m_ls_repeat_pcs);
+  if (const char* s = std::getenv("STATICRECOMP_LOCKSTEP_WHITELIST"))
+    parse_pc_set(s, m_ls_whitelist);
 
   std::fprintf(
-      stderr,
-      "[lockstep] ENABLED: start=%llu limit=%llu maxreport=%llu stepcap=%d whitelist=%zu\n",
+      stderr, "[lockstep] ENABLED: start=%llu limit=%llu maxreport=%llu stepcap=%d "
+              "repeat=%zu whitelist=%zu\n",
       (unsigned long long)m_ls_start, (unsigned long long)m_ls_limit,
-      (unsigned long long)m_ls_max_report, m_ls_step_cap, m_ls_whitelist.size());
+      (unsigned long long)m_ls_max_report, m_ls_step_cap, m_ls_repeat_pcs.size(),
+      m_ls_whitelist.size());
 }
 
 bool StaticRecompLockstepVerifier::ShouldCheck(u32 address) const
@@ -105,7 +107,8 @@ bool StaticRecompLockstepVerifier::ShouldCheck(u32 address) const
     return false;
   if (!LockstepWindowOpen())
     return false;
-  return address == m_ls_repeat_pc || m_ls_checked.find(address) == m_ls_checked.end();
+  return m_ls_repeat_pcs.find(address) != m_ls_repeat_pcs.end() ||
+         m_ls_checked.find(address) == m_ls_checked.end();
 }
 
 bool StaticRecompLockstepVerifier::LockstepWindowOpen() const

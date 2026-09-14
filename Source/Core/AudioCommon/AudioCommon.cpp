@@ -7,6 +7,9 @@
 #include <fmt/format.h>
 
 #include "AudioCommon/AlsaSoundStream.h"
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+#include "AudioCommon/CoreAudioSoundStream.h"
+#endif
 #include "AudioCommon/CubebStream.h"
 #include "AudioCommon/Mixer.h"
 #include "AudioCommon/NullSoundStream.h"
@@ -30,6 +33,11 @@ constexpr int AUDIO_VOLUME_MAX = 100;
 
 static std::unique_ptr<SoundStream> CreateSoundStreamForBackend(std::string_view backend)
 {
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+  if (backend == BACKEND_COREAUDIO && CoreAudioSound::IsValid())
+    return std::make_unique<CoreAudioSound>();
+  else
+#endif
   if (backend == BACKEND_CUBEB && CubebStream::IsValid())
     return std::make_unique<CubebStream>();
   else if (backend == BACKEND_OPENAL && OpenALStream::IsValid())
@@ -98,6 +106,9 @@ void ShutdownSoundStream(Core::System& system)
 
 std::string GetDefaultSoundBackend()
 {
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+  return BACKEND_COREAUDIO;
+#endif
 #if defined(ANDROID)
   return BACKEND_OPENSLES;
 #else
@@ -123,6 +134,10 @@ std::vector<std::string> GetSoundBackends()
   std::vector<std::string> backends;
 
   backends.emplace_back(BACKEND_NULLSOUND);
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED)
+  if (CoreAudioSound::IsValid())
+    backends.emplace_back(BACKEND_COREAUDIO);
+#endif
   if (CubebStream::IsValid())
     backends.emplace_back(BACKEND_CUBEB);
   if (AlsaSound::IsValid())

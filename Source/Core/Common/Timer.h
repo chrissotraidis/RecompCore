@@ -35,13 +35,19 @@ private:
 class PrecisionTimer
 {
 public:
+  struct Result
+  {
+    Clock::duration coarse_sleep{};
+    Clock::duration final_spin{};
+  };
+
   PrecisionTimer();
   ~PrecisionTimer();
 
   PrecisionTimer(const PrecisionTimer&) = delete;
   PrecisionTimer& operator=(const PrecisionTimer&) = delete;
 
-  void SleepUntil(Clock::time_point);
+  Result SleepUntil(Clock::time_point);
 
 private:
 #ifdef _WIN32

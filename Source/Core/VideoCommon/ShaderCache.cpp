@@ -3,12 +3,14 @@
 
 #include "VideoCommon/ShaderCache.h"
 
+#include <fstream>
 #include <utility>
 
 #include <fmt/format.h>
 
 #include "Common/Assert.h"
 #include "Common/FileUtil.h"
+#include "Common/FramePhaseTiming.h"
 #include "Common/MsgHandler.h"
 #include "Core/Config/ConfigManager.h"
 
@@ -1266,12 +1268,21 @@ ShaderCache::GetEFBCopyToVRAMPipeline(const TextureConversionShaderGen::TCShader
   if (iter != m_efb_copy_to_vram_pipelines.end())
     return iter->second.get();
 
+  if (const char* uid_log_path = std::getenv("MELEEPAD_EFB_VRAM_UID_LOG"))
+  {
+    std::ofstream uid_log(uid_log_path, std::ios_base::app);
+    uid_log << fmt::format("{}\n", *uid.GetUidData());
+  }
+
+  const TimePoint shader_start = Clock::now();
   auto shader_code = TextureConversionShaderGen::GeneratePixelShader(m_api_type, uid.GetUidData());
   auto shader = g_gfx->CreateShaderFromSource(
       ShaderStage::Pixel, shader_code.GetBuffer(), nullptr,
       fmt::format("EFB copy to VRAM pixel shader: {}", *uid.GetUidData()));
+  const TimePoint shader_end = Clock::now();
   if (!shader)
   {
+    Common::FramePhaseTiming::AddEfbPipelineMiss(true, shader_end - shader_start, DT{});
     m_efb_copy_to_vram_pipelines.emplace(uid, nullptr);
     return nullptr;
   }
@@ -1288,6 +1299,8 @@ ShaderCache::GetEFBCopyToVRAMPipeline(const TextureConversionShaderGen::TCShader
   config.framebuffer_state = RenderState::GetRGBA8FramebufferState();
   config.usage = AbstractPipelineUsage::Utility;
   auto iiter = m_efb_copy_to_vram_pipelines.emplace(uid, g_gfx->CreatePipeline(config));
+  Common::FramePhaseTiming::AddEfbPipelineMiss(true, shader_end - shader_start,
+                                                Clock::now() - shader_end);
   return iiter.first->second.get();
 }
 
@@ -1297,13 +1310,16 @@ const AbstractPipeline* ShaderCache::GetEFBCopyToRAMPipeline(const EFBCopyParams
   if (iter != m_efb_copy_to_ram_pipelines.end())
     return iter->second.get();
 
+  const TimePoint shader_start = Clock::now();
   const std::string shader_code =
       TextureConversionShaderTiled::GenerateEncodingShader(uid, m_api_type);
   const auto shader =
       g_gfx->CreateShaderFromSource(ShaderStage::Pixel, shader_code, nullptr,
                                     fmt::format("EFB copy to RAM pixel shader: {}", uid));
+  const TimePoint shader_end = Clock::now();
   if (!shader)
   {
+    Common::FramePhaseTiming::AddEfbPipelineMiss(false, shader_end - shader_start, DT{});
     m_efb_copy_to_ram_pipelines.emplace(uid, nullptr);
     return nullptr;
   }
@@ -1317,6 +1333,8 @@ const AbstractPipeline* ShaderCache::GetEFBCopyToRAMPipeline(const EFBCopyParams
   config.framebuffer_state = RenderState::GetColorFramebufferState(AbstractTextureFormat::BGRA8);
   config.usage = AbstractPipelineUsage::Utility;
   auto iiter = m_efb_copy_to_ram_pipelines.emplace(uid, g_gfx->CreatePipeline(config));
+  Common::FramePhaseTiming::AddEfbPipelineMiss(false, shader_end - shader_start,
+                                                Clock::now() - shader_end);
   return iiter.first->second.get();
 }
 
@@ -1397,6 +1415,25 @@ bool ShaderCache::CompileSharedPipelines()
       if (!m_palette_conversion_pipelines[i])
         return false;
     }
+  }
+
+  if (std::getenv("MELEEPAD_PREWARM_EFB_VRAM"))
+  {
+    constexpr std::array formats = {EFBCopyFormat::R4, EFBCopyFormat::RGBA8,
+                                    EFBCopyFormat::XFB};
+    for (const EFBCopyFormat format : formats)
+    {
+      TextureConversionShaderGen::TCShaderUid uid;
+      uid.GetUidData()->dst_format = format;
+      if (!GetEFBCopyToVRAMPipeline(uid))
+        return false;
+    }
+
+    TextureConversionShaderGen::TCShaderUid half_scale_xfb_uid;
+    half_scale_xfb_uid.GetUidData()->dst_format = EFBCopyFormat::XFB;
+    half_scale_xfb_uid.GetUidData()->scale_by_half = true;
+    if (!GetEFBCopyToVRAMPipeline(half_scale_xfb_uid))
+      return false;
   }
 
   return true;

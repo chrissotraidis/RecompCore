@@ -72,7 +72,7 @@
 	shallow = true
 [submodule "Externals/enet/enet"]
 	path = Externals/enet/enet
-	url = https://github.com/lsalzman/enet.git
+	url = https://github.com/chrissotraidis/enet.git
 	shallow = true
 [submodule "hidapi-src"]
 	path = Externals/hidapi/hidapi-src
@@ -136,6 +136,6 @@
 	shallow = true
 [submodule "DolRecomp"]
 	path = DolRecomp
-	url = https://github.com/ExpansionPak/DolRecomp.git
+	url = https://github.com/chrissotraidis/DolRecomp.git
 	branch = main
 	shallow = true

@@ -131,6 +131,7 @@ public:
 
   std::vector<const Player*> GetPlayers();
   std::vector<Player> GetPlayersSnapshot();
+  PadMappingArray GetPadMappingSnapshot();
   PadMappingArray GetWiimoteMappingSnapshot();
   const NetSettings& GetNetSettings() const;
 
@@ -374,6 +375,7 @@ private:
 
   u64 m_initial_rtc = 0;
   u32 m_timebase_frame = 0;
+  u64 m_last_boundary_sequence_sent = 0;
 
   std::unique_ptr<IOS::HLE::FS::FileSystem> m_wii_sync_fs;
   std::vector<u64> m_wii_sync_titles;

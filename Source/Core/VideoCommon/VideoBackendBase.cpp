@@ -13,6 +13,7 @@
 
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
+#include "Common/FramePhaseTiming.h"
 #include "Common/FileUtil.h"
 #include "Common/Logging/Log.h"
 
@@ -97,6 +98,7 @@ void VideoBackendBase::Video_OutputXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride
 {
   if (!m_initialized || !g_presenter)
     return;
+  Common::FramePhaseTiming::AddXfbOutputRequest();
 
   auto& system = Core::System::GetInstance();
   auto& core_timing = system.GetCoreTiming();
@@ -106,7 +108,9 @@ void VideoBackendBase::Video_OutputXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride
     system.GetFifo().SyncGPU(Fifo::SyncGPUReason::Swap);
 
     const TimePoint presentation_time = core_timing.GetTargetHostTime(ticks);
+    Common::FramePhaseTiming::AddXfbSwapQueued();
     AsyncRequests::GetInstance()->PushEvent([=] {
+      Common::FramePhaseTiming::AddXfbSwapExecuted();
       g_presenter->ViSwap(xfb_addr, fb_width, fb_stride, fb_height, ticks, presentation_time);
     });
   }

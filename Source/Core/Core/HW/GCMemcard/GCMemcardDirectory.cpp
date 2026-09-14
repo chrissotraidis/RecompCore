@@ -181,7 +181,8 @@ GCMemcardDirectory::GCMemcardDirectory(std::string directory, ExpansionInterface
                                        const Memcard::HeaderData& header_data, u32 game_id)
     : MemoryCardBase(slot, header_data.m_size_mb), m_game_id(game_id), m_last_block(-1),
       m_hdr(header_data), m_bat1(header_data.m_size_mb), m_saves(0),
-      m_save_directory(std::move(directory)), m_exiting(false)
+      m_save_directory(std::move(directory)),
+      m_save_data_writable(Config::Get(Config::SESSION_SAVE_DATA_WRITABLE)), m_exiting(false)
 {
   // Use existing header data if available
   {
@@ -255,16 +256,12 @@ GCMemcardDirectory::GCMemcardDirectory(std::string directory, ExpansionInterface
   m_dir2 = m_dir1;
   m_bat2 = m_bat1;
 
-  m_flush_thread = std::thread(&GCMemcardDirectory::FlushThread, this);
+  if (m_save_data_writable)
+    m_flush_thread = std::thread(&GCMemcardDirectory::FlushThread, this);
 }
 
 void GCMemcardDirectory::FlushThread()
 {
-  if (!Config::Get(Config::SESSION_SAVE_DATA_WRITABLE))
-  {
-    return;
-  }
-
   Common::SetCurrentThreadName(fmt::format("Memcard {} flushing thread", m_card_slot).c_str());
 
   constexpr std::chrono::seconds flush_interval{1};
@@ -288,11 +285,15 @@ void GCMemcardDirectory::FlushThread()
 
 GCMemcardDirectory::~GCMemcardDirectory()
 {
-  m_exiting.Set();
-  m_flush_trigger.Set();
-  m_flush_thread.join();
+  if (m_flush_thread.joinable())
+  {
+    m_exiting.Set();
+    m_flush_trigger.Set();
+    m_flush_thread.join();
+  }
 
-  FlushToFile();
+  if (m_save_data_writable)
+    FlushToFile();
 }
 
 s32 GCMemcardDirectory::Read(u32 src_address, s32 length, u8* dest_address)

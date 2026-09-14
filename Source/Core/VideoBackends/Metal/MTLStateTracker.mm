@@ -9,6 +9,7 @@
 
 #include "Common/Align.h"
 #include "Common/Assert.h"
+#include "Common/Logging/Log.h"
 
 #include "Core/System.h"
 
@@ -417,6 +418,13 @@ void Metal::StateTracker::FlushEncoders()
   [m_current_render_cmdbuf
       addCompletedHandler:[backref = m_backref, draw = m_current_draw,
                            q = std::move(m_current_perf_query)](id<MTLCommandBuffer> buf) {
+        if ([buf status] == MTLCommandBufferStatusError)
+        {
+          NSError* error = [buf error];
+          ERROR_LOG_FMT(HOST_GPU, "Metal command buffer failed code={} description={}",
+                        error ? [error code] : 0,
+                        error ? [[error localizedDescription] UTF8String] : "unknown");
+        }
         std::lock_guard<std::mutex> guard(backref->mtx);
         if (StateTracker* tracker = backref->state_tracker)
         {

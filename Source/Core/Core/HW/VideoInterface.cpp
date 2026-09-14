@@ -11,6 +11,7 @@
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
 #include "Common/Config/Config.h"
+#include "Common/FramePhaseTiming.h"
 #include "Common/Logging/Log.h"
 
 #include "VideoCommon/OnScreenDisplay.h"
@@ -682,7 +683,12 @@ void VideoInterfaceManager::Update(u64 ticks)
   // in case frame counter display is enabled
 
   if (is_at_field_boundary)
-    m_system.GetMovie().FrameUpdate();
+  {
+    auto& movie = m_system.GetMovie();
+    movie.FrameUpdate();
+    if (Common::FramePhaseTiming::IsEmulatedFrameIndexEnabled())
+      Common::FramePhaseTiming::SetEmulatedFrameIndex(movie.GetCurrentFrame());
+  }
 
   // If this half-line is at some boundary of the "active video lines" in either field, we either
   // need to (a) send a request to the GPU thread to actually render the XFB, or (b) increment

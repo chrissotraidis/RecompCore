@@ -78,7 +78,7 @@ PipeDevice::PipeDevice(int fd, std::string name) : m_fd(fd), m_name(std::move(na
 {
   for (const auto& tok : s_button_tokens)
   {
-    PipeInput* btn = new PipeInput("Button " + tok);
+    PipeInput* btn = new PipeInput("Button " + tok, true);
     AddInput(btn);
     m_buttons[tok] = btn;
   }
