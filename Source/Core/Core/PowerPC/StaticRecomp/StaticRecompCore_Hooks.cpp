@@ -210,6 +210,17 @@ u32 StaticRecompCore::HookSPRRead(CPUState* cpu, u16 spr, u32 cia)
     return ppc.spr[SPR_PMC4];
   case SPR_IABR:
     return ppc.spr[SPR_IABR] & ~1u;
+  case SPR_TL:
+  case SPR_TU:
+  {
+    // spr[TL/TU] is a stale cache; materialize the live timebase the same way
+    // the interpreter's mfspr does (honoring the lockstep TB pin).
+    const u64 time_base = StaticRecompLockstep::g_tb_override_active ?
+                              StaticRecompLockstep::g_tb_override_value :
+                              core->m_system.GetSystemTimers().GetFakeTimeBase();
+    core->m_system.GetPowerPC().WriteFullTimeBaseValue(time_base);
+    break;
+  }
   default:
     break;
   }

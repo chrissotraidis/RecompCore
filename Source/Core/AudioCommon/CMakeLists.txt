@@ -13,6 +13,13 @@ add_library(audiocommon
   WaveFile.h
 )
 
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "tvOS")
+  target_sources(audiocommon PRIVATE
+    CoreAudioSoundStream.cpp
+    CoreAudioSoundStream.h
+  )
+endif()
+
 if(ENABLE_CUBEB)
   message(STATUS "Cubeb found, enabling Cubeb sound backend")
   target_sources(audiocommon PRIVATE

@@ -1,7 +1,6 @@
 add_library(inputcommon
   DynamicInputTextureManager.cpp
   DynamicInputTextureManager.h
-  GCAdapter.cpp
   GCAdapter.h
   ImageOperations.cpp
   ImageOperations.h
@@ -77,6 +76,12 @@ add_library(inputcommon
   DynamicInputTextures/DITSpecification.h
 )
 
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "tvOS")
+  target_sources(inputcommon PRIVATE GCAdapter_iOS.cpp)
+else()
+  target_sources(inputcommon PRIVATE GCAdapter.cpp)
+endif()
+
 target_link_libraries(inputcommon
 PUBLIC
   common
@@ -113,7 +118,7 @@ if(WIN32)
     )
   endif()
   target_link_libraries(inputcommon PRIVATE cfgmgr32.lib dinput8.lib dxguid.lib)
-elseif(APPLE)
+elseif(APPLE AND NOT (CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "tvOS"))
   target_sources(inputcommon PRIVATE
     ControllerInterface/Quartz/Quartz.h
     ControllerInterface/Quartz/Quartz.mm
@@ -149,7 +154,7 @@ elseif(ANDROID)
   )
 endif()
 
-if(NOT ANDROID)
+if(TARGET LibUSB::LibUSB)
   target_link_libraries(inputcommon PUBLIC LibUSB::LibUSB)
 endif()
 

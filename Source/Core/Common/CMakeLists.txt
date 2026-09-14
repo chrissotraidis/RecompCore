@@ -65,7 +65,6 @@ add_library(common
   FatFsUtil.h
   FileSearch.cpp
   FileSearch.h
-  FilesystemWatcher.cpp
   FilesystemWatcher.h
   FileUtil.cpp
   FileUtil.h
@@ -167,6 +166,14 @@ add_library(common
   WindowSystemInfo.h
   WorkQueueThread.h
 )
+
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "tvOS")
+  # e-dant/watcher uses macOS-only FSEvents on Apple platforms, which is not
+  # available on the iOS device SDK; provide a linkable no-op.
+  target_sources(common PRIVATE FilesystemWatcher_iOS.cpp)
+else()
+  target_sources(common PRIVATE FilesystemWatcher.cpp)
+endif()
 
 add_dependencies(common dolphin_scmrev)
 
@@ -327,7 +334,7 @@ if(WIN32)
   if(MSVC)
     target_sources(common PRIVATE CompatPatches.cpp)
   endif()
-elseif(APPLE)
+elseif(APPLE AND NOT (CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "tvOS"))
   target_sources(common PRIVATE
     GL/GLInterface/AGL.h
     GL/GLInterface/AGL.mm

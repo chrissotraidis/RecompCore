@@ -22,7 +22,8 @@
 #ifdef _WIN32
 #include "Common/Assert.h"
 #endif
-#if defined(__APPLE__) && !defined(USE_SIGACTION_ON_APPLE)
+#if defined(__APPLE__) && !defined(USE_SIGACTION_ON_APPLE) && \
+    !defined(__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__)
 #include "Common/Thread.h"
 #endif
 
@@ -120,7 +121,8 @@ bool IsExceptionHandlerSupported()
   return true;
 }
 
-#elif defined(__APPLE__) && !defined(USE_SIGACTION_ON_APPLE)
+#elif defined(__APPLE__) && !defined(USE_SIGACTION_ON_APPLE) && \
+    !defined(__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__)
 
 static void CheckKR(const char* name, kern_return_t kr)
 {
@@ -254,6 +256,21 @@ void UninstallExceptionHandler()
 bool IsExceptionHandlerSupported()
 {
   return true;
+}
+
+#elif defined(__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__)
+
+void InstallExceptionHandler()
+{
+}
+
+void UninstallExceptionHandler()
+{
+}
+
+bool IsExceptionHandlerSupported()
+{
+  return false;
 }
 
 #elif defined(_POSIX_VERSION) && !defined(_M_GENERIC)

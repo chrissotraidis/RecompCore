@@ -152,6 +152,8 @@ private:
     std::atomic<bool> m_queue_fading{false};
     std::atomic<bool> m_queue_looping{false};
     float m_fade_volume = 1.0;
+    double m_dynamic_rate = 1.0;
+    bool m_prebuffering = true;
 
     void Enqueue();
     bool Dequeue(Granule* granule);

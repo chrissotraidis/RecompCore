@@ -16,7 +16,7 @@
 #else
 #include <stdio.h>
 #include <sys/mman.h>
-#if defined(_M_ARM_64) && defined(__APPLE__)
+#if defined(_M_ARM_64) && defined(__APPLE__) && !defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) && !defined(__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__)
 #include <pthread.h>
 #endif
 #if defined __APPLE__ || defined __FreeBSD__ || defined __OpenBSD__ || defined __NetBSD__
@@ -93,7 +93,7 @@ static int& JITPageWriteNestCounter()
 // Allows a thread to write to executable memory, but not execute the data.
 void JITPageWriteEnableExecuteDisable()
 {
-#if defined(_M_ARM_64) && defined(__APPLE__)
+#if defined(_M_ARM_64) && defined(__APPLE__) && !defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) && !defined(__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__)
   if (JITPageWriteNestCounter() == 0)
   {
     pthread_jit_write_protect_np(0);
@@ -112,7 +112,7 @@ void JITPageWriteDisableExecuteEnable()
   if (JITPageWriteNestCounter() < 0)
     PanicAlertFmt("JITPageWriteNestCounter() underflowed");
 
-#if defined(_M_ARM_64) && defined(__APPLE__)
+#if defined(_M_ARM_64) && defined(__APPLE__) && !defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) && !defined(__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__)
   if (JITPageWriteNestCounter() == 0)
   {
     pthread_jit_write_protect_np(1);

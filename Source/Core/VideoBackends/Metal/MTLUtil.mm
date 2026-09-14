@@ -78,8 +78,12 @@ void Metal::Util::PopulateBackendInfo(BackendInfo* backend_info)
   backend_info->bSupportsPartialMultisampleResolve = false;
   backend_info->bSupportsDynamicVertexLoader = true;
   backend_info->bSupportsVSLinePointExpand = true;
+#if TARGET_OS_OSX
   backend_info->bSupportsHDROutput =
       1.0 < [[NSScreen deepestScreen] maximumPotentialExtendedDynamicRangeColorComponentValue];
+#else
+  backend_info->bSupportsHDROutput = false;
+#endif
 }
 
 void Metal::Util::PopulateBackendInfoAdapters(BackendInfo* backend_info,
@@ -552,7 +556,7 @@ Metal::Util::TranslateShaderToMSL(ShaderStage stage, std::string_view source,
   spirv_cross::CompilerMSL::Options options;
 #if TARGET_OS_OSX
   options.platform = spirv_cross::CompilerMSL::Options::macOS;
-#elif TARGET_OS_IOS
+#elif TARGET_OS_IOS || TARGET_OS_TV
   options.platform = spirv_cross::CompilerMSL::Options::iOS;
   // Otherwise SPIRV-Cross will try to compile subgroup ops to quad ops instead
   // (And crash because there's no quad_min or quad_max)

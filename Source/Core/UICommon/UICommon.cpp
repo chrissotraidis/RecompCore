@@ -55,7 +55,7 @@
 #include "UICommon/DBusUtils.h"
 #endif
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) && !defined(__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__)
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #endif
 
@@ -517,7 +517,7 @@ void InhibitScreenSaver(bool inhibit)
                           (inhibit ? (ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) : 0));
 #endif
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && !defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) && !defined(__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__)
   static IOPMAssertionID s_power_assertion = kIOPMNullAssertionID;
   if (inhibit)
   {

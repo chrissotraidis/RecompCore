@@ -22,7 +22,7 @@
 #ifdef HAVE_X11
 #define CIFACE_USE_XLIB
 #endif
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) && !defined(__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__)
 #define CIFACE_USE_OSX
 #endif
 #if defined(HAVE_LIBEVDEV) && defined(HAVE_LIBUDEV)
