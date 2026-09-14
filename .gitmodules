@@ -136,6 +136,6 @@
 	shallow = true
 [submodule "DolRecomp"]
 	path = DolRecomp
-	url = https://github.com/ExpansionPak/DolRecomp.git
+	url = https://github.com/chrissotraidis/DolRecomp.git
 	branch = main
 	shallow = true
