@@ -5,6 +5,8 @@
 
 #include <AudioUnit/AudioUnit.h>
 
+#include <vector>
+
 #include "AudioCommon/SoundStream.h"
 
 class CoreAudioSound final : public SoundStream
@@ -20,8 +22,12 @@ private:
   static OSStatus OutputCallback(void* ref_con, AudioUnitRenderActionFlags* action_flags,
                                  const AudioTimeStamp* timestamp, UInt32 bus_number,
                                  UInt32 number_frames, AudioBufferList* io_data);
+  bool SetOutputFormat(UInt32 channels, AudioChannelLayoutTag layout_tag);
+  bool InitializeOutput(UInt32 channels, AudioChannelLayoutTag layout_tag);
 
   AudioUnit m_audio_unit = nullptr;
+  UInt32 m_channels = 2;
+  std::vector<float> m_surround_scratch;
   int m_volume = 100;
   bool m_running = false;
 };
