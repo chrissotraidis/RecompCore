@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Isolated offline prototype. Not connected to GalaxyPad's mixer or controls.
+// Fixed-capacity audio tempo processing used by the iOS mixer.
 #pragma once
 
 #include <algorithm>
@@ -219,7 +219,29 @@ class AudioTempo final {
       double best = -2.;
       double overlapEnergy = 1.e-20;
       for (const auto a : m_overlap) overlapEnergy += a.left*a.left + a.right*a.right;
-      for (auto candidate = low; candidate <= high; ++candidate) {
+      auto candidate = low;
+#if defined(GALAXYPAD_AUDIO_BATCHED_SEARCH) && GALAXYPAD_AUDIO_BATCHED_SEARCH
+      // Independent candidate accumulators permit SIMD across candidates,
+      // without reassociating the sample-order reduction within a candidate.
+      // Keep scoring in ascending order so ties select the same offset.
+      for (; candidate + 3 <= high; candidate += 4) {
+        double dots[4] = {}, energies[4] = {1.e-20, 1.e-20, 1.e-20, 1.e-20};
+        for (std::size_t i = 0; i < Hop; ++i) {
+          const auto a = m_overlap[i];
+          for (std::size_t lane = 0; lane < 4; ++lane) {
+            const auto b = At(candidate + i + lane);
+            dots[lane] += a.left*b.left + a.right*b.right;
+            energies[lane] += b.left*b.left + b.right*b.right;
+          }
+        }
+        for (std::size_t lane = 0; lane < 4; ++lane) {
+          const double score = dots[lane] / std::sqrt(overlapEnergy * energies[lane]) -
+              .0001 * std::abs(double(candidate + lane) - m_position) / Search;
+          if (score > best) {best = score; start = candidate + lane;}
+        }
+      }
+#endif
+      for (; candidate <= high; ++candidate) {
         double dot = 0., energy = 1.e-20;
         for (std::size_t i = 0; i < Hop; ++i) {
           const auto a = m_overlap[i], b = At(candidate + i);

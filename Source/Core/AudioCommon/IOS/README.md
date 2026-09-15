@@ -19,3 +19,14 @@ host, linked against the frozen core archive SHA-256
 `7fe0ea02261edb7d89853e6d83f8a687b5783cf3f50b0b67671591d6effb4e5a`.
 Rebuild every Mixer header consumer when changing variants; never swap a lone
 Mixer object into an archive built with a different layout.
+
+Opt-in audio search experiment (September 15, 2026):
+`GALAXYPAD_AUDIO_BATCHED_SEARCH=1` evaluates four independent correlation
+candidates together. Each candidate retains its original sample accumulation
+order, double accumulators and ascending tie selection; incomplete batches use
+the scalar path. It changes no class layout, queue policy or search range.
+The default remains scalar pending physical comparison. The frozen hashes above
+identify the original accepted inputs, not this optional source extension.
+Current AudioTempo.h SHA-256: `373a6a3c9db469a386e963c77c9d36060becf22da245a555b69b39444e7463ed`.
+GalaxyPad's differential PCM/accounting/sanitizer test covers both variants.
+This addition was implemented with AI assistance; no upstream submission is made.
