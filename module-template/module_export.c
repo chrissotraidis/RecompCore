@@ -8,9 +8,31 @@
 
 #include "StaticRecompABI.h"
 
-static int chassis_dispatch(CPUState* ctx, u32 address)
+#if defined(GALAXYPAD_OUTLINE_DISPATCH_SLOWPATH) && GALAXYPAD_OUTLINE_DISPATCH_SLOWPATH && \
+    !defined(DOLRECOMP_ENABLE_REPLACEMENTS)
+// Keep hook and physical-address handling in the original implementation.
+// The common virtual-address path needs neither observer calls nor alias retry.
+static __attribute__((noinline)) int chassis_dispatch_slow(CPUState* ctx, u32 address)
 {
     return dolrecomp_call(ctx, address);
+}
+#endif
+
+static int chassis_dispatch(CPUState* ctx, u32 address)
+{
+#if defined(GALAXYPAD_OUTLINE_DISPATCH_SLOWPATH) && GALAXYPAD_OUTLINE_DISPATCH_SLOWPATH && \
+    !defined(DOLRECOMP_ENABLE_REPLACEMENTS)
+    if (ctx->host_call)
+        return chassis_dispatch_slow(ctx, address);
+    ctx->pc = address;
+    DolRecompFunction fn = dolrecomp_find_original(address);
+    if (!fn)
+        return chassis_dispatch_slow(ctx, address);
+    fn(ctx);
+    return 1;
+#else
+    return dolrecomp_call(ctx, address);
+#endif
 }
 
 static void chassis_on_state_loaded(CPUState* ctx)
