@@ -27,6 +27,16 @@ order, double accumulators and ascending tie selection; incomplete batches use
 the scalar path. It changes no class layout, queue policy or search range.
 The default remains scalar pending physical comparison. The frozen hashes above
 identify the original accepted inputs, not this optional source extension.
-Current AudioTempo.h SHA-256: `373a6a3c9db469a386e963c77c9d36060becf22da245a555b69b39444e7463ed`.
+Batched-search baseline AudioTempo.h SHA-256: `373a6a3c9db469a386e963c77c9d36060becf22da245a555b69b39444e7463ed`.
 GalaxyPad's differential PCM/accounting/sanitizer test covers both variants.
 This addition was implemented with AI assistance; no upstream submission is made.
+
+## Optional sample-energy cache
+
+`GALAXYPAD_AUDIO_CACHED_ENERGY=1` computes repeated search sample energies once
+per search, retaining the float expressions, ordered double accumulation and
+ascending tie-breaking. It works with scalar or batched search, allocates no
+heap memory and does not alter class layout. Default remains disabled. The
+additional fixed stack scratch is 3.5 KiB. Current AudioTempo.h SHA-256: `4830d3f0568cb8faf50c7c2fb7720f50b9958bbed37dc310fddbbd4898035871`.
+Host component timing and exact PCM/accounting validation are recorded in
+GalaxyPad docs/PERFORMANCE-CONTINUATION-2026-09-16.md; no iPhone FPS claim.
