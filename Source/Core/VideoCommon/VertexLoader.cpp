@@ -14,6 +14,14 @@
 #include "VideoCommon/VertexLoader_TextCoord.h"
 #include "VideoCommon/VideoCommon.h"
 
+#ifndef GALAXYPAD_INDEXED_VERTEX_BATCH
+#define GALAXYPAD_INDEXED_VERTEX_BATCH 0
+#endif
+#if GALAXYPAD_INDEXED_VERTEX_BATCH
+#include "VideoCommon/VertexLoaderIndexedBatch.h"
+#include <cstdio>
+#endif
+
 // This pointer is used as the source/dst for all fixed function loader calls
 const u8* g_video_buffer_read_ptr;
 u8* g_vertex_manager_write_ptr;
@@ -255,6 +263,58 @@ void VertexLoader::WriteCall(TPipelineFunction func)
 
 int VertexLoader::RunVertices(const u8* src, u8* dst, int count)
 {
+#if GALAXYPAD_INDEXED_VERTEX_BATCH
+  static u64 total_vertices = 0, batch_vertices = 0, next_report = 1u << 20;
+  total_vertices += count;
+  const auto report = [&] {
+    if (total_vertices >= next_report)
+    {
+      std::fprintf(stderr, "[indexed-vertex-batch] eligible=%llu total=%llu\n",
+                   static_cast<unsigned long long>(batch_vertices),
+                   static_cast<unsigned long long>(total_vertices));
+      next_report = total_vertices + (1u << 20);
+    }
+  };
+  // Match the complete compiled stage sequence; unsupported formats retain the
+  // generic path. Resolve once per batch, never once per vertex.
+  const auto* stage = m_PipelineStages.begin();
+  const auto* end = m_PipelineStages.end();
+  const bool matrix = stage != end && *stage == PosMtx_ReadDirect_UByte;
+  if (matrix)
+    ++stage;
+  static const auto position = VertexLoader_Position::GetFunction(
+      VertexComponentFormat::Index16, ComponentFormat::Short, CoordComponentCount::XYZ);
+  static const auto normal = VertexLoader_Normal::GetFunction(
+      VertexComponentFormat::Index16, ComponentFormat::Short, NormalComponentCount::N, false);
+  if (end - stage >= 3 && stage[0] == position && stage[1] == normal)
+  {
+    stage += 2;
+    static const auto color_function = VertexLoader_Color::GetFunction(
+        VertexComponentFormat::Index16, ColorFormat::RGBA8888);
+    const bool color = *stage == color_function;
+    if (color)
+      ++stage;
+    static const auto texcoord = VertexLoader_TextCoord::GetFunction(
+        VertexComponentFormat::Index16, ComponentFormat::Short, TexComponentCount::ST);
+    int texcoords = 0;
+    while (stage != end && *stage == texcoord && texcoords < 8)
+    {
+      ++stage;
+      ++texcoords;
+    }
+    if (end - stage == 1 && *stage == SkipVertex)
+    {
+      batch_vertices += count;
+      report();
+      if (matrix)
+        return color ? IndexedVertexBatch::Run<true, true>(this, src, dst, count, texcoords) :
+                       IndexedVertexBatch::Run<true, false>(this, src, dst, count, texcoords);
+      return color ? IndexedVertexBatch::Run<false, true>(this, src, dst, count, texcoords) :
+                     IndexedVertexBatch::Run<false, false>(this, src, dst, count, texcoords);
+    }
+  }
+  report();
+#endif
   g_vertex_manager_write_ptr = dst;
   g_video_buffer_read_ptr = src;
 
