@@ -124,8 +124,20 @@ class AudioTempo final {
     }
     // Queue error adjusts input advance, not sample frequency. Bounds explicitly
     // limit this prototype to slowdown compensation, rather than unbounded replay.
-    m_ratio = std::clamp(m_rateEstimate + .50 * (double(queued) - TargetInput) / TargetInput,
-                         .60, 1.03);
+    // At 30-35 FPS a 60% floor consumes more input than the game supplies,
+    // repeatedly exhausting the analysis window. Leave correction headroom
+    // below the tested 55% supply so the queue can refill after jitter.
+#if defined(GALAXYPAD_AUDIO_LOW_SPEED) && GALAXYPAD_AUDIO_LOW_SPEED
+    constexpr double minimumRatio = .45;
+    // One less retained hop offsets added stretch delay under packet jitter.
+    // Startup, capacity and the normal-speed bypass retain their old bounds.
+    constexpr double controlTarget = TargetInput - Hop;
+#else
+    constexpr double minimumRatio = .60;
+    constexpr double controlTarget = TargetInput;
+#endif
+    m_ratio = std::clamp(m_rateEstimate + .50 * (double(queued) - controlTarget) / controlTarget,
+                         minimumRatio, 1.03);
     // Stay bit-transparent at normal speed despite producer packet jitter.
     // Enter tempo processing only when real forward reserve is being drained;
     // return to bypass only after sustained supply has rebuilt that reserve.
@@ -134,7 +146,14 @@ class AudioTempo final {
     const auto neededHops = count > pending ? (count-pending+Hop-1)/Hop : 0;
     const auto unityNeed = neededHops ? Window+(neededHops-1)*Hop : 0;
     const bool wasUnity = m_unity;
-    if (m_unity && forward < unityNeed) m_unity = false;
+#if defined(GALAXYPAD_AUDIO_LOW_SPEED) && GALAXYPAD_AUDIO_LOW_SPEED
+    // Once supply falls, leave bypass with a hop in reserve. Waiting until the
+    // next complete callback cannot fit is too late for a 1.0 -> 0.55 step.
+    const auto unityReserve = m_supply < .95 ? Hop : 0;
+#else
+    constexpr std::size_t unityReserve = 0;
+#endif
+    if (m_unity && forward < unityNeed + unityReserve) m_unity = false;
     else if (!m_unity && m_fullSpeedWindows >= 2 && m_supply >= .995 &&
              forward >= TargetInput-Search-Hop) m_unity = true;
     if (wasUnity != m_unity) {

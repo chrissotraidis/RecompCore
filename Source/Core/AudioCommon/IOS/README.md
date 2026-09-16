@@ -37,6 +37,20 @@ This addition was implemented with AI assistance; no upstream submission is made
 per search, retaining the float expressions, ordered double accumulation and
 ascending tie-breaking. It works with scalar or batched search, allocates no
 heap memory and does not alter class layout. Default remains disabled. The
-additional fixed stack scratch is 3.5 KiB. Current AudioTempo.h SHA-256: `4830d3f0568cb8faf50c7c2fb7720f50b9958bbed37dc310fddbbd4898035871`.
+additional fixed stack scratch is 3.5 KiB. Cached-energy revision AudioTempo.h SHA-256: `4830d3f0568cb8faf50c7c2fb7720f50b9958bbed37dc310fddbbd4898035871`.
 Host component timing and exact PCM/accounting validation are recorded in
 GalaxyPad docs/PERFORMANCE-CONTINUATION-2026-09-16.md; no iPhone FPS claim.
+
+## Opt-in low-speed continuity repair
+
+`GALAXYPAD_AUDIO_LOW_SPEED=1` lowers the analysis floor from 0.60 to 0.45,
+reduces the queue control target by one hop, and leaves unity bypass one hop
+earlier when measured supply falls. This addresses persistent starvation below
+36 FPS and short gaps on a sharp slowdown. Tested supply coverage begins at
+0.55; 0.45 is correction headroom, not a supported sustained speed claim.
+It preserves normal-speed PCM, input accounting, bounded storage and real stall
+reporting. Existing 0.67-1.0 mixer latency checks retain their 120 ms limit; new
+0.55-0.60 coverage uses a separate 160 ms wall-age limit, excluding hardware
+output latency. No default promotion or game-FPS gain is implied.
+
+Current AudioTempo.h SHA-256: `404bbaba9c08ba96b2f7708078e9a6d444660fb4be68200d34a8fab5c0d5561f`.
