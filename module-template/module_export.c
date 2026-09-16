@@ -72,3 +72,32 @@ RECOMP_MODULE_EXPORT const StaticRecompModuleDesc* staticrecomp_get_module(void)
 {
     return &s_desc;
 }
+
+#if defined(GALAXYPAD_VOID_DISPATCH) && GALAXYPAD_VOID_DISPATCH
+// Optional v1 entry for callers that do not consume dispatch's coverage result.
+// Keep the original ABI entry unchanged. A void return lets the final chunk
+// call be a tail call; hook ordering and physical-address retries stay exact.
+RECOMP_MODULE_EXPORT void staticrecomp_dispatch_void_v1(CPUState* ctx, u32 address)
+{
+    u32 alias;
+    ctx->pc = address;
+    if (dolrecomp_dispatch_replacement(ctx, address)) return;
+    if (ctx->host_call && ppc_host_call(ctx, address)) return;
+    DolRecompFunction fn = dolrecomp_find_original(address);
+    if (fn) {
+        ctx->pc = address;
+        fn(ctx);
+        return;
+    }
+    if (dolrecomp_physical_pc_alias(ctx, address, &alias)) {
+        ctx->pc = alias;
+        if (dolrecomp_dispatch_replacement(ctx, alias)) return;
+        if (ctx->host_call && ppc_host_call(ctx, alias)) return;
+        fn = dolrecomp_find_original(alias);
+        if (fn) {
+            ctx->pc = alias;
+            fn(ctx);
+        }
+    }
+}
+#endif

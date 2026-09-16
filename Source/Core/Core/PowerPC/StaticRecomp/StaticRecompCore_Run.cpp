@@ -101,6 +101,15 @@ void StaticRecompCore::Run()
   auto& interpreter = m_system.GetInterpreter();
   auto& memory = m_system.GetMemory();
   const CPU::State* state_ptr = m_system.GetCPU().GetStatePtr();
+#if defined(GALAXYPAD_VOID_DISPATCH) && GALAXYPAD_VOID_DISPATCH
+  // The descriptor/CPU ABI has already been validated by LoadModule. Resolve
+  // once per Run lifetime; attached and older modules retain the ABI dispatch.
+  using VoidDispatch = void (*)(CPUState*, u32);
+  const auto void_dispatch = m_module && m_library.IsOpen() ?
+      reinterpret_cast<VoidDispatch>(
+          m_library.GetSymbolAddress("staticrecomp_dispatch_void_v1")) : nullptr;
+  std::fprintf(stderr, "[staticrecomp] void-dispatch=%u\n", void_dispatch ? 1u : 0u);
+#endif
   FilePtr dispatch_trace = OpenDispatchTrace();
 
   m_guest.ram = memory.GetRAM();
@@ -217,7 +226,12 @@ void StaticRecompCore::Run()
             m_direct_must_yield = false;
             m_in_native_dispatch = true;
           }
-          m_module->dispatch(&m_guest, linked_dispatch_address);
+#if defined(GALAXYPAD_VOID_DISPATCH) && GALAXYPAD_VOID_DISPATCH
+          if (void_dispatch)
+            void_dispatch(&m_guest, linked_dispatch_address);
+          else
+#endif
+            m_module->dispatch(&m_guest, linked_dispatch_address);
           m_in_native_dispatch = false;
           if (m_has_rel_modules)
             m_guest.pc = TranslateRelAddress(m_guest.pc);
