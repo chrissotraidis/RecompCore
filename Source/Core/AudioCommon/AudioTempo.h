@@ -219,6 +219,16 @@ class AudioTempo final {
       double best = -2.;
       double overlapEnergy = 1.e-20;
       for (const auto a : m_overlap) overlapEnergy += a.left*a.left + a.right*a.right;
+      // Overlapping search candidates reuse the same sample energies. Cache
+      // each float expression once; retain the original double summation order.
+#if defined(GALAXYPAD_AUDIO_CACHED_ENERGY) && GALAXYPAD_AUDIO_CACHED_ENERGY
+      std::array<float, 2 * Search + Hop> sampleEnergy;
+      const auto energyCount = high >= low ? high - low + Hop : 0;
+      for (std::size_t i = 0; i < energyCount; ++i) {
+        const auto b = At(low + i);
+        sampleEnergy[i] = b.left*b.left + b.right*b.right;
+      }
+#endif
       auto candidate = low;
 #if defined(GALAXYPAD_AUDIO_BATCHED_SEARCH) && GALAXYPAD_AUDIO_BATCHED_SEARCH
       // Independent candidate accumulators permit SIMD across candidates,
@@ -231,7 +241,11 @@ class AudioTempo final {
           for (std::size_t lane = 0; lane < 4; ++lane) {
             const auto b = At(candidate + i + lane);
             dots[lane] += a.left*b.left + a.right*b.right;
+#if defined(GALAXYPAD_AUDIO_CACHED_ENERGY) && GALAXYPAD_AUDIO_CACHED_ENERGY
+            energies[lane] += sampleEnergy[candidate - low + i + lane];
+#else
             energies[lane] += b.left*b.left + b.right*b.right;
+#endif
           }
         }
         for (std::size_t lane = 0; lane < 4; ++lane) {
@@ -246,7 +260,11 @@ class AudioTempo final {
         for (std::size_t i = 0; i < Hop; ++i) {
           const auto a = m_overlap[i], b = At(candidate + i);
           dot += a.left*b.left + a.right*b.right;
+#if defined(GALAXYPAD_AUDIO_CACHED_ENERGY) && GALAXYPAD_AUDIO_CACHED_ENERGY
+          energy += sampleEnergy[candidate - low + i];
+#else
           energy += b.left*b.left + b.right*b.right;
+#endif
         }
         // Mild center preference breaks ties in quiet/periodic regions, keeping
         // analysis position independent from phase-alignment corrections.
