@@ -53,4 +53,4 @@ reporting. Existing 0.67-1.0 mixer latency checks retain their 120 ms limit; new
 0.55-0.60 coverage uses a separate 160 ms wall-age limit, excluding hardware
 output latency. No default promotion or game-FPS gain is implied.
 
-Current AudioTempo.h SHA-256: `404bbaba9c08ba96b2f7708078e9a6d444660fb4be68200d34a8fab5c0d5561f`.
+Current AudioTempo.h SHA-256: `96fcb2b365dd4318479620cb43593c390d152f90521e618a7d79d5959975ac68`.

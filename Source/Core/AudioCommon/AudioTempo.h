@@ -149,7 +149,7 @@ class AudioTempo final {
 #if defined(GALAXYPAD_AUDIO_LOW_SPEED) && GALAXYPAD_AUDIO_LOW_SPEED
     // Once supply falls, leave bypass with a hop in reserve. Waiting until the
     // next complete callback cannot fit is too late for a 1.0 -> 0.55 step.
-    const auto unityReserve = m_supply < .95 ? Hop : 0;
+    const auto unityReserve = m_rateEstimate < .90 ? Hop : 0;
 #else
     constexpr std::size_t unityReserve = 0;
 #endif
