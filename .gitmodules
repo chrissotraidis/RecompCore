@@ -139,3 +139,6 @@
 	url = https://github.com/chrissotraidis/DolRecomp.git
 	branch = main
 	shallow = true
+[submodule "SlippiAdapter/rust"]
+	path = SlippiAdapter/rust
+	url = https://github.com/chrissotraidis/slippi-rust-extensions.git
