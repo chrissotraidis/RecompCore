@@ -3,7 +3,7 @@
 Optional source adapter for MeleePad, derived from Project Slippi Dolphin commit
 `41a7a3a110ed52999486ae1901c8fbb9a63d4f13` and this RecompCore fork.
 Original copyright and license headers are retained. Slippi Dolphin's COPYING
-is included here; open-vcdiff and semver retain their own notices.
+is included here; open-vcdiff, semver and nlohmann JSON retain their own notices.
 
 The Source directory is the maintained adapter used by the iOS target. It
 contains native static-recompilation adaptations, matchmaking mode gates,
