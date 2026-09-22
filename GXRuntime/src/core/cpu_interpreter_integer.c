@@ -15,8 +15,8 @@ u32 ppc_mfspr(CPUState* cpu, u16 spr, u32 cia) {
     case 19: return cpu->dar;
     case 26: return cpu->srr0;
     case 27: return cpu->srr1;
-    case 268: return (u32)cpu->timebase;
-    case 269: return (u32)(cpu->timebase >> 32);
+    case 268: return ppc_mftb(cpu, 268, cia);
+    case 269: return ppc_mftb(cpu, 269, cia);
     case 282: return cpu->ear;
     case 287: return cpu->spr_read ? cpu->spr_read(cpu, spr, cia) : 0x00083214u;
     case 912:
@@ -53,11 +53,19 @@ void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia) {
     case 27: cpu->srr1 = value; return;
     case 282: cpu->ear = value; return;
     case 284:
+        if (cpu->spr_write) {
+            cpu->spr_write(cpu, spr, value, cia);
+            return;
+        }
         cpu->timebase = (cpu->timebase & 0xFFFFFFFF00000000ull) | value;
-        break;
+        return;
     case 285:
+        if (cpu->spr_write) {
+            cpu->spr_write(cpu, spr, value, cia);
+            return;
+        }
         cpu->timebase = ((u64)value << 32) | (cpu->timebase & 0xFFFFFFFFull);
-        break;
+        return;
     case 912:
     case 913:
     case 914:
@@ -79,8 +87,7 @@ void ppc_mtspr(CPUState* cpu, u16 spr, u32 value, u32 cia) {
         cpu->spr_write(cpu, spr, value, cia);
         return;
     }
-    if (spr != 284 && spr != 285)
-        ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
+    ppc_program_exception(cpu, PPC_PROGRAM_ILLEGAL, cia);
 }
 
 static bool wrapped_register_range_contains(u8 first, u32 count, u8 reg) {

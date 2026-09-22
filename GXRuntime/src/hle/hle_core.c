@@ -94,6 +94,13 @@ static void restore_callback_context(CPUState* cpu, const HleSavedContext* saved
     cpu->cr = saved->cr;
     cpu->xer = saved->xer;
     cpu->fpscr = saved->fpscr;
+    if (getenv("BLUEWAKE_TRACE_AUDIO_OBJECT") != NULL &&
+        saved->pc >= 0x80270000u && saved->pc < 0x802A0000u) {
+        fprintf(stderr,
+                "[hle-context-restore] pc=0x%08X saved_msr=0x%08X "
+                "current_msr=0x%08X\n",
+                saved->pc, saved->msr, cpu->msr);
+    }
     cpu->msr = saved->msr;
     cpu->srr0 = saved->srr0;
     cpu->srr1 = saved->srr1;
@@ -884,4 +891,3 @@ void dol_hle_VIConfigure(CPUState* cpu) {
         mem_read16(cpu, mode + 0x0Eu),
         mem_read16(cpu, mode + 0x10u));
 }
-

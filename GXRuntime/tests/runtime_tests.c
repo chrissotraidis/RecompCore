@@ -31,7 +31,7 @@
 #include <stdio.h>
 #include <string.h>
 
-_Static_assert(GXRUNTIME_CPU_ABI_VERSION == 4u,
+_Static_assert(GXRUNTIME_CPU_ABI_VERSION == 6u,
                "update runtime ABI tests when the CPU ABI changes");
 _Static_assert(GXRUNTIME_CPU_ABI_DOLRECOMP_PREFIX == 1u,
                "GXRuntime generated-code prefix must stay explicit");
@@ -95,6 +95,7 @@ static unsigned g_platform_tlut_guest_calls;
 static unsigned g_platform_copy_guest_calls;
 static unsigned g_spr_reads;
 static unsigned g_spr_writes;
+static u64 g_spr_write_timebase;
 static unsigned g_cache_controls;
 static u16 g_last_spr;
 static u32 g_last_spr_value;
@@ -109,11 +110,11 @@ static u32 test_spr_read(CPUState* cpu, u16 spr, u32 cia) {
 }
 
 static void test_spr_write(CPUState* cpu, u16 spr, u32 value, u32 cia) {
-    (void)cpu;
     (void)cia;
     g_spr_writes++;
     g_last_spr = spr;
     g_last_spr_value = value;
+    g_spr_write_timebase = cpu->timebase;
 }
 
 static void test_cache_control(CPUState* cpu, u8 operation, u32 ea, u32 cia) {
@@ -151,7 +152,7 @@ static void test_audio_push_capture(const s16* samples, u32 frames) {
     assert(samples != NULL);
     assert(frames == 8u);
     memcpy(g_captured_audio, samples, frames * 2u * sizeof(samples[0]));
-    g_captured_audio_frames = frames;
+    g_captured_audio_frames += frames;
 }
 
 static bool test_audio_read(void* user, u32 source_address, u8* data,
@@ -2021,7 +2022,95 @@ static void test_audio_dma_pcm_boundary(void) {
     assert(g_captured_audio[3] == -1);
     assert(g_captured_audio[4] == (s16)0x1234);
     assert(g_captured_audio[5] == (s16)0xABCD);
+
+    DolAudioDma aggregate;
+    DolAudioDma sliced;
+    dol_audio_dma_init(&aggregate);
+    dol_audio_dma_init(&sliced);
+    dol_audio_dma_set_work_rate(&aggregate, 4000000u);
+    dol_audio_dma_set_work_rate(&sliced, 4000000u);
+    dol_audio_dma_set_source(&aggregate, 0x00100000u);
+    dol_audio_dma_set_source(&sliced, 0x00100000u);
+    dol_audio_dma_write_control(&aggregate, DOL_AUDIO_DMA_ENABLE | 1u);
+    dol_audio_dma_write_control(&sliced, DOL_AUDIO_DMA_ENABLE | 1u);
+    dol_audio_dma_ack_interrupt(&aggregate);
+    dol_audio_dma_ack_interrupt(&sliced);
+
+    g_captured_audio_frames = 0u;
+    assert(dol_audio_dma_consume_pcm16_stereo_work(
+        &aggregate, 2500u, test_audio_read, (void*)pcm_chunk));
+    assert(g_captured_audio_frames == 16u);
+    assert(aggregate.work_counter == 500u);
+
+    g_captured_audio_frames = 0u;
+    assert(!dol_audio_dma_consume_pcm16_stereo_work(
+        &sliced, 500u, test_audio_read, (void*)pcm_chunk));
+    assert(dol_audio_dma_consume_pcm16_stereo_work(
+        &sliced, 1000u, test_audio_read, (void*)pcm_chunk));
+    assert(dol_audio_dma_consume_pcm16_stereo_work(
+        &sliced, 1000u, test_audio_read, (void*)pcm_chunk));
+    assert(g_captured_audio_frames == 16u);
+    assert(sliced.work_counter == aggregate.work_counter);
+    assert(sliced.remaining_blocks == aggregate.remaining_blocks);
+    assert(sliced.current_source_address == aggregate.current_source_address);
+    assert(sliced.interrupt_pending == aggregate.interrupt_pending);
     dol_platform_reset();
+}
+
+static void test_audio_stream_counter(void) {
+    DolAudioDma aggregate;
+    DolAudioDma sliced;
+    u64 value = 0u;
+    dol_audio_dma_init(&aggregate);
+    dol_audio_dma_init(&sliced);
+    dol_audio_dma_set_work_rate(&aggregate, 486000000u);
+    dol_audio_dma_set_work_rate(&sliced, 486000000u);
+
+    dol_audio_dma_ai_mmio_write(
+        &aggregate, DOL_AUDIO_DMA_AI_CONTROL_OFF, 4u,
+        DOL_AUDIO_DMA_AI_CONTROL_INIT | DOL_AUDIO_DMA_AI_PSTAT_BIT);
+    dol_audio_dma_ai_mmio_write(
+        &sliced, DOL_AUDIO_DMA_AI_CONTROL_OFF, 4u,
+        DOL_AUDIO_DMA_AI_CONTROL_INIT | DOL_AUDIO_DMA_AI_PSTAT_BIT);
+
+    dol_audio_dma_advance_stream(&aggregate, 30375u);
+    dol_audio_dma_advance_stream(&sliced, 10000u);
+    dol_audio_dma_advance_stream(&sliced, 10000u);
+    dol_audio_dma_advance_stream(&sliced, 10375u);
+    assert(aggregate.sample_counter == 3u);
+    assert(sliced.sample_counter == aggregate.sample_counter);
+    assert(sliced.sample_counter_remainder ==
+           aggregate.sample_counter_remainder);
+
+    dol_audio_dma_ai_mmio_read(
+        &aggregate, DOL_AUDIO_DMA_AI_SAMPLE_COUNTER_OFF, 4u, &value);
+    assert(value == 3u);
+    value = 0u;
+    dol_audio_dma_ai_mmio_read(
+        &aggregate, DOL_AUDIO_DMA_AI_SAMPLE_COUNTER_OFF, 4u, &value);
+    assert(value == 3u);
+
+    dol_audio_dma_ai_mmio_write(
+        &aggregate, DOL_AUDIO_DMA_AI_SAMPLE_COUNTER_OFF, 4u, 41u);
+    dol_audio_dma_ai_mmio_read(
+        &aggregate, DOL_AUDIO_DMA_AI_SAMPLE_COUNTER_OFF, 4u, &value);
+    assert(value == 41u);
+    dol_audio_dma_ai_mmio_write(
+        &aggregate, DOL_AUDIO_DMA_AI_CONTROL_OFF, 4u,
+        DOL_AUDIO_DMA_AI_CONTROL_INIT | DOL_AUDIO_DMA_AI_PSTAT_BIT |
+            DOL_AUDIO_DMA_AI_SCRESET_BIT);
+    dol_audio_dma_ai_mmio_read(
+        &aggregate, DOL_AUDIO_DMA_AI_SAMPLE_COUNTER_OFF, 4u, &value);
+    assert(value == 0u);
+    assert(aggregate.sample_counter_remainder == 0u);
+
+    dol_audio_dma_ai_mmio_write(
+        &aggregate, DOL_AUDIO_DMA_AI_CONTROL_OFF, 4u,
+        DOL_AUDIO_DMA_AI_CONTROL_INIT);
+    dol_audio_dma_advance_stream(&aggregate, 486000000u);
+    dol_audio_dma_ai_mmio_read(
+        &aggregate, DOL_AUDIO_DMA_AI_SAMPLE_COUNTER_OFF, 4u, &value);
+    assert(value == 0u);
 }
 
 static void test_audio_adpcm_decoder(void) {
@@ -2495,6 +2584,15 @@ static void test_native_system_helpers(void) {
     assert(g_spr_writes == 1 && g_last_spr == 1008);
     assert(g_last_spr_value == 0xCAFEBABEu);
 
+    cpu.timebase = 0x1122334455667788ull;
+    g_spr_writes = 0;
+    g_spr_write_timebase = 0u;
+    ppc_mtspr(&cpu, 284, 0xAABBCCDDu, 0x8000100Cu);
+    assert(g_spr_writes == 1 && g_last_spr == 284);
+    assert(g_last_spr_value == 0xAABBCCDDu);
+    assert(g_spr_write_timebase == 0x1122334455667788ull);
+    assert(cpu.timebase == 0x1122334455667788ull);
+
     cpu.xer = 5;
     cpu.gpr[10] = 0x80000100u;
     cpu.gpr[11] = 0;
@@ -2567,6 +2665,7 @@ int main(void) {
     test_di_device();
     test_audio_dma();
     test_audio_dma_pcm_boundary();
+    test_audio_stream_counter();
     test_audio_adpcm_decoder();
     test_audio_voice_mixer();
     test_audio_event_adapter();

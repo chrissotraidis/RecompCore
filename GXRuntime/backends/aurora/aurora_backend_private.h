@@ -144,6 +144,10 @@ void shadow_frontend_set_array(u32 attr, u32 guest_address, u8 stride);
 bool frontend_guest_address_resolver_bridge(void*, u32 address, u32 size, DolGuestAddressSpace space, DolGuestResourceKind resource, DolGuestResolvedRange* out);
 void shadow_frontend_call_display_list(const void* data, u32 size);
 void shadow_frontend_write(u64 value, u8 size);
+// Waits for the FIFO translation worker to catch up with everything appended so
+// far. The auras's reset paths call it so the front end is not reset while a
+// batch is in flight.
+void shadow_frontend_flush_pending(void);
 unsigned long long shadow_transform_frame_number();
 void log_transform_matrix(const char* label, unsigned index, const float* values);
 void shadow_transform_observer(const gxruntime::aurora_recomp::ConsumedDraw& draw, unsigned long long cumulative_draw, void*);
@@ -171,6 +175,7 @@ bool aurora_backend_should_quit(void);
 void aurora_backend_present(void);
 void aurora_backend_mark_gx_begin(void);
 void aurora_backend_gx_write(u64 value, u8 size);
+void aurora_backend_gx_flush(void);
 void aurora_backend_call_display_list(const void* data, u32 size);
 void aurora_backend_set_array(u32 attr, const void* data, u32 size, u8 stride);
 void aurora_backend_set_array_guest(u32 attr, u32 guest_address, const void* data, u32 size, u8 stride);

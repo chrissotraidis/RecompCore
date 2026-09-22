@@ -47,6 +47,11 @@ void dol_platform_gx_write(u64 value, u8 size) {
         g_ops.gx_write(value, size);
 }
 
+void dol_platform_gx_flush(void) {
+    if (g_ops.gx_flush != NULL)
+        g_ops.gx_flush();
+}
+
 void dol_platform_call_display_list(const void* data, u32 size) {
     if (g_ops.call_display_list != NULL && data != NULL && size != 0)
         g_ops.call_display_list(data, size);

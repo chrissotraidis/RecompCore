@@ -32,6 +32,7 @@ typedef struct DolPlatformOps {
 
     void (*mark_gx_begin)(void);
     void (*gx_write)(u64 value, u8 size);
+    void (*gx_flush)(void);
     void (*call_display_list)(const void* data, u32 size);
     void (*set_array)(u32 attr, const void* data, u32 size, u8 stride);
     void (*set_array_guest)(u32 attr, u32 guest_address, const void* data,
@@ -73,6 +74,10 @@ bool dol_platform_should_quit(void);
 void dol_platform_present(void);
 void dol_platform_mark_gx_begin(void);
 void dol_platform_gx_write(u64 value, u8 size);
+// Parse whatever the FIFO write path has buffered. The host calls this where the
+// guest is about to observe GPU progress - the draw-done commit - so the
+// translation is never behind a wait it is supposed to satisfy.
+void dol_platform_gx_flush(void);
 void dol_platform_call_display_list(const void* data, u32 size);
 void dol_platform_set_array(u32 attr, const void* data, u32 size, u8 stride);
 void dol_platform_set_array_guest(u32 attr, u32 guest_address,

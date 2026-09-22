@@ -14,6 +14,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <span>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #if GXRUNTIME_HAS_AURORA_RECOMP
 // gxcore substrate submission lives in the Aurora fork (lib/gfx/gxcore_draw.cpp),
@@ -262,9 +266,119 @@ void trace_on_present() {
     g_trace_frame_begun = false;
 }
 
+// Defined below, next to the write path it batches. The guest-visible
+// synchronizations call it before they change or consume front-end state.
+static void shadow_frontend_flush(void);
+
+// The FIFO's translation runs on a worker rather than on the thread that
+// executes the guest.
+//
+// The front end's state - the parse position, the GX register image and its own
+// buffer - is touched only from that worker, so nothing guards it; the lock
+// guards the hand-off buffer alone. The guest-visible synchronizations drain
+// first, through shadow_frontend_flush, and that is the only place the main
+// thread waits; the byte budget only wakes the worker. Aurora's submission is a
+// queue drained by its own render worker, so calling the sink from here is the
+// path Aurora expects, and the trace writer stays on the calling thread because
+// it is a file writer and the parse is what feeds it.
+// docs/status/CURRENT.md, 2026-09-22.
+namespace {
+
+std::mutex g_fifo_worker_mutex;
+std::condition_variable g_fifo_worker_cv;
+std::condition_variable g_fifo_worker_idle_cv;
+std::vector<std::uint8_t> g_fifo_handoff;
+std::thread g_fifo_worker_thread;
+bool g_fifo_worker_started = false;
+bool g_fifo_worker_stop = false;
+bool g_fifo_work_pending = false;
+bool g_fifo_worker_idle = true;
+std::uint64_t g_fifo_appended = 0;
+std::uint64_t g_fifo_parsed = 0;
+
+void g_fifo_translate(std::vector<std::uint8_t>& batch) {
+    if (batch.empty())
+        return;
+    const std::span<const std::uint8_t> bytes(batch.data(), batch.size());
+    bool flushed = false;
+    if (g_shadow_frontend.write_fifo(bytes)) {
+        if (g_gx_core_enabled)
+            flushed = g_shadow_frontend.flush(&g_core_sink);
+        else
+            flushed = g_shadow_frontend.flush(&g_shadow_packet_sink);
+    }
+    if (!flushed) {
+        std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
+        g_shadow_frontend_failed = true;
+    }
+}
+
+void g_fifo_worker_main() {
+    for (;;) {
+        std::vector<std::uint8_t> batch;
+        std::uint64_t parsed = 0;
+        {
+            std::unique_lock<std::mutex> lock(g_fifo_worker_mutex);
+            g_fifo_worker_cv.wait(lock, [] {
+                return g_fifo_work_pending || g_fifo_worker_stop;
+            });
+            if (!g_fifo_work_pending)
+                return;
+            g_fifo_work_pending = false;
+            batch.swap(g_fifo_handoff);
+            parsed = g_fifo_appended;
+        }
+        g_fifo_translate(batch);
+        {
+            std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
+            g_fifo_parsed = parsed;
+            if (!g_fifo_work_pending)
+                g_fifo_worker_idle = true;
+        }
+        g_fifo_worker_idle_cv.notify_all();
+    }
+}
+
+void g_fifo_worker_start() {
+    if (g_fifo_worker_started || trace_should_record())
+        return;
+    g_fifo_worker_started = true;
+    g_fifo_worker_thread = std::thread(g_fifo_worker_main);
+}
+
+void g_fifo_enqueue(const std::uint8_t* bytes, u8 size) {
+    {
+        std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
+        g_fifo_handoff.insert(g_fifo_handoff.end(), bytes, bytes + size);
+        ++g_fifo_appended;
+        g_fifo_work_pending = true;
+        g_fifo_worker_idle = false;
+    }
+    g_fifo_worker_cv.notify_one();
+}
+
+// Waits until the worker has translated everything appended so far. Called at
+// the barriers and only there.
+static void g_fifo_drain() {
+    std::unique_lock<std::mutex> lock(g_fifo_worker_mutex);
+    const std::uint64_t target = g_fifo_appended;
+    if (g_fifo_worker_idle && g_fifo_parsed >= target)
+        return;
+    g_fifo_work_pending = true;
+    g_fifo_worker_cv.notify_one();
+    g_fifo_worker_idle_cv.wait(lock, [target] {
+        return g_fifo_worker_idle && g_fifo_parsed >= target;
+    });
+}
+
+}  // namespace
+
 void shadow_frontend_set_array(u32 attr, u32 guest_address, u8 stride) {
     if (!g_shadow_frontend_enabled || g_shadow_frontend_failed)
         return;
+    // The mirror must not run ahead of bytes the parser has not seen, or a
+    // draw already in the FIFO would be decoded with this array's successor.
+    shadow_frontend_flush();
     u8 cp_attr = 0;
     if (!gx_attr_to_cp_array(attr, &cp_attr)) {
         shadow_frontend_fail_metadata("unsupported GX array attribute", attr,
@@ -306,6 +420,9 @@ bool frontend_guest_address_resolver_bridge(
 void shadow_frontend_call_display_list(const void* data, u32 size) {
     if (!g_shadow_frontend_enabled || g_shadow_frontend_failed)
         return;
+    // Same ordering rule as the array mirror: the HLE path parses the list
+    // immediately, so anything already in the FIFO has to be parsed first.
+    shadow_frontend_flush();
     const std::span<const std::uint8_t> bytes(
         static_cast<const std::uint8_t*>(data), size);
     if (g_gx_core_enabled) {
@@ -345,9 +462,28 @@ void shadow_frontend_call_display_list(const void* data, u32 size) {
     }
 }
 
+// The FIFO is parsed in batches rather than once per guest store.
+//
+// A store that leaves a partial command in the buffer is re-parsed by the next
+// flush, so flushing per store re-scans that partial once per byte written, and
+// every store also pays the flush path's notification, packet-emission and drain
+// scans. The batch is bounded in bytes, and the guest-visible synchronizations
+// flush first: the CP array mirror and the HLE display-list path here, and the
+// draw-done commit in the host through dol_platform_gx_flush. Nothing else the
+// guest can observe depends on the parse having happened, because the FIFO's own
+// read-back is serviced by the front end's state and the parse does not run
+// backwards. docs/status/CURRENT.md, 2026-09-22.
+static constexpr std::size_t kShadowFrontendFlushBytes = 1024u;
+static std::size_t g_shadow_frontend_pending_bytes;
+static u64 g_shadow_frontend_last_write_value;
+static u8 g_shadow_frontend_last_write_size;
+
+static void shadow_frontend_flush(void);
+
 void shadow_frontend_write(u64 value, u8 size) {
     if (!g_shadow_frontend_enabled || g_shadow_frontend_failed)
         return;
+    g_fifo_worker_start();
     std::uint8_t bytes[8] = {};
     switch (size) {
     case 1:
@@ -372,9 +508,37 @@ void shadow_frontend_write(u64 value, u8 size) {
         return;
     }
     const std::span<const std::uint8_t> fragment(bytes, size);
+    g_shadow_frontend_last_write_value = value;
+    g_shadow_frontend_last_write_size = size;
+    g_shadow_frontend_pending_bytes += size;
+    if (g_fifo_worker_started) {
+        g_fifo_enqueue(bytes, size);
+        return;
+    }
+    if (!g_shadow_frontend.write_fifo(fragment)) {
+        g_shadow_frontend_failed = true;
+        std::fprintf(stderr,
+                     "[gx] shadow RetailGxFrontend refused a %u-byte FIFO "
+                     "fragment\n",
+                     static_cast<unsigned>(size));
+        return;
+    }
+    if (g_shadow_frontend_pending_bytes >= kShadowFrontendFlushBytes)
+        shadow_frontend_flush();
+}
+
+static void shadow_frontend_flush(void) {
+    if (!g_shadow_frontend_enabled || g_shadow_frontend_failed)
+        return;
+    if (g_fifo_worker_started) {
+        g_fifo_drain();
+        return;
+    }
+    g_shadow_frontend_pending_bytes = 0u;
+    const u64 value = g_shadow_frontend_last_write_value;
+    const u8 size = g_shadow_frontend_last_write_size;
     if (g_gx_core_enabled) {
-        if (!g_shadow_frontend.write_fifo(fragment) ||
-            !g_shadow_frontend.flush(&g_core_sink)) {
+        if (!g_shadow_frontend.flush(&g_core_sink)) {
             g_shadow_frontend_failed = true;
             std::fprintf(stderr,
                          "[gx-core] frontend rejected FIFO after %llu byte(s): "
@@ -398,8 +562,7 @@ void shadow_frontend_write(u64 value, u8 size) {
         }
         return;
     }
-    if (!g_shadow_frontend.write_fifo(fragment) ||
-        !g_shadow_frontend.flush(&g_shadow_packet_sink)) {
+    if (!g_shadow_frontend.flush(&g_shadow_packet_sink)) {
         g_shadow_frontend_failed = true;
         const auto& failed = g_shadow_packet_sink.failed_packet();
         std::fprintf(stderr,
@@ -442,6 +605,12 @@ void shadow_frontend_write(u64 value, u8 size) {
                      static_cast<unsigned>(failed.event.kind), failed.event.a,
                      failed.event.b, failed.event.c, failed.event.d);
     }
+}
+
+// Called by the host at the draw-done commit, where the guest is about to
+// observe the PE finish, and by the platform layer's flush hook.
+void shadow_frontend_flush_pending(void) {
+    shadow_frontend_flush();
 }
 
 unsigned long long shadow_transform_frame_number() {
@@ -866,6 +1035,18 @@ void aurora_backend_call_display_list(const void* data, u32 size) {
     gx_aurora::flush_pending_resource_metadata();
     aurora::gx::fifo::write_data(data, size);
     gx_aurora::g_fifo_bytes += size;
+}
+
+// Parses whatever the FIFO write path has buffered. The host calls this at the
+// draw-done commit, where the guest is about to observe GPU progress, so the
+// translation is never behind a wait it is supposed to satisfy. Without Aurora
+// there is no front end to drain.
+void aurora_backend_gx_flush(void) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    if (!gx_aurora::g_initialized)
+        return;
+    gx_aurora::shadow_frontend_flush_pending();
+#endif
 }
 
 void aurora_backend_gx_write(u64 value, u8 size) {

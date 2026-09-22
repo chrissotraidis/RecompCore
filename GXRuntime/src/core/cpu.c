@@ -49,6 +49,43 @@ static u32 g_guest_alias_count;
 static u32 g_guest_alias_min_start = UINT32_MAX;
 static u64 g_guest_alias_max_end;
 bool g_ppc_guest_aliases_overlap_mem1;
+// Cost census for the alias path (docs/status/REORGANIZATION_2026-09-17.md, W4).
+// get_ram_ptr sends every untagged MEM1 access through ppc_guest_alias_resolve
+// as soon as one alias touches MEM1, and the resolver is a linear scan of the
+// registry. Whether that matters depends on numbers nobody has: how often the
+// resolver is entered, how far it scans before it answers, and how often a scan
+// is cut short by the bounds test. Inert unless BLUEWAKE_TRACE_ALIAS_COST is set.
+static u64 g_alias_cost_calls;
+static u64 g_alias_cost_pruned;
+static u64 g_alias_cost_iterations;
+static u64 g_alias_cost_hits;
+static bool g_alias_cost_reported;
+
+static void ppc_guest_alias_cost_report(void);
+
+static bool ppc_guest_alias_cost_on(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("BLUEWAKE_TRACE_ALIAS_COST") != NULL ? 1 : 0;
+        if (enabled)
+            atexit(ppc_guest_alias_cost_report);
+    }
+    return enabled != 0;
+}
+
+static void ppc_guest_alias_cost_report(void) {
+    if (g_alias_cost_reported || getenv("BLUEWAKE_TRACE_ALIAS_COST") == NULL)
+        return;
+    g_alias_cost_reported = true;
+    fprintf(stderr,
+            "[alias-cost] resolve_calls=%llu pruned_by_bounds=%llu "
+            "iterations=%llu hits=%llu aliases=%u overlap_mem1=%d\n",
+            (unsigned long long)g_alias_cost_calls,
+            (unsigned long long)g_alias_cost_pruned,
+            (unsigned long long)g_alias_cost_iterations,
+            (unsigned long long)g_alias_cost_hits, g_guest_alias_count,
+            g_ppc_guest_aliases_overlap_mem1 ? 1 : 0);
+}
 
 static void ppc_guest_alias_recompute_bounds(void) {
     g_guest_alias_min_start = UINT32_MAX;
@@ -167,14 +204,24 @@ GXRUNTIME_EXPORT bool ppc_guest_alias_resolve(u32 address, u32 size,
                                               u32* journal_offset) {
     if (pointer == NULL || size == 0u)
         return false;
+    const bool cost = ppc_guest_alias_cost_on();
+    if (cost)
+        g_alias_cost_calls++;
     if (address < g_guest_alias_min_start ||
-        (u64)address + size > g_guest_alias_max_end)
+        (u64)address + size > g_guest_alias_max_end) {
+        if (cost)
+            g_alias_cost_pruned++;
         return false;
+    }
     for (u32 i = 0; i < g_guest_alias_count; ++i) {
+        if (cost)
+            g_alias_cost_iterations++;
         const PPCGuestAlias* alias = &g_guest_aliases[i];
         if (address < alias->linked_start || size > alias->size ||
             address - alias->linked_start > alias->size - size)
             continue;
+        if (cost)
+            g_alias_cost_hits++;
         *pointer = alias->storage + (address - alias->linked_start);
         if (journal_offset != NULL)
             *journal_offset = address - GC_RAM_BASE;
@@ -312,6 +359,8 @@ void ppc_alignment_exception(CPUState* cpu, u32 ea, u32 cia) {
 }
 
 u32 ppc_mftb(CPUState* cpu, u16 tbr, u32 cia) {
+    if ((tbr == 268 || tbr == 269) && cpu->spr_read)
+        return cpu->spr_read(cpu, tbr, cia);
     if (tbr == 268)
         return (u32)cpu->timebase;
     if (tbr == 269)

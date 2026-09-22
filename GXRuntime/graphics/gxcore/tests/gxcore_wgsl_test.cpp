@@ -1068,6 +1068,35 @@ void test_tev_modulate() {
   CHECK(counters.tev_multi_texmap == 0);
   CHECK(counters.alpha_compare_ignored == 0);
 
+  // A single-texmap draw must bind the texmap selected by TEV, not the most
+  // recently written texture packet. J3D commonly leaves another slot as the
+  // last write before drawing hair and other layered materials.
+  {
+    gxc::GxCoreState slot_state = state;
+    slot_state.apply(bp(0x28, 3u | (1u << 6))); // stage 0 samples texmap 3
+    ar::ConsumedDraw slot_draw = draw;
+    slot_draw.texture.slot = 7u;
+    slot_draw.texture.address = 0x80700000u;
+    static const std::uint8_t slot3_bytes[64] = {};
+    slot_draw.textures[3] = slot_draw.texture;
+    slot_draw.textures[3].slot = 3u;
+    slot_draw.textures[3].address = 0x80330000u;
+    slot_draw.textures[3].size = sizeof slot3_bytes;
+    slot_draw.textures[3].host_data = slot3_bytes;
+    slot_draw.textures[3].host_available = sizeof slot3_bytes;
+
+    gxc::GapCounters slot_gaps;
+    const gxc::DrawPlan slot_plan =
+        slot_state.build_draw_plan(slot_draw, slot_gaps);
+    CHECK(slot_plan.ok);
+    CHECK(gxc::used_texmap_mask(slot_plan.pipeline.shader) == (1u << 3u));
+    CHECK(slot_plan.texmap_mask == 0u);
+    CHECK(slot_plan.tex_slot == 3u);
+    CHECK(slot_plan.tex_address == 0x80330000u);
+    CHECK(slot_plan.tex_data == slot3_bytes);
+    CHECK(slot_plan.tex_available == sizeof slot3_bytes);
+  }
+
   // Aliased tev-color vs konst decode (both live off 0xE0/0xE1).
   CHECK(plan.pixel_constants.colors[0][0] == 100);
   CHECK(plan.pixel_constants.colors[0][1] == 150);

@@ -50,16 +50,31 @@ static void recompute_work_units_per_chunk(DolAudioDma* dma) {
 }
 
 static void apply_ai_control(DolAudioDma* dma) {
-    const u32 control = load_be32(dma->ai_regs + DOL_AUDIO_DMA_AI_CONTROL_OFF);
+    u32 control = load_be32(dma->ai_regs + DOL_AUDIO_DMA_AI_CONTROL_OFF);
     // Dolphin: AIDFR set == 32 kHz AID, clear == 48 kHz AID (inverted w.r.t.
     // the rate name).
     const u32 rate = (control & DOL_AUDIO_DMA_AI_AIDFR_BIT) != 0u
                          ? DOL_AUDIO_DMA_32KHZ
                          : DOL_AUDIO_DMA_48KHZ;
-    if (dma->sample_rate == rate)
-        return;
-    dol_audio_dma_set_sample_rate(dma, rate);
-    dol_platform_audio_set_sample_rate(rate);
+    if (dma->sample_rate != rate) {
+        dol_audio_dma_set_sample_rate(dma, rate);
+        dol_platform_audio_set_sample_rate(rate);
+    }
+
+    const u32 stream_rate =
+        (control & DOL_AUDIO_DMA_AI_AISFR_BIT) != 0u
+            ? DOL_AUDIO_DMA_48KHZ
+            : DOL_AUDIO_DMA_32KHZ;
+    if (dma->stream_sample_rate != stream_rate) {
+        dma->stream_sample_rate = stream_rate;
+        dma->sample_counter_remainder = 0u;
+    }
+    if ((control & DOL_AUDIO_DMA_AI_SCRESET_BIT) != 0u) {
+        dma->sample_counter = 0u;
+        dma->sample_counter_remainder = 0u;
+        control &= ~DOL_AUDIO_DMA_AI_SCRESET_BIT;
+        store_be32(dma->ai_regs + DOL_AUDIO_DMA_AI_CONTROL_OFF, control);
+    }
 }
 
 void dol_audio_dma_init(DolAudioDma* dma) {
@@ -67,6 +82,7 @@ void dol_audio_dma_init(DolAudioDma* dma) {
     dma->sample_rate = DOL_AUDIO_DMA_32KHZ;
     dma->chunks_per_second =
         DOL_AUDIO_DMA_32KHZ / DOL_AUDIO_DMA_FRAMES_PER_CHUNK;
+    dma->stream_sample_rate = DOL_AUDIO_DMA_48KHZ;
     dma->work_units_per_chunk = 1;
     store_be32(dma->ai_regs + DOL_AUDIO_DMA_AI_CONTROL_OFF,
                DOL_AUDIO_DMA_AI_CONTROL_INIT);
@@ -182,18 +198,26 @@ bool dol_audio_dma_consume_pcm16_stereo_work(DolAudioDma* dma,
     u32 source_address = 0;
     u8 bytes[DOL_AUDIO_DMA_FRAMES_PER_CHUNK * 4u];
     s16 samples[DOL_AUDIO_DMA_FRAMES_PER_CHUNK * 2u];
+    bool consumed = false;
 
-    if (read_source == NULL ||
-        !dol_audio_dma_advance(dma, work_units, &source_address) ||
-        !read_source(user, source_address, bytes, sizeof bytes))
+    if (read_source == NULL)
         return false;
 
-    for (u32 i = 0; i < DOL_AUDIO_DMA_FRAMES_PER_CHUNK * 2u; i++) {
-        const u32 offset = i * 2u;
-        samples[i] = (s16)(((u16)bytes[offset] << 8) | bytes[offset + 1u]);
+    u64 pending_work = work_units;
+    while (dol_audio_dma_advance(dma, pending_work, &source_address)) {
+        pending_work = 0u;
+        if (!read_source(user, source_address, bytes, sizeof bytes))
+            return false;
+
+        for (u32 i = 0; i < DOL_AUDIO_DMA_FRAMES_PER_CHUNK * 2u; i++) {
+            const u32 offset = i * 2u;
+            samples[i] =
+                (s16)(((u16)bytes[offset] << 8) | bytes[offset + 1u]);
+        }
+        dol_platform_audio_push(samples, DOL_AUDIO_DMA_FRAMES_PER_CHUNK);
+        consumed = true;
     }
-    dol_platform_audio_push(samples, DOL_AUDIO_DMA_FRAMES_PER_CHUNK);
-    return true;
+    return consumed;
 }
 
 bool dol_audio_dma_consume_pcm16_stereo(DolAudioDma* dma,
@@ -201,6 +225,22 @@ bool dol_audio_dma_consume_pcm16_stereo(DolAudioDma* dma,
                                         void* user) {
     return dol_audio_dma_consume_pcm16_stereo_work(dma, 1u, read_source,
                                                    user);
+}
+
+void dol_audio_dma_advance_stream(DolAudioDma* dma, u64 work_units) {
+    if (dma == NULL || dma->work_units_per_second == 0u ||
+        (load_be32(dma->ai_regs + DOL_AUDIO_DMA_AI_CONTROL_OFF) &
+         DOL_AUDIO_DMA_AI_PSTAT_BIT) == 0u)
+        return;
+
+    const u64 rate = dma->stream_sample_rate;
+    const u64 denominator = dma->work_units_per_second;
+    const u64 whole_seconds = work_units / denominator;
+    const u64 partial_work = work_units % denominator;
+    const u64 scaled = partial_work * rate + dma->sample_counter_remainder;
+    dma->sample_counter +=
+        (u32)(whole_seconds * rate + scaled / denominator);
+    dma->sample_counter_remainder = scaled % denominator;
 }
 
 static u32 latched_dma_source(const DolAudioDma* dma) {
@@ -219,6 +259,10 @@ void dol_audio_dma_ai_mmio_read(DolAudioDma* dma, u32 offset, u8 size,
                                 u64* value) {
     if (dma == NULL || value == NULL)
         return;
+    if (offset == DOL_AUDIO_DMA_AI_SAMPLE_COUNTER_OFF && size == 4u) {
+        *value = dma->sample_counter;
+        return;
+    }
     *value = register_read(dma->ai_regs, offset, size);
 }
 
@@ -227,6 +271,11 @@ void dol_audio_dma_ai_mmio_write(DolAudioDma* dma, u32 offset, u8 size,
     if (dma == NULL)
         return;
     register_write(dma->ai_regs, offset, size, value);
+    if (offset == DOL_AUDIO_DMA_AI_SAMPLE_COUNTER_OFF && size == 4u) {
+        dma->sample_counter = (u32)value;
+        dma->sample_counter_remainder = 0u;
+        return;
+    }
     if (offset < DOL_AUDIO_DMA_AI_CONTROL_OFF + 4u &&
         offset + size > DOL_AUDIO_DMA_AI_CONTROL_OFF)
         apply_ai_control(dma);

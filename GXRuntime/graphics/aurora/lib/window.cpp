@@ -142,6 +142,11 @@ void sync_paused() {
   });
 }
 
+// The pad layer latches keyboard presses from the event stream, because a press
+// that is drained and released between two of its samples is otherwise invisible
+// to it. See the latch in lib/dolphin/pad/pad.cpp.
+extern "C" void PADLatchKeyEvent(int scancode, int down);
+
 void process_event(SDL_Event& event) {
 #ifdef AURORA_ENABLE_GX
   imgui::process_event(event);
@@ -192,6 +197,13 @@ void process_event(SDL_Event& event) {
   }
   case SDL_EVENT_MOUSE_WHEEL:
     input::set_mouse_scroll(event.wheel.x, event.wheel.y);
+    break;
+  case SDL_EVENT_KEY_DOWN:
+  case SDL_EVENT_KEY_UP:
+    // Feed the pad latch before anything else can consume the event, so a press
+    // is recorded even on a frame slow enough to drain it and its release in the
+    // same poll batch.
+    PADLatchKeyEvent(event.key.scancode, event.key.down ? 1 : 0);
     break;
   case SDL_EVENT_QUIT:
     g_events.push_back(AuroraEvent{
@@ -342,6 +354,14 @@ void destroy_window() {
 void show_window() {
   if (g_window != nullptr) {
     TRY_WARN(SDL_ShowWindow(g_window), "Failed to show window: {}", SDL_GetError());
+    // A displayed window is not a key window. SDL only sets SDL_WINDOW_INPUT_FOCUS
+    // on a raised window, and without that flag no keyboard event is delivered to
+    // this process, so a human launch would show the game and answer nothing.
+    TRY_WARN(SDL_RaiseWindow(g_window), "Failed to raise window: {}", SDL_GetError());
+    TRY_WARN(SDL_SyncWindow(g_window), "Failed to sync window: {}", SDL_GetError());
+    const auto focus_flags = static_cast<unsigned long long>(SDL_GetWindowFlags(g_window));
+    Log.info("Window shown: input_focus={} flags=0x{:X}",
+             (focus_flags & static_cast<unsigned long long>(SDL_WINDOW_INPUT_FOCUS)) != 0ull, focus_flags);
   }
 }
 
@@ -365,6 +385,14 @@ bool initialize() {
     TRY(SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1"), "Error setting {}: {}",
         SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, SDL_GetError());
   }
+
+  // SDL 3 does not activate the application when a window is shown or raised
+  // unless these hints ask for it. A game launched from a shell therefore gets a
+  // visible window that is never the key window, and no key press ever arrives.
+  TRY(SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "1"), "Error setting {}: {}",
+      SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, SDL_GetError());
+  TRY(SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, "1"), "Error setting {}: {}",
+      SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, SDL_GetError());
 
   return true;
 }

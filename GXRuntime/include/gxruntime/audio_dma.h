@@ -19,9 +19,12 @@
 #define DOL_AUDIO_DMA_DSP_REG_BYTES 0x40u
 
 #define DOL_AUDIO_DMA_AI_CONTROL_OFF 0x00u
+#define DOL_AUDIO_DMA_AI_SAMPLE_COUNTER_OFF 0x08u
 // AICR bits (Dolphin AudioInterface.h). AIDFR is intentionally inverted w.r.t.
 // the rate name: AIDFR set == 32 kHz AID, clear == 48 kHz AID.
+#define DOL_AUDIO_DMA_AI_PSTAT_BIT 0x00000001u
 #define DOL_AUDIO_DMA_AI_AISFR_BIT 0x00000002u
+#define DOL_AUDIO_DMA_AI_SCRESET_BIT 0x00000020u
 #define DOL_AUDIO_DMA_AI_AIDFR_BIT 0x00000040u
 #define DOL_AUDIO_DMA_AI_CONTROL_INIT \
     (DOL_AUDIO_DMA_AI_AISFR_BIT | DOL_AUDIO_DMA_AI_AIDFR_BIT)
@@ -49,6 +52,9 @@ typedef struct DolAudioDma {
     u64 work_units_per_second;
     u64 work_units_per_frame;
     u64 work_units_per_chunk;
+    u64 sample_counter_remainder;
+    u32 sample_counter;
+    u32 stream_sample_rate;
     bool interrupt_pending;
     // Big-endian AI/DSP register files. AI CR DRIVES the AID sample rate; DSP
     // control carries the AID interrupt mask and DMA address/length state.
@@ -97,6 +103,10 @@ bool dol_audio_dma_consume_pcm16_stereo_work(DolAudioDma* dma,
                                              u64 work_units,
                                              DolAudioDmaReadFn read_source,
                                              void* user);
+
+// Advance the AI streaming sample counter from the same guest-cycle domain as
+// DMA. Reads do not advance time, and elapsed-work partitioning is invariant.
+void dol_audio_dma_advance_stream(DolAudioDma* dma, u64 work_units);
 
 // AI/DSP-AID device register MMIO. The game writes the AI control register to
 // select the AID sample rate; DSP control carries the AID interrupt status/mask

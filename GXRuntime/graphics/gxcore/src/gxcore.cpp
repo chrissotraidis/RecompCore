@@ -1375,28 +1375,40 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
     }
   }
   if (key.textured != 0u) {
+    const std::uint32_t used = used_texmap_mask(key);
+    const ar::ConsumedTexture* primary = &draw.texture;
+    if (texmap_popcount(used) == 1u) {
+      for (std::uint32_t t = 0; t < 8u; ++t) {
+        if ((used & (1u << t)) == 0u)
+          continue;
+        const ar::ConsumedTexture& candidate = draw.textures[t];
+        if (candidate.valid && candidate.resolved && candidate.width > 0u &&
+            candidate.height > 0u)
+          primary = &candidate;
+        break;
+      }
+    }
     plan.has_texture = true;
-    plan.tex_slot = draw.texture.slot & 7u;
-    plan.tex_address = draw.texture.address;
-    plan.tex_size = draw.texture.size;
-    plan.tex_format = draw.texture.format;
-    plan.tex_width = draw.texture.width;
-    plan.tex_height = draw.texture.height;
-    plan.tex_data = draw.texture.host_data;
-    plan.tex_available = draw.texture.host_available;
+    plan.tex_slot = primary->slot & 7u;
+    plan.tex_address = primary->address;
+    plan.tex_size = primary->size;
+    plan.tex_format = primary->format;
+    plan.tex_width = primary->width;
+    plan.tex_height = primary->height;
+    plan.tex_data = primary->host_data;
+    plan.tex_available = primary->host_available;
     // Carry the resolved TLUT palette for CI-format textures (A3 decode
     // consumer). Frontend leaves has_tlut false for non-CI/unresolved.
-    plan.has_tlut = draw.texture.has_tlut;
-    plan.tlut_address = draw.texture.tlut_address;
-    plan.tlut_format = draw.texture.tlut_format;
-    plan.tlut_entries = draw.texture.tlut_entries;
-    plan.tlut_data = draw.texture.tlut_host_data;
-    plan.tlut_available = draw.texture.tlut_host_available;
+    plan.has_tlut = primary->has_tlut;
+    plan.tlut_address = primary->tlut_address;
+    plan.tlut_format = primary->tlut_format;
+    plan.tlut_entries = primary->tlut_entries;
+    plan.tlut_data = primary->tlut_host_data;
+    plan.tlut_available = primary->tlut_host_available;
     // Multi-texmap (63/Mfin): when a TEV combines >1 texmap (THP YUV Y/U/V) the
     // single flat texture above is not enough. Populate the per-texmap set from
     // the per-slot bound textures. texmap_mask stays 0 for <=1 distinct texmap
-    // so single-texmap draws keep the flat fast path byte-for-byte.
-    const std::uint32_t used = used_texmap_mask(key);
+    // so single-texmap draws retain the flat renderer path.
     if (texmap_popcount(used) > 1u) {
       plan.texmap_mask = used;
       for (std::uint32_t t = 0; t < 8u; ++t) {

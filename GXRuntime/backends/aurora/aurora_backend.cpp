@@ -157,6 +157,7 @@ void install_platform_ops() {
         .present = aurora_backend_present,
         .mark_gx_begin = aurora_backend_mark_gx_begin,
         .gx_write = aurora_backend_gx_write,
+        .gx_flush = aurora_backend_gx_flush,
         .call_display_list = aurora_backend_call_display_list,
         .set_array = aurora_backend_set_array,
         .set_array_guest = aurora_backend_set_array_guest,
@@ -323,6 +324,9 @@ bool dol_aurora_initialize(int argc, char** argv,
                      "through the Dolphin-ported gxcore, live Aurora gx layer "
                      "bypassed\n");
     }
+    // The FIFO translation runs on a worker now, so the reset has to wait for
+    // it to be idle before the front end's state is cleared.
+    gx_aurora::shadow_frontend_flush_pending();
     gx_aurora::g_shadow_frontend_failed = false;
     gx_aurora::g_shadow_frontend.reset(nullptr);
     gx_aurora::g_shadow_frontend.set_packet_drain_enabled(gx_aurora::g_shadow_frontend_enabled);

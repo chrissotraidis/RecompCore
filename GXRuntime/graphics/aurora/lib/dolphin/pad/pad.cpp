@@ -5,10 +5,13 @@
 #include <dolphin/pad.h>
 #include <dolphin/si.h>
 #include <SDL3/SDL_mouse.h>
+#include <SDL3/SDL_timer.h>
 
 #include <array>
 #include <sys/stat.h>
 #include <ranges>
+#include <cstdio>
+#include <cstdlib>
 
 namespace {
 constexpr int32_t k_mappingsFileVersion = 4;
@@ -672,6 +675,63 @@ static void merge_virtual_status(PADStatus& status, const PADStatus& virtualStat
   status.analogB = std::max(status.analogB, virtualStatus.analogB);
 }
 
+// A keyboard press is an event, not a level, and the guest only ever sees the
+// pad through PADRead. PADRead samples the keyboard once per guest frame, and
+// Aurora drains the whole SDL queue once per *rendered* frame, so when a frame
+// is slow a press and its release are both drained before any sample happens:
+// the sampled state ends that frame already released and the press is thrown
+// away without ever having been visible. Measured on this host, a 40 ms J press
+// produced no sample at all while a 400 ms press was seen cleanly, and this
+// project's Outset awake cutscene renders at 7-9 fps, which is one sample every
+// 110-136 ms. A person tapping A through that cutscene loses presses the same
+// way, and the runtime reports nothing when it happens.
+//
+// The latch below keeps every key-down that arrives on the event stream and
+// holds it until a pad read has actually observed it, so no press can be
+// dropped whatever the frame time. A press that is genuinely held keeps its real
+// duration: the release event ends the window, and the sampled state is still
+// consulted, so holding a key behaves exactly as it did before.
+namespace {
+constexpr int k_latchScancodes = SDL_SCANCODE_COUNT;
+std::array<unsigned long long, k_latchScancodes> g_latchDownAt{};
+std::array<unsigned long long, k_latchScancodes> g_latchUpAt{};
+std::array<bool, k_latchScancodes> g_latchObserved{};
+} // namespace
+
+// Called from the event pump for every SDL key event, which is the only place
+// the full press/release sequence is still available.
+extern "C" void PADLatchKeyEvent(int scancode, int down) {
+  if (scancode < 0 || scancode >= k_latchScancodes) {
+    return;
+  }
+  const unsigned long long now = static_cast<unsigned long long>(SDL_GetTicks());
+  if (down) {
+    g_latchDownAt[scancode] = now == 0ull ? 1ull : now;
+    g_latchUpAt[scancode] = 0ull;
+    g_latchObserved[scancode] = false;
+  } else if (g_latchDownAt[scancode] != 0ull) {
+    g_latchUpAt[scancode] = now;
+  }
+}
+
+// The keyboard as the guest should see it: the live sample, or a latched press
+// that is still down or has not yet been observed by a pad read.
+static bool latched_key_down(int scancode, const bool* kbState, int numKeys) {
+  if (scancode < 0 || scancode >= k_latchScancodes) {
+    return scancode < numKeys && kbState[scancode] != 0;
+  }
+  if (g_latchDownAt[scancode] != 0ull) {
+    if (!g_latchObserved[scancode]) {
+      return true;
+    }
+    if (g_latchUpAt[scancode] != 0ull &&
+        static_cast<unsigned long long>(SDL_GetTicks()) <= g_latchUpAt[scancode]) {
+      return true;
+    }
+  }
+  return scancode < numKeys && kbState[scancode] != 0;
+}
+
 u32 PADRead(PADStatus* status) {
   if (!g_keyboardBindingsLoaded) {
     g_keyboardBindingsLoaded = true;
@@ -702,8 +762,9 @@ u32 PADRead(PADStatus* status) {
     status[i].err = PAD_ERR_NONE;
     if (g_keyboardBindings[i].m_mappingsSet) {
       std::ranges::for_each(
-          g_keyboardBindings[i].m_buttonMapping, [&kbState, &i, &status](const PADKeyButtonBinding& mapping) {
-            if (mapping.scancode > PAD_KEY_INVALID && kbState[mapping.scancode]) {
+          g_keyboardBindings[i].m_buttonMapping, [&kbState, &numKeys, &i, &status](const PADKeyButtonBinding& mapping) {
+            if (mapping.scancode > PAD_KEY_INVALID &&
+                latched_key_down(mapping.scancode, kbState, numKeys)) {
               status[i].button |= mapping.padButton;
             } else if (is_mouse_scancode(mapping.scancode) && is_mouse_button_pressed(mapping.scancode)) {
               status[i].button |= mapping.padButton;
@@ -714,7 +775,7 @@ u32 PADRead(PADStatus* status) {
       for (const auto& binding : g_keyboardBindings[i].m_axisMapping) {
         bool pressed = false;
         if (binding.scancode > PAD_KEY_INVALID) {
-          pressed = binding.scancode < numKeys && kbState[binding.scancode];
+          pressed = latched_key_down(binding.scancode, kbState, numKeys);
         } else if (is_mouse_scancode(binding.scancode)) {
           pressed = is_mouse_button_pressed(binding.scancode);
         }
@@ -907,6 +968,89 @@ u32 PADRead(PADStatus* status) {
       if (g_virtualPadActive[i]) {
         merge_virtual_status(status[i], g_virtualPadStatus[i]);
       }
+    }
+  }
+  // Opt-in probe: BLUEWAKE_INPUT_PROBE reports whether SDL itself sees
+  // keyboard focus and key state, so an input gap can be attributed to the
+  // SDL layer instead of guessed at. Inert when the variable is unset.
+  // It prints on *change* rather than on a read cadence: the first key-down and
+  // every subsequent change of the pressed set is reported, which is the only
+  // cadence under which a held key cannot be missed.
+  static const bool s_input_probe = std::getenv("BLUEWAKE_INPUT_PROBE") != nullptr;
+  if (s_input_probe) {
+    static unsigned long long s_probe_reads = 0;
+    static unsigned long long s_probe_prints = 0;
+    static int s_last_j = -1;
+    static int s_last_return = -1;
+    static int s_last_pressed = -1;
+    static unsigned s_last_button = 0xFFFFu;
+    ++s_probe_reads;
+
+    int pressed_count = 0;
+    int pressed_codes[8] = {0};
+    for (int scan = 0; scan < numKeys; ++scan) {
+      if (kbState[scan] != 0) {
+        if (pressed_count < 8) {
+          pressed_codes[pressed_count] = scan;
+        }
+        ++pressed_count;
+      }
+    }
+    const int j_down = numKeys > SDL_SCANCODE_J && kbState[SDL_SCANCODE_J] != 0 ? 1 : 0;
+    const int return_down = numKeys > SDL_SCANCODE_RETURN && kbState[SDL_SCANCODE_RETURN] != 0 ? 1 : 0;
+    // What the guest is actually handed, which is what the latch above decides.
+    // The two disagree whenever a press was drained between samples, and that
+    // disagreement is the whole point of the latch, so both are printed.
+    int latched_count = 0;
+    int latched_codes[8] = {0};
+    for (int scan = 0; scan < numKeys; ++scan) {
+      if (latched_key_down(scan, kbState, numKeys)) {
+        if (latched_count < 8) {
+          latched_codes[latched_count] = scan;
+        }
+        ++latched_count;
+      }
+    }
+    const unsigned button = static_cast<unsigned>(status[0].button);
+
+    const bool changed = j_down != s_last_j || return_down != s_last_return ||
+                         pressed_count != s_last_pressed || button != s_last_button;
+    if (changed || s_probe_prints < 12ull) {
+      s_last_j = j_down;
+      s_last_return = return_down;
+      s_last_pressed = pressed_count;
+      s_last_button = button;
+      ++s_probe_prints;
+      SDL_Window* kb_focus = SDL_GetKeyboardFocus();
+      SDL_Window* ms_focus = SDL_GetMouseFocus();
+      const unsigned long long flags =
+          kb_focus != nullptr
+              ? (unsigned long long)SDL_GetWindowFlags(kb_focus)
+              : 0ull;
+      std::fprintf(stderr,
+                   "[input-probe] print=%llu read=%llu keys=%d kbFocus=%p "
+                   "msFocus=%p flags=0x%llX pressed=%d J=%d RETURN=%d "
+                   "codes=%d,%d,%d,%d,%d,%d,%d,%d mappingsSet=%d "
+                   "latched=%d latched_codes=%d,%d,%d,%d,%d,%d,%d,%d "
+                   "port0_button=0x%04X err=%d\n",
+                   s_probe_prints, s_probe_reads, numKeys, (void*)kb_focus,
+                   (void*)ms_focus, flags, pressed_count, j_down, return_down,
+                   pressed_codes[0], pressed_codes[1], pressed_codes[2],
+                   pressed_codes[3], pressed_codes[4], pressed_codes[5],
+                   pressed_codes[6], pressed_codes[7],
+                   g_keyboardBindings[0].m_mappingsSet ? 1 : 0,
+                   latched_count, latched_codes[0], latched_codes[1],
+                   latched_codes[2], latched_codes[3], latched_codes[4],
+                   latched_codes[5], latched_codes[6], latched_codes[7],
+                   button, (int)status[0].err);
+    }
+  }
+  // Every latched press this read could have delivered has now been delivered,
+  // so it is released on the next read unless the key is still physically down
+  // or the release event has not fallen behind this sample yet.
+  for (int s = 0; s < k_latchScancodes; ++s) {
+    if (g_latchDownAt[s] != 0ull) {
+      g_latchObserved[s] = true;
     }
   }
   return rumbleSupport;

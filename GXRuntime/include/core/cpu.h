@@ -30,7 +30,7 @@ extern "C" {
 //   consumes and resets it (Dolphin chassis: per-dispatch flush into
 //   ppc_state.downcount). Hosts that do not meter guest time may ignore it
 //   (s64: it cannot wrap in any realistic session).
-#define GXRUNTIME_CPU_ABI_VERSION 4u
+#define GXRUNTIME_CPU_ABI_VERSION 6u
 #define GXRUNTIME_CPU_ABI_DOLRECOMP_PREFIX 1u
 #define GXRUNTIME_CPU_ABI_EXTERNAL_POINTER_EXTENSION 1u
 
@@ -175,6 +175,9 @@ struct CPUState {
     PPCSPRRead spr_read;
     PPCSPRWrite spr_write;
     PPCCacheControl cache_control;
+    u32 cycle_observation_suffix;
+    u32 cycle_deadline_active;
+    s64 cycle_deadline_budget;
 };
 
 #include <stdio.h>
