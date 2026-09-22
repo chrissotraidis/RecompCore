@@ -399,6 +399,11 @@ bool dol_aurora_initialize(int argc, char** argv,
 void dol_aurora_shutdown(void) {
     if (!gx_aurora::g_initialized)
         return;
+    // The translation worker has to be gone before the frame is closed and the
+    // device destroyed, and before process exit destroys a std::thread that is
+    // still joinable. Stopping it here also lets the bytes it has not parsed
+    // yet be recorded into the frame that is about to be submitted.
+    gx_aurora::shadow_frontend_stop_worker();
     dol_platform_reset();
     if (gx_aurora::g_frame_open) {
         aurora_end_frame();

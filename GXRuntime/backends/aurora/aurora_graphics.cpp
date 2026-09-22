@@ -379,6 +379,34 @@ void g_fifo_worker_start() {
     g_fifo_worker_thread = std::thread(g_fifo_worker_main);
 }
 
+// Stops the translation worker and waits for it, so that nothing is recording
+// into Aurora while the device is destroyed and so that no worker thread
+// outlives the process's statics. A std::thread still joinable when exit
+// destroys it calls std::terminate: every rendered run of this worker before
+// this existed ended in SIGABRT after a normal guest stop (measured 2026-09-22),
+// and a batch in flight during device teardown is a use-after-free on top of it.
+void g_fifo_worker_stop_and_join() {
+    std::thread worker;
+    {
+        std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
+        if (!g_fifo_worker_started)
+            return;
+        g_fifo_worker_stop = true;
+        // Wake the worker even with no bytes pending, so it is not left in the
+        // predicate wait when this joins it.
+        g_fifo_work_pending = true;
+        worker.swap(g_fifo_worker_thread);
+        g_fifo_worker_started = false;
+    }
+    g_fifo_worker_cv.notify_all();
+    if (worker.joinable())
+        worker.join();
+    std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
+    // A later initialization may start the worker again.
+    g_fifo_worker_stop = false;
+    g_fifo_worker_idle = true;
+}
+
 void g_fifo_enqueue(const std::uint8_t* bytes, u8 size) {
     {
         std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
@@ -657,6 +685,11 @@ static void shadow_frontend_flush(void) {
 // observe the PE finish, and by the platform layer's flush hook.
 void shadow_frontend_flush_pending(void) {
     shadow_frontend_flush();
+}
+
+// Called by the platform layer before the device is destroyed.
+void shadow_frontend_stop_worker(void) {
+    g_fifo_worker_stop_and_join();
 }
 
 unsigned long long shadow_transform_frame_number() {

@@ -148,6 +148,11 @@ void shadow_frontend_write(u64 value, u8 size);
 // far. The auras's reset paths call it so the front end is not reset while a
 // batch is in flight.
 void shadow_frontend_flush_pending(void);
+// Stops the FIFO translation worker and waits for it. The platform layer calls
+// this before the device is destroyed; the worker records into Aurora's frame
+// packet, and a worker thread that outlives the process's statics calls
+// std::terminate.
+void shadow_frontend_stop_worker(void);
 unsigned long long shadow_transform_frame_number();
 void log_transform_matrix(const char* label, unsigned index, const float* values);
 void shadow_transform_observer(const gxruntime::aurora_recomp::ConsumedDraw& draw, unsigned long long cumulative_draw, void*);
