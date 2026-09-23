@@ -25,6 +25,15 @@ bool dol_aurora_initialize(int argc, char** argv,
                            const AuroraBackendConfig* config);
 void dol_aurora_shutdown(void);
 
+// Host overlay hooks. The overlay callback runs on the main thread inside the
+// open Aurora frame, just before it is submitted, so it may issue ImGui draw
+// calls that composite over the game. The event observer sees every SDL event
+// Aurora forwards (touch, keyboard, controller) as a const SDL_Event*.
+typedef void (*DolAuroraOverlayFn)(void* user);
+typedef void (*DolAuroraEventObserverFn)(const void* sdl_event, void* user);
+void dol_aurora_set_overlay(DolAuroraOverlayFn draw, void* user);
+void dol_aurora_set_event_observer(DolAuroraEventObserverFn observe, void* user);
+
 #ifdef __cplusplus
 }
 #endif

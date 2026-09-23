@@ -930,6 +930,7 @@ void aurora_backend_present(void) {
     }
 #endif
     if (gx_aurora::g_frame_open) {
+        gx_aurora::run_host_overlay();
         aurora_end_frame();
         gx_aurora::g_frame_open = false;
     }

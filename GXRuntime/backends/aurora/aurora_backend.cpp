@@ -11,12 +11,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <window.hpp>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 namespace gx_aurora {
 
 bool g_initialized = false;
 bool g_frame_open = false;
 bool g_should_quit = false;
+DolAuroraOverlayFn g_host_overlay = nullptr;
+void* g_host_overlay_user = nullptr;
+DolAuroraEventObserverFn g_host_event_observer = nullptr;
+void* g_host_event_user = nullptr;
 bool g_graphics_log = false;
 bool g_force_untextured = false;
 bool g_gx_core_enabled = true;
@@ -145,8 +153,15 @@ void poll_events() {
     while (event != nullptr && event->type != AURORA_NONE) {
         if (event->type == AURORA_EXIT)
             g_should_quit = true;
+        if (event->type == AURORA_SDL_EVENT && g_host_event_observer != nullptr)
+            g_host_event_observer(&event->sdl, g_host_event_user);
         ++event;
     }
+}
+
+void run_host_overlay() {
+    if (g_host_overlay != nullptr)
+        g_host_overlay(g_host_overlay_user);
 }
 
 void install_platform_ops() {
@@ -231,6 +246,20 @@ bool dol_aurora_initialize(int argc, char** argv,
     gx_aurora::g_initialized = info.window != nullptr;
     if (!gx_aurora::g_initialized)
         return false;
+
+    // Keep the guest's configured frame aspect instead of stretching it to the
+    // window. iPad and iPhone windows are rarely 4:3; the macOS window is
+    // created 4:3 and stays unchanged unless DOL_AURORA_ASPECT_FIT is set.
+    {
+        bool aspect_fit = false;
+#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
+        aspect_fit = true;
+#endif
+        const char* fit_env = std::getenv("DOL_AURORA_ASPECT_FIT");
+        if (fit_env != nullptr && fit_env[0] != '\0')
+            aspect_fit = fit_env[0] != '0';
+        aurora::window::set_frame_buffer_aspect_fit(aspect_fit);
+    }
 
     gx_aurora::g_graphics_log = backend_config->graphics_logging;
     gx_aurora::g_force_untextured = backend_config->force_untextured;
@@ -399,6 +428,16 @@ bool dol_aurora_initialize(int argc, char** argv,
     gx_aurora::set_initial_frame_recording(gx_aurora::g_frame_open);
     gx_aurora::install_platform_ops();
     return true;
+}
+
+void dol_aurora_set_overlay(DolAuroraOverlayFn draw, void* user) {
+    gx_aurora::g_host_overlay = draw;
+    gx_aurora::g_host_overlay_user = user;
+}
+
+void dol_aurora_set_event_observer(DolAuroraEventObserverFn observe, void* user) {
+    gx_aurora::g_host_event_observer = observe;
+    gx_aurora::g_host_event_user = user;
 }
 
 void dol_aurora_shutdown(void) {

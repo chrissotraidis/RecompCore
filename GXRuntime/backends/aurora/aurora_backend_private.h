@@ -172,6 +172,8 @@ DolGuestResourceKind map_resource_kind(aurora::gx::recomp::ResourceKind kind);
 bool aurora_guest_address_resolver_bridge(void*, std::uint32_t address, std::uint32_t size, aurora::gx::recomp::AddressSpace space, aurora::gx::recomp::ResourceKind resource, const void** data, std::uint32_t* available);
 
 void install_platform_ops();
+// Host overlay hooks (see gxruntime/aurora_backend.h).
+void run_host_overlay();
 // Opens (or closes) the frame begun at initialization to the FIFO worker.
 void set_initial_frame_recording(bool open);
 
