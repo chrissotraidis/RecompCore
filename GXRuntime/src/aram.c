@@ -23,6 +23,10 @@ bool aram_contains(u32 ea) {
     return ea >= ARAM_BASE && ea < ARAM_BASE + ARAM_SIZE;
 }
 
+u8* aram_buffer(void) {
+    return g_aram;
+}
+
 // Offset of a guest ARAM address into the buffer. Accepts both CPU-window
 // addresses (>= ARAM_BASE) and raw ARAM-space offsets (< ARAM_SIZE), since the
 // SDK uses both forms.

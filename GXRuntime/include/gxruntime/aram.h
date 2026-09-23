@@ -30,5 +30,8 @@ void aram_write(u32 ea, u64 value, u8 size);
 // direction. Used by the ARStartDMA intercept.
 void aram_dma_to_aram(const u8* ram, u32 ram_addr, u32 aram_addr, u32 length);
 void aram_dma_to_ram(u8* ram, u32 ram_addr, u32 aram_addr, u32 length);
+// The flat ARAM buffer (ARAM_SIZE bytes, guest byte order), for a DSP backend
+// that addresses ARAM directly. NULL before aram_init.
+u8* aram_buffer(void);
 
 #endif
