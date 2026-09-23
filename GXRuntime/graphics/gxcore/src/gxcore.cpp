@@ -710,6 +710,15 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
                       : 0u;
   if (key.has_pos_mtx_idx != 0u && key.lit_valid != 0u)
     ++counters.per_vertex_normal_matrix;
+  for (std::uint32_t c = 0; c < 4u; ++c) {
+    const std::uint8_t mask = key.litchan[c].light_mask;
+    for (std::uint32_t l = 0; l < 8u; ++l)
+      if ((mask & (1u << l)) && draw.light_word_mask[l] == 0u) {
+        ++counters.lit_light_missing;
+        c = 4u;
+        break;
+      }
+  }
   // Only count normals/lighting as ignored when we fall back to passthrough.
   if (walk.has_normal && key.lit_valid == 0u)
     ++counters.normals_ignored;
@@ -741,6 +750,16 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
     if (static_cast<TexGenType>(tg.texgentype) == TexGenType::EmbossMap &&
         !walk.has_nbt)
       ++counters.texgen_emboss_cached_nbt;
+    {
+      const auto t = static_cast<TexGenType>(tg.texgentype);
+      if (t == TexGenType::Color0 || t == TexGenType::Color1) {
+        const std::uint32_t ch = t == TexGenType::Color0 ? 0u : 1u;
+        if (key.litchan[ch].enablelighting)
+          ++counters.texgen_color_lit;
+        else
+          ++counters.texgen_color_unlit;
+      }
+    }
 
     // The current vertex layout emits position and Tex0..Tex3 source rows for
     // regular matrix texgens. Classify every other legal source instead of

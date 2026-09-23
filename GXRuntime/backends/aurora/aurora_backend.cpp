@@ -548,6 +548,11 @@ void dol_aurora_shutdown(void) {
                      gaps.logic_op_ignored, gaps.dst_alpha_active,
                      gaps.early_depth_active, gaps.ztexture_active,
                      gaps.ztexture_ignored);
+        std::fprintf(stderr,
+                     "[gx-core] toon: texgen_color_lit=%llu texgen_color_unlit=%llu "
+                     "lit_light_missing=%llu\n",
+                     gaps.texgen_color_lit, gaps.texgen_color_unlit,
+                     gaps.lit_light_missing);
         const auto& texture_stats =
             aurora::gfx::gxcore::texture_cache_stats();
         std::fprintf(stderr,

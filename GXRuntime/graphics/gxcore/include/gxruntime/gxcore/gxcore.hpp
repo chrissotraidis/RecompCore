@@ -52,6 +52,10 @@ struct GapCounters {
   unsigned long long texgen_source_normal = 0;  // supported regular normal source
   unsigned long long texgen_source_normal_default = 0; // no normal attribute
   unsigned long long texgen_source_colors = 0;  // regular source row not emitted
+  // Toon/ramp diagnostics: color texgens and the channel they read.
+  unsigned long long texgen_color_lit = 0;      // Color0/1 texgen, channel lit
+  unsigned long long texgen_color_unlit = 0;    // Color0/1 texgen, channel unlit
+  unsigned long long lit_light_missing = 0;     // lit channel names a light never loaded
   unsigned long long texgen_source_binormal = 0; // regular T/B source not emitted
   unsigned long long texgen_source_tex47 = 0;   // regular Tex4..Tex7 not captured
   unsigned long long texgen_source_unknown = 0; // regular source row > Tex7
