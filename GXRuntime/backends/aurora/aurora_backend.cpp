@@ -25,6 +25,8 @@ DolAuroraOverlayFn g_host_overlay = nullptr;
 void* g_host_overlay_user = nullptr;
 DolAuroraEventObserverFn g_host_event_observer = nullptr;
 void* g_host_event_user = nullptr;
+DolAuroraHoldFn g_host_hold = nullptr;
+void* g_host_hold_user = nullptr;
 bool g_graphics_log = false;
 bool g_force_untextured = false;
 bool g_gx_core_enabled = true;
@@ -162,6 +164,10 @@ void poll_events() {
 void run_host_overlay() {
     if (g_host_overlay != nullptr)
         g_host_overlay(g_host_overlay_user);
+}
+
+bool host_wants_hold() {
+    return g_host_hold != nullptr && g_host_hold(g_host_hold_user);
 }
 
 void install_platform_ops() {
@@ -438,6 +444,11 @@ void dol_aurora_set_overlay(DolAuroraOverlayFn draw, void* user) {
 void dol_aurora_set_event_observer(DolAuroraEventObserverFn observe, void* user) {
     gx_aurora::g_host_event_observer = observe;
     gx_aurora::g_host_event_user = user;
+}
+
+void dol_aurora_set_hold(DolAuroraHoldFn should_hold, void* user) {
+    gx_aurora::g_host_hold = should_hold;
+    gx_aurora::g_host_hold_user = user;
 }
 
 void dol_aurora_shutdown(void) {

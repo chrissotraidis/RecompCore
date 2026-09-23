@@ -174,8 +174,12 @@ bool aurora_guest_address_resolver_bridge(void*, std::uint32_t address, std::uin
 void install_platform_ops();
 // Host overlay hooks (see gxruntime/aurora_backend.h).
 void run_host_overlay();
+// True while the host asks for the guest to be held (see dol_aurora_set_hold).
+bool host_wants_hold();
 // Opens (or closes) the frame begun at initialization to the FIFO worker.
 void set_initial_frame_recording(bool open);
+// Retries begin_frame after the window could not present (see the definition).
+void reopen_frame_if_unframed();
 
 } // namespace gx_aurora
 

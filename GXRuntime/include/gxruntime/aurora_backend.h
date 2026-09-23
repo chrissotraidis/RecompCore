@@ -33,6 +33,11 @@ typedef void (*DolAuroraOverlayFn)(void* user);
 typedef void (*DolAuroraEventObserverFn)(const void* sdl_event, void* user);
 void dol_aurora_set_overlay(DolAuroraOverlayFn draw, void* user);
 void dol_aurora_set_event_observer(DolAuroraEventObserverFn observe, void* user);
+// While no frame can be opened, the backend asks this predicate whether the
+// host wants the guest held (for example an iOS app that is not active). If so
+// it pumps events and sleeps on the main thread until the predicate clears.
+typedef bool (*DolAuroraHoldFn)(void* user);
+void dol_aurora_set_hold(DolAuroraHoldFn should_hold, void* user);
 
 #ifdef __cplusplus
 }

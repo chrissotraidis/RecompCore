@@ -10,6 +10,7 @@
 #include <gx/gx.hpp>
 #include <gx/recomp.hpp>
 #include <gxruntime/guest_memory_dirty.h>
+#include <SDL3/SDL_timer.h>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -737,6 +738,43 @@ void set_initial_frame_recording(bool open) {
     g_aurora_recording_open = open;
 }
 
+// A present opens the next frame, and only the core sink's display copy
+// triggers a present. When begin_frame fails - the window is minimized or the
+// iOS app is in the background, so the surface is released - no frame is open,
+// every batch goes to the packet sink, no display copy reaches the core sink,
+// and nothing would ever open a frame again: the game keeps running behind a
+// blank window. The worker counts those unframed batches; when that count moves
+// the main thread retries begin_frame here, once per new unframed batch.
+void reopen_frame_if_unframed() {
+    static std::uint64_t s_seen_unframed = 0;
+    if (g_frame_open || g_should_quit)
+        return;
+    const std::uint64_t unframed =
+        g_aurora_unframed_batches.load(std::memory_order_relaxed);
+    if (unframed == s_seen_unframed)
+        return;
+    s_seen_unframed = unframed;
+    std::lock_guard<std::mutex> recording(g_aurora_recording_mutex);
+    poll_events();
+    if (host_wants_hold()) {
+        const Uint64 start = SDL_GetTicks();
+        std::fprintf(stderr, "[gfx] guest held while the host is inactive\n");
+        while (!g_should_quit && host_wants_hold()) {
+            SDL_Delay(50);
+            poll_events();
+        }
+        std::fprintf(stderr, "[gfx] guest released after %.1f s\n",
+                     (SDL_GetTicks() - start) / 1000.0);
+    }
+    if (g_should_quit)
+        return;
+    g_frame_open = aurora_begin_frame();
+    g_aurora_recording_open = g_frame_open;
+    if (g_frame_open)
+        std::fprintf(stderr, "[gfx] frame reopened after %llu unframed batch(es)\n",
+                     static_cast<unsigned long long>(unframed));
+}
+
 unsigned long long shadow_transform_frame_number() {
     return g_frame_open ? g_present_count + 1ull : g_present_count;
 }
@@ -1212,6 +1250,8 @@ void aurora_backend_gx_write(u64 value, u8 size) {
     gx_aurora::shadow_frontend_write(value, size);
     if (gx_aurora::trace_should_record())
         gx_aurora::g_trace_writer.gx_write(size, value);
+    if (gx_aurora::g_gx_core_enabled && !gx_aurora::g_frame_open)
+        gx_aurora::reopen_frame_if_unframed();
     if (gx_aurora::g_gx_core_enabled)
         if (gx_aurora::g_display_copy_pending) {
             gx_aurora::g_display_copy_pending = false;
