@@ -392,6 +392,11 @@ bool dol_aurora_initialize(int argc, char** argv,
 
     gx_aurora::poll_events();
     gx_aurora::g_frame_open = !gx_aurora::g_should_quit && aurora_begin_frame();
+    // The first frame is opened here rather than by a present, so it must also
+    // be opened to the FIFO translation worker. Otherwise every batch falls
+    // back to the packet sink, the core sink never sees the display copy that
+    // triggers the first present, and no frame is ever recorded or shown.
+    gx_aurora::set_initial_frame_recording(gx_aurora::g_frame_open);
     gx_aurora::install_platform_ops();
     return true;
 }

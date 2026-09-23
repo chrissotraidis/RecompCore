@@ -692,6 +692,11 @@ void shadow_frontend_stop_worker(void) {
     g_fifo_worker_stop_and_join();
 }
 
+void set_initial_frame_recording(bool open) {
+    std::lock_guard<std::mutex> recording(g_aurora_recording_mutex);
+    g_aurora_recording_open = open;
+}
+
 unsigned long long shadow_transform_frame_number() {
     return g_frame_open ? g_present_count + 1ull : g_present_count;
 }
