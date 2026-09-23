@@ -295,6 +295,10 @@ bool g_fifo_worker_started = false;
 bool g_fifo_worker_stop = false;
 bool g_fifo_work_pending = false;
 bool g_fifo_worker_idle = true;
+// True only while the worker is blocked on g_fifo_worker_cv. The enqueue path
+// runs once per guest FIFO write; signalling a worker that is already awake
+// cost 2.1% of the game thread in pthread_cond_signal (iOS simulator sample).
+bool g_fifo_worker_sleeping = false;
 std::uint64_t g_fifo_appended = 0;
 std::uint64_t g_fifo_parsed = 0;
 
@@ -393,9 +397,11 @@ void g_fifo_worker_main() {
         std::uint64_t parsed = 0;
         {
             std::unique_lock<std::mutex> lock(g_fifo_worker_mutex);
-            g_fifo_worker_cv.wait(lock, [] {
-                return g_fifo_work_pending || g_fifo_worker_stop;
-            });
+            while (!g_fifo_work_pending && !g_fifo_worker_stop) {
+                g_fifo_worker_sleeping = true;
+                g_fifo_worker_cv.wait(lock);
+                g_fifo_worker_sleeping = false;
+            }
             if (!g_fifo_work_pending)
                 return;
             g_fifo_work_pending = false;
@@ -449,14 +455,17 @@ void g_fifo_worker_stop_and_join() {
 }
 
 void g_fifo_enqueue(const std::uint8_t* bytes, u8 size) {
+    bool wake;
     {
         std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
         g_fifo_handoff.insert(g_fifo_handoff.end(), bytes, bytes + size);
         ++g_fifo_appended;
         g_fifo_work_pending = true;
         g_fifo_worker_idle = false;
+        wake = g_fifo_worker_sleeping;
     }
-    g_fifo_worker_cv.notify_one();
+    if (wake)
+        g_fifo_worker_cv.notify_one();
 }
 
 // Waits until the worker has translated everything appended so far. Called at
