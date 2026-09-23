@@ -176,7 +176,10 @@ inline constexpr bool UseTextureBuffer = true;
 // Keep these slices bounded and segment long command intervals before they
 // overflow; fixed growth cannot cover an interval with no display copy.
 inline constexpr uint64_t UniformBufferSize = 25165824;  // 24mb
-inline constexpr uint64_t VertexBufferSize = 12582912;   // 12mb
+// Wind Waker's Outset frames fill 12 MB of vertices; a full area split the frame
+// into two submissions, and each split waited on the GPU for a staging buffer
+// (measured on the iOS simulator). 24 MB holds a whole frame.
+inline constexpr uint64_t VertexBufferSize = 25165824;   // 24mb
 inline constexpr uint64_t IndexBufferSize = 8388608;     // 8mb
 inline constexpr uint64_t StorageBufferSize = 8388608;   // 8mb
 inline constexpr uint64_t TextureUploadSize = 25165824;  // 24mb
@@ -294,6 +297,9 @@ static Range push_indices(ArrayRef<T> data, size_t alignment) {
   return push_indices(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T), alignment);
 }
 Range push_uniform(const uint8_t* data, size_t length);
+// Identifies the frame packet (a new one per frame and per staging segment)
+// that staging ranges belong to; 0 when no frame is recording.
+uint64_t current_frame_id();
 template <typename T>
 static Range push_uniform(const T& data) {
   return push_uniform(reinterpret_cast<const uint8_t*>(&data), sizeof(T));

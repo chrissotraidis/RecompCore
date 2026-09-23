@@ -1764,6 +1764,10 @@ Range push_uniform(const uint8_t* data, size_t length) {
   return push(current_frame_packet().uniforms, data, length, g_cachedLimits.minUniformBufferOffsetAlignment);
 }
 
+uint64_t current_frame_id() {
+  return g_recordingFrame == nullptr ? 0 : current_frame_packet().frameId;
+}
+
 Range push_storage(const uint8_t* data, size_t length) {
   ZoneScoped;
   return push(current_frame_packet().storage, data, length, g_cachedLimits.minStorageBufferOffsetAlignment);

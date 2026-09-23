@@ -11,6 +11,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -704,6 +705,46 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
                     clearDepthValue, fmt);
 }
 
+// Uniform de-duplication across consecutive draws.
+//
+// Each draw carries the full vertex-constant block (every position, texture
+// and normal matrix, about 2 KB) and a pixel-constant block, and consecutive
+// draws of one model often carry byte-identical blocks. Pushing them anyway
+// filled Aurora's 24 MB uniform staging area in the middle of Wind Waker's
+// Outset frames, and each split waited on the GPU. A draw whose block matches
+// the previous draw's, within the same frame packet, reuses that range.
+struct UniformCache {
+  std::vector<uint8_t> bytes;
+  Range range{};
+  uint64_t frameId = 0;
+  uint64_t hits = 0;
+  uint64_t pushes = 0;
+};
+static UniformCache g_vertexUniformCache;
+static UniformCache g_pixelUniformCache;
+
+static Range push_uniform_dedup(UniformCache& cache, const uint8_t* data,
+                                size_t length) {
+  static const bool enabled = [] {
+    const char* env = std::getenv("DOL_AURORA_UNIFORM_DEDUP");
+    return env == nullptr || env[0] != '0';
+  }();
+  const uint64_t frameId = current_frame_id();
+  if (enabled && frameId != 0 && cache.frameId == frameId && cache.bytes.size() == length &&
+      std::memcmp(cache.bytes.data(), data, length) == 0) {
+    ++cache.hits;
+    return cache.range;
+  }
+  ++cache.pushes;
+  if (((cache.hits + cache.pushes) & 0x3FFFFu) == 0)
+    Log.info("GXCore uniform reuse: {} of {} blocks reused",
+             cache.hits, cache.hits + cache.pushes);
+  cache.range = push_uniform(data, length);
+  cache.bytes.assign(data, data + length);
+  cache.frameId = frameId;
+  return cache.range;
+}
+
 bool submit_draw_plan(const gxc::DrawPlan& plan) {
   if (!plan.ok || plan.vertex_count == 0 || plan.indices.empty()) {
     return false;
@@ -950,12 +991,13 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const auto idxRange = push_indices(
       reinterpret_cast<const uint8_t*>(plan.indices.data()),
       indexBytes, 4);
-  const auto uniformRange = push_uniform(
-      reinterpret_cast<const uint8_t*>(&plan.constants),
+  const auto uniformRange = push_uniform_dedup(
+      g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
       sizeof(plan.constants));
   Range pixelUniformRange{};
   if (tev) {
-    pixelUniformRange = push_uniform(
+    pixelUniformRange = push_uniform_dedup(
+        g_pixelUniformCache,
         reinterpret_cast<const uint8_t*>(&plan.pixel_constants),
         sizeof(plan.pixel_constants));
   }
