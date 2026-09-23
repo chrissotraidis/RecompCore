@@ -432,7 +432,10 @@ void g_fifo_worker_start() {
 // destroys it calls std::terminate: every rendered run of this worker before
 // this existed ended in SIGABRT after a normal guest stop (measured 2026-09-22),
 // and a batch in flight during device teardown is a use-after-free on top of it.
+void g_fifo_publish_local();
+
 void g_fifo_worker_stop_and_join() {
+    g_fifo_publish_local();
     std::thread worker;
     {
         std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
@@ -454,23 +457,44 @@ void g_fifo_worker_stop_and_join() {
     g_fifo_worker_idle = true;
 }
 
-void g_fifo_enqueue(const std::uint8_t* bytes, u8 size) {
+// Gather-pipe bytes collect on the main thread and reach the worker in batches:
+// taking the worker mutex once per 1-4 byte guest write cost several percent of
+// the game thread. Every barrier that needs the worker to have seen the bytes
+// (g_fifo_drain, shutdown) publishes the local batch first.
+std::vector<std::uint8_t> g_fifo_local;
+constexpr std::size_t kFifoLocalBatch = 1024u;
+
+void g_fifo_publish_local() {
+    if (g_fifo_local.empty())
+        return;
     bool wake;
     {
         std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
-        g_fifo_handoff.insert(g_fifo_handoff.end(), bytes, bytes + size);
+        if (g_fifo_handoff.empty())
+            g_fifo_handoff.swap(g_fifo_local);
+        else
+            g_fifo_handoff.insert(g_fifo_handoff.end(), g_fifo_local.begin(),
+                                  g_fifo_local.end());
         ++g_fifo_appended;
         g_fifo_work_pending = true;
         g_fifo_worker_idle = false;
         wake = g_fifo_worker_sleeping;
     }
+    g_fifo_local.clear();
     if (wake)
         g_fifo_worker_cv.notify_one();
+}
+
+void g_fifo_enqueue(const std::uint8_t* bytes, u8 size) {
+    g_fifo_local.insert(g_fifo_local.end(), bytes, bytes + size);
+    if (g_fifo_local.size() >= kFifoLocalBatch)
+        g_fifo_publish_local();
 }
 
 // Waits until the worker has translated everything appended so far. Called at
 // the barriers and only there.
 static void g_fifo_drain() {
+    g_fifo_publish_local();
     std::unique_lock<std::mutex> lock(g_fifo_worker_mutex);
     // Called from the guest's synchronization points, which never run inside
     // the present transition; if one ever does, waiting here would deadlock
