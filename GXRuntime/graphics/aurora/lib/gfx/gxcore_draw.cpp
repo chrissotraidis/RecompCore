@@ -810,6 +810,19 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
           uint32_t height, const void* data, uint32_t available, bool has_tlut,
           uint32_t tlut_address, uint32_t tlut_format, uint32_t tlut_entries,
           const void* tlut_data, uint32_t tlut_available) -> TextureHandle {
+    // Only CI formats read a palette. The frontend reports whatever TLUT was
+    // last bound for every texture, so without this a non-CI image drawn under
+    // two different palettes had two cache identities at one address, evicted
+    // itself and was decoded and uploaded again on every alternation: Wind
+    // Waker's HUD did that about 23 times a frame (I4/IA4 images, same texels).
+    if (!gxc::is_ci_format(format)) {
+      has_tlut = false;
+      tlut_address = 0u;
+      tlut_format = 0u;
+      tlut_entries = 0u;
+      tlut_data = nullptr;
+      tlut_available = 0u;
+    }
     auto efbIt = g_efbCopyTextures.find(address);
     if (efbIt != g_efbCopyTextures.end() && efbIt->second.handle) {
       uint64_t memoryEpoch = 0;
@@ -899,6 +912,19 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                                  tlut_available);
     } else {
       decoded = gxc::decode_texture(format, width, height, bytes, size);
+    }
+    {
+      static const bool s_upload_log = std::getenv("DOL_GXCORE_TEX_UPLOAD_LOG") != nullptr;
+      if (s_upload_log)
+        std::fprintf(stderr, "[tex-upload] addr=%08X fmt=%u %ux%u size=%u efb=%d prior=%d tlut=%08X hash=%016llX pfmt=%u p%ux%u psize=%u\n",
+                     address, format, width, height, tsize,
+                     g_efbCopyTextures.find(address) != g_efbCopyTextures.end() ? 1 : 0,
+                     addrIt != g_textureAddrKey.end() ? 1 : 0, tlut_address,
+                     (unsigned long long)content_hash,
+                     addrIt != g_textureAddrKey.end() ? addrIt->second.key.format : 0u,
+                     addrIt != g_textureAddrKey.end() ? addrIt->second.key.width : 0u,
+                     addrIt != g_textureAddrKey.end() ? addrIt->second.key.height : 0u,
+                     addrIt != g_textureAddrKey.end() ? addrIt->second.key.size : 0u);
     }
     TextureHandle handle;
     if (!decoded.empty()) {
