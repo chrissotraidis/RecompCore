@@ -247,11 +247,12 @@ struct EfbCopyKey {
   uint32_t width;
   uint32_t height;
   uint32_t format;
+  bool opaque;  // the view reads alpha as one (EFB without alpha)
   bool operator==(const EfbCopyKey&) const = default;
   template <typename H>
   friend H AbslHashValue(H h, const EfbCopyKey& key) {
     return H::combine(std::move(h), key.address, key.width, key.height,
-                      key.format);
+                      key.format, key.opaque);
   }
 };
 absl::flat_hash_map<EfbCopyKey, TextureHandle> g_efbCopyCache;
@@ -674,7 +675,11 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
   // so a larger texture needs nothing else.
   uint32_t dstWidth = std::max(cmd.destination_width, static_cast<uint32_t>(1));
   uint32_t dstHeight = std::max(cmd.destination_height, static_cast<uint32_t>(1));
-  if (gx::g_gxState.viewportPolicy != AURORA_VIEWPORT_NATIVE) {
+  static const bool scale_copies = [] {
+    const char* env = std::getenv("DOL_GXCORE_COPY_SCALE");
+    return env == nullptr || env[0] != '0';
+  }();
+  if (scale_copies && gx::g_gxState.viewportPolicy != AURORA_VIEWPORT_NATIVE) {
     const auto [logicalW, logicalH] = gx::logical_fb_size();
     const auto [targetW, targetH] = gfx::get_render_target_size();
     if (logicalW != 0 && logicalH != 0 && targetW != 0 && targetH != 0) {
@@ -685,15 +690,17 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
     }
   }
 
-  const EfbCopyKey key{cmd.dest_address, dstWidth, dstHeight, cmd.format};
+  const EfbCopyKey key{cmd.dest_address, dstWidth, dstHeight, cmd.format, !cmd.efb_has_alpha};
   auto it = g_efbCopyCache.find(key);
   if (it == g_efbCopyCache.end() || !it->second) {
     TextureHandle handle;
     if (gfx::tex_copy_conv::needs_conversion(fmt)) {
       handle = gfx::new_conv_texture(dstWidth, dstHeight, fmt, "GXCore Copy Conv");
     } else {
-      handle = gfx::new_render_texture(dstWidth, dstHeight, GX_TF_RGBA8,
-                                       "GXCore Copy");
+      // As Aurora's GXCopyTex: an RGB565 target, or an EFB without alpha,
+      // gets a view whose alpha reads one.
+      const auto viewFmt = fmt == GX_TF_RGB565 || !cmd.efb_has_alpha ? GX_TF_RGB565 : GX_TF_RGBA8;
+      handle = gfx::new_render_texture(dstWidth, dstHeight, viewFmt, "GXCore Copy");
     }
     it = g_efbCopyCache.insert_or_assign(key, handle).first;
   }

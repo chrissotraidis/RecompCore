@@ -534,6 +534,10 @@ struct EfbCopyCommand {
   bool color_update = true;
   bool alpha_update = true;
   bool depth_update = true;
+  // PE_CONTROL pixel format at the copy: RGBA6_Z24 has an alpha channel, the
+  // other formats do not, and reading their alpha yields one (Dolphin, and
+  // Aurora's GXCopyTex, which then gives the copy an opaque alpha).
+  bool efb_has_alpha = true;
 };
 
 // --- WGSL generation ----------------------------------------------------------

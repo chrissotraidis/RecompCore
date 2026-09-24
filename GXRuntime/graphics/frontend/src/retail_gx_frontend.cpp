@@ -705,9 +705,31 @@ bool RetailGxFrontend::handle_bp(std::uint32_t raw) {
     state_.texture_tlut_format[slot] = bp_get(value, 2u, 10u);
     // GXLoadTexObj writes SETTLUT after SETIMAGE0-3 (the SDK's
     // GXLoadTexObjPreLoaded), so the texture event emitted at SETIMAGE3
-    // carried the palette this slot had for the previous texture. Resolve
-    // the slot again now that its palette register is current; the later
-    // event is the one a draw binds.
+    // carried the palette this slot had for the previous texture. Only a
+    // palette (C4/C8/C14X2) texture needs the current one.
+    const DolGxRecompTexture& texture = state_.textures[slot];
+    if (!texture.valid ||
+        (texture.format != 0x8u && texture.format != 0x9u && texture.format != 0xAu))
+      return true;
+    // Usually that texture event is still the newest one and not yet handed
+    // to the sink: correct its palette in place. A second texture event per
+    // load cost about a fifth of the simulator's heavy Outset view.
+    if (state_.trace_count > emitted_trace_count_) {
+      DolGxRecompTraceEvent& ev = state_.trace[state_.trace_count - 1u];
+      if (ev.kind == DOL_GX_RECOMP_EVENT_TEXTURE && ev.a == slot) {
+        const std::uint16_t offset = state_.texture_tlut_tmem_offset[slot];
+        if (offset < DOL_GX_RECOMP_TMEM_TLUT_SLOTS && state_.tmem_tluts[offset].valid) {
+          ev.tlut_address = state_.tmem_tluts[offset].physical_base;
+          ev.tlut_format = state_.texture_tlut_format[slot];
+          ev.tlut_entries = state_.tmem_tluts[offset].entries;
+        } else {
+          ev.tlut_address = 0u;
+          ev.tlut_format = 0u;
+          ev.tlut_entries = 0u;
+        }
+        return true;
+      }
+    }
     return maybe_resolve_texture(slot);
   }
 

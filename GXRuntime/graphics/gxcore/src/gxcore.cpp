@@ -1662,6 +1662,8 @@ bool GxCoreSink::submit_packet(const ar::RenderPacket& packet) {
     const bool zmode_seen = live_state_.bp_valid(0x40u);
     const std::uint32_t cmode0 = live_state_.bp(0x41u);
     const std::uint32_t zmode = live_state_.bp(0x40u);
+    const bool pe_control_seen = live_state_.bp_valid(0x43u);
+    const std::uint32_t pe_control = live_state_.bp(0x43u);
     const EfbCopyCommand cmd{
         .dest_address = r.address,
         .byte_size = r.size,
@@ -1681,6 +1683,7 @@ bool GxCoreSink::submit_packet(const ar::RenderPacket& packet) {
         .color_update = !cmode0_seen || ((cmode0 >> 3u) & 1u) != 0u,
         .alpha_update = !cmode0_seen || ((cmode0 >> 4u) & 1u) != 0u,
         .depth_update = !zmode_seen || ((zmode >> 4u) & 1u) != 0u,
+        .efb_has_alpha = !pe_control_seen || (pe_control & 7u) == 1u,
     };
     copy_observer_(cmd, copy_observer_user_);
     if (r.format == 0xFu) {
