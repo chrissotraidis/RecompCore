@@ -503,6 +503,39 @@ void test_unresolved_tlut_load_is_noop() {
   assert(!saw_packet(unresolved_source_sink, DOL_GX_RECOMP_EVENT_TLUT));
 }
 
+// One drain-mode batch that produces more trace events than the trace holds
+// (DOL_GX_RECOMP_MAX_TRACE_EVENTS) must still hand every event to the sink:
+// the parser's own register image stays right when events are dropped, so a
+// dropped VCD write left the consumer decoding draws with a stale stride.
+void test_large_batch_drains_instead_of_dropping() {
+  std::vector<std::uint8_t> fifo;
+  const std::uint32_t writes = DOL_GX_RECOMP_MAX_TRACE_EVENTS + 1000u;
+  for (std::uint32_t i = 0; i < writes; ++i)
+    push_bp(fifo, DOL_GX_BP_REG_GENMODE, i & 0xFu);
+  push_cp(fifo, DOL_GX_CP_REG_VCD_LO, 0x6601u);
+
+  RetailGxFrontend frontend;
+  frontend.set_packet_drain_enabled(true);
+  RecordingAuroraRenderSink sink;
+  assert(frontend.write_fifo(fifo));
+  assert(frontend.flush(&sink));
+  assert(frontend.last_error() == nullptr);
+  std::size_t bp_packets = 0;
+  bool saw_vcd = false;
+  for (const auto& packet : sink.packets()) {
+    if (packet.kind != RenderPacketKind::State)
+      continue;
+    if (packet.state.kind == RenderStateKind::BpReg &&
+        packet.state.index == DOL_GX_BP_REG_GENMODE)
+      ++bp_packets;
+    if (packet.state.kind == RenderStateKind::CpVcd &&
+        packet.state.index == 0u && packet.state.value == 0x6601u)
+      saw_vcd = true;
+  }
+  assert(bp_packets == writes);
+  assert(saw_vcd);
+}
+
 // GXLoadTexObj writes SETIMAGE0-3 and then SETTLUT for a CI texture. The
 // texture a draw binds must carry the palette named by that later SETTLUT,
 // not the one the slot held for the previous texture (the Wind Waker title
@@ -658,6 +691,7 @@ int main() {
   test_fragmented_zero_vertex_draw_is_noop();
   test_unresolved_tlut_load_is_noop();
   test_tlut_written_after_image_selects_palette();
+  test_large_batch_drains_instead_of_dropping();
   test_xf_projection_capture();
 
   CPUState cpu;

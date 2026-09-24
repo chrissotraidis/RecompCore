@@ -2,12 +2,24 @@
 #include "gxruntime/gx_recomp.h"
 #include "gx_recomp_internal.h"
 
+#include <stdio.h>
 #include <string.h>
 
 void dol_gx_recomp_trace_event(DolGxRecompState* gx, DolGxRecompEventKind kind,
                         u32 a, u32 b, u32 c, u32 d) {
 
-    if (gx == NULL || gx->trace_count >= DOL_GX_RECOMP_MAX_TRACE_EVENTS)
+    if (gx != NULL && gx->trace_count >= DOL_GX_RECOMP_MAX_TRACE_EVENTS) {
+        /* A dropped event leaves a consumer with state the parser has but it
+         * does not; the frontend drains before this in drain mode, so saying
+         * so loudly (at powers of two) is the right failure. */
+        static unsigned long long dropped = 0;
+        ++dropped;
+        if ((dropped & (dropped - 1u)) == 0u)
+            fprintf(stderr, "[gx-trace] trace full: %llu event(s) dropped (last kind %u)\n",
+                    dropped, (unsigned)kind);
+        return;
+    }
+    if (gx == NULL)
         return;
     DolGxRecompTraceEvent* event = &gx->trace[gx->trace_count++];
     event->kind = kind;

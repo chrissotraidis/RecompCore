@@ -72,6 +72,12 @@ void after_submit() noexcept {
   if (!g_requested.load(std::memory_order_acquire)) {
     return;
   }
+  // MapAsync is issued after g_mutex is released: with AllowSpontaneous the
+  // callback may run inside MapAsync, and complete_map takes g_mutex, so
+  // mapping under the lock deadlocked the render worker (and then the main
+  // thread in take()) - seen as a frame-capture run hanging for good.
+  wgpu::Buffer mapBuffer;
+  uint64_t mapSize = 0;
   {
     std::lock_guard lock{g_mutex};
     if (g_inFlight) {
@@ -142,11 +148,15 @@ void after_submit() noexcept {
     };
     const auto buffer = encoder.Finish(&CommandBufferDescriptor);
     webgpu::g_queue.Submit(1, &buffer);
-    g_buffer.MapAsync(wgpu::MapMode::Read, 0, byteSize,
-                      wgpu::CallbackMode::AllowSpontaneous,
-                      [](wgpu::MapAsyncStatus status, wgpu::StringView message) {
-                        complete_map(status, message);
-                      });
+    mapBuffer = g_buffer;
+    mapSize = byteSize;
+  }
+  if (mapBuffer) {
+    mapBuffer.MapAsync(wgpu::MapMode::Read, 0, mapSize,
+                       wgpu::CallbackMode::AllowSpontaneous,
+                       [](wgpu::MapAsyncStatus status, wgpu::StringView message) {
+                         complete_map(status, message);
+                       });
   }
   g_requested.store(false, std::memory_order_release);
 }

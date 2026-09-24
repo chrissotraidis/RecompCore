@@ -119,6 +119,10 @@ private:
                    std::size_t command_offset);
   bool emit_new_packets(AuroraRenderSink& sink, std::uint32_t first_event);
   void drain_emitted_packets(std::uint32_t emitted_count);
+  // Drain mode only: hand every pending event to the sink and reclaim the
+  // trace, so one large batch cannot overflow it (see parse_stream).
+  bool emit_and_drain(AuroraRenderSink& sink);
+  AuroraRenderSink* parse_sink_ = nullptr;
 
   DolGxRecompState state_{};
   std::vector<std::uint8_t> fifo_buffer_;

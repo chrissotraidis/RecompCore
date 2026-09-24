@@ -377,8 +377,13 @@ bool RetailGxFrontend::flush(AuroraRenderSink* sink) {
   }
 
   std::size_t consumed = 0;
-  if (!parse_stream(fifo_buffer_, true, true, 0u, &consumed))
+  parse_sink_ = packet_drain_enabled_ ? sink : nullptr;
+  const bool parsed = parse_stream(fifo_buffer_, true, true, 0u, &consumed);
+  parse_sink_ = nullptr;
+  if (!parsed)
     return false;
+  if (packet_drain_enabled_)
+    first_event = emitted_trace_count_;
 
   if (consumed != 0u) {
     fifo_buffer_.erase(fifo_buffer_.begin(),
@@ -414,10 +419,14 @@ bool RetailGxFrontend::write_display_list(std::span<const std::uint8_t> bytes,
                                  static_cast<std::uint32_t>(bytes.size())))
       return false;
     std::size_t dl_consumed = 0;
-    if (!parse_stream(bytes, false, false, 1u, &dl_consumed) ||
-        dl_consumed != bytes.size()) {
+    parse_sink_ = packet_drain_enabled_ ? sink : nullptr;
+    const bool parsed = parse_stream(bytes, false, false, 1u, &dl_consumed);
+    parse_sink_ = nullptr;
+    if (!parsed || dl_consumed != bytes.size()) {
       return false;
     }
+    if (packet_drain_enabled_)
+      first_event = emitted_trace_count_;
   }
   notify_events(first_event);
 
@@ -441,11 +450,16 @@ bool RetailGxFrontend::replay_fifo(std::span<const std::uint8_t> bytes,
   }
 
   std::size_t consumed = 0;
-  if (bytes.empty() ||
-      !parse_stream(bytes, false, true, 0u, &consumed) ||
-      consumed != bytes.size()) {
+  if (bytes.empty())
+    return false;
+  parse_sink_ = packet_drain_enabled_ ? sink : nullptr;
+  const bool parsed = parse_stream(bytes, false, true, 0u, &consumed);
+  parse_sink_ = nullptr;
+  if (!parsed || consumed != bytes.size()) {
     return false;
   }
+  if (packet_drain_enabled_)
+    first_event = emitted_trace_count_;
   notify_events(first_event);
 
   if (sink == nullptr)
@@ -497,6 +511,17 @@ bool RetailGxFrontend::parse_stream(std::span<const std::uint8_t> bytes,
 
   std::size_t pos = 0;
   while (pos < bytes.size()) {
+    // The trace holds DOL_GX_RECOMP_MAX_TRACE_EVENTS events and silently drops
+    // the rest, while this parser's own register image stays correct - so an
+    // overflowing batch left the sink with stale VCD/BP/XF state: gxcore
+    // skipped thousands of draws on a stride it had not been told about, and
+    // how many depended on batch size (the Wind Waker title's sky went missing
+    // in some frames). In drain mode, hand the pending events to the sink at a
+    // command boundary before the trace can fill.
+    if (parse_sink_ != nullptr &&
+        state_.trace_count + 512u >= DOL_GX_RECOMP_MAX_TRACE_EVENTS &&
+        !emit_and_drain(*parse_sink_))
+      return false;
     const std::uint8_t cmd = bytes[pos];
     if (cmd == 0x00u) {
       if (record_fifo_bytes &&
@@ -971,6 +996,15 @@ void RetailGxFrontend::drain_emitted_packets(std::uint32_t emitted_count) {
                static_cast<std::size_t>(remaining) * sizeof(state_.trace[0]));
   state_.trace_count = remaining;
   emitted_trace_count_ = 0u;
+}
+
+bool RetailGxFrontend::emit_and_drain(AuroraRenderSink& sink) {
+  const std::uint32_t first_event = emitted_trace_count_;
+  notify_events(first_event);
+  if (!emit_new_packets(sink, first_event))
+    return false;
+  drain_emitted_packets(state_.trace_count);
+  return true;
 }
 
 } // namespace gxruntime::aurora_recomp

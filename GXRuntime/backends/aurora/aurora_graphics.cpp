@@ -422,6 +422,13 @@ void g_fifo_worker_main() {
 void g_fifo_worker_start() {
     if (g_fifo_worker_started || trace_should_record())
         return;
+    // DOL_GX_FIFO_WORKER=0 translates on the guest thread (A/B and diagnosis).
+    static const bool disabled = [] {
+        const char* env = std::getenv("DOL_GX_FIFO_WORKER");
+        return env != nullptr && env[0] == '0';
+    }();
+    if (disabled)
+        return;
     g_fifo_worker_started = true;
     g_fifo_worker_thread = std::thread(g_fifo_worker_main);
 }
