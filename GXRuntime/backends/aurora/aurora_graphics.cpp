@@ -1395,10 +1395,15 @@ void aurora_backend_gx_write(u64 value, u8 size) {
         gx_aurora::g_trace_writer.gx_write(size, value);
     if (gx_aurora::g_gx_core_enabled && !gx_aurora::g_frame_open)
         gx_aurora::reopen_frame_if_unframed();
-    if (gx_aurora::g_gx_core_enabled)
-        if (gx_aurora::g_display_copy_pending.exchange(false)) {
-            aurora_backend_present();
-        }
+    // A relaxed load first: the flag is almost always clear, and an atomic
+    // exchange at every gather-pipe write is a read-modify-write the core
+    // pays for even when there is nothing to take. Only the exchange claims
+    // the request, so a present is still taken exactly once.
+    if (gx_aurora::g_gx_core_enabled &&
+        gx_aurora::g_display_copy_pending.load(std::memory_order_relaxed) &&
+        gx_aurora::g_display_copy_pending.exchange(false)) {
+        aurora_backend_present();
+    }
     if (gx_aurora::g_gx_core_enabled)
         return;
 #endif
