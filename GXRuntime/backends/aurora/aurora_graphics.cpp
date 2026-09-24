@@ -1203,6 +1203,21 @@ void aurora_backend_present(void) {
     const unsigned long long present_fifo = gx_aurora::g_fifo_bytes;
     gx_aurora::g_fifo_bytes = 0;
     gx_aurora::poll_events();
+    // The host may hold the guest at this frame boundary: a menu or layout
+    // editor is open, or the app is leaving the foreground. Events keep being
+    // pumped so the host UI stays live, the last frame stays on screen, and
+    // no GPU work is issued until the hold ends.
+    if (!gx_aurora::g_should_quit && gx_aurora::host_wants_hold()) {
+        const Uint64 start = SDL_GetTicks();
+        std::fprintf(stderr, "[gfx] guest held by the host at present=%llu\n",
+                     gx_aurora::g_present_count);
+        while (!gx_aurora::g_should_quit && gx_aurora::host_wants_hold()) {
+            SDL_Delay(16);
+            gx_aurora::poll_events();
+        }
+        std::fprintf(stderr, "[gfx] guest released after %.1f s\n",
+                     (SDL_GetTicks() - start) / 1000.0);
+    }
     if (!gx_aurora::g_should_quit) {
         gx_aurora::g_frame_open = aurora_begin_frame();
         // The frame the worker records into exists from here until the next
