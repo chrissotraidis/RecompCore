@@ -60,6 +60,12 @@ public:
                     std::uint8_t stride);
   bool load_cp_reg(std::uint8_t reg, std::uint32_t value);
   void set_packet_drain_enabled(bool enabled);
+  // Stop a FIFO parse right after a display copy (GXCopyDisp), leaving the
+  // rest buffered for the next flush. A host that presents at the display copy
+  // needs the frame to end exactly there: draws after it belong to the next
+  // frame. display_copy_stopped() reports that the last flush stopped so.
+  void set_stop_at_display_copy(bool enabled) { stop_at_display_copy_ = enabled; }
+  bool display_copy_stopped() const { return display_copy_stopped_; }
 
   // Read-only tap on the decode event stream (histograms): invoked
   // for every trace event a successful flush/write_display_list/replay_fifo
@@ -123,6 +129,8 @@ private:
   // trace, so one large batch cannot overflow it (see parse_stream).
   bool emit_and_drain(AuroraRenderSink& sink);
   AuroraRenderSink* parse_sink_ = nullptr;
+  bool stop_at_display_copy_ = false;
+  bool display_copy_stopped_ = false;
 
   DolGxRecompState state_{};
   std::vector<std::uint8_t> fifo_buffer_;

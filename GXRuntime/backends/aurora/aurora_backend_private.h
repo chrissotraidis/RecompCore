@@ -6,6 +6,7 @@
 #include "gxruntime/platform.h"
 #include <SDL3/SDL_audio.h>
 #include <array>
+#include <atomic>
 #include <string>
 #include <unordered_map>
 
@@ -83,7 +84,9 @@ extern bool g_shadow_frontend_failed;
 extern gxruntime::gxcore::GxCoreSink g_core_sink;
 extern unsigned long long g_core_submitted;
 extern unsigned long long g_core_rejected;
-extern bool g_display_copy_pending;
+// Set by the copy observer (the FIFO worker's thread in worker mode) when a
+// display copy ends a frame; the main thread presents and clears it.
+extern std::atomic<bool> g_display_copy_pending;
 
 
 

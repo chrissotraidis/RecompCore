@@ -57,7 +57,7 @@ bool g_shadow_frontend_failed = false;
 gxruntime::gxcore::GxCoreSink g_core_sink;
 unsigned long long g_core_submitted = 0;
 unsigned long long g_core_rejected = 0;
-bool g_display_copy_pending = false;
+std::atomic<bool> g_display_copy_pending{false};
 
 unsigned long long g_shadow_last_draw_total = 0;
 unsigned long long g_shadow_last_vertex_total = 0;
@@ -365,6 +365,9 @@ bool dol_aurora_initialize(int argc, char** argv,
     gx_aurora::g_shadow_frontend_failed = false;
     gx_aurora::g_shadow_frontend.reset(nullptr);
     gx_aurora::g_shadow_frontend.set_packet_drain_enabled(gx_aurora::g_shadow_frontend_enabled);
+    // The frame ends at the display copy: stop each parse there so the draws
+    // after it are recorded after the present, into the next frame.
+    gx_aurora::g_shadow_frontend.set_stop_at_display_copy(gx_aurora::g_gx_core_enabled);
     gx_aurora::g_shadow_packet_sink.reset();
     gx_aurora::g_shadow_packet_sink.set_streaming(true);
     gx_aurora::g_shadow_packet_sink.set_draw_observer(

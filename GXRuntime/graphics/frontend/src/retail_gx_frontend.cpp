@@ -369,6 +369,7 @@ bool RetailGxFrontend::write_fifo(std::span<const std::uint8_t> bytes) {
 
 bool RetailGxFrontend::flush(AuroraRenderSink* sink) {
   last_error_ = nullptr;
+  display_copy_stopped_ = false;
   std::uint32_t first_event = 0;
   if (packet_drain_enabled_) {
     first_event = emitted_trace_count_;
@@ -661,6 +662,13 @@ bool RetailGxFrontend::parse_stream(std::span<const std::uint8_t> bytes,
         return fail_parse("BP register handler rejected", cmd, pos,
                           bytes[pos + 1u], read_be32(bytes, pos + 1u));
       pos += 5u;
+      if (stop_at_display_copy_ && allow_partial && depth == 0u &&
+          bytes[pos - 4u] == DOL_GX_BP_REG_TRIGGER_EFB_COPY &&
+          (bytes[pos - 2u] & 0x40u) != 0u) {
+        // BP 0x52 with bit 14 set: GXCopyDisp. End this flush here.
+        display_copy_stopped_ = true;
+        break;
+      }
       continue;
     }
 

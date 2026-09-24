@@ -536,6 +536,38 @@ void test_large_batch_drains_instead_of_dropping() {
   assert(saw_vcd);
 }
 
+// A host that presents at the display copy needs the parse to end there: the
+// draws after GXCopyDisp belong to the next frame.
+void test_flush_stops_after_display_copy() {
+  std::vector<std::uint8_t> fifo;
+  push_bp(fifo, DOL_GX_BP_REG_GENMODE, 1u);
+  push_bp(fifo, DOL_GX_BP_REG_TRIGGER_EFB_COPY, (1u << 14u) | (1u << 11u));
+  push_bp(fifo, DOL_GX_BP_REG_GENMODE, 2u);
+
+  RetailGxFrontend frontend;
+  frontend.set_packet_drain_enabled(true);
+  frontend.set_stop_at_display_copy(true);
+  RecordingAuroraRenderSink sink;
+  assert(frontend.write_fifo(fifo));
+  assert(frontend.flush(&sink));
+  assert(frontend.display_copy_stopped());
+  assert(frontend.pending_fifo_size() == 5u);
+  auto genmode_writes = [&] {
+    std::size_t n = 0;
+    for (const auto& packet : sink.packets())
+      if (packet.kind == RenderPacketKind::State &&
+          packet.state.kind == RenderStateKind::BpReg &&
+          packet.state.index == DOL_GX_BP_REG_GENMODE)
+        ++n;
+    return n;
+  };
+  assert(genmode_writes() == 1u);
+  assert(frontend.flush(&sink));
+  assert(!frontend.display_copy_stopped());
+  assert(frontend.pending_fifo_size() == 0u);
+  assert(genmode_writes() == 2u);
+}
+
 // GXLoadTexObj writes SETIMAGE0-3 and then SETTLUT for a CI texture. The
 // texture a draw binds must carry the palette named by that later SETTLUT,
 // not the one the slot held for the previous texture (the Wind Waker title
@@ -692,6 +724,7 @@ int main() {
   test_unresolved_tlut_load_is_noop();
   test_tlut_written_after_image_selects_palette();
   test_large_batch_drains_instead_of_dropping();
+  test_flush_stops_after_display_copy();
   test_xf_projection_capture();
 
   CPUState cpu;

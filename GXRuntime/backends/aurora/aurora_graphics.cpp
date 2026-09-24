@@ -12,6 +12,7 @@
 #include <gxruntime/guest_memory_dirty.h>
 #include <SDL3/SDL_timer.h>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +36,11 @@ void set_texture_dirty_epoch_observer(
 
 namespace gx_aurora {
 
+// True while the FIFO worker translates. Then the worker requests each present
+// itself, once per display copy (wait_for_present), and the copy observer must
+// not: its request, raised mid-parse, led to a second, empty present.
+std::atomic<bool> g_worker_mode{false};
+
 #if GXRUNTIME_HAS_AURORA_RECOMP
 bool core_texture_dirty_epoch(uint32_t address, uint32_t size,
                               uint64_t* epoch) {
@@ -52,7 +58,7 @@ void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
 
 void core_copy_observer(const gxruntime::gxcore::EfbCopyCommand& cmd, void*) {
     aurora::gfx::gxcore::copy_efb_to_texture(cmd);
-    if (cmd.format == 0xFu)
+    if (cmd.format == 0xFu && !g_worker_mode.load(std::memory_order_relaxed))
         g_display_copy_pending = true;
 }
 #endif
@@ -327,6 +333,18 @@ bool g_aurora_recording_in_transition = false;
 // silent, because before this gate existed that state was a null dereference.
 std::atomic<std::uint64_t> g_aurora_unframed_batches = 0;
 
+// Display-copy hand-off (worker mode). The frontend stops a parse right after a
+// display copy; the worker then leaves the recording lock and waits here until
+// the main thread has presented, so the next frame's first draws are recorded
+// into the next frame. Before this the worker ran on into them and they landed
+// in the frame being presented: the Wind Waker title intermittently showed its
+// logo and island over a black sky and sea (the sky is drawn first).
+std::condition_variable g_present_cv;
+std::uint64_t g_presents_done = 0;      // under g_fifo_worker_mutex
+bool g_worker_waiting_present = false;  // under g_fifo_worker_mutex
+std::uint64_t g_present_wait_seen = 0;  // g_presents_done when the wait began
+void wait_for_present(std::unique_lock<std::mutex>& recording);
+
 void g_fifo_translate(std::vector<std::uint8_t>& batch) {
     if (batch.empty())
         return;
@@ -334,8 +352,8 @@ void g_fifo_translate(std::vector<std::uint8_t>& batch) {
     // One batch, one frame: the lock keeps the main thread from closing the
     // packet underneath this recording, and the gate below keeps this batch
     // from recording into a packet that does not exist yet.
-    std::lock_guard<std::mutex> recording(g_aurora_recording_mutex);
-    const bool record_into_aurora = g_gx_core_enabled && g_aurora_recording_open;
+    std::unique_lock<std::mutex> recording(g_aurora_recording_mutex);
+    bool record_into_aurora = g_gx_core_enabled && g_aurora_recording_open;
     if (g_gx_core_enabled && !record_into_aurora)
         g_aurora_unframed_batches.fetch_add(1, std::memory_order_relaxed);
     // Feed the front end in the slices the single-threaded path flushes at.
@@ -356,6 +374,14 @@ void g_fifo_translate(std::vector<std::uint8_t>& batch) {
             flushed = g_shadow_frontend.flush(&g_core_sink);
         else
             flushed = g_shadow_frontend.flush(&g_shadow_packet_sink);
+        // A parse that stopped at a display copy resumes on the buffered rest
+        // only after the present, and may stop again at the next one.
+        while (flushed && g_shadow_frontend.display_copy_stopped()) {
+            wait_for_present(recording);
+            record_into_aurora = g_gx_core_enabled && g_aurora_recording_open;
+            flushed = record_into_aurora ? g_shadow_frontend.flush(&g_core_sink)
+                                         : g_shadow_frontend.flush(&g_shadow_packet_sink);
+        }
     }
     if (!flushed) {
         std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
@@ -419,6 +445,27 @@ void g_fifo_worker_main() {
     }
 }
 
+// Called by the worker with the recording lock held, after a parse stopped at a
+// display copy. Lock order is recording, then g_fifo_worker_mutex, everywhere.
+void wait_for_present(std::unique_lock<std::mutex>& recording) {
+    std::unique_lock<std::mutex> lock(g_fifo_worker_mutex);
+    if (g_fifo_worker_stop)
+        return;
+    const std::uint64_t seen = g_presents_done;
+    g_worker_waiting_present = true;
+    g_present_wait_seen = seen;
+    // One request per stop: the main thread presents at its next GX write, or
+    // in a drain that is waiting on this worker (woken below), whichever comes
+    // first; the other finds the request already served.
+    g_display_copy_pending = true;
+    g_fifo_worker_idle_cv.notify_all();
+    recording.unlock();
+    g_present_cv.wait(lock, [seen] { return g_presents_done != seen || g_fifo_worker_stop; });
+    g_worker_waiting_present = false;
+    lock.unlock();
+    recording.lock();
+}
+
 void g_fifo_worker_start() {
     if (g_fifo_worker_started || trace_should_record())
         return;
@@ -430,6 +477,7 @@ void g_fifo_worker_start() {
     if (disabled)
         return;
     g_fifo_worker_started = true;
+    g_worker_mode = true;
     g_fifo_worker_thread = std::thread(g_fifo_worker_main);
 }
 
@@ -454,8 +502,10 @@ void g_fifo_worker_stop_and_join() {
         g_fifo_work_pending = true;
         worker.swap(g_fifo_worker_thread);
         g_fifo_worker_started = false;
+        g_worker_mode = false;
     }
     g_fifo_worker_cv.notify_all();
+    g_present_cv.notify_all();
     if (worker.joinable())
         worker.join();
     std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
@@ -521,9 +571,26 @@ static void g_fifo_drain() {
         return;
     g_fifo_work_pending = true;
     g_fifo_worker_cv.notify_one();
-    g_fifo_worker_idle_cv.wait(lock, [target] {
-        return g_fifo_worker_idle && g_fifo_parsed >= target;
-    });
+    for (;;) {
+        g_fifo_worker_idle_cv.wait(lock, [target] {
+            return (g_fifo_worker_idle && g_fifo_parsed >= target) ||
+                   g_worker_waiting_present;
+        });
+        if (g_fifo_worker_idle && g_fifo_parsed >= target)
+            return;
+        if (g_presents_done != g_present_wait_seen) {
+            // Already presented for this stop; the worker is waking up.
+            g_fifo_worker_idle_cv.wait_for(lock, std::chrono::milliseconds(1));
+            continue;
+        }
+        // The worker stopped at a display copy and waits for the present that
+        // ends the frame; this thread is the one that presents.
+        lock.unlock();
+        // No present has happened since the wait began, so this is the one.
+        g_display_copy_pending = false;
+        aurora_backend_present();
+        lock.lock();
+    }
 }
 
 }  // namespace
@@ -1262,6 +1329,11 @@ void aurora_backend_present(void) {
     // presentable), and the worker may record.
     gx_aurora::g_aurora_recording_in_transition = false;
     aurora_recording.unlock();
+    {
+        std::lock_guard<std::mutex> lock(gx_aurora::g_fifo_worker_mutex);
+        ++gx_aurora::g_presents_done;
+    }
+    gx_aurora::g_present_cv.notify_all();
 }
 
 void aurora_backend_mark_gx_begin(void) {
@@ -1308,8 +1380,7 @@ void aurora_backend_gx_write(u64 value, u8 size) {
     if (gx_aurora::g_gx_core_enabled && !gx_aurora::g_frame_open)
         gx_aurora::reopen_frame_if_unframed();
     if (gx_aurora::g_gx_core_enabled)
-        if (gx_aurora::g_display_copy_pending) {
-            gx_aurora::g_display_copy_pending = false;
+        if (gx_aurora::g_display_copy_pending.exchange(false)) {
             aurora_backend_present();
         }
     if (gx_aurora::g_gx_core_enabled)
