@@ -150,6 +150,9 @@ private:
   TraceEventObserver event_observer_ = nullptr;
   void* event_observer_user_ = nullptr;
   std::uint32_t emitted_trace_count_ = 0;
+  // Texture slots (bit per slot) whose palette TMEM was reloaded after the
+  // texture event was emitted; re-resolved at the next draw.
+  std::uint8_t tlut_stale_mask_ = 0;
   std::uint64_t next_packet_sequence_ = 0;
   // emit_new_packets' reused packet (see there).
   RenderPacket scratch_packet_{};

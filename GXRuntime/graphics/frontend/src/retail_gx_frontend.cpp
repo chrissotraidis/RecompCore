@@ -760,6 +760,7 @@ bool RetailGxFrontend::handle_bp(std::uint32_t raw) {
           ev.tlut_format = 0u;
           ev.tlut_entries = 0u;
         }
+        tlut_stale_mask_ &= static_cast<std::uint8_t>(~(1u << slot));
         return true;
       }
     }
@@ -793,6 +794,24 @@ bool RetailGxFrontend::handle_bp(std::uint32_t raw) {
     (void)dol_gx_recomp_resolve_tmem_tlut(
         &state_, tmem_offset, state_.bp_regs[DOL_GX_BP_REG_LOAD_TLUT0], 0u,
         static_cast<std::uint16_t>(line_count * 16u), &tlut);
+    // The hardware reads a palette from TMEM when it draws, so a palette loaded
+    // after a texture is bound is the one that texture draws with. J2D pictures
+    // with two textures do this: both use TLUT0, and the second texture's palette
+    // load replaces the first's before the draw (Wind Waker's pause-menu cursor
+    // draws cursor_00_01's texels with cursor_00_02's palette on hardware and in
+    // Dolphin). A bound palette texture on the loaded TMEM range is re-resolved
+    // before the next draw (handle_draw). A load moves 32 bytes a line; SETTLUT
+    // offsets count 512-byte units.
+    const std::uint32_t units = (line_count * 32u + 511u) / 512u;
+    for (std::uint8_t s = 0; s < DOL_GX_RECOMP_TEXTURE_SLOTS && s < 8u; ++s) {
+      const DolGxRecompTexture& texture = state_.textures[s];
+      if (!texture.valid || !state_.texture_tlut_valid[s] ||
+          (texture.format != 0x8u && texture.format != 0x9u && texture.format != 0xAu))
+        continue;
+      const std::uint32_t offset = state_.texture_tlut_tmem_offset[s];
+      if (offset >= tmem_offset && offset < tmem_offset + units)
+        tlut_stale_mask_ |= static_cast<std::uint8_t>(1u << s);
+    }
     return true;
   }
   default:
@@ -808,6 +827,8 @@ bool RetailGxFrontend::maybe_resolve_texture(std::uint8_t slot) {
   if (!state_.bp_valid[image0_reg] || !state_.bp_valid[image3_reg])
     return true;
   DolGxRecompTexture texture;
+  if (slot < 8u)
+    tlut_stale_mask_ &= static_cast<std::uint8_t>(~(1u << slot));
   return dol_gx_recomp_resolve_texture_image(
       &state_, slot, state_.bp_regs[image0_reg], state_.bp_regs[image3_reg],
       &texture);
@@ -862,6 +883,16 @@ bool RetailGxFrontend::handle_draw(std::uint8_t command,
       !state_.vertex_layouts[vtx_fmt].valid)
     return fail_parse("draw vertex layout missing", command, command_offset);
 
+  // A palette loaded since its texture was bound (see LOAD_TLUT1): emit the
+  // texture again so this draw decodes with the palette TMEM now holds.
+  if (tlut_stale_mask_ != 0u) {
+    const std::uint8_t stale = tlut_stale_mask_;
+    for (std::uint8_t s = 0; s < 8u; ++s)
+      if ((stale & (1u << s)) != 0u && !maybe_resolve_texture(s))
+        return fail_parse("stale palette texture resolve failed", command,
+                          command_offset, s);
+    tlut_stale_mask_ = 0u;
+  }
   const DolGxRecompVertexLayout* layout = &state_.vertex_layouts[vtx_fmt];
   if (state_.trace_count < DOL_GX_RECOMP_MAX_TRACE_EVENTS) {
     state_.trace[state_.trace_count++] = {
