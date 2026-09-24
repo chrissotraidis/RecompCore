@@ -509,6 +509,9 @@ std::uint32_t build_array_sizes(const ConsumedDraw& draw, std::uint32_t* out,
 
 RenderPacket make_render_packet(std::uint64_t sequence,
                                 const DolGxRecompTraceEvent& event);
+// In-place form for a reused packet: packet.draw must already be zeroed.
+void fill_render_packet(RenderPacket& packet, std::uint64_t sequence,
+                        const DolGxRecompTraceEvent& event);
 const char* trace_event_name(DolGxRecompEventKind kind);
 
 } // namespace gxruntime::aurora_recomp

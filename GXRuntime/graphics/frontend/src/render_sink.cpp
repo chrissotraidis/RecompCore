@@ -529,13 +529,19 @@ std::uint32_t build_array_sizes(const ConsumedDraw& draw, std::uint32_t* out,
   return non_zero;
 }
 
-RenderPacket make_render_packet(std::uint64_t sequence,
-                                const DolGxRecompTraceEvent& event) {
-  RenderPacket packet{
-      .kind = RenderPacketKind::TraceEvent,
-      .sequence = sequence,
-      .event = event,
-  };
+// Fills everything but the draw section, which the caller must hand over
+// zeroed (make_render_packet does; the frontend's reused packet clears it only
+// around Draw events). RenderDrawPacket carries the full matrix, light and XF
+// snapshots, about 2.5 KB, and zeroing it for every BP/XF state event was 9% of
+// the translation worker (iPad simulator sample, heavy Outset view).
+void fill_render_packet(RenderPacket& packet, std::uint64_t sequence,
+                        const DolGxRecompTraceEvent& event) {
+  packet.kind = RenderPacketKind::TraceEvent;
+  packet.sequence = sequence;
+  packet.event = event;
+  packet.stream = {};
+  packet.state = {};
+  packet.resource = {};
 
   switch (event.kind) {
   case DOL_GX_RECOMP_EVENT_FIFO_BYTES:
@@ -692,17 +698,20 @@ RenderPacket make_render_packet(std::uint64_t sequence,
     break;
   case DOL_GX_RECOMP_EVENT_DRAW:
     packet.kind = RenderPacketKind::Draw;
-    packet.draw = {
-        .primitive = event.a,
-        .vtx_fmt = event.b,
-        .vertex_count = event.c,
-        .vertex_size = event.d,
-    };
+    packet.draw.primitive = event.a;
+    packet.draw.vtx_fmt = event.b;
+    packet.draw.vertex_count = event.c;
+    packet.draw.vertex_size = event.d;
     break;
   default:
     break;
   }
+}
 
+RenderPacket make_render_packet(std::uint64_t sequence,
+                                const DolGxRecompTraceEvent& event) {
+  RenderPacket packet{};
+  fill_render_packet(packet, sequence, event);
   return packet;
 }
 

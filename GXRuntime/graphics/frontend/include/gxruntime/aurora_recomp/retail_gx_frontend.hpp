@@ -151,6 +151,9 @@ private:
   void* event_observer_user_ = nullptr;
   std::uint32_t emitted_trace_count_ = 0;
   std::uint64_t next_packet_sequence_ = 0;
+  // emit_new_packets' reused packet (see there).
+  RenderPacket scratch_packet_{};
+  bool scratch_draw_dirty_ = false;
   const char* last_error_ = nullptr;
   std::size_t last_error_offset_ = 0;
   std::uint8_t last_error_opcode_ = 0;
