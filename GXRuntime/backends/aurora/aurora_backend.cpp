@@ -42,6 +42,8 @@ u32 g_audio_sample_rate = 32000;
 SDL_AudioStream* g_audio_stream = nullptr;
 bool g_audio_playing = false;
 int g_audio_prebuffer_ms = 40;
+unsigned long long g_audio_starved_count = 0;
+unsigned long long g_audio_stretched_count = 0;
 int g_audio_max_queue_ms = 250;
 DolPlatformGuestAddressResolverFn g_guest_address_resolver = nullptr;
 void* g_guest_address_resolver_user = nullptr;
@@ -409,6 +411,8 @@ bool dol_aurora_initialize(int argc, char** argv,
         gx_aurora::audio_ms_env("DOL_AUDIO_MAX_QUEUE_MS", 250, gx_aurora::g_audio_prebuffer_ms, 1000);
     gx_aurora::g_audio_push_count = 0;
     gx_aurora::g_audio_throttle_count = 0;
+    gx_aurora::g_audio_starved_count = 0;
+    gx_aurora::g_audio_stretched_count = 0;
     gx_aurora::g_audio_low_log_push = 0;
     gx_aurora::g_audio_sample_rate = 32000;
 
@@ -572,6 +576,9 @@ void dol_aurora_shutdown(void) {
     }
 #endif
     if (gx_aurora::g_audio_stream != nullptr) {
+        std::fprintf(stderr, "[audio] summary pushes=%llu starved=%llu stretched=%llu throttles=%llu\n",
+                     gx_aurora::g_audio_push_count, gx_aurora::g_audio_starved_count,
+                     gx_aurora::g_audio_stretched_count, gx_aurora::g_audio_throttle_count);
         SDL_DestroyAudioStream(gx_aurora::g_audio_stream);
         gx_aurora::g_audio_stream = nullptr;
         gx_aurora::g_audio_playing = false;

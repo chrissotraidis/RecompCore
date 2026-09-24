@@ -43,6 +43,8 @@ extern unsigned long long g_present_count;
 extern unsigned long long g_fifo_bytes;
 extern unsigned long long g_audio_push_count;
 extern unsigned long long g_audio_throttle_count;
+extern unsigned long long g_audio_starved_count;
+extern unsigned long long g_audio_stretched_count;
 extern unsigned long long g_audio_low_log_push;
 extern u32 g_audio_sample_rate;
 extern SDL_AudioStream* g_audio_stream;
