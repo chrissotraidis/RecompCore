@@ -542,10 +542,24 @@ void g_fifo_publish_local() {
         g_fifo_worker_cv.notify_one();
 }
 
+// DOL_GX_FIFO_BATCH=N publishes every N bytes instead of kFifoLocalBatch, so
+// the worker sees the stream cut at other places (a test of the parser's
+// carry-over across batches; the guest's work does not depend on it).
+static std::size_t fifo_local_batch_limit() {
+    static const std::size_t limit = [] {
+        const char* env = std::getenv("DOL_GX_FIFO_BATCH");
+        const long value = env != nullptr ? std::strtol(env, nullptr, 10) : 0;
+        return value > 0 && value <= static_cast<long>(kFifoLocalBatch)
+                   ? static_cast<std::size_t>(value)
+                   : kFifoLocalBatch;
+    }();
+    return limit;
+}
+
 inline void g_fifo_enqueue(const std::uint8_t* bytes, u8 size) {
     std::memcpy(g_fifo_local + g_fifo_local_size, bytes, size);
     g_fifo_local_size += size;
-    if (g_fifo_local_size >= kFifoLocalBatch)
+    if (g_fifo_local_size >= fifo_local_batch_limit())
         g_fifo_publish_local();
 }
 
