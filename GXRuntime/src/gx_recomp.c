@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <stdlib.h>
+#include <stdio.h>
 #include "gxruntime/gx_recomp.h"
 #include "gx_recomp_internal.h"
 
@@ -772,11 +774,20 @@ bool dol_gx_recomp_resolve_tmem_tlut(DolGxRecompState* gx, u16 tmem_offset,
         tmem_offset >= DOL_GX_RECOMP_TMEM_TLUT_SLOTS || entries == 0u)
         return false;
     const u32 byte_size = (u32)entries * 2u;
-    const u32 physical_base = texture_physical_base(load_tlut0);
+    /* The GameCube ignores the upper bits of the palette source address, and
+     * Wind Waker sets some: its menus load palettes from 0x110047E0,
+     * 0x1CE9F2E0 and the like (Dolphin masks the same way in LOADTLUT1). A
+     * rejected load left the previous palette in TMEM, so the pause menu's
+     * SAVE tab was drawn with an arrow icon's palette. */
+    const u32 physical_base = texture_physical_base(load_tlut0) & 0x01FFFFFFu;
     DolGuestResolvedRange range;
     if (!resolve_physical(gx, physical_base, byte_size,
-                          DOL_GUEST_RESOURCE_TLUT, &range))
+                          DOL_GUEST_RESOURCE_TLUT, &range)) {
+        if (getenv("DOL_GXCORE_TLUT_LOG") != NULL)
+            fprintf(stderr, "[tlut-fail] tmem=%u addr=%08X entries=%u\n",
+                    (unsigned)tmem_offset, physical_base, (unsigned)entries);
         return false;
+    }
     DolGxRecompTlut tlut = {
         .valid = true,
         .slot = tmem_offset < DOL_GX_RECOMP_TLUT_SLOTS ? (u8)tmem_offset
@@ -790,6 +801,20 @@ bool dol_gx_recomp_resolve_tmem_tlut(DolGxRecompState* gx, u16 tmem_offset,
     };
     gx->tmem_tluts[tmem_offset] = tlut;
     *out = tlut;
+    {
+        /* DOL_GXCORE_TLUT_LOG=1: report each palette load (diagnostics). */
+        static int s_tlut_log = -1;
+        if (s_tlut_log < 0)
+            s_tlut_log = getenv("DOL_GXCORE_TLUT_LOG") != NULL ? 1 : 0;
+        if (s_tlut_log && range.data != NULL) {
+            const u8* b = (const u8*)range.data;
+            fprintf(stderr, "[tlut-load] tmem=%u addr=%08X entries=%u:", (unsigned)tmem_offset,
+                    physical_base, (unsigned)entries);
+            for (u32 e = 0; e < 16u && e < entries; ++e)
+                fprintf(stderr, " %02X%02X", b[e * 2u], b[e * 2u + 1u]);
+            fprintf(stderr, "\n");
+        }
+    }
     dol_gx_recomp_trace_event(gx, DOL_GX_RECOMP_EVENT_TLUT, tmem_offset, physical_base,
                 byte_size, format);
     return true;
