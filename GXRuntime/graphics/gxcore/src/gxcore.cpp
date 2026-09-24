@@ -1636,6 +1636,12 @@ void GxCoreSink::on_consumed_draw(const ar::ConsumedDraw& draw,
 bool GxCoreSink::submit_packet(const ar::RenderPacket& packet) {
   if (packet.kind == ar::RenderPacketKind::State) {
     live_state_.apply(packet.state);
+    if (!replay_overflow_) {
+      if (since_draw_.size() < kMaxReplay)
+        since_draw_.push_back(packet.state);
+      else
+        replay_overflow_ = true;
+    }
     // A BP 0x52 with no copy observer (headless Mode A) is a stubbed copy;
     // when an observer is registered the copy is performed (counted below on
     // its resolved CopyDestination packet, which carries the real params).
@@ -1699,8 +1705,19 @@ bool GxCoreSink::submit_packet(const ar::RenderPacket& packet) {
   // fires the observer, which must see the state that was current at that
   // previous draw (pending_state_), not this packet's.
   const bool ok = consumer_.submit_packet(packet);
-  if (packet.kind == ar::RenderPacketKind::Draw)
-    pending_state_ = live_state_;
+  if (packet.kind == ar::RenderPacketKind::Draw) {
+    // pending_state_ becomes live_state_: by replaying what changed since the
+    // last draw, not by copying the whole state (1.4 KB) at every draw - that
+    // copy was a large part of the GX worker's memmove (simulator sample).
+    if (replay_overflow_) {
+      pending_state_ = live_state_;
+      replay_overflow_ = false;
+    } else {
+      for (const auto& state : since_draw_)
+        pending_state_.apply(state);
+    }
+    since_draw_.clear();
+  }
   return ok;
 }
 

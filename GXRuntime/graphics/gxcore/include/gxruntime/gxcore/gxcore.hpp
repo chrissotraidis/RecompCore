@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include <cstddef>
+#include <vector>
 
 // gxcore consumer side: accumulates the normalized packet stream's
 // register state (BP regs, CP VCD/VAT) and turns each span-complete
@@ -182,6 +184,13 @@ private:
   gxruntime::aurora_recomp::ConsumingAuroraRenderSink consumer_;
   GxCoreState live_state_;    // updated by every state packet
   GxCoreState pending_state_; // snapshot paired with the pending draw
+  // State packets applied to live_state_ since the last draw. At a draw they
+  // are replayed onto pending_state_, which then equals live_state_ exactly
+  // (apply depends only on the state and the packet) without copying the
+  // whole state per draw. Past kMaxReplay the next draw copies instead.
+  static constexpr std::size_t kMaxReplay = 256u;
+  std::vector<gxruntime::aurora_recomp::RenderStatePacket> since_draw_;
+  bool replay_overflow_ = false;
   CachedVertexAttrs cached_attrs_{}; // cross-draw N/B/T fallback (stream order)
   PlanObserver plan_observer_ = nullptr;
   void* plan_observer_user_ = nullptr;

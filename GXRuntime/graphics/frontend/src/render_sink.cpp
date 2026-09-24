@@ -196,16 +196,37 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
       if (arrays_[i].base_valid && arrays_[i].stride_valid)
         active_mask |= (1u << i);
     }
-    ConsumedDraw draw{
-        .sequence = packet.sequence,
-        .primitive = packet.draw.primitive,
-        .vtx_fmt = packet.draw.vtx_fmt,
-        .vertex_count = packet.draw.vertex_count,
-        .vertex_size = packet.draw.vertex_size,
-        .cull_all = cull_all_,
-        .active_array_mask = active_mask,
-        .texture = bound_texture_,
-    };
+    // The previous draw's trailing INDEXED_SPAN packets are now all in, so it is
+    // span-complete: assemble it before it is replaced.
+    if (!draws_.empty())
+      accumulate_assembly(draws_.back());
+    // Build the new draw in place. In streaming mode the one retained draw is
+    // reused - reset to a fresh ConsumedDraw but keeping its payload buffer's
+    // capacity - instead of building a local, copying it into the vector and
+    // freeing and reallocating the payload per draw (the GX worker's memmove
+    // and malloc/free in the simulator sample). Every field below is the same
+    // value the local copy carried.
+    ConsumedDraw* slot;
+    if (streaming_ && draws_.size() == 1u) {
+      slot = &draws_[0];
+      std::vector<std::uint8_t> keep = std::move(slot->vertex_payload);
+      *slot = ConsumedDraw{};
+      keep.clear();
+      slot->vertex_payload = std::move(keep);
+    } else {
+      if (streaming_)
+        draws_.clear();
+      slot = &draws_.emplace_back();
+    }
+    ConsumedDraw& draw = *slot;
+    draw.sequence = packet.sequence;
+    draw.primitive = packet.draw.primitive;
+    draw.vtx_fmt = packet.draw.vtx_fmt;
+    draw.vertex_count = packet.draw.vertex_count;
+    draw.vertex_size = packet.draw.vertex_size;
+    draw.cull_all = cull_all_;
+    draw.active_array_mask = active_mask;
+    draw.texture = bound_texture_;
     for (std::uint32_t t = 0; t < ConsumedDraw::kMaxTexmaps; ++t)
       draw.textures[t] = bound_textures_[t];
     draw.transform_flags = packet.draw.transform_flags;
@@ -236,24 +257,12 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
                 sizeof(draw.tex_matrix_word_mask));
     std::memcpy(draw.xf_regs, packet.draw.xf_regs, sizeof(draw.xf_regs));
     draw.xf_reg_mask = packet.draw.xf_reg_mask;
-    // The previous draw's trailing INDEXED_SPAN packets are now all in, so it is
-    // span-complete: assemble it before it is dropped (streaming clears draws_).
-    if (!draws_.empty())
-      accumulate_assembly(draws_.back());
-    // Array inputs are appended by the draw's trailing INDEXED_SPAN packets
-    // (only indexed attrs read CP arrays). In streaming mode keep only the
-    // latest draw so the vector stays bounded; back() is still the target of
-    // those spans.
-    if (streaming_)
-      draws_.clear();
-    draws_.push_back(draw);
-    back_assembled_ = false; // the just-pushed draw is not yet assembled
+    back_assembled_ = false; // the just-placed draw is not yet assembled
     // Retain the draw's raw per-vertex bytes (valid only during this call) so an
-    // issuing sink can assemble vertices after submit. Append after push_back so
-    // the copy lands on the just-added draw.
+    // issuing sink can assemble vertices after submit.
     if (packet.draw.vertex_payload != nullptr &&
         packet.draw.vertex_payload_size != 0u) {
-      draws_.back().vertex_payload.assign(
+      draw.vertex_payload.assign(
           packet.draw.vertex_payload,
           packet.draw.vertex_payload + packet.draw.vertex_payload_size);
       payload_bytes_ += packet.draw.vertex_payload_size;
