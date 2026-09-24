@@ -703,7 +703,12 @@ bool RetailGxFrontend::handle_bp(std::uint32_t raw) {
     state_.texture_tlut_tmem_offset[slot] =
         static_cast<std::uint16_t>(bp_get(value, 10u, 0u));
     state_.texture_tlut_format[slot] = bp_get(value, 2u, 10u);
-    return true;
+    // GXLoadTexObj writes SETTLUT after SETIMAGE0-3 (the SDK's
+    // GXLoadTexObjPreLoaded), so the texture event emitted at SETIMAGE3
+    // carried the palette this slot had for the previous texture. Resolve
+    // the slot again now that its palette register is current; the later
+    // event is the one a draw binds.
+    return maybe_resolve_texture(slot);
   }
 
   switch (reg) {

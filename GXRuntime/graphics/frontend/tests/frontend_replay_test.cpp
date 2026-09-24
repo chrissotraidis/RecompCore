@@ -503,6 +503,50 @@ void test_unresolved_tlut_load_is_noop() {
   assert(!saw_packet(unresolved_source_sink, DOL_GX_RECOMP_EVENT_TLUT));
 }
 
+// GXLoadTexObj writes SETIMAGE0-3 and then SETTLUT for a CI texture. The
+// texture a draw binds must carry the palette named by that later SETTLUT,
+// not the one the slot held for the previous texture (the Wind Waker title
+// logo drew with a stale palette before this was fixed).
+void test_tlut_written_after_image_selects_palette() {
+  CPUState cpu;
+  assert(cpu_init(&cpu));
+  DolGuestMemory memory;
+  assert(dol_guest_memory_init(&memory, nullptr));
+  DolGuestAddressResolver resolver;
+  dol_guest_address_resolver_init(&resolver, &memory, &cpu);
+
+  constexpr std::uint32_t texture_base = 0x800u;
+  constexpr std::uint32_t first_tlut = 0x1000u;
+  constexpr std::uint32_t second_tlut = 0x1400u;
+  std::vector<std::uint8_t> fifo;
+  push_bp(fifo, DOL_GX_BP_REG_LOAD_TLUT0, first_tlut >> 5u);
+  push_bp(fifo, DOL_GX_BP_REG_LOAD_TLUT1, 0x20u | (1u << 10u));
+  push_bp(fifo, DOL_GX_BP_REG_LOAD_TLUT0, second_tlut >> 5u);
+  push_bp(fifo, DOL_GX_BP_REG_LOAD_TLUT1, 0x30u | (1u << 10u));
+  for (const std::uint32_t tmem : {0x20u, 0x30u}) {
+    push_bp(fifo, DOL_GX_BP_REG_TX_SETIMAGE0 + 1u, tex_image0(16u, 8u, 9u));
+    push_bp(fifo, DOL_GX_BP_REG_TX_SETIMAGE3 + 1u, texture_base >> 5u);
+    push_bp(fifo, DOL_GX_BP_REG_TX_SETTLUT + 1u, tmem | (2u << 10u));
+  }
+
+  RetailGxFrontend frontend(resolver);
+  RecordingAuroraRenderSink sink;
+  assert(frontend.replay_fifo(fifo, &sink));
+  assert(frontend.last_error() == nullptr);
+  std::uint32_t bound_tlut = 0u;
+  std::uint32_t bound_format = 0xFFu;
+  for (const auto& packet : sink.packets()) {
+    if (packet.kind == RenderPacketKind::Resource &&
+        packet.resource.kind == RenderResourceKind::Texture &&
+        packet.resource.index == 1u) {
+      bound_tlut = packet.resource.tlut_address;
+      bound_format = packet.resource.tlut_format;
+    }
+  }
+  assert(bound_tlut == second_tlut);
+  assert(bound_format == 2u);
+}
+
 // The XF projection register (XF 0x1020) is decoded from a direct XF_LOAD that
 // covers it, so the recomp's projection transform is inspectable for the
 // Dolphin-vs-recomp transform diff. A wrong/degenerate projection puts geometry
@@ -613,6 +657,7 @@ int main() {
   test_fragmented_fifo_display_list_frontend();
   test_fragmented_zero_vertex_draw_is_noop();
   test_unresolved_tlut_load_is_noop();
+  test_tlut_written_after_image_selects_palette();
   test_xf_projection_capture();
 
   CPUState cpu;
