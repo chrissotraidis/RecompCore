@@ -29,6 +29,7 @@ namespace aurora::gfx::gxcore {
 bool submit_draw_plan(const gxruntime::gxcore::DrawPlan& plan);
 void copy_efb_to_texture(const gxruntime::gxcore::EfbCopyCommand& cmd);
 void reset_texture_cache();
+void note_frame_presented();
 void set_texture_dirty_epoch_observer(
     bool (*observer)(uint32_t, uint32_t, uint64_t*));
 } // namespace aurora::gfx::gxcore
@@ -50,6 +51,70 @@ bool core_texture_dirty_epoch(uint32_t address, uint32_t size,
 void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
     if (!plan.ok)
         return; // skip reasons are tallied in the sink gap counters
+    // DOL_GXCORE_PLAN_TEX=<hex guest address>: print the TEV setup of draws
+    // that sample that texture (first 12), for comparing a draw with Dolphin.
+    static const long long s_plan_tex = [] {
+        const char* env = std::getenv("DOL_GXCORE_PLAN_TEX");
+        return env != nullptr ? std::strtoll(env, nullptr, 16) : -1ll;
+    }();
+    static int s_plan_tex_reports = 0;
+    if (s_plan_tex >= 0 && s_plan_tex_reports < 12 && plan.has_texture &&
+        (plan.tex_address & 0x3FFFFFFFu) == (static_cast<u32>(s_plan_tex) & 0x3FFFFFFFu)) {
+        ++s_plan_tex_reports;
+        const auto& k = plan.pipeline.shader;
+        std::fprintf(stderr, "[plan-tex] present=%llu fmt=%u %ux%u tlut=%08X tlutfmt=%u stages=%u tev_valid=%u chans=%u lit=%u blend=%u src=%u dst=%u alpha=%u/%u/%u\n",
+                     g_present_count, plan.tex_format, plan.tex_width, plan.tex_height,
+                     plan.tlut_address, plan.tlut_format, k.num_tev_stages, k.tev_valid,
+                     k.num_color_chans, k.lit_valid, plan.pipeline.blend_enable,
+                     plan.pipeline.src_factor, plan.pipeline.dst_factor,
+                     k.alpha_comp0, k.alpha_comp1, k.alpha_logic);
+        for (unsigned n = 0; n < k.num_tev_stages && n < 16u; ++n) {
+            const auto& t = k.tev_stages[n];
+            std::fprintf(stderr, "[plan-tex]   stage%u cc a=%u b=%u c=%u d=%u bias=%u op=%u scale=%u dest=%u | ac a=%u b=%u c=%u d=%u dest=%u | ksel kc=%u ka=%u order tc=%u map=%u chan=%u en=%u swap tex=%u%u%u%u ras=%u%u%u%u\n",
+                         n, t.cc_a, t.cc_b, t.cc_c, t.cc_d, t.cc_bias, t.cc_op, t.cc_scale, t.cc_dest,
+                         t.ac_a, t.ac_b, t.ac_c, t.ac_d, t.ac_dest, t.ksel_kc, t.ksel_ka,
+                         t.tevorders_texcoord, t.tevorders_texmap, t.tevorders_colorchan, t.tevorders_enable,
+                         t.tex_swap[0], t.tex_swap[1], t.tex_swap[2], t.tex_swap[3],
+                         t.ras_swap[0], t.ras_swap[1], t.ras_swap[2], t.ras_swap[3]);
+        }
+        if (plan.tlut_data != nullptr && plan.tlut_entries != 0u) {
+            const auto* t = static_cast<const std::uint8_t*>(plan.tlut_data);
+            std::fprintf(stderr, "[plan-tex]   tlut entries=%u:", plan.tlut_entries);
+            for (unsigned e = 0; e < plan.tlut_entries && e < 16u; ++e)
+                std::fprintf(stderr, " %02X%02X", t[e * 2u], t[e * 2u + 1u]);
+            std::fprintf(stderr, "\n");
+        }
+        if (plan.tex_data != nullptr) {
+            const auto* t = static_cast<const std::uint8_t*>(plan.tex_data);
+            std::fprintf(stderr, "[plan-tex]   texels:");
+            for (unsigned b = 0; b < 2048u && b < plan.tex_size; ++b)
+                std::fprintf(stderr, " %02X", t[b]);
+            std::fprintf(stderr, "\n");
+        }
+        std::fprintf(stderr, "[plan-tex]   chans captured=%02X has_color0=%u has_color1=%u litchan(mat/amb/en)=",
+                     k.chan_captured_mask, k.has_color0, k.has_color1);
+        for (unsigned j = 0; j < 4u; ++j)
+            std::fprintf(stderr, " %u/%u/%u", k.litchan[j].matsource, k.litchan[j].ambsource, k.litchan[j].enablelighting);
+        {
+            const unsigned stride = gxruntime::gxcore::kVertexFloats;
+            for (unsigned v = 0; v < plan.vertex_count && v < 4u; ++v) {
+                const float* p = plan.vertices.data() + v * stride;
+                std::fprintf(stderr, "[plan-tex]   v%u pos=%.1f,%.1f,%.1f col0=%.3f,%.3f,%.3f,%.3f\n", v, p[0], p[1], p[2], p[4], p[5], p[6], p[7]);
+            }
+        }
+        const auto& vc = plan.constants;
+        std::fprintf(stderr, " mat0=%d,%d,%d,%d amb0=%d,%d,%d,%d\n",
+                     vc.materials[2][0], vc.materials[2][1], vc.materials[2][2], vc.materials[2][3],
+                     vc.materials[0][0], vc.materials[0][1], vc.materials[0][2], vc.materials[0][3]);
+        const auto& c = plan.pixel_constants;
+        std::fprintf(stderr, "[plan-tex]   c0=%d,%d,%d,%d c1=%d,%d,%d,%d c2=%d,%d,%d,%d prev=%d,%d,%d,%d k0=%d,%d,%d,%d k1=%d,%d,%d,%d\n",
+                     c.colors[1][0], c.colors[1][1], c.colors[1][2], c.colors[1][3],
+                     c.colors[2][0], c.colors[2][1], c.colors[2][2], c.colors[2][3],
+                     c.colors[3][0], c.colors[3][1], c.colors[3][2], c.colors[3][3],
+                     c.colors[0][0], c.colors[0][1], c.colors[0][2], c.colors[0][3],
+                     c.kcolors[0][0], c.kcolors[0][1], c.kcolors[0][2], c.kcolors[0][3],
+                     c.kcolors[1][0], c.kcolors[1][1], c.kcolors[1][2], c.kcolors[1][3]);
+    }
     if (aurora::gfx::gxcore::submit_draw_plan(plan))
         ++g_core_submitted;
     else
@@ -1096,6 +1161,9 @@ void aurora_backend_present(void) {
         gx_aurora::g_frame_open = false;
     }
     ++gx_aurora::g_present_count;
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    aurora::gfx::gxcore::note_frame_presented();
+#endif
     if (gx_aurora::g_frame_pacing_log &&
         (gx_aurora::g_present_count <= 10 || (gx_aurora::g_present_count % 60) == 0)) {
         const AuroraStats* stats = aurora_get_stats();

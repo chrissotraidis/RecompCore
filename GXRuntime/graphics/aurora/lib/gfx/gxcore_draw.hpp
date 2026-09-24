@@ -67,6 +67,8 @@ void copy_efb_to_texture(const gxruntime::gxcore::EfbCopyCommand& cmd);
 bool submit_draw_plan(const gxruntime::gxcore::DrawPlan& plan);
 // Drop the texture cache + reset its stats (start of a replay run).
 void reset_texture_cache();
+// Once per presented frame: small textures are re-hashed at most once a frame.
+void note_frame_presented();
 
 using TextureDirtyEpochObserver =
     bool (*)(uint32_t address, uint32_t size, uint64_t* epoch);

@@ -11,6 +11,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -233,8 +234,28 @@ struct TextureAddressState {
   uint64_t tlut_epoch = 0;
   bool texel_epoch_valid = false;
   bool tlut_epoch_valid = false;
+  // Small textures only (see kAlwaysRehashBytes): hash of the texels and
+  // palette as last decoded, and the frame in which they were last compared.
+  uint64_t small_hash = 0;
+  uint64_t verified_frame = ~0ull;
 };
 absl::flat_hash_map<uint32_t, TextureAddressState> g_textureAddrKey;
+// Counts presented frames; a small texture is re-hashed at most once in each.
+std::atomic<uint64_t> g_textureVerifyFrame{0};
+// A small texture is re-hashed even when its dirty epoch has not moved: the
+// game rewrites some in place with plain CPU stores that no dirty mark sees
+// (Wind Waker's A/B action labels, 80x24 IA4 at 0x01673420 and 0x01674C60,
+// showed "Charts" for "Choose"/"Return" in the pause menu). Dolphin reads
+// memory coherently, so the reference shows the new text. Once a frame per
+// texture, up to 4 KB of texels plus the palette.
+constexpr uint32_t kAlwaysRehashBytes = 4096u;
+uint64_t small_texture_hash(const uint8_t* bytes, uint32_t size,
+                            const void* tlut, uint32_t tlut_size) {
+  uint64_t h = XXH3_64bits(bytes, size);
+  if (tlut != nullptr && tlut_size != 0u)
+    h ^= XXH3_64bits(tlut, tlut_size) * 0x9E3779B97F4A7C15ull;
+  return h;
+}
 TextureCacheStats g_textureCacheStats;
 TextureDirtyEpochObserver g_textureDirtyEpochObserver = nullptr;
 
@@ -618,6 +639,10 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   pass.DrawIndexed(data.indexCount);
 }
 
+void note_frame_presented() {
+  g_textureVerifyFrame.fetch_add(1u, std::memory_order_relaxed);
+}
+
 void reset_texture_cache() {
   g_textureCache.clear();
   g_textureAddrKey.clear();
@@ -865,11 +890,33 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
           priorKey.height == height && priorKey.tlut_address == tlut_address &&
           priorKey.tlut_format == tlut_format &&
           priorKey.tlut_entries == tlut_entries;
-      if (sameIdentity && previous.texel_epoch_valid &&
+      const uint64_t frame = g_textureVerifyFrame.load(std::memory_order_relaxed);
+      bool small_changed = false;
+      if (sameIdentity && size <= kAlwaysRehashBytes && previous.verified_frame != frame) {
+        const uint64_t h = small_texture_hash(bytes, size, tlut_data, tlutSize);
+        if (h != previous.small_hash)
+          small_changed = true;
+        else
+          addrIt->second.verified_frame = frame;
+      }
+      if (sameIdentity && !small_changed && previous.texel_epoch_valid &&
           previous.tlut_epoch_valid && previous.texel_epoch == texelEpoch &&
           previous.tlut_epoch == tlutEpoch) {
         auto cached = g_textureCache.find(priorKey);
         if (cached != g_textureCache.end()) {
+          // DOL_GXCORE_TEX_VERIFY=1: re-hash every generation hit and report the
+          // ones whose texels changed without a dirty mark (a write path the
+          // dirty tracking does not see).
+          static const bool s_verify = std::getenv("DOL_GXCORE_TEX_VERIFY") != nullptr;
+          if (s_verify) {
+            const auto* vbytes = static_cast<const uint8_t*>(data);
+            if (vbytes != nullptr &&
+                XXH3_64bits(vbytes, std::min(tsize, available)) != priorKey.content_hash &&
+                !gxc::is_ci_format(format))
+              std::fprintf(stderr, "[tex-stale] addr=%08X fmt=%u %ux%u size=%u epoch=%llu\n",
+                           address, format, width, height, tsize,
+                           (unsigned long long)texelEpoch);
+          }
           ++g_textureCacheStats.hits;
           ++g_textureCacheStats.generation_hits;
           return cached->second;
@@ -886,6 +933,11 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       // the declared GX palette belongs to this texture cache identity.
       content_hash = XXH3_64bits_withSeed(tlut_data, tlutSize, content_hash);
     }
+    const uint64_t small_hash =
+        size <= kAlwaysRehashBytes ? small_texture_hash(bytes, size, tlut_data, tlutSize) : 0u;
+    const uint64_t verify_frame = size <= kAlwaysRehashBytes
+                                      ? g_textureVerifyFrame.load(std::memory_order_relaxed)
+                                      : ~0ull;
     const TextureKey key{address,     tsize,        format,      width,
                          height,      tlut_address, tlut_format, tlut_entries,
                          content_hash};
@@ -893,7 +945,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     if (it != g_textureCache.end()) {
       ++g_textureCacheStats.hits;
       g_textureAddrKey[address] = TextureAddressState{
-          key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid};
+          key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid,
+          small_hash, verify_frame};
       return it->second;
     }
     // New content for this identity: evict any prior entry cached at the same
@@ -926,6 +979,25 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                      addrIt != g_textureAddrKey.end() ? addrIt->second.key.height : 0u,
                      addrIt != g_textureAddrKey.end() ? addrIt->second.key.size : 0u);
     }
+    {
+      // DOL_GXCORE_DUMP_TEX=<hex address>: write the decoded RGBA of that
+      // texture as /tmp/gxcore-tex-<address>-<n>.pam (diagnostics).
+      static const long long s_dump = [] {
+        const char* env = std::getenv("DOL_GXCORE_DUMP_TEX");
+        return env != nullptr ? std::strtoll(env, nullptr, 16) : -1ll;
+      }();
+      static int s_dumped = 0;
+      if (s_dump >= 0 && (address & 0x3FFFFFFFu) == (static_cast<uint32_t>(s_dump) & 0x3FFFFFFFu) &&
+          !decoded.empty() && s_dumped < 4) {
+        char path[128];
+        std::snprintf(path, sizeof(path), "/tmp/gxcore-tex-%08X-%d.pam", address, s_dumped++);
+        if (FILE* f = std::fopen(path, "wb")) {
+          std::fprintf(f, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", width, height);
+          std::fwrite(decoded.data(), 1, decoded.size(), f);
+          std::fclose(f);
+        }
+      }
+    }
     TextureHandle handle;
     if (!decoded.empty()) {
       handle = new_static_texture_2d(
@@ -946,7 +1018,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     }
     g_textureCache.emplace(key, handle);
     g_textureAddrKey[address] = TextureAddressState{
-        key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid};
+        key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid,
+        small_hash, verify_frame};
     return handle;
   };
 
