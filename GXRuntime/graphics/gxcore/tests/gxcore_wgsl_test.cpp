@@ -671,7 +671,7 @@ void test_five_texgens() {
   CHECK(w.find("let fixpoint_uv4 = vec2i(in.uv4.xy * "
                "vec2f(psc.texdims[4].zw * 128))") != std::string::npos);
   CHECK(w.find("let uv = vec2f(fixpoint_uv4) / "
-               "(vec2f(textureDimensions(tex0)) * 128.0)") !=
+               "(gx_texdims(psc.texdims[0].xy, textureDimensions(tex0)) * 128.0)") !=
         std::string::npos);
 }
 
@@ -860,8 +860,12 @@ void test_tev_texcoord_scale() {
   CHECK(w.find("texdims: array<vec4i, 8>") != std::string::npos);
   CHECK(w.find("vec2i(in.uv0.xy * vec2f(psc.texdims[0].zw * 128))") !=
         std::string::npos);
-  CHECK(w.find("vec2f(fixpoint_uv0) / (vec2f(textureDimensions(tex0)) * "
-               "128.0)") != std::string::npos);
+  // Texcoords normalize by the texmap's guest size (texdims.xy), falling
+  // back to the GPU texture's size, so scaled EFB copies sample correctly.
+  CHECK(w.find("vec2f(fixpoint_uv0) / (gx_texdims(psc.texdims[0].xy, "
+               "textureDimensions(tex0)) * 128.0)") != std::string::npos);
+  CHECK(w.find("fn gx_texdims(logical: vec2i, actual: vec2u) -> vec2f") !=
+        std::string::npos);
 }
 
 // Golden WGSL for the 1-stage modulate TEV key (tex * rasterized color0).
@@ -889,6 +893,10 @@ struct PixelShaderConstants {
 @group(2) @binding(0) var<uniform> psc: PixelShaderConstants;
 @group(3) @binding(0) var tex0: texture_2d<f32>;
 @group(3) @binding(1) var samp0: sampler;
+fn gx_texdims(logical: vec2i, actual: vec2u) -> vec2f {
+    if (logical.x > 0 && logical.y > 0) { return vec2f(logical); }
+    return vec2f(actual);
+}
 struct VertexIn {
     @location(0) rawpos: vec3f,
     @location(1) posmtx: u32,
@@ -949,7 +957,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4f {
     let fixpoint_uv0 = vec2i(in.uv0.xy * vec2f(psc.texdims[0].zw * 128));
     // TEV stage 0
     rastemp = col0i.rgba;
-    { let uv = vec2f(fixpoint_uv0) / (vec2f(textureDimensions(tex0)) * 128.0); rawtextemp = vec4i(round(textureSample(tex0, samp0, uv) * 255.0)); }
+    { let uv = vec2f(fixpoint_uv0) / (gx_texdims(psc.texdims[0].xy, textureDimensions(tex0)) * 128.0); rawtextemp = vec4i(round(textureSample(tex0, samp0, uv) * 255.0)); }
     textemp = rawtextemp.rgba;
     tevin_a = vec4i(vec3i(0,0,0), 0) & vec4i(255,255,255,255);
     tevin_b = vec4i(textemp.rgb, textemp.a) & vec4i(255,255,255,255);

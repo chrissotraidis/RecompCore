@@ -340,11 +340,12 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
         texcoord < kMaxTexGens && key.tex_gens[texcoord].projection != 0u;
     if (direct_sample && indirect_enabled) {
       emitf(out,
-            "    let stage_dims%u = vec2i(textureDimensions(tex%u));\n"
+            "    let stage_dims%u = vec2i(gx_texdims(psc.texdims[%u].xy, "
+            "textureDimensions(tex%u)));\n"
             "    let base_coord%u = fixpoint_uv%u;\n"
             "    var stage_uv%u = vec2f(base_coord%u) / "
             "(vec2f(stage_dims%u) * 128.0);\n",
-            n, texunit, n, texcoord, n, n, n);
+            n, texunit, texunit, n, texcoord, n, n, n);
     }
 
     const bool valid_indirect = s.ind_stage < key.num_ind_stages;
@@ -360,9 +361,9 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
             "    let ind_coord_scaled%u = fixpoint_uv%u >> "
             "vec2u(%uu, %uu);\n"
             "    let ind_uv%u = vec2f(ind_coord_scaled%u) / "
-            "(vec2f(textureDimensions(tex%u)) * 128.0);\n",
+            "(gx_texdims(psc.texdims[%u].xy, textureDimensions(tex%u)) * 128.0);\n",
             n, indcoord, static_cast<unsigned>(ind.scale_s),
-            static_cast<unsigned>(ind.scale_t), n, n, indunit);
+            static_cast<unsigned>(ind.scale_t), n, n, indunit, indunit);
       emitf(out,
             "    let ind_raw%u = vec3i(round(textureSample(tex%u, samp%u, "
             "ind_uv%u).abg * 255.0));\n",
@@ -461,16 +462,16 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key) {
       } else if (proj) {
         emitf(out,
               "    { let uv = vec2f(fixpoint_uv%u) / "
-              "(vec2f(textureDimensions(tex%u)) * 128.0); "
+              "(gx_texdims(psc.texdims[%u].xy, textureDimensions(tex%u)) * 128.0); "
               "rawtextemp = vec4i(round(textureSample(tex%u, samp%u, uv) * "
               "255.0)); }\n",
-              texcoord, texunit, texunit, texunit);
+              texcoord, texunit, texunit, texunit, texunit);
       } else {
         emitf(out,
               "    { let uv = vec2f(fixpoint_uv%u) / "
-              "(vec2f(textureDimensions(tex%u)) * 128.0); rawtextemp = "
+              "(gx_texdims(psc.texdims[%u].xy, textureDimensions(tex%u)) * 128.0); rawtextemp = "
               "vec4i(round(textureSample(tex%u, samp%u, uv) * 255.0)); }\n",
-              texcoord, texunit, texunit, texunit);
+              texcoord, texunit, texunit, texunit, texunit);
       }
       emitf(out, "    textemp = rawtextemp.%c%c%c%c;\n",
             kRgbaSwizzle[s.tex_swap[0]], kRgbaSwizzle[s.tex_swap[1]],
@@ -871,6 +872,16 @@ std::string generate_wgsl(const ShaderKey& key) {
               "@group(%u) @binding(%u) var samp%u: sampler;\n",
               tex_group, 2u * t, t, tex_group, 2u * t + 1u, t);
       }
+    }
+    if (tev) {
+      // Texcoords normalize by the texmap's size as the guest sees it
+      // (Dolphin's texdim.xy). An EFB copy is allocated at the render scale,
+      // so its GPU size is larger than the guest's; unset entries fall back
+      // to the texture's own size.
+      emit(out, "fn gx_texdims(logical: vec2i, actual: vec2u) -> vec2f {\n"
+                "    if (logical.x > 0 && logical.y > 0) { return vec2f(logical); }\n"
+                "    return vec2f(actual);\n"
+                "}\n");
     }
   }
 

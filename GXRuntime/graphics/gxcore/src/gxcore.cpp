@@ -1480,6 +1480,22 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
     plan.pixel_constants.texdims[i][3] = static_cast<std::int32_t>(
         (bp_valid_[treg] ? bits(bp_regs_[treg], 16, 0) : 0u) + 1u);
   }
+  // texdims[texmap].xy: the size of each sampled texmap as the guest sees
+  // it, which normalizes texcoords (Dolphin's texdim.xy). Slot 0 carries the
+  // single-texmap path's texture; a multi-texmap draw fills each used slot.
+  if (plan.has_texture) {
+    if (plan.texmap_mask == 0u) {
+      plan.pixel_constants.texdims[0][0] = static_cast<std::int32_t>(plan.tex_width);
+      plan.pixel_constants.texdims[0][1] = static_cast<std::int32_t>(plan.tex_height);
+    } else {
+      for (std::uint32_t t = 0; t < 8u; ++t) {
+        if ((plan.texmap_mask & (1u << t)) == 0u || !plan.textures[t].valid)
+          continue;
+        plan.pixel_constants.texdims[t][0] = static_cast<std::int32_t>(plan.textures[t].width);
+        plan.pixel_constants.texdims[t][1] = static_cast<std::int32_t>(plan.textures[t].height);
+      }
+    }
+  }
 
   for (std::uint32_t m = 0; m < 3u; ++m) {
     const std::uint32_t a = bp_valid_[0x06u + 3u * m]

@@ -11,6 +11,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -664,10 +665,25 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
       .width = static_cast<int32_t>(cmd.width),
       .height = static_cast<int32_t>(cmd.height),
   });
-  const uint32_t dstWidth =
-      std::max(cmd.destination_width, static_cast<uint32_t>(1));
-  const uint32_t dstHeight =
-      std::max(cmd.destination_height, static_cast<uint32_t>(1));
+  // The copy is made at the render target's scale, as Aurora's own
+  // GXCopyTex does (dolphin/gx/GXFrameBuffer.cpp scale_copy_dst) and as
+  // Dolphin's scaled EFB copies do. Allocated at the guest's size, a game
+  // that copies the whole EFB and draws it back (Wind Waker's depth of field
+  // and blur passes, every frame) replaced its high-resolution scene with a
+  // 640x480 image stretched over it. Sampling uses normalized coordinates,
+  // so a larger texture needs nothing else.
+  uint32_t dstWidth = std::max(cmd.destination_width, static_cast<uint32_t>(1));
+  uint32_t dstHeight = std::max(cmd.destination_height, static_cast<uint32_t>(1));
+  if (gx::g_gxState.viewportPolicy != AURORA_VIEWPORT_NATIVE) {
+    const auto [logicalW, logicalH] = gx::logical_fb_size();
+    const auto [targetW, targetH] = gfx::get_render_target_size();
+    if (logicalW != 0 && logicalH != 0 && targetW != 0 && targetH != 0) {
+      const float sx = static_cast<float>(targetW) / static_cast<float>(logicalW);
+      const float sy = static_cast<float>(targetH) / static_cast<float>(logicalH);
+      dstWidth = std::max<uint32_t>(static_cast<uint32_t>(std::lround(dstWidth * sx)), 1u);
+      dstHeight = std::max<uint32_t>(static_cast<uint32_t>(std::lround(dstHeight * sy)), 1u);
+    }
+  }
 
   const EfbCopyKey key{cmd.dest_address, dstWidth, dstHeight, cmd.format};
   auto it = g_efbCopyCache.find(key);
