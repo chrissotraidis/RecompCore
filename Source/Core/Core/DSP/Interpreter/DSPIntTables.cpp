@@ -3,6 +3,8 @@
 
 #include "Core/DSP/Interpreter/DSPIntTables.h"
 
+#include "Core/DSP/DSPTables.h"
+
 #include <array>
 
 #include "Common/CommonTypes.h"
@@ -242,6 +244,11 @@ std::array<InterpreterFunction, 256> s_ext_op_table;
 bool s_tables_initialized = false;
 }  // Anonymous namespace
 
+// The predecoded table lives here rather than inside GetDecodedOp so that the
+// dispatch path is an index with no initialization guard in front of it; it is
+// filled at the end of InitInstructionTables, once, from the two tables above.
+std::array<DecodedInterpreterOp, 65536> s_decoded_ops;
+
 InterpreterFunction GetOp(UDSPInstruction inst)
 {
   return s_op_table[inst];
@@ -257,28 +264,19 @@ InterpreterFunction GetExtOp(UDSPInstruction inst)
   return s_ext_op_table[inst & 0xFF];
 }
 
-const DecodedInterpreterOp& GetDecodedOp(UDSPInstruction inst)
-{
-  static const std::array<DecodedInterpreterOp, 65536> decoded_ops = [] {
-    std::array<DecodedInterpreterOp, 65536> table;
-    for (size_t i = 0; i < table.size(); ++i)
-    {
-      const auto instruction = static_cast<UDSPInstruction>(i);
-      table[i] = {
-          .main = GetOp(instruction),
-          .extension = GetExtOp(instruction),
-          .extended = GetOpTemplate(instruction)->extended,
-      };
-    }
-    return table;
-  }();
-  return decoded_ops[inst];
-}
-
 void InitInstructionTables()
 {
   if (s_tables_initialized)
     return;
+
+  // The decoded table below reads the opcode templates, which live in
+  // DSPTables.cpp and are filled by DSP::InitInstructionTable. That call is
+  // already made by the host before it initializes the core, but the decoded
+  // table cannot be built on the assumption that it happened: the interpreter
+  // is constructed from the core's own constructor, so building it here without
+  // this call dereferences a null template. InitInstructionTable is a rebuild
+  // from constant data and is safe to repeat.
+  DSP::InitInstructionTable();
 
   // ext op table
   for (size_t i = 0; i < s_ext_op_table.size(); i++)
@@ -302,6 +300,19 @@ void InitInstructionTables()
       continue;
 
     s_op_table[i] = iter->function;
+  }
+
+  // The decoded table is a pure function of the two tables above, so it is built
+  // here with them: one pass at construction instead of a guard, an acquire
+  // load and a call at every dispatched instruction.
+  for (size_t i = 0; i < s_decoded_ops.size(); ++i)
+  {
+    const auto instruction = static_cast<UDSPInstruction>(i);
+    s_decoded_ops[i] = {
+        .main = GetOp(instruction),
+        .extension = GetExtOp(instruction),
+        .extended = GetOpTemplate(instruction)->extended,
+    };
   }
 
   s_tables_initialized = true;

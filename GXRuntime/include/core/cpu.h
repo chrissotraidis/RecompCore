@@ -115,6 +115,8 @@ void ppc_guest_alias_clear(void);
 bool ppc_guest_alias_resolve(u32 address, u32 size, u8** pointer,
                              u32* journal_offset);
 extern bool g_ppc_guest_aliases_overlap_mem1;
+// Moves whenever the alias set is touched; see the definition.
+extern u32 g_ppc_guest_alias_generation;
 
 enum {
     PPC_CACHE_DCBST,
