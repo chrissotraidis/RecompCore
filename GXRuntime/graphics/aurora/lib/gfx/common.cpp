@@ -1861,4 +1861,16 @@ bool aurora_take_framebuffer_readback(const uint8_t** rgba, uint32_t* width, uin
 }
 
 void aurora_pump_framebuffer_readback() { aurora::gfx::enqueue_process_events(); }
+
+bool aurora_peek_z(uint16_t x, uint16_t y, uint32_t* z) {
+  aurora::gfx::depth_peek::request_snapshot();
+  uint32_t value = 0;
+  if (!aurora::gfx::depth_peek::read_latest(x, y, value)) {
+    return false;
+  }
+  if (z != nullptr) {
+    *z = value;
+  }
+  return true;
+}
 float aurora_get_fps() { return aurora::gfx::calculate_fps(); }

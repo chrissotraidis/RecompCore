@@ -45,6 +45,15 @@ bool aurora_take_framebuffer_readback(const uint8_t** rgba, uint32_t* width, uin
 /* Drive GPU event processing while waiting for take (no frame, no present). */
 void aurora_pump_framebuffer_readback();
 
+/*
+ * EFB depth peek for a translated game, whose GXPeekZ reads 0xC8400000 +
+ * (y << 12) + (x << 2) directly: the latest depth snapshot (24-bit, far
+ * 0xFFFFFF) at EFB coordinates, and a request for the next one. Returns false
+ * before the first snapshot completes. Snapshots are asynchronous (one or
+ * more frames old), which games that peek for visibility tests tolerate.
+ */
+bool aurora_peek_z(uint16_t x, uint16_t y, uint32_t* z);
+
 #ifdef __cplusplus
 }
 #endif
