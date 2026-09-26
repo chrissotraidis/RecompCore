@@ -225,6 +225,10 @@ struct TextureKey {
 };
 
 absl::flat_hash_map<TextureKey, TextureHandle> g_textureCache;
+// Original textures drawn while their HD replacement decodes on a background
+// thread. They stay out of g_textureCache so the next draw asks again; the
+// entry goes when the replacement arrives (or with the cache's clears).
+absl::flat_hash_map<TextureKey, TextureHandle> g_textureAwaitingReplacement;
 // address -> the key currently cached at that guest address. When new content
 // arrives at an address (movie streaming, screen transitions), the prior entry
 // for that address is evicted so the content-hashed cache stays bounded to one
@@ -646,6 +650,7 @@ void note_frame_presented() {
 
 void reset_texture_cache() {
   g_textureCache.clear();
+  g_textureAwaitingReplacement.clear();
   g_textureAddrKey.clear();
   g_efbCopyCache.clear();
   g_efbCopyTextures.clear();
@@ -959,17 +964,20 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     // time these guest bytes are seen, look for a replacement before decoding.
     // The handle is cached under the same content key as a decode would be,
     // so later draws of the same texture never repeat the lookup.
+    bool replacementPending = false;
     if (texture_replacement::has_source_replacements()) {
       static unsigned long long s_lookups;
       static const bool s_log_misses = std::getenv("DOL_TEXREP_LOG_MISSES") != nullptr;
       ++s_lookups;
       const auto replacement = texture_replacement::find_replacement_for_guest(
           width, height, format, bytes, size, static_cast<const uint8_t*>(tlut_data),
-          tlut_data != nullptr ? std::min(tlut_available, tlut_entries * 2u) : 0u);
-      if (s_log_misses && !(replacement.has_value() && *replacement))
+          tlut_data != nullptr ? std::min(tlut_available, tlut_entries * 2u) : 0u,
+          &replacementPending);
+      if (s_log_misses && !replacementPending && !(replacement.has_value() && *replacement))
         std::fprintf(stderr, "[mods] texture miss #%llu addr=%08X fmt=%u %ux%u size=%u tlut=%u\n", s_lookups,
                      address, format, width, height, size, tlut_entries);
       if (replacement.has_value() && *replacement) {
+        g_textureAwaitingReplacement.erase(key);
         ++g_textureCacheStats.uploads;
         static unsigned long long s_replaced;
         if (++s_replaced <= 3u || (s_replaced % 200u) == 0u)
@@ -981,6 +989,12 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
             key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid,
             small_hash, verify_frame};
         return *replacement;
+      }
+      if (replacementPending) {
+        if (auto it = g_textureAwaitingReplacement.find(key); it != g_textureAwaitingReplacement.end())
+          return it->second;
+      } else {
+        g_textureAwaitingReplacement.erase(key);
       }
     }
     // gxcore owns the decode for every format: produce tightly-packed RGBA8 and
@@ -1044,6 +1058,10 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                                      "GXCore Texture");
       ++g_textureCacheStats.uploads;
       ++g_textureCacheStats.raw_fallback;
+    }
+    if (replacementPending) {
+      g_textureAwaitingReplacement[key] = handle;
+      return handle;
     }
     g_textureCache.emplace(key, handle);
     g_textureAddrKey[address] = TextureAddressState{

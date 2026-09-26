@@ -25,6 +25,9 @@
 #include <cstring>
 #include <filesystem>
 #include <list>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -833,6 +836,53 @@ aurora::gfx::TextureHandle load_entry_handle(const aurora::texture::ReplacementK
   return handle;
 }
 
+// Background decoding of file replacements for find_replacement_for_guest.
+// PNG decoding of an HD texture takes milliseconds to tens of milliseconds, and
+// the gxcore path asks from the GX worker, which the game thread waits on at
+// every draw-done: decoding there held the game for about 55 ms when a scene's
+// HD textures first appeared. The decoder thread fills s_decoded; the GPU
+// texture is still created by the caller (the only thread that uploads).
+struct DecodeJob {
+  aurora::texture::ReplacementKey key;
+  ReplacementEntry entry;
+};
+std::mutex s_decodeMutex;
+std::condition_variable s_decodeCv;
+std::deque<DecodeJob> s_decodeQueue;
+absl::flat_hash_set<aurora::texture::ReplacementKey, ReplacementKeyHash> s_decodePending;
+absl::flat_hash_map<aurora::texture::ReplacementKey, std::optional<aurora::gfx::ConvertedTexture>, ReplacementKeyHash>
+    s_decoded;
+bool s_decoderStarted = false;
+
+void decoder_main() noexcept {
+  for (;;) {
+    DecodeJob job;
+    {
+      std::unique_lock lk(s_decodeMutex);
+      s_decodeCv.wait(lk, [] { return !s_decodeQueue.empty(); });
+      job = std::move(s_decodeQueue.front());
+      s_decodeQueue.pop_front();
+    }
+    auto converted = load_file_replacement(job.entry);
+    std::lock_guard lk(s_decodeMutex);
+    s_decoded.insert_or_assign(job.key, std::move(converted));
+  }
+}
+
+aurora::gfx::TextureHandle insert_cache_locked(const aurora::texture::ReplacementKey& key,
+                                               const ReplacementEntry& entry,
+                                               aurora::gfx::TextureHandle handle) noexcept {
+  const uint64_t replacementBytes =
+      aurora::gfx::calc_texture_size(handle->format, handle->size.width, handle->size.height, handle->mipCount);
+  s_replacementLru.push_front(key);
+  s_cacheByKey.emplace(
+      key,
+      SelectedCache{.handle = handle, .id = entry.id, .bytes = replacementBytes, .lruIt = s_replacementLru.begin()});
+  s_replacementCacheBytes += replacementBytes;
+  evict_replacement_cache_if_needed();
+  return handle;
+}
+
 std::optional<aurora::gfx::TextureHandle>
 find_replacement_for_key_locked(const aurora::texture::ReplacementKey& key) noexcept {
   const auto* entry = find_selected_entry_locked(key);
@@ -850,16 +900,7 @@ find_replacement_for_key_locked(const aurora::texture::ReplacementKey& key) noex
   if (!handle) {
     return std::nullopt;
   }
-
-  const uint64_t replacementBytes =
-      aurora::gfx::calc_texture_size(handle->format, handle->size.width, handle->size.height, handle->mipCount);
-  s_replacementLru.push_front(key);
-  s_cacheByKey.emplace(
-      key,
-      SelectedCache{.handle = handle, .id = entry->id, .bytes = replacementBytes, .lruIt = s_replacementLru.begin()});
-  s_replacementCacheBytes += replacementBytes;
-  evict_replacement_cache_if_needed();
-  return handle;
+  return insert_cache_locked(key, *entry, std::move(handle));
 }
 
 bool dump_editable_texture_dds(const aurora::texture::TextureSourceKey& key, const GXTexObj_& obj) noexcept {
@@ -1267,7 +1308,8 @@ bool has_source_replacements() noexcept {
 
 std::optional<TextureHandle> find_replacement_for_guest(uint32_t width, uint32_t height, uint32_t format,
                                                         const uint8_t* data, uint32_t data_size,
-                                                        const uint8_t* tlut, uint32_t tlut_bytes) noexcept {
+                                                        const uint8_t* tlut, uint32_t tlut_bytes,
+                                                        bool* pending) noexcept {
   ZoneScoped;
   if (data == nullptr || width == 0 || height == 0) {
     return std::nullopt;
@@ -1319,6 +1361,51 @@ std::optional<TextureHandle> find_replacement_for_guest(uint32_t width, uint32_t
   if (!replacementKey.has_value()) {
     return std::nullopt;
   }
-  return find_replacement_for_key_locked(*replacementKey);
+  static const bool s_sync = std::getenv("DOL_TEXREP_SYNC") != nullptr;
+  const auto* entry = find_selected_entry_locked(*replacementKey);
+  if (pending == nullptr || s_sync || entry == nullptr || entry->kind != EntryKind::File) {
+    return find_replacement_for_key_locked(*replacementKey);
+  }
+  if (const auto cache = s_cacheByKey.find(*replacementKey);
+      cache != s_cacheByKey.end() && cache->second.id == entry->id) {
+    touch_cached_replacement(cache);
+    return cache->second.handle;
+  }
+  if (s_failedIds.contains(entry->id)) {
+    return std::nullopt;
+  }
+  std::optional<aurora::gfx::ConvertedTexture> decoded;
+  bool ready = false;
+  {
+    std::lock_guard dlk(s_decodeMutex);
+    if (auto it = s_decoded.find(*replacementKey); it != s_decoded.end()) {
+      decoded = std::move(it->second);
+      s_decoded.erase(it);
+      s_decodePending.erase(*replacementKey);
+      ready = true;
+    } else if (!s_decodePending.contains(*replacementKey)) {
+      s_decodePending.insert(*replacementKey);
+      s_decodeQueue.push_back(DecodeJob{*replacementKey, *entry});
+      if (!s_decoderStarted) {
+        s_decoderStarted = true;
+        std::thread(decoder_main).detach();
+      }
+      s_decodeCv.notify_one();
+    }
+  }
+  if (!ready) {
+    *pending = true;
+    return std::nullopt;
+  }
+  if (!decoded.has_value()) {
+    s_failedIds.insert(entry->id);
+    return std::nullopt;
+  }
+  erase_cache_locked(*replacementKey);
+  auto handle = create_converted_texture_handle(*replacementKey, *entry, *decoded);
+  if (!handle) {
+    return std::nullopt;
+  }
+  return insert_cache_locked(*replacementKey, *entry, std::move(handle));
 }
 } // namespace aurora::gfx::texture_replacement
