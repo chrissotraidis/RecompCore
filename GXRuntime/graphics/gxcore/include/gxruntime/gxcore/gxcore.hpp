@@ -117,6 +117,11 @@ public:
   DrawPlan build_draw_plan(const gxruntime::aurora_recomp::ConsumedDraw& draw,
                            GapCounters& counters,
                            CachedVertexAttrs* cached = nullptr) const;
+  // As build_draw_plan, into a caller-owned plan whose vector capacity is kept
+  // across draws (no per-draw allocation of the vertex and index arrays).
+  void build_draw_plan_into(const gxruntime::aurora_recomp::ConsumedDraw& draw,
+                            GapCounters& counters, CachedVertexAttrs* cached,
+                            DrawPlan& plan) const;
 
   std::uint32_t bp(std::uint8_t reg) const { return bp_regs_[reg]; }
   bool bp_valid(std::uint8_t reg) const { return bp_valid_[reg]; }
@@ -192,6 +197,7 @@ private:
   std::vector<gxruntime::aurora_recomp::RenderStatePacket> since_draw_;
   bool replay_overflow_ = false;
   CachedVertexAttrs cached_attrs_{}; // cross-draw N/B/T fallback (stream order)
+  DrawPlan scratch_plan_{};          // reused by on_consumed_draw
   PlanObserver plan_observer_ = nullptr;
   void* plan_observer_user_ = nullptr;
   CopyObserver copy_observer_ = nullptr;

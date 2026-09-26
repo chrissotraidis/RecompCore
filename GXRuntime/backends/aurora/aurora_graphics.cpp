@@ -630,7 +630,25 @@ inline void g_fifo_enqueue(const std::uint8_t* bytes, u8 size) {
 
 // Waits until the worker has translated everything appended so far. Called at
 // the barriers and only there.
+static void g_fifo_drain_impl();
+std::atomic<unsigned long long> g_timing_drain_us{0};
+std::atomic<unsigned long long> g_timing_present_us{0};
+std::atomic<unsigned long long> g_timing_end_frame_us{0};
+std::atomic<unsigned long long> g_timing_draws{0};
+std::atomic<unsigned long long> g_timing_present_in_drain_us{0};
+bool g_timing_in_drain = false;  // main thread only
+static unsigned long long timing_now_us() {
+    return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 static void g_fifo_drain() {
+    const unsigned long long start = timing_now_us();
+    g_timing_in_drain = true;
+    g_fifo_drain_impl();
+    g_timing_in_drain = false;
+    g_timing_drain_us += timing_now_us() - start;
+}
+static void g_fifo_drain_impl() {
     g_fifo_publish_local();
     std::unique_lock<std::mutex> lock(g_fifo_worker_mutex);
     // Called from the guest's synchronization points, which never run inside
@@ -1121,7 +1139,56 @@ void shadow_transform_observer(
 
 extern "C" {
 
+static void aurora_backend_present_impl(void);
+
+// Timed for the per-second frame diagnostics (dol_aurora_frame_timing).
 void aurora_backend_present(void) {
+    const unsigned long long start = gx_aurora::timing_now_us();
+    aurora_backend_present_impl();
+    const unsigned long long spent = gx_aurora::timing_now_us() - start;
+    gx_aurora::g_timing_present_us += spent;
+    if (gx_aurora::g_timing_in_drain)
+        gx_aurora::g_timing_present_in_drain_us += spent;
+}
+
+void dol_aurora_frame_timing(DolAuroraFrameTiming* out) {
+    out->presents = gx_aurora::g_present_count;
+    out->drain_us = gx_aurora::g_timing_drain_us - gx_aurora::g_timing_present_in_drain_us;
+    out->present_us = gx_aurora::g_timing_present_us;
+    out->end_frame_us = gx_aurora::g_timing_end_frame_us;
+    out->draws = gx_aurora::g_timing_draws;
+    out->audio_throttles = gx_aurora::g_audio_throttle_count;
+    out->audio_dropped = gx_aurora::g_audio_dropped_count;
+    out->audio_queued_ms = 0;
+    if (gx_aurora::g_audio_stream != nullptr && gx_aurora::g_audio_sample_rate != 0u) {
+        const int queued = SDL_GetAudioStreamQueued(gx_aurora::g_audio_stream);
+        out->audio_queued_ms =
+            queued > 0 ? static_cast<int>(queued * 1000ll / (gx_aurora::g_audio_sample_rate * 4ll)) : 0;
+    }
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    out->display_copies = gx_aurora::g_shadow_frontend.display_copies();
+#else
+    out->display_copies = 0;
+#endif
+}
+
+// A present the worker requested at a display copy is taken at the main
+// thread's next GX write. If the worker finishes the frame while the guest is
+// idle waiting for the next retrace, there is no write until the game starts
+// its next frame, so the finished frame waited up to a frame time: two or
+// three frames a second stayed on screen for 60 ms while the game was on time
+// ([late] lines, 2026-09-26). The host calls this at every retrace as well.
+void aurora_backend_service_present(void) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    if (!gx_aurora::g_initialized || !gx_aurora::g_gx_core_enabled)
+        return;
+    if (gx_aurora::g_display_copy_pending.load(std::memory_order_relaxed) &&
+        gx_aurora::g_display_copy_pending.exchange(false))
+        aurora_backend_present();
+#endif
+}
+
+static void aurora_backend_present_impl(void) {
     if (!gx_aurora::g_initialized)
         return;
     // Everything below up to the next begin_frame runs with no frame packet for
@@ -1157,7 +1224,10 @@ void aurora_backend_present(void) {
 #endif
     if (gx_aurora::g_frame_open) {
         gx_aurora::run_host_overlay();
+        gx_aurora::g_timing_draws += aurora_get_stats()->drawCallCount;
+        const unsigned long long end_frame_start = gx_aurora::timing_now_us();
         aurora_end_frame();
+        gx_aurora::g_timing_end_frame_us += gx_aurora::timing_now_us() - end_frame_start;
         gx_aurora::g_frame_open = false;
     }
     ++gx_aurora::g_present_count;

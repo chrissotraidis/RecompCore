@@ -136,6 +136,10 @@ void aurora_set_log_level(AuroraLogLevel level);
 void aurora_set_pause_on_focus_lost(bool value);
 void aurora_set_background_input(bool value);
 void aurora_set_resampler(AuroraSampler sampler);
+/* Internal render resolution as a multiple of the game's 640x480 frame
+   buffer (3 renders 1920x1440 and scales the result to the window); 0 renders
+   at the window's native pixel size. Takes effect at the next frame. */
+void aurora_set_frame_buffer_scale(float scale);
 
 AuroraBackend aurora_get_backend();
 const AuroraBackend* aurora_get_available_backends(size_t* count);

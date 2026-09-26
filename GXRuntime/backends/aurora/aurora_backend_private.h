@@ -43,6 +43,7 @@ extern unsigned long long g_present_count;
 extern unsigned long long g_fifo_bytes;
 extern unsigned long long g_audio_push_count;
 extern unsigned long long g_audio_throttle_count;
+extern unsigned long long g_audio_dropped_count;
 extern unsigned long long g_audio_starved_count;
 extern unsigned long long g_audio_stretched_count;
 extern unsigned long long g_audio_low_log_push;

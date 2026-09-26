@@ -566,17 +566,36 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
                                       GapCounters& counters,
                                       CachedVertexAttrs* cached) const {
   DrawPlan plan;
+  build_draw_plan_into(draw, counters, cached, plan);
+  return plan;
+}
+
+// The same plan, written into a caller-owned object. The sink builds one plan
+// per draw (about 20,000 a frame on Wind Waker's title), and returning a fresh
+// DrawPlan allocated and freed its vertex and index arrays every time; reusing
+// one object keeps their capacity. Every other field is reset to its default.
+void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
+                                       GapCounters& counters,
+                                       CachedVertexAttrs* cached,
+                                       DrawPlan& plan) const {
+  {
+    std::vector<float> vertices = std::move(plan.vertices);
+    std::vector<std::uint16_t> indices = std::move(plan.indices);
+    plan = DrawPlan{};
+    vertices.clear();
+    indices.clear();
+    plan.vertices = std::move(vertices);
+    plan.indices = std::move(indices);
+  }
   auto skip = [&](const char* reason) {
     plan.ok = false;
     plan.skip_reason = reason;
     ++counters.draws_skipped;
-    return plan;
   };
   auto noop = [&](const char* reason) {
     plan.ok = false;
     plan.skip_reason = reason;
     ++counters.draws_noop;
-    return plan;
   };
 
   if (draw.cull_all) {
@@ -1223,8 +1242,16 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
 
   // Uniforms.
   VertexShaderConstants& c = plan.constants;
-  for (std::uint32_t row = 0; row < 63u; ++row)
-    (void)load_matrix_row(draw, row, c.transformmatrices[row]);
+  // Rows 0-29 are position_matrices laid end to end (3 rows of 4 per matrix)
+  // and rows 30-62 are tex_matrices the same way, so the 63 per-row copies
+  // load_matrix_row made (their validity result was discarded) are two block
+  // copies. This ran for every draw, about 18,000 a frame in heavy scenes.
+  static_assert(sizeof(draw.position_matrices) == 30u * 4u * sizeof(float));
+  static_assert(sizeof(draw.tex_matrices) == 33u * 4u * sizeof(float));
+  std::memcpy(&c.transformmatrices[0][0], draw.position_matrices,
+              sizeof(draw.position_matrices));
+  std::memcpy(&c.transformmatrices[30][0], draw.tex_matrices,
+              sizeof(draw.tex_matrices));
   const std::uint32_t pn_row = draw.current_pn_matrix * 3u;
   for (std::uint32_t k = 0; k < 3u; ++k)
     (void)load_matrix_row(draw, pn_row + k, c.posnormalmatrix[k]);
@@ -1613,7 +1640,7 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
 
   plan.ok = true;
   ++counters.draws_planned;
-  return plan;
+  return;
 }
 
 // --- Sink ---------------------------------------------------------------------
@@ -1628,8 +1655,9 @@ void GxCoreSink::on_consumed_draw(const ar::ConsumedDraw& draw,
   auto* self = static_cast<GxCoreSink*>(user);
   if (self->plan_observer_ == nullptr)
     return;
-  const DrawPlan plan = self->pending_state_.build_draw_plan(
-      draw, self->counters_, &self->cached_attrs_);
+  DrawPlan& plan = self->scratch_plan_;
+  self->pending_state_.build_draw_plan_into(draw, self->counters_,
+                                            &self->cached_attrs_, plan);
   self->plan_observer_(plan, self->plan_observer_user_);
 }
 

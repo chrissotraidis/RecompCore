@@ -37,6 +37,7 @@ unsigned long long g_present_count = 0;
 unsigned long long g_fifo_bytes = 0;
 unsigned long long g_audio_push_count = 0;
 unsigned long long g_audio_throttle_count = 0;
+unsigned long long g_audio_dropped_count = 0;
 unsigned long long g_audio_low_log_push = 0;
 u32 g_audio_sample_rate = 32000;
 SDL_AudioStream* g_audio_stream = nullptr;

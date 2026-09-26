@@ -3,6 +3,7 @@
 #include "gxruntime/aurora_recomp/retail_gx_frontend_c.h"
 
 #include <cstring>
+#include <cstdio>
 #include <new>
 
 namespace gxruntime::aurora_recomp {
@@ -246,11 +247,21 @@ std::uint32_t payload_pn_matrix_mask(const DolGxRecompState& state,
   return mask;
 }
 
-DrawTransformSnapshot snapshot_transform(const DolGxRecompState& state,
-                                         const DolGxRecompVertexLayout& layout,
-                                         std::span<const std::uint8_t> vertex_data,
-                                         std::uint16_t vertex_count) {
-  DrawTransformSnapshot out{};
+// Fills a queue slot in place. Every field is written (the arrays by a copy or,
+// for an invalid position matrix, a zero of that slot), so a reused slot reads
+// exactly as a value-initialized one would, without zeroing 2.3 KB first and
+// copying the result into the queue afterwards (both were per-draw memsets and
+// memmoves on the GX worker, about 18,000 draws a frame in heavy scenes).
+void snapshot_transform_into(DrawTransformSnapshot& out,
+                             const DolGxRecompState& state,
+                             const DolGxRecompVertexLayout& layout,
+                             std::span<const std::uint8_t> vertex_data,
+                             std::uint16_t vertex_count) {
+  out.transform_flags = 0u;
+  out.position_matrix_valid_mask = 0u;
+  std::memset(out.viewport, 0, sizeof(out.viewport));
+  std::memset(out.projection, 0, sizeof(out.projection));
+  out.projection_type = 0u;
   if (state.viewport_valid) {
     out.transform_flags |= kDrawTransformViewportValid;
     std::memcpy(out.viewport, state.viewport, sizeof(out.viewport));
@@ -266,8 +277,11 @@ DrawTransformSnapshot snapshot_transform(const DolGxRecompState& state,
   if (out.payload_pn_matrix_mask != 0u)
     out.transform_flags |= kDrawTransformPayloadPnMatrixValid;
   for (std::uint32_t i = 0; i < DOL_GX_RECOMP_POSITION_MATRIX_COUNT; ++i) {
-    if (!state.position_matrix_valid[i])
+    if (!state.position_matrix_valid[i]) {
+      std::memset(out.position_matrices[i], 0,
+                  sizeof(out.position_matrices[i]));
       continue;
+    }
     out.position_matrix_valid_mask |= (1u << i);
     std::memcpy(out.position_matrices[i], state.position_matrices[i],
                 sizeof(out.position_matrices[i]));
@@ -286,7 +300,6 @@ DrawTransformSnapshot snapshot_transform(const DolGxRecompState& state,
               sizeof(out.tex_matrix_word_mask));
   std::memcpy(out.xf_regs, state.xf_regs, sizeof(out.xf_regs));
   out.xf_reg_mask = state.xf_reg_mask;
-  return out;
 }
 
 } // namespace
@@ -302,6 +315,7 @@ void RetailGxFrontend::reset(const DolGuestAddressResolver* resolver) {
   fifo_buffer_.clear();
   draw_payload_queue_.clear();
   draw_transform_queue_.clear();
+  draw_queue_count_ = 0u;
   draw_payload_head_ = 0u;
   draw_transform_head_ = 0u;
   zero_vertex_draws_ = 0u;
@@ -637,7 +651,22 @@ bool RetailGxFrontend::parse_stream(std::span<const std::uint8_t> bytes,
                   static_cast<const std::uint8_t*>(range.data), range.size},
               false, false, depth + 1u, &dl_consumed) ||
           dl_consumed != range.size) {
-        return false;
+        // A display list that does not parse as GX commands (first met in
+        // Wind Waker's Hyrule stage, 2026-09-26) used to fail the whole FIFO,
+        // and a failed front end presents nothing more: a black screen with
+        // the game running. Drop that list, name it once, and go on; the
+        // cost is whatever that one list would have drawn.
+        static unsigned s_bad_lists = 0;
+        if (s_bad_lists < 8u) {
+          ++s_bad_lists;
+          std::fprintf(stderr,
+                       "[gx-frontend] skipped display list 0x%08X (%u bytes): %s "
+                       "(parsed %zu)\n",
+                       address, size, last_error_ != nullptr ? last_error_ : "trailing bytes",
+                       dl_consumed);
+        }
+        last_error_ = nullptr;
+        ++display_lists_skipped_;
       }
       continue;
     }
@@ -662,6 +691,11 @@ bool RetailGxFrontend::parse_stream(std::span<const std::uint8_t> bytes,
         return fail_parse("BP register handler rejected", cmd, pos,
                           bytes[pos + 1u], read_be32(bytes, pos + 1u));
       pos += 5u;
+      // Display copies (BP 0x52 with bit 14, GXCopyDisp): the game's own
+      // frames, counted to tell a game running at 15 fps from frames lost
+      // between the game and the screen.
+      if (bytes[pos - 4u] == DOL_GX_BP_REG_TRIGGER_EFB_COPY && (bytes[pos - 2u] & 0x40u) != 0u)
+        display_copies_.fetch_add(1u, std::memory_order_relaxed);
       if (stop_at_display_copy_ && allow_partial && depth == 0u &&
           bytes[pos - 4u] == DOL_GX_BP_REG_TRIGGER_EFB_COPY &&
           (bytes[pos - 2u] & 0x40u) != 0u) {
@@ -714,7 +748,34 @@ bool RetailGxFrontend::parse_stream(std::span<const std::uint8_t> bytes,
       continue;
     }
 
-    return fail_parse("unsupported FIFO opcode", cmd, pos);
+    // Dolphin's OpcodeDecoder hands an opcode it does not know to
+    // HandleUnknownOpcode, charges one cycle and continues with the next
+    // byte (0x44, "unknown metrics", is a known no-op the same way). Failing
+    // the parse instead stopped every later present: Wind Waker's Hyrule
+    // stage met an 0x7F just after loading and the screen stayed black
+    // (2026-09-26). Skip the byte, say so for the first few, and carry on.
+    {
+      static unsigned s_unknown_reports = 0;
+      if (cmd != 0x44u && s_unknown_reports < 8u) {
+        ++s_unknown_reports;
+        char context[64] = {0};
+        std::size_t n = 0;
+        for (std::size_t i = pos >= 6u ? pos - 6u : 0u;
+             i < bytes.size() && i < pos + 10u && n + 3u < sizeof(context); ++i)
+          n += static_cast<std::size_t>(std::snprintf(context + n, sizeof(context) - n,
+                                                      i == pos ? "[%02X]" : "%02X ", bytes[i]));
+        std::fprintf(stderr,
+                     "[gx-frontend] skipped unknown FIFO opcode 0x%02X at offset %zu "
+                     "depth %u: %s\n",
+                     static_cast<unsigned>(cmd), pos, static_cast<unsigned>(depth), context);
+      }
+      ++unknown_opcodes_skipped_;
+      if (record_fifo_bytes &&
+          !dol_gx_recomp_push_fifo(&state_, bytes.data() + pos, 1u))
+        return false;
+      ++pos;
+      continue;
+    }
   }
 
   *consumed = pos;
@@ -904,9 +965,18 @@ bool RetailGxFrontend::handle_draw(std::uint8_t command,
     };
     // Retain this draw's raw per-vertex bytes in trace order; emit_new_packets
     // pops them in lockstep so each Draw packet references its own payload.
-    draw_payload_queue_.emplace_back(vertex_data.begin(), vertex_data.end());
-    draw_transform_queue_.push_back(
-        snapshot_transform(state_, *layout, vertex_data, vertex_count));
+    // Both queues keep their slots across drains (draw_queue_count_ is the
+    // live length), so a slot's payload vector keeps its capacity instead of
+    // being allocated and freed for every draw.
+    if (draw_queue_count_ == draw_payload_queue_.size()) {
+      draw_payload_queue_.emplace_back();
+      draw_transform_queue_.emplace_back();
+    }
+    draw_payload_queue_[draw_queue_count_].assign(vertex_data.begin(),
+                                                  vertex_data.end());
+    snapshot_transform_into(draw_transform_queue_[draw_queue_count_], state_,
+                            *layout, vertex_data, vertex_count);
+    ++draw_queue_count_;
   }
 
   for (std::uint32_t i = 0u; i < layout->indexed_attr_count; ++i) {
@@ -962,14 +1032,28 @@ bool RetailGxFrontend::emit_new_packets(AuroraRenderSink& sink,
     // reads as freshly built.
     const bool is_draw = events[i].kind == DOL_GX_RECOMP_EVENT_DRAW;
     RenderPacket& packet = scratch_packet_;
-    if (is_draw || scratch_draw_dirty_)
+    // A Draw packet whose transform snapshot is queued has every array
+    // overwritten below, so only its payload pointer needs resetting; the
+    // full 2.3 KB zero is kept for a draw without one. After a draw only the
+    // header is cleared: the sinks read packet.draw for Draw packets alone.
+    const bool draw_has_transform =
+        is_draw && draw_transform_head_ < draw_queue_count_;
+    if (is_draw && !draw_has_transform) {
       packet.draw = {};
+    } else if (is_draw || scratch_draw_dirty_) {
+      packet.draw.primitive = 0u;
+      packet.draw.vtx_fmt = 0u;
+      packet.draw.vertex_count = 0u;
+      packet.draw.vertex_size = 0u;
+      packet.draw.vertex_payload = nullptr;
+      packet.draw.vertex_payload_size = 0u;
+    }
     scratch_draw_dirty_ = is_draw;
     fill_render_packet(packet, sequence, events[i]);
     // Draw events are emitted exactly once, in order, so the retained payloads
     // pop FIFO in lockstep. Attach this draw's raw bytes for the issuing sink.
     if (packet.kind == RenderPacketKind::Draw &&
-        draw_payload_head_ < draw_payload_queue_.size()) {
+        draw_payload_head_ < draw_queue_count_) {
       const std::vector<std::uint8_t>& payload =
           draw_payload_queue_[draw_payload_head_++];
       packet.draw.vertex_payload = payload.data();
@@ -977,7 +1061,7 @@ bool RetailGxFrontend::emit_new_packets(AuroraRenderSink& sink,
           static_cast<std::uint32_t>(payload.size());
     }
     if (packet.kind == RenderPacketKind::Draw &&
-        draw_transform_head_ < draw_transform_queue_.size()) {
+        draw_transform_head_ < draw_queue_count_) {
       const DrawTransformSnapshot& transform =
           draw_transform_queue_[draw_transform_head_++];
       packet.draw.transform_flags = transform.transform_flags;
@@ -1029,8 +1113,7 @@ void RetailGxFrontend::drain_emitted_packets(std::uint32_t emitted_count) {
   // Drain mode emits every pending event each flush, so all retained draw
   // payloads were just consumed; release them and reset the FIFO cursor so the
   // queue cannot grow unbounded across a long run.
-  draw_payload_queue_.clear();
-  draw_transform_queue_.clear();
+  draw_queue_count_ = 0u;
   draw_payload_head_ = 0u;
   draw_transform_head_ = 0u;
   if (emitted_count >= state_.trace_count) {

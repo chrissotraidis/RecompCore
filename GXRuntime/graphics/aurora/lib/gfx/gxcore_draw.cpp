@@ -1055,9 +1055,13 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       // Multi-texmap: bind each used texmap at 2t (texture) / 2t+1 (sampler),
       // matching the WGSL declarations. If any referenced texmap fails to
       // resolve the draw is not drawable (avoids a missing-bind-group error).
-      std::vector<TextureHandle> held;
-      std::vector<wgpu::Sampler> heldSamplers;
-      std::vector<WGPUBindGroupEntry> entries;
+      // At most eight texmaps, two entries each: fixed arrays, so a draw does
+      // not allocate (the title screen issues about 20,000 draws a frame).
+      std::array<TextureHandle, 8> held{};
+      std::array<wgpu::Sampler, 8> heldSamplers{};
+      std::array<WGPUBindGroupEntry, 16> entries{};
+      size_t heldCount = 0;
+      size_t entryCount = 0;
       bool complete = true;
       for (uint32_t t = 0; t < 8u; ++t) {
         if ((plan.texmap_mask & (1u << t)) == 0u)
@@ -1073,20 +1077,20 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
           complete = false;
           break;
         }
-        held.push_back(bound);
-        heldSamplers.push_back(
-            sampler_ref(sampler_descriptor(plan.samplers[t])));
-        entries.push_back(WGPUBindGroupEntry{
-            .binding = 2u * t, .textureView = bound->sampleTextureView.Get()});
-        entries.push_back(WGPUBindGroupEntry{.binding = 2u * t + 1u,
-                                             .sampler = heldSamplers.back().Get()});
+        held[heldCount] = bound;
+        heldSamplers[heldCount] = sampler_ref(sampler_descriptor(plan.samplers[t]));
+        entries[entryCount++] = WGPUBindGroupEntry{
+            .binding = 2u * t, .textureView = bound->sampleTextureView.Get()};
+        entries[entryCount++] = WGPUBindGroupEntry{
+            .binding = 2u * t + 1u, .sampler = heldSamplers[heldCount].Get()};
+        ++heldCount;
       }
       if (!complete)
         return false;
       const WGPUBindGroupDescriptor descriptor{
           .label = {"GXCore Texture Bind Group", WGPU_STRLEN},
           .layout = texture_bind_group_layout(plan.texmap_mask).Get(),
-          .entryCount = entries.size(),
+          .entryCount = entryCount,
           .entries = entries.data(),
       };
       textureBindGroup = bind_group_ref(descriptor);

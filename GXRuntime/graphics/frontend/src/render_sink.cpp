@@ -209,10 +209,12 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
     ConsumedDraw* slot;
     if (streaming_ && draws_.size() == 1u) {
       slot = &draws_[0];
-      std::vector<std::uint8_t> keep = std::move(slot->vertex_payload);
-      *slot = ConsumedDraw{};
-      keep.clear();
-      slot->vertex_payload = std::move(keep);
+      // Every other field is assigned below, and arrays[] entries are fully
+      // written when a span appends them, so resetting the count and the
+      // payload is the whole reset (a value-initialize here zeroed 3.7 KB per
+      // draw only for the copies below to overwrite it).
+      slot->array_input_count = 0u;
+      slot->vertex_payload.clear();
     } else {
       if (streaming_)
         draws_.clear();

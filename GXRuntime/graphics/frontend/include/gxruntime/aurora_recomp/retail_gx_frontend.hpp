@@ -3,6 +3,7 @@
 
 #include "gxruntime/aurora_recomp/render_sink.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -100,6 +101,7 @@ public:
   // counts each unmerged one in drawCallCount). Replay adds this to its draw
   // count when gating against recorded PRESENT_STATS.
   std::uint64_t zero_vertex_draws() const { return zero_vertex_draws_; }
+  std::uint64_t display_copies() const { return display_copies_.load(std::memory_order_relaxed); }
   const char* last_error() const { return last_error_; }
   std::size_t last_error_offset() const { return last_error_offset_; }
   std::uint8_t last_error_opcode() const { return last_error_opcode_; }
@@ -141,12 +143,16 @@ private:
   // inner heap storage the emitted packets point at.
   std::vector<std::vector<std::uint8_t>> draw_payload_queue_;
   std::vector<DrawTransformSnapshot> draw_transform_queue_;
+  std::size_t draw_queue_count_ = 0; // live slots; the vectors keep capacity
   std::size_t draw_payload_head_ = 0;
   std::size_t draw_transform_head_ = 0;
   void notify_events(std::uint32_t first_event);
 
   bool packet_drain_enabled_ = false;
   std::uint64_t zero_vertex_draws_ = 0;
+  std::uint64_t unknown_opcodes_skipped_ = 0;
+  std::uint64_t display_lists_skipped_ = 0;
+  std::atomic<std::uint64_t> display_copies_{0};
   TraceEventObserver event_observer_ = nullptr;
   void* event_observer_user_ = nullptr;
   std::uint32_t emitted_trace_count_ = 0;

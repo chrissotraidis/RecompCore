@@ -73,6 +73,19 @@ void aurora_backend_audio_push(const s16* samples, u32 frames) {
     }
 
     int queued = SDL_GetAudioStreamQueued(gx_aurora::g_audio_stream);
+    // With the host pacing retraces by the wall clock (BlueWake's
+    // BLUEWAKE_WALL_PACE), the queue must not pace the game as well: its 1 ms
+    // waits added up to about 35 ms whenever the device drained a buffer, and
+    // two or three frames a second stayed on screen for 60 ms. A push that
+    // would overfill the queue is dropped instead and counted.
+    static const bool no_throttle = [] {
+        const char* env = std::getenv("DOL_AUDIO_NO_THROTTLE");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    if (no_throttle && queued > max_queued_bytes) {
+        gx_aurora::g_audio_dropped_count++;
+        return;
+    }
     unsigned waited_ms = 0;
     while (queued > max_queued_bytes && waited_ms < 20u) {
         gx_aurora::g_audio_throttle_count++;
