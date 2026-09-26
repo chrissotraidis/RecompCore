@@ -32,6 +32,7 @@ void reset_texture_cache();
 void note_frame_presented();
 void set_texture_dirty_epoch_observer(
     bool (*observer)(uint32_t, uint32_t, uint64_t*));
+unsigned long long texture_upload_count();
 } // namespace aurora::gfx::gxcore
 #endif
 
@@ -499,7 +500,24 @@ void g_fifo_worker_main() {
             batch.swap(g_fifo_handoff);
             parsed = g_fifo_appended;
         }
+        // A slow batch holds the game thread at its next draw-done; say what
+        // the worker made in it (pipelines, decoded textures) so the cause
+        // is in the session log. DOL_GX_SLOW_BATCH_MS sets the bar (20).
+        static const long slow_ms = [] {
+            const char* env = std::getenv("DOL_GX_SLOW_BATCH_MS");
+            return env != nullptr ? std::strtol(env, nullptr, 10) : 20L;
+        }();
+        const auto t0 = std::chrono::steady_clock::now();
+        const uint32_t pipelines0 = aurora_get_stats()->createdPipelines;
+        const unsigned long long uploads0 = aurora::gfx::gxcore::texture_upload_count();
         g_fifo_translate(batch);
+        const long ms = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                              std::chrono::steady_clock::now() - t0)
+                                              .count());
+        if (slow_ms > 0 && ms >= slow_ms)
+            std::fprintf(stderr, "[gx-slow] batch_ms=%ld bytes=%zu pipelines=%u textures=%llu\n", ms,
+                         batch.size(), aurora_get_stats()->createdPipelines - pipelines0,
+                         aurora::gfx::gxcore::texture_upload_count() - uploads0);
         {
             std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
             g_fifo_parsed = parsed;

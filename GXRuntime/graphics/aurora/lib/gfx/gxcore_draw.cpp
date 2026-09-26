@@ -662,6 +662,7 @@ void set_texture_dirty_epoch_observer(TextureDirtyEpochObserver observer) {
 }
 
 const TextureCacheStats& texture_cache_stats() { return g_textureCacheStats; }
+unsigned long long texture_upload_count() { return g_textureCacheStats.uploads; }
 
 // Resolve the current EFB region into a texture the guest-identity path can bind
 // later, keyed by the copy's destination address (63/S16). Mirrors aurora
