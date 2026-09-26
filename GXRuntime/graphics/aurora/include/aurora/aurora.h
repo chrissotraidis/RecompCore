@@ -140,6 +140,11 @@ void aurora_set_resampler(AuroraSampler sampler);
    buffer (3 renders 1920x1440 and scales the result to the window); 0 renders
    at the window's native pixel size. Takes effect at the next frame. */
 void aurora_set_frame_buffer_scale(float scale);
+/* Anisotropic filtering for every mipmapped, linearly filtered texture, as
+   Dolphin's "Anisotropic Filtering" enhancement: 1 (or 0) leaves the game's
+   own sampler settings, 2-16 forces that many samples. Takes effect at the
+   next draw. DOL_AURORA_FORCE_ANISO sets the starting value. */
+void aurora_set_forced_anisotropy(unsigned samples);
 
 AuroraBackend aurora_get_backend();
 const AuroraBackend* aurora_get_available_backends(size_t* count);

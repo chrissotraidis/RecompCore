@@ -230,6 +230,21 @@ void test_state_to_plan_and_wgsl() {
     CHECK(sampler_plan.samplers[0].mipmap_filter == 2u);
   }
 
+  // Hardware 5 (GX_LIN_MIP_NEAR) and 2 (GX_NEAR_MIP_LIN): bit 7 is the
+  // minification filter, bits 5-6 the mip mode (Dolphin's TexMode0).
+  {
+    gxc::GxCoreState sampler_state = state;
+    sampler_state.apply(bp(0x80u, 5u << 5u));
+    gxc::GapCounters gaps;
+    const gxc::DrawPlan lin_mip_near = sampler_state.build_draw_plan(draw, gaps);
+    CHECK(lin_mip_near.samplers[0].min_filter == 1u);
+    CHECK(lin_mip_near.samplers[0].mipmap_filter == 1u);
+    sampler_state.apply(bp(0x80u, 2u << 5u));
+    const gxc::DrawPlan near_mip_lin = sampler_state.build_draw_plan(draw, gaps);
+    CHECK(near_mip_lin.samplers[0].min_filter == 0u);
+    CHECK(near_mip_lin.samplers[0].mipmap_filter == 2u);
+  }
+
   // J3D writes BP SU_SSIZE/SU_TSIZE for every active texcoord. Dolphin turns
   // scale_minus_1 back into the rasterized fixed-point S/T scale; it is not a
   // texture-unit sampler property and can differ from the sampled image size.

@@ -1401,11 +1401,14 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     if (bp_valid_[mode0_reg]) {
       const std::uint32_t mode0 = bp_regs_[mode0_reg];
       const std::uint32_t min_filter = bits(mode0, 3, 5);
+      // TX_SETMODE0 bits 5-7: the mip mode in bits 5-6 (none, point, linear;
+      // 3 samples as point) and the minification filter in bit 7 (Dolphin's
+      // TexMode0). GX_LIN_MIP_NEAR is 5 and GX_NEAR_MIP_LIN 2 here.
       static constexpr std::uint8_t kMinFilter[8] = {
-          0, 0, 1, 0, 1, 0, 1, 0,
+          0, 0, 0, 0, 1, 1, 1, 1,
       };
       static constexpr std::uint8_t kMipmapFilter[8] = {
-          0, 1, 1, 0, 0, 2, 2, 0,
+          0, 1, 2, 1, 0, 1, 2, 1,
       };
       sampler.wrap_s = static_cast<std::uint8_t>(bits(mode0, 2, 0));
       sampler.wrap_t = static_cast<std::uint8_t>(bits(mode0, 2, 2));

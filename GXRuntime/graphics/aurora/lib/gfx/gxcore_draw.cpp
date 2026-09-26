@@ -1,5 +1,7 @@
 #include "gxcore_draw.hpp"
 
+#include <aurora/aurora.h> // aurora_set_forced_anisotropy
+
 #include "../webgpu/gpu.hpp"
 #include "../gx/gx.hpp" // UseReversedZ + set_logical_viewport (substrate glue)
 #include "texture.hpp"
@@ -106,6 +108,14 @@ wgpu::BlendFactor to_blend_factor_dst(gxc::DstBlendFactor factor,
   }
 }
 
+// Forced anisotropy (aurora_set_forced_anisotropy): 1 leaves the game's samplers.
+std::uint16_t initial_forced_anisotropy() {
+  const char* env = std::getenv("DOL_AURORA_FORCE_ANISO");
+  const long samples = env != nullptr ? std::strtol(env, nullptr, 10) : 1L;
+  return static_cast<std::uint16_t>(std::clamp(samples, 1L, 16L));
+}
+std::atomic<std::uint16_t> g_forcedAnisotropy{initial_forced_anisotropy()};
+
 wgpu::AddressMode to_address_mode(std::uint8_t wrap) {
   switch (wrap) {
   case 1:
@@ -129,6 +139,14 @@ wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler) {
                         : std::max<std::uint16_t>(
                               webgpu::g_graphicsConfig.textureAnisotropy, 1u);
   }
+  // The player's forced anisotropy (aurora_set_forced_anisotropy), with
+  // Dolphin's rule: every texture except one filtered nearest both ways (pixel
+  // art, fonts), all filters linear. Most of Wind Waker's textures have no
+  // mips (TX_SETMODE0 filter 4), so the anisotropic taps are what sharpen the
+  // ground and the walls at a glancing angle.
+  const std::uint16_t forced = g_forcedAnisotropy.load(std::memory_order_relaxed);
+  if (forced > 1u && (sampler.min_filter != 0u || sampler.mag_filter != 0u))
+    maxAnisotropy = std::max(maxAnisotropy, forced);
   auto magFilter = sampler.mag_filter != 0u ? wgpu::FilterMode::Linear
                                              : wgpu::FilterMode::Nearest;
   auto minFilter = sampler.min_filter != 0u ? wgpu::FilterMode::Linear
@@ -1202,3 +1220,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
 }
 
 } // namespace aurora::gfx::gxcore
+
+void aurora_set_forced_anisotropy(unsigned samples) {
+  aurora::gfx::gxcore::g_forcedAnisotropy.store(
+      static_cast<std::uint16_t>(std::clamp(samples, 1u, 16u)), std::memory_order_relaxed);
+}
