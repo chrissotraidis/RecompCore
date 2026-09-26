@@ -423,6 +423,27 @@ AuroraWindowSize get_window_size() {
 
   int fb_w = native_fb_w;
   int fb_h = native_fb_h;
+  const auto [cfgW, cfgH] = vi::configured_fb_size();
+  if (g_frameBufferScale > 0.f && g_frameBufferAspectFit && g_frameBufferAspectOverride > 0.f && cfgH > 0) {
+    // An anamorphic display aspect (the widescreen code) at a render scale:
+    // the game's full height times the scale, and the width that aspect
+    // needs. Fitting the scaled 4:3 frame to 16:9 instead gave 1921x1081 at
+    // 3x, a vertical scale of 2.252, where the game's letterbox bars and the
+    // scene's scissor rounded to different rows and left a line of sky
+    // along the top of the picture. Whole-number scales round alike.
+    fb_h = std::max(1, static_cast<int>(std::lround(static_cast<float>(cfgH) * g_frameBufferScale)));
+    fb_w = std::max(1, static_cast<int>(std::lround(static_cast<float>(fb_h) * g_frameBufferAspectOverride)));
+    const float scale = SDL_GetWindowDisplayScale(g_window);
+    return {
+        .width = static_cast<uint32_t>(width),
+        .height = static_cast<uint32_t>(height),
+        .fb_width = static_cast<uint32_t>(fb_w),
+        .fb_height = static_cast<uint32_t>(fb_h),
+        .native_fb_width = static_cast<uint32_t>(native_fb_w),
+        .native_fb_height = static_cast<uint32_t>(native_fb_h),
+        .scale = scale,
+    };
+  }
   if (g_frameBufferScale > 0.f) {
     const auto [baseW, baseH] = vi::configured_fb_size();
     const auto [scaledW, scaledH] =
