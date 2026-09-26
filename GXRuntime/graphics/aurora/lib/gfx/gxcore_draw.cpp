@@ -4,6 +4,7 @@
 #include "../gx/gx.hpp" // UseReversedZ + set_logical_viewport (substrate glue)
 #include "texture.hpp"
 #include "tex_copy_conv.hpp" // EFB-copy format conversion (63/S16)
+#include "texture_replacement.hpp" // Dolphin-format HD texture packs
 
 #include <gxruntime/gxcore/gxcore.hpp> // EfbCopyCommand
 #include <gxruntime/gxcore/texture_decode.hpp>
@@ -954,6 +955,34 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     addrIt = g_textureAddrKey.find(address);
     if (addrIt != g_textureAddrKey.end())
       g_textureCache.erase(addrIt->second.key);
+    // HD texture packs (Dolphin's tex1_WxH_hash[_tlut]_fmt names): the first
+    // time these guest bytes are seen, look for a replacement before decoding.
+    // The handle is cached under the same content key as a decode would be,
+    // so later draws of the same texture never repeat the lookup.
+    if (texture_replacement::has_source_replacements()) {
+      static unsigned long long s_lookups;
+      static const bool s_log_misses = std::getenv("DOL_TEXREP_LOG_MISSES") != nullptr;
+      ++s_lookups;
+      const auto replacement = texture_replacement::find_replacement_for_guest(
+          width, height, format, bytes, size, static_cast<const uint8_t*>(tlut_data),
+          tlut_data != nullptr ? std::min(tlut_available, tlut_entries * 2u) : 0u);
+      if (s_log_misses && !(replacement.has_value() && *replacement))
+        std::fprintf(stderr, "[mods] texture miss #%llu addr=%08X fmt=%u %ux%u size=%u tlut=%u\n", s_lookups,
+                     address, format, width, height, size, tlut_entries);
+      if (replacement.has_value() && *replacement) {
+        ++g_textureCacheStats.uploads;
+        static unsigned long long s_replaced;
+        if (++s_replaced <= 3u || (s_replaced % 200u) == 0u)
+          std::fprintf(stderr, "[mods] texture replaced #%llu addr=%08X fmt=%u %ux%u -> %ux%u\n",
+                       s_replaced, address, format, width, height, (*replacement)->size.width,
+                       (*replacement)->size.height);
+        g_textureCache.emplace(key, *replacement);
+        g_textureAddrKey[address] = TextureAddressState{
+            key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid,
+            small_hash, verify_frame};
+        return *replacement;
+      }
+    }
     // gxcore owns the decode for every format: produce tightly-packed RGBA8 and
     // upload it as a pre-decoded PC texture (no substrate re-conversion).
     std::vector<uint8_t> decoded;

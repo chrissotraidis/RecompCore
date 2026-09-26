@@ -3,6 +3,7 @@
 #include <aurora/aurora.h>
 #include <aurora/event.h>
 #include <aurora/gfx.h>
+#include <aurora/texture.hpp>
 #include <gxruntime/guest_memory_dirty.h>
 #if GXRUNTIME_HAS_AURORA_RECOMP
 #include <gfx/gxcore_draw.hpp>
@@ -267,7 +268,25 @@ bool dol_aurora_initialize(int argc, char** argv,
         const char* fit_env = std::getenv("DOL_AURORA_ASPECT_FIT");
         if (fit_env != nullptr && fit_env[0] != '\0')
             aspect_fit = fit_env[0] != '0';
+        // DOL_AURORA_ASPECT_RATIO: a display aspect to letterbox to, such as
+        // 1.7778 for a game patched to render anamorphic 16:9 (the
+        // widescreen mod). It implies fitting.
+        const char* ratio_env = std::getenv("DOL_AURORA_ASPECT_RATIO");
+        const float ratio = ratio_env != nullptr ? std::strtof(ratio_env, nullptr) : 0.f;
+        if (ratio > 0.f) {
+            aspect_fit = true;
+            aurora::window::set_frame_buffer_aspect_override(ratio);
+        }
         aurora::window::set_frame_buffer_aspect_fit(aspect_fit);
+    }
+    // DOL_AURORA_TEXTURE_PACK: a folder of Dolphin-format replacement
+    // textures (tex1_WxH_hash[_tlut]_fmt.png or .dds, searched recursively,
+    // with _mipN sidecars), such as an HD texture pack's GZL folder.
+    if (const char* pack = std::getenv("DOL_AURORA_TEXTURE_PACK"); pack != nullptr && pack[0] != '\0') {
+        static aurora::texture::ReplacementGroup s_texture_pack;
+        s_texture_pack = aurora::texture::load_replacement_directory(pack);
+        std::fprintf(stderr, "[mods] texture-pack=%s replacements=%zu\n", pack,
+                     s_texture_pack.registrations.size());
     }
 
     gx_aurora::g_graphics_log = backend_config->graphics_logging;

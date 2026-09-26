@@ -17,6 +17,9 @@
 #include <absl/hash/hash.h>
 
 #include <algorithm>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 #include <array>
 #include <charconv>
 #include <cstring>
@@ -35,7 +38,13 @@ using aurora::webgpu::g_device;
 namespace {
 aurora::Module Log("aurora::texture");
 
+#if defined(__APPLE__) && defined(TARGET_OS_IOS) && TARGET_OS_IOS
+// iPad and iPhone apps share far less memory; the decoded HD textures of a
+// scene stay well under this.
+constexpr uint64_t kReplacementCacheBudgetBytes = 1073741824; // 1GB
+#else
 constexpr uint64_t kReplacementCacheBudgetBytes = 4294967296; // 4GB
+#endif
 constexpr uint64_t kReplacementWildcardTextureHash = 0xFFFFFFFFFFFFFFFFull;
 constexpr uint64_t kReplacementWildcardTlutHash = 0xFFFFFFFFFFFFFFFEull;
 
@@ -1249,5 +1258,67 @@ std::optional<TextureHandle> find_replacement(const GXTexObj_& obj, const GXTlut
 std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept {
   const auto key = build_source_key(obj);
   return format_replacement_filename(key);
+}
+
+bool has_source_replacements() noexcept {
+  std::lock_guard lk(s_registryMutex);
+  return s_sourceEntryCount != 0;
+}
+
+std::optional<TextureHandle> find_replacement_for_guest(uint32_t width, uint32_t height, uint32_t format,
+                                                        const uint8_t* data, uint32_t data_size,
+                                                        const uint8_t* tlut, uint32_t tlut_bytes) noexcept {
+  ZoneScoped;
+  if (data == nullptr || width == 0 || height == 0) {
+    return std::nullopt;
+  }
+  const uint32_t base_size =
+      GXGetTexBufferSize(static_cast<u16>(width), static_cast<u16>(height), format, false, 0);
+  if (base_size == 0 || base_size > data_size) {
+    return std::nullopt;
+  }
+  texture::TextureSourceKey key{
+      .textureHash = XXH64(data, base_size, 0),
+      .width = width,
+      .height = height,
+      .format = format,
+      .hasTlut = format == GX_TF_C4 || format == GX_TF_C8 || format == GX_TF_C14X2,
+  };
+  if (key.hasTlut) {
+    // Dolphin hashes only the palette entries the texture references.
+    uint32_t lo = 0xffff, hi = 0;
+    if (format == GX_TF_C4) {
+      for (uint32_t i = 0; i < base_size; ++i) {
+        lo = std::min({lo, uint32_t(data[i] & 0xf), uint32_t(data[i] >> 4)});
+        hi = std::max({hi, uint32_t(data[i] & 0xf), uint32_t(data[i] >> 4)});
+      }
+    } else if (format == GX_TF_C8) {
+      for (uint32_t i = 0; i < base_size; ++i) {
+        lo = std::min(lo, uint32_t(data[i]));
+        hi = std::max(hi, uint32_t(data[i]));
+      }
+    } else {
+      for (uint32_t i = 0; i + 1 < base_size; i += 2) {
+        const uint32_t v = ((uint32_t(data[i]) << 8) | data[i + 1]) & 0x3fff;
+        lo = std::min(lo, v);
+        hi = std::max(hi, v);
+      }
+    }
+    const size_t offset = 2 * size_t(lo);
+    const size_t size = 2 * (size_t(hi) + 1 - lo);
+    if (tlut == nullptr || lo > hi || offset + size > tlut_bytes) {
+      return std::nullopt;
+    }
+    key.tlutHash = XXH64(tlut + offset, size, 0);
+  }
+  std::lock_guard lk(s_registryMutex);
+  if (s_sourceEntryCount == 0) {
+    return std::nullopt;
+  }
+  const auto replacementKey = find_source_replacement_key_locked(key);
+  if (!replacementKey.has_value()) {
+    return std::nullopt;
+  }
+  return find_replacement_for_key_locked(*replacementKey);
 }
 } // namespace aurora::gfx::texture_replacement

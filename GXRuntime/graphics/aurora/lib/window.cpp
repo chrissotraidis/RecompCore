@@ -42,6 +42,9 @@ SDL_Window* g_window;
 SDL_Renderer* g_renderer;
 float g_frameBufferScale = 0.f;
 bool g_frameBufferAspectFit = false;
+// A display aspect (width / height) to fit instead of the configured frame's,
+// for games patched to render anamorphic 16:9 (0 keeps the frame's aspect).
+float g_frameBufferAspectOverride = 0.f;
 AuroraWindowSize g_windowSize;
 std::vector<AuroraEvent> g_events;
 std::atomic_bool g_backgrounded = false;
@@ -431,8 +434,11 @@ AuroraWindowSize get_window_size() {
   if (g_frameBufferAspectFit) {
     const auto [baseW, baseH] = vi::configured_fb_size();
     if (baseW > 0 && baseH > 0) {
+      const float aspect = g_frameBufferAspectOverride > 0.f
+                               ? g_frameBufferAspectOverride
+                               : static_cast<float>(baseW) / static_cast<float>(baseH);
       const auto [fitW, fitH] =
-          fit_frame_buffer_to_aspect(fb_w, fb_h, static_cast<float>(baseW) / static_cast<float>(baseH));
+          fit_frame_buffer_to_aspect(fb_w, fb_h, aspect);
       fb_w = fitW;
       fb_h = fitH;
     }
@@ -547,6 +553,11 @@ void set_frame_buffer_aspect_fit(bool fit) {
   }
 
   g_frameBufferAspectFit = fit;
+  request_frame_buffer_resize();
+}
+
+void set_frame_buffer_aspect_override(float aspect) {
+  g_frameBufferAspectOverride = aspect > 0.f ? aspect : 0.f;
   request_frame_buffer_resize();
 }
 
