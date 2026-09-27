@@ -844,11 +844,22 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     });
   }
   if (plan.scissor_valid) {
+    // Wind Waker draws its 2D layer (HUD, menus and the fade to and from
+    // black) with a 640x479 scissor, so the frame's last line keeps the
+    // previous scene through every fade. A television hides that line in its
+    // overscan; an iPad shows it as a strip of the old area along the bottom
+    // during transitions. Extend that full-width scissor to the full frame.
+    uint32_t scissorHeight = plan.scissor_height;
+    static const bool s_keepLastLine = std::getenv("DOL_GXCORE_KEEP_SCISSOR_479") != nullptr;
+    if (!s_keepLastLine && plan.scissor_x == 0 && plan.scissor_y == 0 && plan.scissor_width == 640 &&
+        plan.scissor_height == 479) {
+      scissorHeight = 480;
+    }
     gx::set_logical_scissor({
         .x = plan.scissor_x,
         .y = plan.scissor_y,
         .width = plan.scissor_width,
-        .height = plan.scissor_height,
+        .height = static_cast<int32_t>(scissorHeight),
     });
   }
 
