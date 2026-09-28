@@ -587,6 +587,11 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     plan.vertices = std::move(vertices);
     plan.indices = std::move(indices);
   }
+  plan.match_payload = draw.vertex_payload.data();
+  plan.match_payload_size = static_cast<std::uint32_t>(draw.vertex_payload.size());
+  plan.match_primitive = draw.primitive;
+  plan.match_vtx_fmt = draw.vtx_fmt;
+  plan.match_vertex_stride = draw.vertex_size;
   auto skip = [&](const char* reason) {
     plan.ok = false;
     plan.skip_reason = reason;
@@ -618,6 +623,8 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     ++counters.vertex_payload_empty;
     return skip("draw carried no payload");
   }
+
+  plan.match_direct_position = bits(vcd_lo_, 2, 9) == 1u; // VCD position: direct
 
   // BP-derived pipeline state.
   const std::uint32_t gen_mode = bp_valid_[0x00] ? bp_regs_[0x00] : 0u;

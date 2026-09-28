@@ -195,6 +195,10 @@ extern wgpu::BindGroupLayout g_staticBindGroupLayout;
 extern wgpu::BindGroup g_staticBindGroup;
 extern wgpu::BindGroupLayout g_uniformBindGroupLayout;
 extern wgpu::BindGroup g_uniformBindGroup;
+// In-between frames (frame_interp.hpp): blended vertex constants live in their
+// own area, filled while the frame records and uploaded once when it ends, so
+// they never take room from (or split) the frame's staging.
+extern wgpu::BindGroup g_interpUniformBindGroup;
 
 using BindGroupRef = HashType;
 using PipelineRef = HashType;
@@ -247,6 +251,9 @@ void after_submit() noexcept;
 void gpu_synchronize();
 void after_present() noexcept;
 float calculate_fps() noexcept;
+// Game frames finished a second (each one presents once, or twice with an
+// in-between frame); calculate_fps() counts every present.
+float calculate_game_fps() noexcept;
 void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                   Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat = GX_TF_RGBA8);
 
@@ -297,6 +304,9 @@ static Range push_indices(ArrayRef<T> data, size_t alignment) {
   return push_indices(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T), alignment);
 }
 Range push_uniform(const uint8_t* data, size_t length);
+// A block for the in-between frame; an empty range when the area is full
+// (the draw then keeps its own constants there).
+Range push_interp_uniform(const uint8_t* data, size_t length);
 // Identifies the frame packet (a new one per frame and per staging segment)
 // that staging ranges belong to; 0 when no frame is recording.
 uint64_t current_frame_id();

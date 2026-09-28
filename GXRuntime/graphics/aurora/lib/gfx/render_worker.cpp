@@ -16,6 +16,7 @@ std::thread g_thread;
 std::atomic_bool g_running = false;
 std::atomic_size_t g_pendingItems = 0;
 std::thread::id g_workerThreadId;
+WorkCallback g_idleHook;
 
 void complete_sync(const std::shared_ptr<SyncState>& sync) {
   if (!sync) {
@@ -36,6 +37,9 @@ void worker_main() {
   g_workerThreadId = std::this_thread::get_id();
 
   while (true) {
+    if (g_idleHook) {
+      g_idleHook();
+    }
     bool closed = false;
     auto item = g_queue.pop_for(IdlePumpInterval, closed);
     if (!item) {
@@ -264,6 +268,8 @@ void synchronize() {
 }
 
 bool is_worker_thread() noexcept { return g_workerThreadId == std::this_thread::get_id(); }
+
+void set_idle_hook(WorkCallback hook) { g_idleHook = std::move(hook); }
 
 bool is_idle() noexcept { return g_pendingItems.load(std::memory_order_acquire) == 0; }
 

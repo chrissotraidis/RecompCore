@@ -5,6 +5,10 @@
 #include "gfx/render_worker.hpp"
 #include "gx/fifo.hpp"
 #include "imgui.hpp"
+#include <imgui.h>
+
+#include <atomic>
+#include <cstdlib>
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
 #include <webgpu/webgpu_cpp.h>
@@ -245,11 +249,45 @@ bool begin_frame() noexcept {
   return true;
 }
 
+#ifdef AURORA_ENABLE_GX
+// Frames a second at the top of the window (DOL_AURORA_SHOW_FPS=1 or
+// aurora_set_fps_overlay): every present, and the game's own frames under it
+// when in-between frames make the two differ.
+static std::atomic_bool g_showFps{[] {
+  const char* env = std::getenv("DOL_AURORA_SHOW_FPS");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}()};
+
+static void draw_fps_overlay() {
+  if (!g_showFps.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const float shown = gfx::calculate_fps();
+  const float game = gfx::calculate_game_fps();
+  // Top center: the corners hold the game's HUD (hearts, buttons, map, rupees).
+  ImGui::SetNextWindowPos(ImVec2{ImGui::GetIO().DisplaySize.x * 0.5f, 12.f}, ImGuiCond_Always, ImVec2{0.5f, 0.f});
+  ImGui::SetNextWindowBgAlpha(0.6f);
+  constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings |
+                                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+  if (ImGui::Begin("##aurora-fps", nullptr, flags)) {
+    ImGui::SetWindowFontScale(1.5f);
+    if (game > 0.f && shown > game + 5.f) {
+      ImGui::Text("%.0f FPS (game %.0f)", shown, game);
+    } else {
+      ImGui::Text("%.0f FPS", shown);
+    }
+  }
+  ImGui::End();
+}
+#endif
+
 void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
   gx::fifo::drain();
   gfx::finish();
+  draw_fps_overlay();
   auto imguiDrawData = imgui::freeze();
 
   const auto& presentSource = webgpu::present_source();
@@ -428,6 +466,13 @@ AuroraInfo aurora_initialize(int argc, char* argv[], const AuroraConfig* config)
 void aurora_shutdown() { aurora::shutdown(); }
 const AuroraEvent* aurora_update() { return aurora::update(); }
 bool aurora_begin_frame() { return aurora::begin_frame(); }
+void aurora_set_fps_overlay(bool enabled) {
+#ifdef AURORA_ENABLE_GX
+  aurora::g_showFps.store(enabled, std::memory_order_relaxed);
+#else
+  (void)enabled;
+#endif
+}
 void aurora_end_frame() { aurora::end_frame(); }
 AuroraBackend aurora_get_backend() { return aurora::g_config.desiredBackend; }
 const AuroraBackend* aurora_get_available_backends(size_t* count) {
