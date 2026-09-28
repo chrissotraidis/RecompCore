@@ -246,6 +246,27 @@ bool dol_aurora_initialize(int argc, char** argv,
     config.windowHeight = backend_config->window_height != 0
                               ? backend_config->window_height
                               : defaults.window_height;
+    // The display the picture is made for (desktop hosts; iOS fills its
+    // screen). DOL_AURORA_WINDOW=WxH sizes the window in points; otherwise a
+    // widened picture (DOL_AURORA_ASPECT_RATIO) gets a window of its shape at
+    // the configured height, so 16:10 opens 1152x720 rather than 960x720.
+    // DOL_AURORA_FULLSCREEN=1 starts fullscreen (a MacBook's fullscreen area,
+    // below the camera housing, is 16:10).
+    {
+        const char* window_env = std::getenv("DOL_AURORA_WINDOW");
+        unsigned width = 0, height = 0;
+        if (window_env != nullptr && std::sscanf(window_env, "%ux%u", &width, &height) == 2 &&
+            width >= 320 && height >= 240) {
+            config.windowWidth = width;
+            config.windowHeight = height;
+        } else if (const char* ratio_env = std::getenv("DOL_AURORA_ASPECT_RATIO")) {
+            const float ratio = std::strtof(ratio_env, nullptr);
+            if (ratio > 1.0f && ratio < 4.0f)
+                config.windowWidth = static_cast<uint32_t>(config.windowHeight * ratio + 0.5f);
+        }
+        const char* fullscreen_env = std::getenv("DOL_AURORA_FULLSCREEN");
+        config.startFullscreen = fullscreen_env != nullptr && fullscreen_env[0] != '\0' && fullscreen_env[0] != '0';
+    }
     config.allowTextureDumps = backend_config->allow_texture_dumps;
     config.logCallback = gx_aurora::log_callback;
     config.logLevel = backend_config->info_logging ? LOG_INFO : LOG_ERROR;
@@ -278,6 +299,14 @@ bool dol_aurora_initialize(int argc, char** argv,
             aurora::window::set_frame_buffer_aspect_override(ratio);
         }
         aurora::window::set_frame_buffer_aspect_fit(aspect_fit);
+    }
+    // DOL_AURORA_RENDER_SCALE: the render resolution as a multiple of the
+    // game's 480 lines (3 renders 1440 lines, the iOS default); 0 renders at
+    // the window's own pixel height. A widened picture keeps its aspect.
+    if (const char* scale_env = std::getenv("DOL_AURORA_RENDER_SCALE"); scale_env != nullptr && scale_env[0] != '\0') {
+        const float scale = std::strtof(scale_env, nullptr);
+        if (scale >= 0.f && scale <= 8.f)
+            aurora_set_frame_buffer_scale(scale);
     }
     // DOL_AURORA_TEXTURE_PACK: a folder of Dolphin-format replacement
     // textures (tex1_WxH_hash[_tlut]_fmt.png or .dds, searched recursively,
