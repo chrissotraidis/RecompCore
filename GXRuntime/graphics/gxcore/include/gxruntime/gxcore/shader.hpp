@@ -464,6 +464,17 @@ struct DrawPlan {
   std::vector<float> vertices; // kVertexFloats per vertex
   std::vector<std::uint16_t> indices;
   std::uint32_t vertex_count = 0;
+  // The draw's raw FIFO vertex payload (per-vertex indices and direct
+  // attributes) and its command, for matching one model's draw across frames.
+  // Borrowed from the consumed draw: valid only while the plan is submitted.
+  const std::uint8_t* match_payload = nullptr;
+  std::uint32_t match_payload_size = 0;
+  std::uint32_t match_primitive = 0;
+  std::uint32_t match_vtx_fmt = 0;
+  // Positions sent in the payload itself (particles, wave crests, 2D): the
+  // payload differs every frame, so such a draw is matched by its shape.
+  bool match_direct_position = false;
+  std::uint32_t match_vertex_stride = 0; // payload bytes per vertex
   // Viewport, raw XF values (wd/2, -ht/2, zmax*2^24, xorig+342, yorig+342,
   // farz*2^24) — the submission layer maps these through the substrate's
   // logical-viewport scaling.

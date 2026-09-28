@@ -61,6 +61,8 @@ endif ()
 # only when the fork builds inside GXRuntime with the recomp modules on.
 if (TARGET GXRuntime::gxcore)
     target_sources(aurora_gx PRIVATE
+        lib/gfx/frame_interp.cpp
+        lib/gfx/frame_interp.hpp
         lib/gfx/gxcore_draw.cpp
         lib/gfx/gxcore_draw.hpp
     )

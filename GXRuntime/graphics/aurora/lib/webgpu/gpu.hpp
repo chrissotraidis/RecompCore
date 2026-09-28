@@ -65,6 +65,9 @@ bool refresh_surface(bool recreate = true);
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force = false);
 TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled);
 const TextureWithSampler& present_source() noexcept;
+// Render worker: presents `source` in place of the frame buffer while set
+// (the real frame kept aside while an in-between frame took the EFB).
+void set_present_source_override(const TextureWithSampler* source) noexcept;
 wgpu::BindGroup create_copy_bind_group(const TextureWithSampler& source);
 void set_resampler(AuroraSampler sampler) noexcept;
 AuroraSampler get_resampler() noexcept;

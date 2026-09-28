@@ -19,6 +19,9 @@ struct DrawData {
   Range vertRange;
   Range idxRange;
   Range uniformRange;       // VertexShaderConstants (group 1)
+  // The constants blended toward the previous frame, used while the
+  // in-between frame is encoded (frame_interp.hpp); uniformRange otherwise.
+  Range interpUniformRange;
   Range pixelUniformRange;  // PixelShaderConstants (group 2), TEV path only
   uint32_t indexCount;
   BindGroupRef textureBindGroup; // 0 when untextured

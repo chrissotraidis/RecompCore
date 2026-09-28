@@ -83,6 +83,9 @@ void enqueue_work(WorkCallback work);
 void synchronize();
 
 bool is_worker_thread() noexcept;
+// Runs on the worker between queue items and at least every millisecond while
+// it waits: timed work such as a deferred present. Set before initialize().
+void set_idle_hook(WorkCallback hook);
 bool is_idle() noexcept;
 
 } // namespace aurora::gfx::render_worker

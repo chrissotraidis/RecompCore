@@ -1,6 +1,7 @@
 #include "gpu.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -308,8 +309,16 @@ TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool m
   };
 }
 
+static std::atomic<const TextureWithSampler*> g_presentSourceOverride{nullptr};
+
 const TextureWithSampler& present_source() noexcept {
+  if (const auto* source = g_presentSourceOverride.load(std::memory_order_acquire))
+    return *source;
   return g_graphicsConfig.msaaSamples > 1 ? g_frameBufferResolved : g_frameBuffer;
+}
+
+void set_present_source_override(const TextureWithSampler* source) noexcept {
+  g_presentSourceOverride.store(source, std::memory_order_release);
 }
 
 void set_resampler(AuroraSampler sampler) noexcept {

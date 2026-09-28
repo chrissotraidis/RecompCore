@@ -4,6 +4,7 @@
 
 #include "../webgpu/gpu.hpp"
 #include "../gx/gx.hpp" // UseReversedZ + set_logical_viewport (substrate glue)
+#include "frame_interp.hpp"
 #include "texture.hpp"
 #include "tex_copy_conv.hpp" // EFB-copy format conversion (63/S16)
 #include "texture_replacement.hpp" // Dolphin-format HD texture packs
@@ -634,8 +635,12 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   }
   if (data.depthPipeline != 0 && !bind_pipeline(data.depthPipeline, pass))
     return;
-  const std::array vsOffsets{data.uniformRange.offset};
-  pass.SetBindGroup(1, g_uniformBindGroup, vsOffsets.size(), vsOffsets.data());
+  // The in-between frame reads a moved draw's blended constants from their
+  // own area; every other draw keeps its own.
+  const bool blended = frame_interp::encoding_interpolated() && data.interpUniformRange.size != 0;
+  const auto& vsGroup = blended ? g_interpUniformBindGroup : g_uniformBindGroup;
+  const std::array vsOffsets{blended ? data.interpUniformRange.offset : data.uniformRange.offset};
+  pass.SetBindGroup(1, vsGroup, vsOffsets.size(), vsOffsets.data());
   pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset,
                        data.vertRange.size);
   pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16,
@@ -644,8 +649,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     pass.DrawIndexed(data.indexCount);
     if (!bind_pipeline(data.pipeline, pass))
       return;
-    pass.SetBindGroup(1, g_uniformBindGroup, vsOffsets.size(),
-                      vsOffsets.data());
+    pass.SetBindGroup(1, vsGroup, vsOffsets.size(), vsOffsets.data());
   }
   if (data.tev) {
     // group 2 = PS uniform (same dynamic-uniform bind group, its own offset);
@@ -664,6 +668,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
 
 void note_frame_presented() {
   g_textureVerifyFrame.fetch_add(1u, std::memory_order_relaxed);
+  frame_interp::end_game_frame();
 }
 
 void reset_texture_cache() {
@@ -794,7 +799,24 @@ struct UniformCache {
   uint64_t pushes = 0;
 };
 static UniformCache g_vertexUniformCache;
+static UniformCache g_interpUniformCache;
 static UniformCache g_pixelUniformCache;
+
+// The in-between frame's blocks, de-duplicated the same way.
+static Range push_interp_uniform_dedup(const uint8_t* data, size_t length) {
+  UniformCache& cache = g_interpUniformCache;
+  const uint64_t frameId = current_frame_id();
+  if (frameId != 0 && cache.frameId == frameId && cache.range.size != 0 && cache.bytes.size() == length &&
+      std::memcmp(cache.bytes.data(), data, length) == 0) {
+    ++cache.hits;
+    return cache.range;
+  }
+  ++cache.pushes;
+  cache.range = push_interp_uniform(data, length);
+  cache.bytes.assign(data, data + length);
+  cache.frameId = frameId;
+  return cache.range;
+}
 
 static Range push_uniform_dedup(UniformCache& cache, const uint8_t* data,
                                 size_t length) {
@@ -1178,6 +1200,30 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const size_t vertBytes = plan.vertices.size() * sizeof(float);
   const size_t indexBytes = plan.indices.size() * sizeof(uint16_t);
   const size_t pixelUniformBytes = tev ? sizeof(plan.pixel_constants) : 0;
+  // Matched before a staging segment can split the frame; a split frame is
+  // not interpolated.
+  const gxc::VertexShaderConstants* interpConstants =
+      frame_interp::enabled()
+          ? frame_interp::blend_draw(frame_interp::draw_key(plan), frame_interp::used_matrix_rows(plan),
+                                     plan.constants)
+          : nullptr;
+  if (frame_interp::tracing()) {
+    const auto& m = plan.constants.posnormalmatrix;
+    std::fprintf(stderr,
+                 "[frame-interp-trace] %s key=%016llx prim=0x%02X fmt=%u verts=%u payload=%u idx=%d "
+                 "t=(%.1f,%.1f,%.1f) s=%.3f proj00=%.3f proj32=%.1f tex=%08X bt=(%.1f,%.1f,%.1f) bt0=(%.1f,%.1f,%.1f)\n",
+                 frame_interp::last_outcome(), static_cast<unsigned long long>(frame_interp::draw_key(plan)),
+                 plan.match_primitive, plan.match_vtx_fmt, plan.vertex_count, plan.match_payload_size,
+                 plan.pipeline.shader.has_pos_mtx_idx, m[0][3], m[1][3], m[2][3],
+                 std::sqrt(m[0][0] * m[0][0] + m[1][0] * m[1][0] + m[2][0] * m[2][0]), plan.constants.projection[0][0],
+                 plan.constants.projection[3][2], plan.tex_address,
+                 interpConstants ? interpConstants->posnormalmatrix[0][3] : 0.f,
+                 interpConstants ? interpConstants->posnormalmatrix[1][3] : 0.f,
+                 interpConstants ? interpConstants->posnormalmatrix[2][3] : 0.f,
+                 interpConstants ? interpConstants->transformmatrices[0][3] - plan.constants.transformmatrices[0][3] : 0.f,
+                 interpConstants ? interpConstants->transformmatrices[1][3] - plan.constants.transformmatrices[1][3] : 0.f,
+                 interpConstants ? interpConstants->transformmatrices[2][3] - plan.constants.transformmatrices[2][3] : 0.f);
+  }
   if (!staging_has_capacity(vertBytes, indexBytes, sizeof(plan.constants),
                             pixelUniformBytes)) {
     if (!segment_frame() ||
@@ -1197,6 +1243,10 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const auto uniformRange = push_uniform_dedup(
       g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
       sizeof(plan.constants));
+  const auto interpUniformRange =
+      interpConstants != nullptr
+          ? push_interp_uniform_dedup(reinterpret_cast<const uint8_t*>(interpConstants), sizeof(*interpConstants))
+          : Range{};
   Range pixelUniformRange{};
   if (tev) {
     pixelUniformRange = push_uniform_dedup(
@@ -1222,6 +1272,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .vertRange = vertRange,
       .idxRange = idxRange,
       .uniformRange = uniformRange,
+      .interpUniformRange = interpUniformRange,
       .pixelUniformRange = pixelUniformRange,
       .indexCount = static_cast<uint32_t>(plan.indices.size()),
       .textureBindGroup = textureBindGroup,

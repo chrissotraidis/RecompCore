@@ -145,6 +145,17 @@ void aurora_set_frame_buffer_scale(float scale);
    own sampler settings, 2-16 forces that many samples. Takes effect at the
    next draw. DOL_AURORA_FORCE_ANISO sets the starting value. */
 void aurora_set_forced_anisotropy(unsigned samples);
+/* In-between frames: each finished frame is drawn a second time with every
+   draw's transforms blended halfway toward the previous frame and shown
+   first, so a 30 FPS game presents 60 frames a second with its own logic
+   unchanged (one extra half frame of display latency). Takes effect at the
+   next frame. DOL_AURORA_FRAME_INTERP=1 sets the starting value. */
+void aurora_set_frame_interpolation(bool enabled);
+/* A frames-a-second counter at the top of the window (with the game's own
+   rate beside it when in-between frames are on). DOL_AURORA_SHOW_FPS=1 sets
+   the starting value. */
+void aurora_set_fps_overlay(bool enabled);
+bool aurora_get_frame_interpolation(void);
 
 AuroraBackend aurora_get_backend();
 const AuroraBackend* aurora_get_available_backends(size_t* count);
