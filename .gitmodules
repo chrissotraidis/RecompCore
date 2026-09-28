@@ -136,5 +136,5 @@
 	shallow = true
 [submodule "DolRecomp"]
 	path = DolRecomp
-	url = https://github.com/chrissotraidis/DolRecomp.git
+	url = https://github.com/elliotttate/DolRecomp.git
 	branch = bluewake
