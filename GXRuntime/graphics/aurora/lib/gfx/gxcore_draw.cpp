@@ -1,0 +1,1238 @@
+#include "gxcore_draw.hpp"
+
+#include <aurora/aurora.h> // aurora_set_forced_anisotropy
+
+#include "../webgpu/gpu.hpp"
+#include "../gx/gx.hpp" // UseReversedZ + set_logical_viewport (substrate glue)
+#include "texture.hpp"
+#include "tex_copy_conv.hpp" // EFB-copy format conversion (63/S16)
+#include "texture_replacement.hpp" // Dolphin-format HD texture packs
+
+#include <gxruntime/gxcore/gxcore.hpp> // EfbCopyCommand
+#include <gxruntime/gxcore/texture_decode.hpp>
+
+#include <absl/container/flat_hash_map.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+namespace aurora::gfx::gxcore {
+
+namespace gxc = gxruntime::gxcore;
+
+using webgpu::g_device;
+using webgpu::g_graphicsConfig;
+
+static Module Log("aurora::gfx::gxcore");
+
+namespace {
+
+wgpu::CompareFunction to_compare(gxc::CompareMode func) {
+  // GC compare flipped for the substrate's reversed-Z (gx/gx.cpp:526 shape).
+  switch (func) {
+  case gxc::CompareMode::Never:
+    return wgpu::CompareFunction::Never;
+  case gxc::CompareMode::Less:
+    return gx::UseReversedZ ? wgpu::CompareFunction::Greater
+                            : wgpu::CompareFunction::Less;
+  case gxc::CompareMode::Equal:
+    return wgpu::CompareFunction::Equal;
+  case gxc::CompareMode::LEqual:
+    return gx::UseReversedZ ? wgpu::CompareFunction::GreaterEqual
+                            : wgpu::CompareFunction::LessEqual;
+  case gxc::CompareMode::Greater:
+    return gx::UseReversedZ ? wgpu::CompareFunction::Less
+                            : wgpu::CompareFunction::Greater;
+  case gxc::CompareMode::NEqual:
+    return wgpu::CompareFunction::NotEqual;
+  case gxc::CompareMode::GEqual:
+    return gx::UseReversedZ ? wgpu::CompareFunction::LessEqual
+                            : wgpu::CompareFunction::GreaterEqual;
+  case gxc::CompareMode::Always:
+  default:
+    return wgpu::CompareFunction::Always;
+  }
+}
+
+wgpu::BlendFactor to_blend_factor_src(gxc::SrcBlendFactor factor,
+                                      bool dual_source) {
+  switch (factor) {
+  case gxc::SrcBlendFactor::Zero:
+    return wgpu::BlendFactor::Zero;
+  case gxc::SrcBlendFactor::One:
+    return wgpu::BlendFactor::One;
+  case gxc::SrcBlendFactor::DstClr:
+    return wgpu::BlendFactor::Dst;
+  case gxc::SrcBlendFactor::InvDstClr:
+    return wgpu::BlendFactor::OneMinusDst;
+  case gxc::SrcBlendFactor::SrcAlpha:
+    return dual_source ? wgpu::BlendFactor::Src1Alpha
+                       : wgpu::BlendFactor::SrcAlpha;
+  case gxc::SrcBlendFactor::InvSrcAlpha:
+    return dual_source ? wgpu::BlendFactor::OneMinusSrc1Alpha
+                       : wgpu::BlendFactor::OneMinusSrcAlpha;
+  case gxc::SrcBlendFactor::DstAlpha:
+    return wgpu::BlendFactor::DstAlpha;
+  case gxc::SrcBlendFactor::InvDstAlpha:
+  default:
+    return wgpu::BlendFactor::OneMinusDstAlpha;
+  }
+}
+
+wgpu::BlendFactor to_blend_factor_dst(gxc::DstBlendFactor factor,
+                                      bool dual_source) {
+  switch (factor) {
+  case gxc::DstBlendFactor::Zero:
+    return wgpu::BlendFactor::Zero;
+  case gxc::DstBlendFactor::One:
+    return wgpu::BlendFactor::One;
+  case gxc::DstBlendFactor::SrcClr:
+    return wgpu::BlendFactor::Src;
+  case gxc::DstBlendFactor::InvSrcClr:
+    return wgpu::BlendFactor::OneMinusSrc;
+  case gxc::DstBlendFactor::SrcAlpha:
+    return dual_source ? wgpu::BlendFactor::Src1Alpha
+                       : wgpu::BlendFactor::SrcAlpha;
+  case gxc::DstBlendFactor::InvSrcAlpha:
+    return dual_source ? wgpu::BlendFactor::OneMinusSrc1Alpha
+                       : wgpu::BlendFactor::OneMinusSrcAlpha;
+  case gxc::DstBlendFactor::DstAlpha:
+    return wgpu::BlendFactor::DstAlpha;
+  case gxc::DstBlendFactor::InvDstAlpha:
+  default:
+    return wgpu::BlendFactor::OneMinusDstAlpha;
+  }
+}
+
+// Forced anisotropy (aurora_set_forced_anisotropy): 1 leaves the game's samplers.
+std::uint16_t initial_forced_anisotropy() {
+  const char* env = std::getenv("DOL_AURORA_FORCE_ANISO");
+  const long samples = env != nullptr ? std::strtol(env, nullptr, 10) : 1L;
+  return static_cast<std::uint16_t>(std::clamp(samples, 1L, 16L));
+}
+std::atomic<std::uint16_t> g_forcedAnisotropy{initial_forced_anisotropy()};
+
+wgpu::AddressMode to_address_mode(std::uint8_t wrap) {
+  switch (wrap) {
+  case 1:
+    return wgpu::AddressMode::Repeat;
+  case 2:
+    return wgpu::AddressMode::MirrorRepeat;
+  case 0:
+  default:
+    return wgpu::AddressMode::ClampToEdge;
+  }
+}
+
+wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler) {
+  const bool mipmaps = sampler.mipmap_filter != 0u;
+  std::uint16_t maxAnisotropy = 1;
+  if (mipmaps && (sampler.max_aniso == 1u || sampler.max_aniso == 2u)) {
+    maxAnisotropy = sampler.max_aniso == 1u
+                        ? std::max<std::uint16_t>(
+                              webgpu::g_graphicsConfig.textureAnisotropy / 2u,
+                              1u)
+                        : std::max<std::uint16_t>(
+                              webgpu::g_graphicsConfig.textureAnisotropy, 1u);
+  }
+  // The player's forced anisotropy (aurora_set_forced_anisotropy), with
+  // Dolphin's rule: every texture except one filtered nearest both ways (pixel
+  // art, fonts), all filters linear. Most of Wind Waker's textures have no
+  // mips (TX_SETMODE0 filter 4), so the anisotropic taps are what sharpen the
+  // ground and the walls at a glancing angle.
+  const std::uint16_t forced = g_forcedAnisotropy.load(std::memory_order_relaxed);
+  if (forced > 1u && (sampler.min_filter != 0u || sampler.mag_filter != 0u))
+    maxAnisotropy = std::max(maxAnisotropy, forced);
+  auto magFilter = sampler.mag_filter != 0u ? wgpu::FilterMode::Linear
+                                             : wgpu::FilterMode::Nearest;
+  auto minFilter = sampler.min_filter != 0u ? wgpu::FilterMode::Linear
+                                             : wgpu::FilterMode::Nearest;
+  auto mipFilter = sampler.mipmap_filter == 2u
+                       ? wgpu::MipmapFilterMode::Linear
+                       : wgpu::MipmapFilterMode::Nearest;
+  if (maxAnisotropy > 1u) {
+    magFilter = wgpu::FilterMode::Linear;
+    minFilter = wgpu::FilterMode::Linear;
+    mipFilter = wgpu::MipmapFilterMode::Linear;
+  }
+  return {
+      .label = "GXCore Sampler",
+      .addressModeU = to_address_mode(sampler.wrap_s),
+      .addressModeV = to_address_mode(sampler.wrap_t),
+      .addressModeW = wgpu::AddressMode::Repeat,
+      .magFilter = magFilter,
+      .minFilter = minFilter,
+      .mipmapFilter = mipFilter,
+      .lodMinClamp = mipmaps ? static_cast<float>(sampler.min_lod) / 16.f : 0.f,
+      .lodMaxClamp = mipmaps ? static_cast<float>(sampler.max_lod) / 16.f : 0.f,
+      .maxAnisotropy = maxAnisotropy,
+  };
+}
+
+// Texture bind group layout for a used-texmap set (63/Mfin multi-texmap): texmap
+// t occupies binding 2t (texture) + 2t+1 (sampler), matching the WGSL. Cached per
+// mask; used_mask=1 (texmap 0 only) reproduces the pre-Mfin single-texmap layout.
+wgpu::BindGroupLayout texture_bind_group_layout(uint32_t used_mask = 1u) {
+  static absl::flat_hash_map<uint32_t, wgpu::BindGroupLayout> cache;
+  auto it = cache.find(used_mask);
+  if (it != cache.end())
+    return it->second;
+  std::vector<wgpu::BindGroupLayoutEntry> entries;
+  for (uint32_t t = 0; t < 8u; ++t) {
+    if ((used_mask & (1u << t)) == 0u)
+      continue;
+    entries.push_back(wgpu::BindGroupLayoutEntry{
+        .binding = 2u * t,
+        .visibility = wgpu::ShaderStage::Fragment,
+        .texture =
+            wgpu::TextureBindingLayout{
+                .sampleType = wgpu::TextureSampleType::Float,
+                .viewDimension = wgpu::TextureViewDimension::e2D,
+            },
+    });
+    entries.push_back(wgpu::BindGroupLayoutEntry{
+        .binding = 2u * t + 1u,
+        .visibility = wgpu::ShaderStage::Fragment,
+        .sampler =
+            wgpu::SamplerBindingLayout{
+                .type = wgpu::SamplerBindingType::Filtering,
+            },
+    });
+  }
+  const wgpu::BindGroupLayoutDescriptor descriptor{
+      .label = "GXCore Texture Bind Group Layout",
+      .entryCount = entries.size(),
+      .entries = entries.data(),
+  };
+  auto layout = g_device.CreateBindGroupLayout(&descriptor);
+  cache.emplace(used_mask, layout);
+  return layout;
+}
+
+// Guest-identity texture cache (S13 A3). Keyed by the texture's guest identity
+// AND the TLUT identity it indexes: the same CI image bytes re-palettized to a
+// different TLUT decode to different pixels, so the palette address/format/
+// entries are part of the key. 63/Mfin adds `content_hash` (xxh3 of the actual
+// source texels + TLUT): the live game reuses one guest texture-buffer address
+// for different images across screens (stadium select overwrites the captain
+// art) and streams movie frames through a single buffer, so identity alone would
+// bind the stale decode. Hashing the content makes a content change under an
+// unchanged identity a distinct entry (Dolphin/Aurora texel-hash model). Static
+// replay fixtures never rewrite an address, so the no-reconvert property holds.
+struct TextureKey {
+  uint32_t address;
+  uint32_t size;
+  uint32_t format;
+  uint32_t width;
+  uint32_t height;
+  uint32_t tlut_address;
+  uint32_t tlut_format;
+  uint32_t tlut_entries;
+  uint64_t content_hash;
+  bool operator==(const TextureKey&) const = default;
+  template <typename H>
+  friend H AbslHashValue(H h, const TextureKey& key) {
+    return H::combine(std::move(h), key.address, key.size, key.format,
+                      key.width, key.height, key.tlut_address, key.tlut_format,
+                      key.tlut_entries, key.content_hash);
+  }
+};
+
+absl::flat_hash_map<TextureKey, TextureHandle> g_textureCache;
+// Original textures drawn while their HD replacement decodes on a background
+// thread. They stay out of g_textureCache so the next draw asks again; the
+// entry goes when the replacement arrives (or with the cache's clears).
+absl::flat_hash_map<TextureKey, TextureHandle> g_textureAwaitingReplacement;
+// address -> the key currently cached at that guest address. When new content
+// arrives at an address (movie streaming, screen transitions), the prior entry
+// for that address is evicted so the content-hashed cache stays bounded to one
+// live entry per buffer instead of accumulating every historical frame.
+struct TextureAddressState {
+  TextureKey key;
+  uint64_t texel_epoch = 0;
+  uint64_t tlut_epoch = 0;
+  bool texel_epoch_valid = false;
+  bool tlut_epoch_valid = false;
+  // Small textures only (see kAlwaysRehashBytes): hash of the texels and
+  // palette as last decoded, and the frame in which they were last compared.
+  uint64_t small_hash = 0;
+  uint64_t verified_frame = ~0ull;
+};
+absl::flat_hash_map<uint32_t, TextureAddressState> g_textureAddrKey;
+// Counts presented frames; a small texture is re-hashed at most once in each.
+std::atomic<uint64_t> g_textureVerifyFrame{0};
+// A small texture is re-hashed even when its dirty epoch has not moved: the
+// game rewrites some in place with plain CPU stores that no dirty mark sees
+// (Wind Waker's A/B action labels, 80x24 IA4 at 0x01673420 and 0x01674C60,
+// showed "Charts" for "Choose"/"Return" in the pause menu). Dolphin reads
+// memory coherently, so the reference shows the new text. Once a frame per
+// texture, up to 4 KB of texels plus the palette.
+constexpr uint32_t kAlwaysRehashBytes = 4096u;
+uint64_t small_texture_hash(const uint8_t* bytes, uint32_t size,
+                            const void* tlut, uint32_t tlut_size) {
+  uint64_t h = XXH3_64bits(bytes, size);
+  if (tlut != nullptr && tlut_size != 0u)
+    h ^= XXH3_64bits(tlut, tlut_size) * 0x9E3779B97F4A7C15ull;
+  return h;
+}
+TextureCacheStats g_textureCacheStats;
+TextureDirtyEpochObserver g_textureDirtyEpochObserver = nullptr;
+
+// EFB copy allocations mirror GXState::copyTextureCache: one guest destination
+// may be reused with different dimensions or formats, which require distinct GPU
+// textures. g_efbCopyTextures mirrors GXState::copyTextures and selects the most
+// recent allocation when that guest destination is sampled.
+struct EfbCopyKey {
+  uint32_t address;
+  uint32_t width;
+  uint32_t height;
+  uint32_t format;
+  bool opaque;  // the view reads alpha as one (EFB without alpha)
+  bool operator==(const EfbCopyKey&) const = default;
+  template <typename H>
+  friend H AbslHashValue(H h, const EfbCopyKey& key) {
+    return H::combine(std::move(h), key.address, key.width, key.height,
+                      key.format, key.opaque);
+  }
+};
+absl::flat_hash_map<EfbCopyKey, TextureHandle> g_efbCopyCache;
+struct EfbCopyBinding {
+  TextureHandle handle;
+  uint32_t byte_size = 0;
+  uint64_t memory_epoch = 0;
+  bool memory_epoch_valid = false;
+};
+absl::flat_hash_map<uint32_t, EfbCopyBinding> g_efbCopyTextures;
+
+} // namespace
+
+bool needs_early_depth_emulation(const gxc::PipelineKey& key) {
+  if (key.depth_test == 0u || key.depth_update == 0u ||
+      key.early_depth_test == 0u || key.shader.tev_valid == 0u) {
+    return false;
+  }
+
+  // Mirror AlphaTest::TestResult enough to omit the extra pass when the test is
+  // statically guaranteed to pass. Fail and undetermined both need an early
+  // depth write; the ordinary color shader will discard failures afterward.
+  const bool c0_never = key.shader.alpha_comp0 == 0u;
+  const bool c1_never = key.shader.alpha_comp1 == 0u;
+  const bool c0_always = key.shader.alpha_comp0 == 7u;
+  const bool c1_always = key.shader.alpha_comp1 == 7u;
+  bool always_passes = false;
+  switch (key.shader.alpha_logic) {
+  case 0u: // And
+    always_passes = c0_always && c1_always;
+    break;
+  case 1u: // Or
+    always_passes = c0_always || c1_always;
+    break;
+  case 2u: // Xor
+    always_passes = (c0_always && c1_never) ||
+                    (c0_never && c1_always);
+    break;
+  case 3u: // Xnor
+    always_passes = (c0_always && c1_always) ||
+                    (c0_never && c1_never);
+    break;
+  }
+  return !always_passes;
+}
+
+wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
+  const gxc::PipelineKey& key = config.key;
+  const bool depthOnly = config.depthOnly != 0u;
+  CHECK(key.shader.use_dst_alpha == 0 ||
+            webgpu::g_dualSourceBlendingSupported,
+        "GX destination alpha requires WebGPU dual-source blending");
+  std::string wgsl = gxc::generate_wgsl(key.shader);
+  if (depthOnly) {
+    wgsl += "\n@fragment\nfn fs_depth_only() -> @location(0) vec4f {\n"
+            "    return vec4f(0.0);\n}\n";
+  }
+  wgpu::ShaderSourceWGSL sourceDescriptor{};
+  sourceDescriptor.code = wgsl.c_str();
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{
+      .nextInChain = &sourceDescriptor,
+      .label = "GXCore Shader Module",
+  };
+  const auto module = g_device.CreateShaderModule(&moduleDescriptor);
+
+  // Group 0 keeps the pass preamble's static bind group compatible (the shader
+  // never references it); 1 = shared dynamic VS uniform. On the TEV path (S14)
+  // 2 = shared dynamic PS uniform and 3 = texture; else 2 = texture. Putting
+  // the PS uniform before the texture keeps an untextured TEV draw gap-free.
+  const bool tev = key.shader.tev_valid != 0;
+  const bool textured = key.shader.textured != 0;
+  // Multi-texmap: the texture group's layout matches the set of texmaps the WGSL
+  // declares (derived identically from the shader key), so pipeline and bind
+  // group agree. Untextured draws never use the texture group (layoutCount below).
+  const uint32_t tex_mask = textured ? gxc::used_texmap_mask(key.shader) : 1u;
+  std::array<wgpu::BindGroupLayout, 4> bindGroupLayouts{
+      g_staticBindGroupLayout,
+      g_uniformBindGroupLayout,
+      tev ? g_uniformBindGroupLayout : texture_bind_group_layout(tex_mask),
+      texture_bind_group_layout(tex_mask),
+  };
+  const size_t layoutCount =
+      depthOnly ? 2 : tev ? (textured ? 4 : 3) : (textured ? 3 : 2);
+  const wgpu::PipelineLayoutDescriptor layoutDescriptor{
+      .label = "GXCore Pipeline Layout",
+      .bindGroupLayoutCount = layoutCount,
+      .bindGroupLayouts = bindGroupLayouts.data(),
+  };
+  const auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
+
+  // Fixed decoded-vertex layout (gxruntime/gxcore/shader.hpp). The normal
+  // (location 8) is only declared by the lit shader, so add it to the pipeline
+  // only when the key is lit — WGSL requires the vertex layout to satisfy every
+  // shader input.
+  std::vector<wgpu::VertexAttribute> attributes{
+      wgpu::VertexAttribute{
+          .format = wgpu::VertexFormat::Float32x3,
+          .offset = gxc::kVertexPosOffset,
+          .shaderLocation = 0,
+      },
+      wgpu::VertexAttribute{
+          .format = wgpu::VertexFormat::Uint32,
+          .offset = gxc::kVertexPosMtxOffset,
+          .shaderLocation = 1,
+      },
+      wgpu::VertexAttribute{
+          .format = wgpu::VertexFormat::Float32x4,
+          .offset = gxc::kVertexColor0Offset,
+          .shaderLocation = 2,
+      },
+      wgpu::VertexAttribute{
+          .format = wgpu::VertexFormat::Float32x4,
+          .offset = gxc::kVertexColor1Offset,
+          .shaderLocation = 3,
+      },
+      wgpu::VertexAttribute{
+          .format = wgpu::VertexFormat::Float32x2,
+          .offset = gxc::kVertexUvOffset,
+          .shaderLocation = 4,
+      },
+      wgpu::VertexAttribute{
+          .format = wgpu::VertexFormat::Float32x2,
+          .offset = gxc::kVertexUvOffset + 8,
+          .shaderLocation = 5,
+      },
+      wgpu::VertexAttribute{
+          .format = wgpu::VertexFormat::Float32x2,
+          .offset = gxc::kVertexUvOffset + 16,
+          .shaderLocation = 6,
+      },
+      wgpu::VertexAttribute{
+          .format = wgpu::VertexFormat::Float32x2,
+          .offset = gxc::kVertexUvOffset + 24,
+          .shaderLocation = 7,
+      },
+  };
+  // Item-5 texgen inputs must mirror the generator's VertexIn: emboss needs the
+  // NBT normal/binormal/tangent + light dir; a Color1/emboss key that is unlit
+  // still declares the normal (location 8). Detect emboss demand from the key.
+  bool has_emboss = false;
+  bool has_normal_source = false;
+  for (std::uint32_t i = 0; i < key.shader.num_tex_gens; ++i) {
+    const auto type =
+        static_cast<gxc::TexGenType>(key.shader.tex_gens[i].texgentype);
+    if (type == gxc::TexGenType::EmbossMap)
+      has_emboss = true;
+    if (type == gxc::TexGenType::Regular &&
+        static_cast<gxc::TexSourceRow>(key.shader.tex_gens[i].sourcerow) ==
+            gxc::TexSourceRow::Normal)
+      has_normal_source = true;
+  }
+  // Mirror the generator exactly: locations 8/10/11 are declared only when the
+  // vertex FORMAT carries that attribute. A lit/emboss draw whose format omits
+  // it reads the cached fallback from the uniform instead (I_CACHED_NORMAL), so
+  // the shader does not declare the input and the layout must not provide it.
+  if ((key.shader.lit_valid != 0 || has_emboss || has_normal_source) &&
+      key.shader.has_vertex_normal != 0) {
+    attributes.push_back(wgpu::VertexAttribute{
+        .format = wgpu::VertexFormat::Float32x3,
+        .offset = gxc::kVertexNormalOffset,
+        .shaderLocation = 8,
+    });
+  }
+  if (key.shader.has_tex_mtx_idx != 0) {
+    attributes.push_back(wgpu::VertexAttribute{
+        .format = wgpu::VertexFormat::Uint32,
+        .offset = gxc::kVertexTexMtxIdxOffset,
+        .shaderLocation = 9,
+    });
+  }
+  if (has_emboss && key.shader.has_vertex_binormal != 0) {
+    attributes.push_back(wgpu::VertexAttribute{
+        .format = wgpu::VertexFormat::Float32x3,
+        .offset = gxc::kVertexBinormalOffset,
+        .shaderLocation = 10,
+    });
+  }
+  if (has_emboss && key.shader.has_vertex_tangent != 0) {
+    attributes.push_back(wgpu::VertexAttribute{
+        .format = wgpu::VertexFormat::Float32x3,
+        .offset = gxc::kVertexTangentOffset,
+        .shaderLocation = 11,
+    });
+  }
+  if ((key.shader.uv_mask & (1u << 4u)) != 0u) {
+    attributes.push_back(wgpu::VertexAttribute{
+        .format = wgpu::VertexFormat::Float32x2,
+        .offset = gxc::kVertexUvOffset + 32u,
+        .shaderLocation = 12,
+    });
+  }
+  if (key.shader.has_tex_mtx_idx != 0 &&
+      (key.shader.tex_mtx_idx_mask & 0xF0u) != 0u) {
+    attributes.push_back(wgpu::VertexAttribute{
+        .format = wgpu::VertexFormat::Uint32,
+        .offset = gxc::kVertexTexMtxIdxHiOffset,
+        .shaderLocation = 13,
+    });
+  }
+  const wgpu::VertexBufferLayout vertexLayout{
+      .arrayStride = gxc::kVertexStrideBytes,
+      .stepMode = wgpu::VertexStepMode::Vertex,
+      .attributeCount = attributes.size(),
+      .attributes = attributes.data(),
+  };
+
+  const bool emulateEarlyDepth = needs_early_depth_emulation(key);
+  const bool depthCompare = key.depth_test != 0;
+  const wgpu::DepthStencilState depthStencil{
+      .format = g_graphicsConfig.depthFormat,
+      .depthWriteEnabled =
+          depthOnly ? depthCompare && key.depth_update != 0
+                    : depthCompare && key.depth_update != 0 &&
+                          !emulateEarlyDepth,
+      .depthCompare =
+          emulateEarlyDepth && !depthOnly
+              ? wgpu::CompareFunction::Equal
+              : depthCompare ? to_compare(static_cast<gxc::CompareMode>(
+                                   key.depth_func))
+                             : wgpu::CompareFunction::Always,
+  };
+
+  // GC subtract mode forces ONE/ONE with dst - src (Dolphin RenderState).
+  const bool dual_source = key.shader.use_dst_alpha != 0;
+  wgpu::BlendState blendState{};
+  if (key.blend_subtract != 0) {
+    blendState.color = {
+        .operation = wgpu::BlendOperation::ReverseSubtract,
+        .srcFactor = wgpu::BlendFactor::One,
+        .dstFactor = wgpu::BlendFactor::One,
+    };
+    blendState.alpha = dual_source
+                           ? wgpu::BlendComponent{
+                                 .operation = wgpu::BlendOperation::Add,
+                                 .srcFactor = wgpu::BlendFactor::One,
+                                 .dstFactor = wgpu::BlendFactor::Zero,
+                             }
+                           : blendState.color;
+  } else {
+    blendState.color = {
+        .operation = wgpu::BlendOperation::Add,
+        .srcFactor = to_blend_factor_src(
+            static_cast<gxc::SrcBlendFactor>(key.src_factor), dual_source),
+        .dstFactor = to_blend_factor_dst(
+            static_cast<gxc::DstBlendFactor>(key.dst_factor), dual_source),
+    };
+    blendState.alpha = {
+        .operation = wgpu::BlendOperation::Add,
+        .srcFactor = to_blend_factor_src(
+            static_cast<gxc::SrcBlendFactor>(key.src_factor_alpha),
+            dual_source),
+        .dstFactor = to_blend_factor_dst(
+            static_cast<gxc::DstBlendFactor>(key.dst_factor_alpha),
+            dual_source),
+    };
+  }
+  auto writeMask = wgpu::ColorWriteMask::None;
+  if (key.color_update != 0) {
+    writeMask |= wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green |
+                 wgpu::ColorWriteMask::Blue;
+  }
+  if (key.alpha_update != 0)
+    writeMask |= wgpu::ColorWriteMask::Alpha;
+  const bool blending =
+      key.blend_enable != 0 || key.blend_subtract != 0;
+  const wgpu::ColorTargetState colorTarget{
+      .format = g_graphicsConfig.surfaceConfiguration.format,
+      .blend = blending ? &blendState : nullptr,
+      .writeMask = writeMask,
+  };
+  const wgpu::ColorTargetState depthOnlyTarget{
+      .format = g_graphicsConfig.surfaceConfiguration.format,
+      .blend = nullptr,
+      .writeMask = wgpu::ColorWriteMask::None,
+  };
+  const wgpu::FragmentState fragmentState{
+      .module = module,
+      .entryPoint = depthOnly ? "fs_depth_only" : "fs_main",
+      .targetCount = 1,
+      .targets = depthOnly ? &depthOnlyTarget : &colorTarget,
+  };
+
+  auto cullMode = wgpu::CullMode::None;
+  switch (static_cast<gxc::CullMode>(key.cull_mode)) {
+  case gxc::CullMode::Back:
+    cullMode = wgpu::CullMode::Back;
+    break;
+  case gxc::CullMode::Front:
+    cullMode = wgpu::CullMode::Front;
+    break;
+  default:
+    break; // None here; All was skipped at plan time
+  }
+  auto topology = wgpu::PrimitiveTopology::TriangleList;
+  if (key.primitive_topology == 1u) {
+    topology = wgpu::PrimitiveTopology::LineList;
+    cullMode = wgpu::CullMode::None;
+  } else if (key.primitive_topology == 2u) {
+    topology = wgpu::PrimitiveTopology::PointList;
+    cullMode = wgpu::CullMode::None;
+  }
+
+  const wgpu::RenderPipelineDescriptor descriptor{
+      .label = "GXCore Pipeline",
+      .layout = pipelineLayout,
+      .vertex =
+          wgpu::VertexState{
+              .module = module,
+              .entryPoint = "vs_main",
+              .bufferCount = 1,
+              .buffers = &vertexLayout,
+          },
+      .primitive =
+          wgpu::PrimitiveState{
+              .topology = topology,
+              // Substrate winding convention (gx/gx.cpp to_primitive_state).
+              .frontFace = wgpu::FrontFace::CW,
+              .cullMode = cullMode,
+          },
+      .depthStencil = &depthStencil,
+      .multisample =
+          wgpu::MultisampleState{
+              .count = config.msaaSamples,
+          },
+      .fragment = &fragmentState,
+  };
+  return g_device.CreateRenderPipeline(&descriptor);
+}
+
+void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+  // Ensure both asynchronous pipelines are ready before the prepass writes any
+  // depth. Binding the color pipeline first is harmless; it is rebound below.
+  if (!bind_pipeline(data.pipeline, pass)) {
+    return;
+  }
+  if (data.depthPipeline != 0 && !bind_pipeline(data.depthPipeline, pass))
+    return;
+  const std::array vsOffsets{data.uniformRange.offset};
+  pass.SetBindGroup(1, g_uniformBindGroup, vsOffsets.size(), vsOffsets.data());
+  pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset,
+                       data.vertRange.size);
+  pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16,
+                      data.idxRange.offset, data.idxRange.size);
+  if (data.depthPipeline != 0) {
+    pass.DrawIndexed(data.indexCount);
+    if (!bind_pipeline(data.pipeline, pass))
+      return;
+    pass.SetBindGroup(1, g_uniformBindGroup, vsOffsets.size(),
+                      vsOffsets.data());
+  }
+  if (data.tev) {
+    // group 2 = PS uniform (same dynamic-uniform bind group, its own offset);
+    // group 3 = texture.
+    const std::array psOffsets{data.pixelUniformRange.offset};
+    pass.SetBindGroup(2, g_uniformBindGroup, psOffsets.size(),
+                      psOffsets.data());
+    if (data.textureBindGroup != 0) {
+      pass.SetBindGroup(3, find_bind_group(data.textureBindGroup));
+    }
+  } else if (data.textureBindGroup != 0) {
+    pass.SetBindGroup(2, find_bind_group(data.textureBindGroup));
+  }
+  pass.DrawIndexed(data.indexCount);
+}
+
+void note_frame_presented() {
+  g_textureVerifyFrame.fetch_add(1u, std::memory_order_relaxed);
+}
+
+void reset_texture_cache() {
+  g_textureCache.clear();
+  g_textureAwaitingReplacement.clear();
+  g_textureAddrKey.clear();
+  g_efbCopyCache.clear();
+  g_efbCopyTextures.clear();
+  g_textureCacheStats = {};
+}
+
+void set_texture_dirty_epoch_observer(TextureDirtyEpochObserver observer) {
+  g_textureDirtyEpochObserver = observer;
+}
+
+const TextureCacheStats& texture_cache_stats() { return g_textureCacheStats; }
+unsigned long long texture_upload_count() { return g_textureCacheStats.uploads; }
+
+// Resolve the current EFB region into a texture the guest-identity path can bind
+// later, keyed by the copy's destination address (63/S16). Mirrors aurora
+// lib/dolphin/gx/GXFrameBuffer.cpp copy_tex on the same substrate: map the EFB
+// source rect through the logical->render scaling, allocate (or reuse) a resolve
+// target, then gfx::resolve_pass — which converts per format (tex_copy_conv,
+// incl. depth targets) and optionally clears the EFB to the game's copy-clear
+// color/Z afterwards. The bound draw's geometry is already in the pass (the
+// sink flushed the pending draw before firing this).
+void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
+  // Mirror the copy-clear color/Z (BP 0x4F-0x51 at this copy) into the gx
+  // state GXSetCopyClear would have written: begin_frame's pass-0 EFB clear
+  // reads g_gxState.clearColor/clearDepth, and in gxcore mode the live gx
+  // layer that normally maintains them is bypassed. Without this every frame
+  // cleared to the default alpha=1 and e.g. the Strikers shadow-grab alpha
+  // background inverted (glxSwap display-copy clears to {0,0,0,0}).
+  gx::g_gxState.clearColor = {
+      static_cast<float>(cmd.clear_r) / 255.f,
+      static_cast<float>(cmd.clear_g) / 255.f,
+      static_cast<float>(cmd.clear_b) / 255.f,
+      static_cast<float>(cmd.clear_a) / 255.f,
+  };
+  gx::g_gxState.clearDepth = cmd.clear_z;
+  if (cmd.format == 0xFu) {
+    // Display copy (GXCopyDisp): no texture destination; its requested clear
+    // becomes the next frame's EFB clear via the state mirrored above.
+    return;
+  }
+  const auto fmt = static_cast<GXTexFmt>(cmd.format);
+  const gfx::ClipRect srcRect = gx::map_logical_scissor(gfx::ClipRect{
+      .x = static_cast<int32_t>(cmd.src_x),
+      .y = static_cast<int32_t>(cmd.src_y),
+      .width = static_cast<int32_t>(cmd.width),
+      .height = static_cast<int32_t>(cmd.height),
+  });
+  // The copy is made at the render target's scale, as Aurora's own
+  // GXCopyTex does (dolphin/gx/GXFrameBuffer.cpp scale_copy_dst) and as
+  // Dolphin's scaled EFB copies do. Allocated at the guest's size, a game
+  // that copies the whole EFB and draws it back (Wind Waker's depth of field
+  // and blur passes, every frame) replaced its high-resolution scene with a
+  // 640x480 image stretched over it. Sampling uses normalized coordinates,
+  // so a larger texture needs nothing else.
+  uint32_t dstWidth = std::max(cmd.destination_width, static_cast<uint32_t>(1));
+  uint32_t dstHeight = std::max(cmd.destination_height, static_cast<uint32_t>(1));
+  static const bool scale_copies = [] {
+    const char* env = std::getenv("DOL_GXCORE_COPY_SCALE");
+    return env == nullptr || env[0] != '0';
+  }();
+  if (scale_copies && gx::g_gxState.viewportPolicy != AURORA_VIEWPORT_NATIVE) {
+    const auto [logicalW, logicalH] = gx::logical_fb_size();
+    const auto [targetW, targetH] = gfx::get_render_target_size();
+    if (logicalW != 0 && logicalH != 0 && targetW != 0 && targetH != 0) {
+      const float sx = static_cast<float>(targetW) / static_cast<float>(logicalW);
+      const float sy = static_cast<float>(targetH) / static_cast<float>(logicalH);
+      dstWidth = std::max<uint32_t>(static_cast<uint32_t>(std::lround(dstWidth * sx)), 1u);
+      dstHeight = std::max<uint32_t>(static_cast<uint32_t>(std::lround(dstHeight * sy)), 1u);
+    }
+  }
+
+  const EfbCopyKey key{cmd.dest_address, dstWidth, dstHeight, cmd.format, !cmd.efb_has_alpha};
+  auto it = g_efbCopyCache.find(key);
+  if (it == g_efbCopyCache.end() || !it->second) {
+    TextureHandle handle;
+    if (gfx::tex_copy_conv::needs_conversion(fmt)) {
+      handle = gfx::new_conv_texture(dstWidth, dstHeight, fmt, "GXCore Copy Conv");
+    } else {
+      // As Aurora's GXCopyTex: an RGB565 target, or an EFB without alpha,
+      // gets a view whose alpha reads one.
+      const auto viewFmt = fmt == GX_TF_RGB565 || !cmd.efb_has_alpha ? GX_TF_RGB565 : GX_TF_RGBA8;
+      handle = gfx::new_render_texture(dstWidth, dstHeight, viewFmt, "GXCore Copy");
+    }
+    it = g_efbCopyCache.insert_or_assign(key, handle).first;
+  }
+  if (!it->second) {
+    return;
+  }
+  uint64_t memoryEpoch = 0;
+  const bool memoryEpochValid =
+      g_textureDirtyEpochObserver != nullptr && cmd.byte_size != 0u &&
+      g_textureDirtyEpochObserver(cmd.dest_address, cmd.byte_size, &memoryEpoch);
+  g_efbCopyTextures.insert_or_assign(
+      cmd.dest_address,
+      EfbCopyBinding{it->second, cmd.byte_size, memoryEpoch, memoryEpochValid});
+  float clearDepthValue = static_cast<float>(cmd.clear_z) / 16777215.f;
+  if (gx::UseReversedZ) {
+    clearDepthValue = 1.f - clearDepthValue;
+  }
+  gfx::resolve_pass(it->second, srcRect, cmd.clear && cmd.color_update,
+                    cmd.clear && cmd.alpha_update,
+                    cmd.clear && cmd.depth_update,
+                    Vec4<float>{static_cast<float>(cmd.clear_r) / 255.f,
+                                static_cast<float>(cmd.clear_g) / 255.f,
+                                static_cast<float>(cmd.clear_b) / 255.f,
+                                static_cast<float>(cmd.clear_a) / 255.f},
+                    clearDepthValue, fmt);
+}
+
+// Uniform de-duplication across consecutive draws.
+//
+// Each draw carries the full vertex-constant block (every position, texture
+// and normal matrix, about 2 KB) and a pixel-constant block, and consecutive
+// draws of one model often carry byte-identical blocks. Pushing them anyway
+// filled Aurora's 24 MB uniform staging area in the middle of Wind Waker's
+// Outset frames, and each split waited on the GPU. A draw whose block matches
+// the previous draw's, within the same frame packet, reuses that range.
+struct UniformCache {
+  std::vector<uint8_t> bytes;
+  Range range{};
+  uint64_t frameId = 0;
+  uint64_t hits = 0;
+  uint64_t pushes = 0;
+};
+static UniformCache g_vertexUniformCache;
+static UniformCache g_pixelUniformCache;
+
+static Range push_uniform_dedup(UniformCache& cache, const uint8_t* data,
+                                size_t length) {
+  static const bool enabled = [] {
+    const char* env = std::getenv("DOL_AURORA_UNIFORM_DEDUP");
+    return env == nullptr || env[0] != '0';
+  }();
+  const uint64_t frameId = current_frame_id();
+  if (enabled && frameId != 0 && cache.frameId == frameId && cache.bytes.size() == length &&
+      std::memcmp(cache.bytes.data(), data, length) == 0) {
+    ++cache.hits;
+    return cache.range;
+  }
+  ++cache.pushes;
+  if (((cache.hits + cache.pushes) & 0x3FFFFu) == 0)
+    Log.info("GXCore uniform reuse: {} of {} blocks reused",
+             cache.hits, cache.hits + cache.pushes);
+  cache.range = push_uniform(data, length);
+  cache.bytes.assign(data, data + length);
+  cache.frameId = frameId;
+  return cache.range;
+}
+
+bool submit_draw_plan(const gxc::DrawPlan& plan) {
+  if (!plan.ok || plan.vertex_count == 0 || plan.indices.empty()) {
+    return false;
+  }
+
+  if (plan.viewport_valid) {
+    // Raw XF viewport -> logical viewport, the raw path's own formula
+    // (gx/command_processor.cpp XF 0x1A case).
+    const float sx = plan.viewport[0];
+    const float sy = plan.viewport[1];
+    const float sz = plan.viewport[2];
+    const float ox = plan.viewport[3];
+    const float oy = plan.viewport[4];
+    const float oz = plan.viewport[5];
+    const float width = sx * 2.0f;
+    const float height = -sy * 2.0f;
+    gx::set_logical_viewport({
+        .left = ox - 340.0f - width / 2.0f,
+        .top = oy - 340.0f - height / 2.0f,
+        .width = width,
+        .height = height,
+        .znear = (oz - sz) / 1.6777215e7f,
+        .zfar = oz / 1.6777215e7f,
+    });
+  }
+  if (plan.scissor_valid) {
+    // Wind Waker draws its 2D layer (HUD, menus and the fade to and from
+    // black) with a 640x479 scissor, so the frame's last line keeps the
+    // previous scene through every fade. A television hides that line in its
+    // overscan; an iPad shows it as a strip of the old area along the bottom
+    // during transitions. Extend that full-width scissor to the full frame.
+    uint32_t scissorHeight = plan.scissor_height;
+    static const bool s_keepLastLine = std::getenv("DOL_GXCORE_KEEP_SCISSOR_479") != nullptr;
+    if (!s_keepLastLine && plan.scissor_x == 0 && plan.scissor_y == 0 && plan.scissor_width == 640 &&
+        plan.scissor_height == 479) {
+      scissorHeight = 480;
+    }
+    gx::set_logical_scissor({
+        .x = plan.scissor_x,
+        .y = plan.scissor_y,
+        .width = plan.scissor_width,
+        .height = static_cast<int32_t>(scissorHeight),
+    });
+  }
+
+  // Resolve one texmap's texture to a GPU handle: EFB-copy shadow first, else the
+  // guest-identity + content-hash decode cache. Shared by the single-texmap fast
+  // path and the multi-texmap path (63/Mfin, e.g. THP YUV Y/U/V on texmap 0/1/2).
+  auto resolve_texture_handle =
+      [&](uint32_t address, uint32_t tsize, uint32_t format, uint32_t width,
+          uint32_t height, const void* data, uint32_t available, bool has_tlut,
+          uint32_t tlut_address, uint32_t tlut_format, uint32_t tlut_entries,
+          const void* tlut_data, uint32_t tlut_available) -> TextureHandle {
+    // Only CI formats read a palette. The frontend reports whatever TLUT was
+    // last bound for every texture, so without this a non-CI image drawn under
+    // two different palettes had two cache identities at one address, evicted
+    // itself and was decoded and uploaded again on every alternation: Wind
+    // Waker's HUD did that about 23 times a frame (I4/IA4 images, same texels).
+    if (!gxc::is_ci_format(format)) {
+      has_tlut = false;
+      tlut_address = 0u;
+      tlut_format = 0u;
+      tlut_entries = 0u;
+      tlut_data = nullptr;
+      tlut_available = 0u;
+    }
+    auto efbIt = g_efbCopyTextures.find(address);
+    if (efbIt != g_efbCopyTextures.end() && efbIt->second.handle) {
+      uint64_t memoryEpoch = 0;
+      const bool memoryUnchanged =
+          !efbIt->second.memory_epoch_valid ||
+          (g_textureDirtyEpochObserver != nullptr &&
+           g_textureDirtyEpochObserver(address, efbIt->second.byte_size,
+                                       &memoryEpoch) &&
+           memoryEpoch == efbIt->second.memory_epoch);
+      if (memoryUnchanged) {
+        ++g_textureCacheStats.hits;
+        return efbIt->second.handle;
+      }
+      g_efbCopyTextures.erase(efbIt);
+    }
+    if (data == nullptr)
+      return TextureHandle{};
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    const uint32_t size = std::min(tsize, available);
+    uint64_t texelEpoch = 0;
+    uint64_t tlutEpoch = 0;
+    const bool texelEpochValid =
+        g_textureDirtyEpochObserver != nullptr &&
+        g_textureDirtyEpochObserver(address, size, &texelEpoch);
+    const uint32_t tlutSize =
+        gxc::is_ci_format(format) && has_tlut && tlut_data != nullptr
+            ? std::min(tlut_available, tlut_entries * 2u)
+            : 0u;
+    const bool tlutEpochValid =
+        tlutSize == 0u ||
+        (g_textureDirtyEpochObserver != nullptr &&
+         g_textureDirtyEpochObserver(tlut_address, tlutSize, &tlutEpoch));
+    auto addrIt = g_textureAddrKey.find(address);
+    if (texelEpochValid && tlutEpochValid && addrIt != g_textureAddrKey.end()) {
+      const TextureAddressState& previous = addrIt->second;
+      const TextureKey& priorKey = previous.key;
+      const bool sameIdentity =
+          priorKey.address == address && priorKey.size == tsize &&
+          priorKey.format == format && priorKey.width == width &&
+          priorKey.height == height && priorKey.tlut_address == tlut_address &&
+          priorKey.tlut_format == tlut_format &&
+          priorKey.tlut_entries == tlut_entries;
+      const uint64_t frame = g_textureVerifyFrame.load(std::memory_order_relaxed);
+      bool small_changed = false;
+      if (sameIdentity && size <= kAlwaysRehashBytes && previous.verified_frame != frame) {
+        const uint64_t h = small_texture_hash(bytes, size, tlut_data, tlutSize);
+        if (h != previous.small_hash)
+          small_changed = true;
+        else
+          addrIt->second.verified_frame = frame;
+      }
+      if (sameIdentity && !small_changed && previous.texel_epoch_valid &&
+          previous.tlut_epoch_valid && previous.texel_epoch == texelEpoch &&
+          previous.tlut_epoch == tlutEpoch) {
+        auto cached = g_textureCache.find(priorKey);
+        if (cached != g_textureCache.end()) {
+          // DOL_GXCORE_TEX_VERIFY=1: re-hash every generation hit and report the
+          // ones whose texels changed without a dirty mark (a write path the
+          // dirty tracking does not see).
+          static const bool s_verify = std::getenv("DOL_GXCORE_TEX_VERIFY") != nullptr;
+          if (s_verify) {
+            const auto* vbytes = static_cast<const uint8_t*>(data);
+            if (vbytes != nullptr &&
+                XXH3_64bits(vbytes, std::min(tsize, available)) != priorKey.content_hash &&
+                !gxc::is_ci_format(format))
+              std::fprintf(stderr, "[tex-stale] addr=%08X fmt=%u %ux%u size=%u epoch=%llu\n",
+                           address, format, width, height, tsize,
+                           (unsigned long long)texelEpoch);
+          }
+          ++g_textureCacheStats.hits;
+          ++g_textureCacheStats.generation_hits;
+          return cached->second;
+        }
+      }
+    } else if (!texelEpochValid || !tlutEpochValid) {
+      ++g_textureCacheStats.generation_fallbacks;
+    }
+    ++g_textureCacheStats.hashed_lookups;
+    uint64_t content_hash = XXH3_64bits(bytes, size);
+    if (gxc::is_ci_format(format) && has_tlut && tlut_data != nullptr) {
+      ++g_textureCacheStats.palette_hashes;
+      // Resolvers report bytes available to the end of their mapped range. Only
+      // the declared GX palette belongs to this texture cache identity.
+      content_hash = XXH3_64bits_withSeed(tlut_data, tlutSize, content_hash);
+    }
+    const uint64_t small_hash =
+        size <= kAlwaysRehashBytes ? small_texture_hash(bytes, size, tlut_data, tlutSize) : 0u;
+    const uint64_t verify_frame = size <= kAlwaysRehashBytes
+                                      ? g_textureVerifyFrame.load(std::memory_order_relaxed)
+                                      : ~0ull;
+    const TextureKey key{address,     tsize,        format,      width,
+                         height,      tlut_address, tlut_format, tlut_entries,
+                         content_hash};
+    auto it = g_textureCache.find(key);
+    if (it != g_textureCache.end()) {
+      ++g_textureCacheStats.hits;
+      g_textureAddrKey[address] = TextureAddressState{
+          key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid,
+          small_hash, verify_frame};
+      return it->second;
+    }
+    // New content for this identity: evict any prior entry cached at the same
+    // guest address (its buffer was overwritten) to keep the cache bounded.
+    addrIt = g_textureAddrKey.find(address);
+    if (addrIt != g_textureAddrKey.end())
+      g_textureCache.erase(addrIt->second.key);
+    // HD texture packs (Dolphin's tex1_WxH_hash[_tlut]_fmt names): the first
+    // time these guest bytes are seen, look for a replacement before decoding.
+    // The handle is cached under the same content key as a decode would be,
+    // so later draws of the same texture never repeat the lookup.
+    bool replacementPending = false;
+    if (texture_replacement::has_source_replacements()) {
+      static unsigned long long s_lookups;
+      static const bool s_log_misses = std::getenv("DOL_TEXREP_LOG_MISSES") != nullptr;
+      ++s_lookups;
+      const auto replacement = texture_replacement::find_replacement_for_guest(
+          width, height, format, bytes, size, static_cast<const uint8_t*>(tlut_data),
+          tlut_data != nullptr ? std::min(tlut_available, tlut_entries * 2u) : 0u,
+          &replacementPending);
+      if (s_log_misses && !replacementPending && !(replacement.has_value() && *replacement))
+        std::fprintf(stderr, "[mods] texture miss #%llu addr=%08X fmt=%u %ux%u size=%u tlut=%u\n", s_lookups,
+                     address, format, width, height, size, tlut_entries);
+      if (replacement.has_value() && *replacement) {
+        g_textureAwaitingReplacement.erase(key);
+        ++g_textureCacheStats.uploads;
+        static unsigned long long s_replaced;
+        if (++s_replaced <= 3u || (s_replaced % 200u) == 0u)
+          std::fprintf(stderr, "[mods] texture replaced #%llu addr=%08X fmt=%u %ux%u -> %ux%u\n",
+                       s_replaced, address, format, width, height, (*replacement)->size.width,
+                       (*replacement)->size.height);
+        g_textureCache.emplace(key, *replacement);
+        g_textureAddrKey[address] = TextureAddressState{
+            key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid,
+            small_hash, verify_frame};
+        return *replacement;
+      }
+      if (replacementPending) {
+        if (auto it = g_textureAwaitingReplacement.find(key); it != g_textureAwaitingReplacement.end())
+          return it->second;
+      } else {
+        g_textureAwaitingReplacement.erase(key);
+      }
+    }
+    // gxcore owns the decode for every format: produce tightly-packed RGBA8 and
+    // upload it as a pre-decoded PC texture (no substrate re-conversion).
+    std::vector<uint8_t> decoded;
+    if (gxc::is_ci_format(format)) {
+      if (has_tlut && tlut_data != nullptr)
+        decoded = gxc::decode_ci(format, width, height, bytes, size, tlut_format,
+                                 tlut_entries,
+                                 static_cast<const uint8_t*>(tlut_data),
+                                 tlut_available);
+    } else {
+      decoded = gxc::decode_texture(format, width, height, bytes, size);
+    }
+    {
+      static const bool s_upload_log = std::getenv("DOL_GXCORE_TEX_UPLOAD_LOG") != nullptr;
+      if (s_upload_log)
+        std::fprintf(stderr, "[tex-upload] addr=%08X fmt=%u %ux%u size=%u efb=%d prior=%d tlut=%08X hash=%016llX pfmt=%u p%ux%u psize=%u\n",
+                     address, format, width, height, tsize,
+                     g_efbCopyTextures.find(address) != g_efbCopyTextures.end() ? 1 : 0,
+                     addrIt != g_textureAddrKey.end() ? 1 : 0, tlut_address,
+                     (unsigned long long)content_hash,
+                     addrIt != g_textureAddrKey.end() ? addrIt->second.key.format : 0u,
+                     addrIt != g_textureAddrKey.end() ? addrIt->second.key.width : 0u,
+                     addrIt != g_textureAddrKey.end() ? addrIt->second.key.height : 0u,
+                     addrIt != g_textureAddrKey.end() ? addrIt->second.key.size : 0u);
+    }
+    {
+      // DOL_GXCORE_DUMP_TEX=<hex address>: write the decoded RGBA of that
+      // texture as /tmp/gxcore-tex-<address>-<n>.pam (diagnostics).
+      static const long long s_dump = [] {
+        const char* env = std::getenv("DOL_GXCORE_DUMP_TEX");
+        return env != nullptr ? std::strtoll(env, nullptr, 16) : -1ll;
+      }();
+      static int s_dumped = 0;
+      if (s_dump >= 0 && (address & 0x3FFFFFFFu) == (static_cast<uint32_t>(s_dump) & 0x3FFFFFFFu) &&
+          !decoded.empty() && s_dumped < 4) {
+        char path[128];
+        std::snprintf(path, sizeof(path), "/tmp/gxcore-tex-%08X-%d.pam", address, s_dumped++);
+        if (FILE* f = std::fopen(path, "wb")) {
+          std::fprintf(f, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", width, height);
+          std::fwrite(decoded.data(), 1, decoded.size(), f);
+          std::fclose(f);
+        }
+      }
+    }
+    TextureHandle handle;
+    if (!decoded.empty()) {
+      handle = new_static_texture_2d(
+          width, height, 1, GX_TF_RGBA8_PC,
+          ArrayRef<uint8_t>{decoded.data(), decoded.size()}, false,
+          "GXCore Texture");
+      ++g_textureCacheStats.uploads;
+      if (gxc::is_ci_format(format))
+        ++g_textureCacheStats.ci_uploads;
+    } else {
+      // CI without a resolved palette, or a format gxcore does not decode: upload
+      // the raw GX bytes under the original format (old behavior).
+      handle = new_static_texture_2d(width, height, 1, format,
+                                     ArrayRef<uint8_t>{bytes, size}, false,
+                                     "GXCore Texture");
+      ++g_textureCacheStats.uploads;
+      ++g_textureCacheStats.raw_fallback;
+    }
+    if (replacementPending) {
+      g_textureAwaitingReplacement[key] = handle;
+      return handle;
+    }
+    g_textureCache.emplace(key, handle);
+    g_textureAddrKey[address] = TextureAddressState{
+        key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid,
+        small_hash, verify_frame};
+    return handle;
+  };
+
+  BindGroupRef textureBindGroup = 0;
+  if (plan.pipeline.shader.textured != 0) {
+    if (plan.texmap_mask == 0u) {
+      // Single-texmap fast path: primary texture at binding 0/1 (unchanged).
+      if (plan.has_texture) {
+        TextureHandle bound = resolve_texture_handle(
+            plan.tex_address, plan.tex_size, plan.tex_format, plan.tex_width,
+            plan.tex_height, plan.tex_data, plan.tex_available, plan.has_tlut,
+            plan.tlut_address, plan.tlut_format, plan.tlut_entries,
+            plan.tlut_data, plan.tlut_available);
+        if (bound) {
+          const auto sampler =
+              sampler_ref(sampler_descriptor(plan.samplers[plan.tex_slot & 7u]));
+          const std::array entries{
+              WGPUBindGroupEntry{.binding = 0,
+                                 .textureView =
+                                     bound->sampleTextureView.Get()},
+              WGPUBindGroupEntry{.binding = 1, .sampler = sampler.Get()},
+          };
+          const WGPUBindGroupDescriptor descriptor{
+              .label = {"GXCore Texture Bind Group", WGPU_STRLEN},
+              .layout = texture_bind_group_layout(1u).Get(),
+              .entryCount = entries.size(),
+              .entries = entries.data(),
+          };
+          textureBindGroup = bind_group_ref(descriptor);
+        }
+      }
+    } else {
+      // Multi-texmap: bind each used texmap at 2t (texture) / 2t+1 (sampler),
+      // matching the WGSL declarations. If any referenced texmap fails to
+      // resolve the draw is not drawable (avoids a missing-bind-group error).
+      // At most eight texmaps, two entries each: fixed arrays, so a draw does
+      // not allocate (the title screen issues about 20,000 draws a frame).
+      std::array<TextureHandle, 8> held{};
+      std::array<wgpu::Sampler, 8> heldSamplers{};
+      std::array<WGPUBindGroupEntry, 16> entries{};
+      size_t heldCount = 0;
+      size_t entryCount = 0;
+      bool complete = true;
+      for (uint32_t t = 0; t < 8u; ++t) {
+        if ((plan.texmap_mask & (1u << t)) == 0u)
+          continue;
+        const gxc::PlanTexture& pt = plan.textures[t];
+        TextureHandle bound;
+        if (pt.valid)
+          bound = resolve_texture_handle(
+              pt.address, pt.size, pt.format, pt.width, pt.height, pt.data,
+              pt.available, pt.has_tlut, pt.tlut_address, pt.tlut_format,
+              pt.tlut_entries, pt.tlut_data, pt.tlut_available);
+        if (!bound) {
+          complete = false;
+          break;
+        }
+        held[heldCount] = bound;
+        heldSamplers[heldCount] = sampler_ref(sampler_descriptor(plan.samplers[t]));
+        entries[entryCount++] = WGPUBindGroupEntry{
+            .binding = 2u * t, .textureView = bound->sampleTextureView.Get()};
+        entries[entryCount++] = WGPUBindGroupEntry{
+            .binding = 2u * t + 1u, .sampler = heldSamplers[heldCount].Get()};
+        ++heldCount;
+      }
+      if (!complete)
+        return false;
+      const WGPUBindGroupDescriptor descriptor{
+          .label = {"GXCore Texture Bind Group", WGPU_STRLEN},
+          .layout = texture_bind_group_layout(plan.texmap_mask).Get(),
+          .entryCount = entryCount,
+          .entries = entries.data(),
+      };
+      textureBindGroup = bind_group_ref(descriptor);
+    }
+  }
+
+  const bool tev = plan.pipeline.shader.tev_valid != 0;
+  const size_t vertBytes = plan.vertices.size() * sizeof(float);
+  const size_t indexBytes = plan.indices.size() * sizeof(uint16_t);
+  const size_t pixelUniformBytes = tev ? sizeof(plan.pixel_constants) : 0;
+  if (!staging_has_capacity(vertBytes, indexBytes, sizeof(plan.constants),
+                            pixelUniformBytes)) {
+    if (!segment_frame() ||
+        !staging_has_capacity(vertBytes, indexBytes, sizeof(plan.constants),
+                              pixelUniformBytes)) {
+      Log.error("GXCore draw exceeds an empty Aurora staging segment");
+      return false;
+    }
+  }
+
+  const auto vertRange = push_verts(
+      reinterpret_cast<const uint8_t*>(plan.vertices.data()),
+      vertBytes, 4);
+  const auto idxRange = push_indices(
+      reinterpret_cast<const uint8_t*>(plan.indices.data()),
+      indexBytes, 4);
+  const auto uniformRange = push_uniform_dedup(
+      g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
+      sizeof(plan.constants));
+  Range pixelUniformRange{};
+  if (tev) {
+    pixelUniformRange = push_uniform_dedup(
+        g_pixelUniformCache,
+        reinterpret_cast<const uint8_t*>(&plan.pixel_constants),
+        sizeof(plan.pixel_constants));
+  }
+
+  const PipelineConfig colorConfig{
+      .version = GXCorePipelineConfigVersion,
+      .key = plan.pipeline,
+      .msaaSamples = get_sample_count(),
+  };
+  PipelineRef depthPipeline = 0;
+  if (needs_early_depth_emulation(plan.pipeline)) {
+    PipelineConfig depthConfig = colorConfig;
+    depthConfig.depthOnly = 1u;
+    depthPipeline = pipeline_ref(depthConfig);
+  }
+  push_draw_command(DrawData{
+      .pipeline = pipeline_ref(colorConfig),
+      .depthPipeline = depthPipeline,
+      .vertRange = vertRange,
+      .idxRange = idxRange,
+      .uniformRange = uniformRange,
+      .pixelUniformRange = pixelUniformRange,
+      .indexCount = static_cast<uint32_t>(plan.indices.size()),
+      .textureBindGroup = textureBindGroup,
+      .tev = tev,
+  });
+  return true;
+}
+
+} // namespace aurora::gfx::gxcore
+
+void aurora_set_forced_anisotropy(unsigned samples) {
+  aurora::gfx::gxcore::g_forcedAnisotropy.store(
+      static_cast<std::uint16_t>(std::clamp(samples, 1u, 16u)), std::memory_order_relaxed);
+}
