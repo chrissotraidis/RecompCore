@@ -250,6 +250,8 @@ void render_pass(const wgpu::RenderPassEncoder& pass, uint32_t idx);
 void after_submit() noexcept;
 void gpu_synchronize();
 void after_present() noexcept;
+// Rendering fell behind: fewer in-between frames for a while (frame_interp::note_overload).
+void note_render_overload() noexcept;
 float calculate_fps() noexcept;
 // Game frames finished a second (each one presents once, or twice with an
 // in-between frame); calculate_fps() counts every present.
@@ -294,6 +296,9 @@ struct ConvRequest;
 void queue_palette_conv(tex_palette_conv::ConvRequest req);
 
 Range push_verts(const uint8_t* data, size_t length, size_t alignment);
+// Vertices starting on a whole vertex of `stride` bytes (any stride), so a draw
+// can address them as a base vertex in the whole buffer.
+Range push_verts_strided(const uint8_t* data, size_t length, size_t stride);
 template <typename T>
 static Range push_verts(ArrayRef<T> data, size_t alignment) {
   return push_verts(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T), alignment);
@@ -304,6 +309,8 @@ static Range push_indices(ArrayRef<T> data, size_t alignment) {
   return push_indices(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T), alignment);
 }
 Range push_uniform(const uint8_t* data, size_t length);
+// The block push_uniform staged at `range` in the recording frame.
+const uint8_t* uniform_bytes(Range range);
 // Identifies the frame packet (a new one per frame and per staging segment)
 // that staging ranges belong to; 0 when no frame is recording.
 uint64_t current_frame_id();
@@ -326,6 +333,19 @@ struct InterpRanges {
   Range verts[3];
 };
 void resolve_interp_job(size_t slot, const InterpRanges& ranges);
+// One draw of a batch (gxcore_draw.cpp): its indices' count, and its first
+// vertex from the batch's.
+struct BatchDraw {
+  uint32_t indexCount;
+  uint32_t firstVertex;
+};
+// Recording thread: a batch part, for the recording frame; its index.
+uint32_t push_batch_draw(const BatchDraw& draw);
+// Render worker, while an in-between frame is encoded: a batch part.
+const BatchDraw& batch_draw(uint32_t index);
+// Where push_verts_strided and push_indices put what comes next.
+size_t next_vertex_offset(size_t stride);
+size_t next_index_offset();
 // Render worker, while an in-between frame is encoded: a job's ranges, and
 // which of the game frame's in-between frames it is.
 const InterpRanges& interp_job_ranges(uint32_t job);

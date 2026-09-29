@@ -1,6 +1,7 @@
 #include "frame_interp.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -36,6 +37,22 @@ std::atomic_bool g_enabled{env_flag("DOL_AURORA_FRAME_INTERP", false)};
 // asked for at any time and taken at a game frame's start (g_frameSteps).
 std::atomic<int> g_steps{static_cast<int>(std::clamp<uint64_t>(env_u64("DOL_AURORA_FRAME_INTERP_STEPS", 1), 1, 3))};
 int g_frameSteps = g_steps.load(std::memory_order_relaxed);
+// In-between frames need not make the game wait (pace_steps): when the GPU
+// or the render worker keeps falling behind (note_overload), 60 Hz drops to
+// none, and comes back after a calm spell (120 Hz to 60 only when asked).
+std::atomic_bool g_overloaded{false};
+std::atomic<const char*> g_overloadWhy{nullptr}; // the latest overload's cause, for the log
+bool g_frameSkipped = false; // the recording frame has none (recording thread)
+struct Pacing {
+  uint64_t frame = 0;
+  uint64_t lastDrop = 0;
+  uint64_t lastRaise = 0;
+  int wanted = 0;  // g_steps when the budget was last set
+  int budget = 0;  // in-between frames allowed now, 0 to wanted
+  int calm = 0;    // game frames since the last overload
+  int calmNeeded = 0;
+  uint32_t recent = 0; // one bit a game frame, newest lowest: an overload reported
+} g_pacing;
 std::atomic_bool g_encodingInterpolated{false};
 std::atomic<uint64_t> g_gameFrame{1};
 
@@ -1783,12 +1800,80 @@ const gxc::VertexShaderConstants* blended_step(int step) noexcept {
 int frame_steps() noexcept { return g_frameSteps; }
 void set_steps(int steps) noexcept { g_steps.store(std::clamp(steps, 1, kMaxSteps), std::memory_order_relaxed); }
 int steps() noexcept { return g_steps.load(std::memory_order_relaxed); }
+bool frame_skipped() noexcept { return g_frameSkipped; }
+void note_overload(const char* why) noexcept {
+  g_overloadWhy.store(why, std::memory_order_relaxed);
+  g_overloaded.store(true, std::memory_order_relaxed);
+}
+
+// Recording thread, between game frames: the next frame's in-between frames.
+// Overloads (the GPU a frame behind, or the game waiting on rendering) in 3 of
+// the last 8 game frames take 60 Hz to none (and 120 Hz to 60, when pacing
+// is asked for there); one now and then (a texture loading, a late drawable)
+// is not a scene too heavy, and dropping on each one put 120 Hz at 60 most
+// times it did not need to be. The frames in
+// flight still report the overload a drop answers, so a second drop waits a
+// few frames. Calm for 3 s brings one level back, and a level that overloads
+// again soon after coming back waits twice as long the next time (up to 30 s),
+// so a scene just too heavy for 120 settles at 60 instead of stuttering
+// between them.
+static void pace_steps() {
+  static constexpr int kCalmStart = 90;  // game frames, 3 s
+  static constexpr int kCalmMost = 900;  // 30 s
+  static constexpr uint64_t kSettle = 4; // game frames between drops
+  static constexpr uint64_t kSoon = 300; // an overload within 10 s of coming back
+  // DOL_AURORA_FRAME_INTERP_PACING: 0 never lowers them, 1 lowers 120 Hz's
+  // too. Unset, only 60 Hz's are: 120 Hz stays 120, where a drop to 60 for a
+  // stall of a few frames, over by the time it dropped, was felt more than the
+  // stall.
+  static const int setting = [] {
+    const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_PACING");
+    return env != nullptr && env[0] != '\0' ? (env[0] != '0' ? 1 : 0) : -1;
+  }();
+  auto& p = g_pacing;
+  ++p.frame;
+  const int wanted = g_steps.load(std::memory_order_relaxed);
+  const bool pacing = setting == 1 || (setting < 0 && wanted < kMaxSteps);
+  const bool overloaded = g_overloaded.exchange(false, std::memory_order_relaxed) && pacing;
+  p.recent = (p.recent << 1) | (overloaded ? 1u : 0u);
+  const bool sustained = std::popcount(p.recent & 0xFFu) >= 3;
+  if (wanted != p.wanted) {
+    p = Pacing{.frame = p.frame, .wanted = wanted, .budget = wanted, .calmNeeded = kCalmStart};
+  } else if (sustained) {
+    p.calm = 0;
+    if (p.budget > 0 && p.frame - p.lastDrop >= kSettle) {
+      if (p.lastRaise != 0 && p.frame - p.lastRaise < kSoon)
+        p.calmNeeded = std::min(p.calmNeeded * 2, kCalmMost);
+      const int before = p.budget;
+      p.budget = p.budget > 1 ? 1 : 0;
+      p.lastDrop = p.frame;
+      p.recent = 0;
+      const char* why = g_overloadWhy.load(std::memory_order_relaxed);
+      std::fprintf(stderr, "[interp-pace] in-between frames %d -> %d (%s; back after %.0f s calm)\n", before,
+                   p.budget, why != nullptr ? why : "rendering fell behind", p.calmNeeded / 30.0);
+    }
+  } else if (p.budget < wanted) {
+    if (++p.calm >= p.calmNeeded) {
+      const int before = p.budget;
+      p.budget = p.budget == 0 ? 1 : wanted;
+      p.calm = 0;
+      p.lastRaise = p.frame;
+      std::fprintf(stderr, "[interp-pace] in-between frames %d -> %d\n", before, p.budget);
+    }
+  } else if (p.lastRaise != 0 && p.frame - p.lastRaise >= kSoon) {
+    // Held since coming back: the next overload is a new scene's.
+    p.calmNeeded = kCalmStart;
+    p.lastRaise = 0;
+  }
+  g_frameSteps = std::clamp(std::min(p.budget, wanted), 1, kMaxSteps);
+  g_frameSkipped = p.budget == 0;
+}
 
 bool last_blend_repeated() noexcept { return g_blendRepeated; }
 
 bool frame_verdict() noexcept {
   g_lastVerdict = false;
-  if (!enabled() || !g_havePrevious || g_frameCounts.blended == 0)
+  if (!enabled() || g_frameSkipped || !g_havePrevious || g_frameCounts.blended == 0)
     return false;
   // A cut: most draws have a counterpart that is not plausibly the same thing.
   // Copies just come into view count too (after a cut every copy of a model
@@ -1872,7 +1957,7 @@ void end_game_frame() noexcept {
     g_predicted = g_motions[g_leadingMotion];
     g_predicted.derived = false; // its parts again, for the next frame's steps
   }
-  g_frameSteps = g_steps.load(std::memory_order_relaxed);
+  pace_steps();
   g_motionCount = 0;
   g_leadingMotion = -1;
   g_newInView = UINT32_MAX;

@@ -48,7 +48,19 @@ struct DrawData {
   uint32_t indexCount;
   BindGroupRef textureBindGroup; // 0 when untextured
   bool tev = false; // TEV path: PS uniform at group 2, texture at group 3
+  // A tagged particle's, whose in-between vertices are its own (interpVertRange).
+  bool ownVertices = false;
+  // Consecutive draws of one state whose vertices and indices follow on are
+  // one draw (submit_draw_plan); an in-between frame whose blocks for them
+  // differ draws them one by one: their parts are batch_draw(batch + i), their
+  // jobs interpJob + i.
+  uint32_t batch = UINT32_MAX;
+  uint32_t batchSize = 1;
 };
+
+// Recording: the pass's last command, when it is a GXCore draw a following
+// draw may extend; nullptr otherwise.
+DrawData* last_recorded_draw() noexcept;
 
 // Bump when generate_wgsl output or the DrawData/vertex layout changes: the
 // persisted pipeline cache precompiles stored configs at startup, and a
@@ -78,6 +90,9 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config);
 bool needs_early_depth_emulation(
     const gxruntime::gxcore::PipelineKey& key);
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
+// At a render pass's start, and after anything else draws in it: what
+// render() last bound is not known.
+void reset_pass_state();
 
 // Perform one EFB copy-to-texture (63/S16): resolve the current EFB region into
 // a texture keyed by the copy destination address, so a later draw binding that

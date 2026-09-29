@@ -42,6 +42,11 @@ constexpr int kMaxSteps = 3;
 void set_steps(int steps) noexcept;
 int steps() noexcept;
 int frame_steps() noexcept;
+// Rendering fell behind (the GPU a game frame behind, the game waiting on the
+// render worker, a long wait for a drawable): the next game frames get fewer
+// in-between frames, or none (frame_skipped), until it has been calm a while.
+void note_overload(const char* why) noexcept;
+bool frame_skipped() noexcept;
 
 // The key for a draw's vertex stream; 0 when the plan carries no payload.
 uint64_t draw_key(const gxruntime::gxcore::DrawPlan& plan) noexcept;
