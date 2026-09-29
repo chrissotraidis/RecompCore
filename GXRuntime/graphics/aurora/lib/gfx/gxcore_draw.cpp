@@ -182,7 +182,18 @@ wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler) {
 // t occupies binding 2t (texture) + 2t+1 (sampler), matching the WGSL. Cached per
 // mask; used_mask=1 (texmap 0 only) reproduces the pre-Mfin single-texmap layout.
 wgpu::BindGroupLayout texture_bind_group_layout(uint32_t used_mask = 1u) {
+  // Both the pipeline compiler and FIFO submission use this cache. A lookup
+  // concurrent with flat_hash_map growth can read an invalid layout handle.
+  static std::mutex mutex;
+  std::lock_guard lock{mutex};
   static absl::flat_hash_map<uint32_t, wgpu::BindGroupLayout> cache;
+  // Retaining the owner also prevents pointer reuse from matching a dead
+  // device after renderer reinitialization.
+  static wgpu::Device owner;
+  if (owner.Get() != g_device.Get()) {
+    cache.clear();
+    owner = g_device;
+  }
   auto it = cache.find(used_mask);
   if (it != cache.end())
     return it->second;
@@ -635,60 +646,190 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   return g_device.CreateRenderPipeline(&descriptor);
 }
 
+// What render() last bound in the pass being encoded, so a draw sets only
+// what differs from the draw before it. Every draw set its vertex and index
+// ranges and its bind groups again, six or seven commands a draw, and the
+// in-between frames encode every draw once more each (three times at 120 Hz):
+// the render worker's encoding was most of a game frame in a busy scene. The
+// vertex and index buffers are bound whole once (a draw's range is its base
+// vertex and first index), and a bind group is set again only when it or its
+// offset changed or the pipeline did (a tev pipeline's group 2 is another
+// layout than an untextured one's).
+namespace {
+struct PassState {
+  WGPUBuffer vertexBuffer = nullptr; // bound whole, or a particle's range
+  uint64_t vertexOffset = 0;
+  bool indexBound = false;
+  PipelineRef pipeline = 0;
+  WGPUBindGroup group1 = nullptr;
+  uint32_t offset1 = UINT32_MAX;
+  WGPUBindGroup group2 = nullptr;
+  uint32_t offset2 = UINT32_MAX;
+  WGPUBindGroup group3 = nullptr;
+};
+PassState g_pass;
+} // namespace
+
+void reset_pass_state() { g_pass = PassState{}; }
+
+// What a draw, or one of a batch's (submit_draw_plan) draws, is encoded with:
+// its constants and a particle's in-between vertices (empty: the frame's
+// own), its indices, and its first vertex from the batch's.
+namespace {
+struct DrawPart {
+  Range uniform;
+  Range verts;
+  uint32_t firstIndex;
+  uint32_t indexCount;
+  uint32_t firstVertex;
+};
+} // namespace
+
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+  const auto bind = [&](PipelineRef ref) {
+    if (!bind_pipeline(ref, pass))
+      return false;
+    if (ref != g_pass.pipeline) {
+      g_pass.pipeline = ref;
+      g_pass.group1 = g_pass.group2 = g_pass.group3 = nullptr;
+    }
+    return true;
+  };
   // Ensure both asynchronous pipelines are ready before the prepass writes any
   // depth. Binding the color pipeline first is harmless; it is rebound below.
-  if (!bind_pipeline(data.pipeline, pass)) {
+  if (!bind(data.pipeline)) {
     return;
   }
-  if (data.depthPipeline != 0 && !bind_pipeline(data.depthPipeline, pass))
+  if (data.depthPipeline != 0 && !bind(data.depthPipeline))
     return;
-  // The in-between frame reads a moved draw's blended constants from their
-  // own area; every other draw keeps its own.
   // The in-between frame being encoded: its step's block and vertices (a
   // traced frame's own, matched while recording, are one step's).
-  Range interpUniform{}, interpVerts{};
-  if (frame_interp::encoding_interpolated()) {
-    const int step = interp_replay_step();
+  const bool interpolated = frame_interp::encoding_interpolated();
+  const int step = interpolated ? interp_replay_step() : 0;
+  const auto job_ranges = [&](uint32_t job, Range& uniform, Range& verts) {
+    uniform = verts = {};
+    if (!interpolated)
+      return;
     if (data.interpJob != UINT32_MAX) {
-      const InterpRanges& job = interp_job_ranges(data.interpJob);
-      interpUniform = job.uniform[step];
-      interpVerts = job.verts[step];
+      const InterpRanges& ranges = interp_job_ranges(job);
+      uniform = ranges.uniform[step];
+      verts = ranges.verts[step];
     } else if (step == 0) {
-      interpUniform = data.interpUniformRange;
-      interpVerts = data.interpVertRange;
+      uniform = data.interpUniformRange;
+      verts = data.interpVertRange;
+    }
+  };
+  const uint32_t firstIndex = data.idxRange.offset / sizeof(uint16_t);
+  // One draw, or a batch as one; a batch whose draws' in-between blocks (or a
+  // particle's vertices, laid out apart from the batch's) differ, one by one.
+  static std::vector<DrawPart> parts;
+  parts.clear();
+  DrawPart whole{.firstIndex = firstIndex, .indexCount = data.indexCount, .firstVertex = 0};
+  job_ranges(data.interpJob, whole.uniform, whole.verts);
+  bool asOne = true;
+  if (interpolated && data.batchSize > 1 && data.interpJob != UINT32_MAX) {
+    for (uint32_t i = 1; i < data.batchSize && asOne; ++i) {
+      Range uniform, verts;
+      job_ranges(data.interpJob + i, uniform, verts);
+      const uint32_t first = batch_draw(data.batch + i).firstVertex;
+      asOne = uniform.offset == whole.uniform.offset && uniform.size == whole.uniform.size &&
+              (whole.verts.size == 0 ? verts.size == 0
+                                     : verts.size != 0 && verts.offset == whole.verts.offset +
+                                                                              first * gxc::kVertexStrideBytes);
+    }
+    if (!asOne) {
+      uint32_t index = firstIndex;
+      for (uint32_t i = 0; i < data.batchSize; ++i) {
+        const BatchDraw& part = batch_draw(data.batch + i);
+        DrawPart& draw = parts.emplace_back(
+            DrawPart{.firstIndex = index, .indexCount = part.indexCount, .firstVertex = part.firstVertex});
+        job_ranges(data.interpJob + i, draw.uniform, draw.verts);
+        index += part.indexCount;
+      }
     }
   }
-  const bool blended = interpUniform.size != 0;
-  const auto& vsGroup = blended ? g_interpUniformBindGroup : g_uniformBindGroup;
-  const std::array vsOffsets{blended ? interpUniform.offset : data.uniformRange.offset};
-  pass.SetBindGroup(1, vsGroup, vsOffsets.size(), vsOffsets.data());
-  // A particle's vertices, blended, from the in-between vertex area.
-  if (interpVerts.size != 0)
-    pass.SetVertexBuffer(0, g_interpVertexBuffer, interpVerts.offset, interpVerts.size);
-  else
+  if (asOne)
+    parts.push_back(whole);
+
+  const auto setGroup1 = [&](const DrawPart& part) {
+    const bool blended = part.uniform.size != 0;
+    const auto& vsGroup = blended ? g_interpUniformBindGroup : g_uniformBindGroup;
+    const uint32_t vsOffset = blended ? part.uniform.offset : data.uniformRange.offset;
+    if (vsGroup.Get() != g_pass.group1 || vsOffset != g_pass.offset1) {
+      pass.SetBindGroup(1, vsGroup, 1, &vsOffset);
+      g_pass.group1 = vsGroup.Get();
+      g_pass.offset1 = vsOffset;
+    }
+  };
+  // The vertices: from the whole buffer at the draw's (or batch's) base
+  // vertex, or a particle's blended ones from the in-between vertex area,
+  // bound where the part's first index (counted from the batch's first
+  // vertex) finds them.
+  const auto setVertices = [&](const DrawPart& part) -> int32_t {
+    const uint64_t back = uint64_t{part.firstVertex} * gxc::kVertexStrideBytes;
+    if (part.verts.size != 0 && part.verts.offset >= back) {
+      const uint64_t offset = part.verts.offset - back;
+      if (g_pass.vertexBuffer != g_interpVertexBuffer.Get() || g_pass.vertexOffset != offset) {
+        pass.SetVertexBuffer(0, g_interpVertexBuffer, offset);
+        g_pass.vertexBuffer = g_interpVertexBuffer.Get();
+        g_pass.vertexOffset = offset;
+      }
+      return 0;
+    }
+    if (data.vertRange.offset % gxc::kVertexStrideBytes == 0) {
+      if (g_pass.vertexBuffer != g_vertexBuffer.Get() || g_pass.vertexOffset != 0) {
+        pass.SetVertexBuffer(0, g_vertexBuffer);
+        g_pass.vertexBuffer = g_vertexBuffer.Get();
+        g_pass.vertexOffset = 0;
+      }
+      return static_cast<int32_t>(data.vertRange.offset / gxc::kVertexStrideBytes);
+    }
     pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset, data.vertRange.size);
-  pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16,
-                      data.idxRange.offset, data.idxRange.size);
+    g_pass.vertexBuffer = g_vertexBuffer.Get();
+    g_pass.vertexOffset = data.vertRange.offset;
+    return 0;
+  };
+  if (!g_pass.indexBound) {
+    pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16);
+    g_pass.indexBound = true;
+  }
+  const auto draw = [&] {
+    for (const DrawPart& part : parts) {
+      setGroup1(part);
+      const int32_t baseVertex = setVertices(part);
+      pass.DrawIndexed(part.indexCount, 1, part.firstIndex, baseVertex);
+    }
+  };
   if (data.depthPipeline != 0) {
-    pass.DrawIndexed(data.indexCount);
-    if (!bind_pipeline(data.pipeline, pass))
+    draw();
+    if (!bind(data.pipeline))
       return;
-    pass.SetBindGroup(1, vsGroup, vsOffsets.size(), vsOffsets.data());
   }
   if (data.tev) {
     // group 2 = PS uniform (same dynamic-uniform bind group, its own offset);
     // group 3 = texture.
-    const std::array psOffsets{data.pixelUniformRange.offset};
-    pass.SetBindGroup(2, g_uniformBindGroup, psOffsets.size(),
-                      psOffsets.data());
+    const uint32_t psOffset = data.pixelUniformRange.offset;
+    if (g_uniformBindGroup.Get() != g_pass.group2 || psOffset != g_pass.offset2) {
+      pass.SetBindGroup(2, g_uniformBindGroup, 1, &psOffset);
+      g_pass.group2 = g_uniformBindGroup.Get();
+      g_pass.offset2 = psOffset;
+    }
     if (data.textureBindGroup != 0) {
-      pass.SetBindGroup(3, find_bind_group(data.textureBindGroup));
+      const auto& group = find_bind_group(data.textureBindGroup);
+      if (group.Get() != g_pass.group3) {
+        pass.SetBindGroup(3, group);
+        g_pass.group3 = group.Get();
+      }
     }
   } else if (data.textureBindGroup != 0) {
-    pass.SetBindGroup(2, find_bind_group(data.textureBindGroup));
+    const auto& group = find_bind_group(data.textureBindGroup);
+    if (group.Get() != g_pass.group2 || g_pass.offset2 != UINT32_MAX) {
+      pass.SetBindGroup(2, group);
+      g_pass.group2 = group.Get();
+      g_pass.offset2 = UINT32_MAX;
+    }
   }
-  pass.DrawIndexed(data.indexCount);
+  draw();
 }
 
 void note_frame_presented() {
@@ -816,8 +957,10 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
 // filled Aurora's 24 MB uniform staging area in the middle of Wind Waker's
 // Outset frames, and each split waited on the GPU. A draw whose block matches
 // the previous draw's, within the same frame packet, reuses that range.
+// The block a cache last took is compared where it was staged (uniform_bytes,
+// or interp_uniform_bytes for the in-between frames'): a copy of each block
+// kept aside for the comparison was a tenth of the FIFO worker's copying.
 struct UniformCache {
-  std::vector<uint8_t> bytes;
   Range range{};
   uint64_t frameId = 0;
   uint64_t hits = 0;
@@ -830,13 +973,12 @@ static UniformCache g_pixelUniformCache;
 // Whether `data` is the block the cache last took, in this frame packet.
 static bool repeats_cached(const UniformCache& cache, const uint8_t* data, size_t length) {
   const uint64_t frameId = current_frame_id();
-  return frameId != 0 && cache.frameId == frameId && cache.bytes.size() == length &&
-         std::memcmp(cache.bytes.data(), data, length) == 0;
+  return frameId != 0 && cache.frameId == frameId && cache.range.size == length &&
+         std::memcmp(uniform_bytes(cache.range), data, length) == 0;
 }
 
-// The in-between frame's blocks, de-duplicated the same way. Their staging is
-// plain memory, so the last block is compared where it was staged rather than
-// copied aside as well. repeated: the in-between frame made this block the way
+// The in-between frame's blocks, de-duplicated the same way. repeated: the
+// in-between frame made this block the way
 // it made the last one, from the same constants (frame_interp::last_blend_repeated),
 // so its bytes are the same.
 static Range push_interp_uniform_dedup(UniformCache& cache, uint64_t frameId, size_t slot, const uint8_t* data,
@@ -887,6 +1029,9 @@ Range push_blended_vertices(size_t slot, const std::vector<float>& vertices, con
 
 struct InterpHelper {
   static constexpr uint64_t Capacity = 1024;
+  // A sleeping helper is woken for this many jobs at once (or by
+  // wait_interp_jobs at the frame's end), not for every draw.
+  static constexpr uint64_t WakeBatch = 32;
   std::unique_ptr<InterpJob[]> ring{new InterpJob[Capacity]};
   std::atomic<uint64_t> produced{0};
   std::atomic<uint64_t> consumed{0};
@@ -911,10 +1056,12 @@ void interp_helper_main(InterpHelper* h) {
     const uint64_t tail = h->consumed.load(std::memory_order_relaxed);
     if (tail == h->produced.load(std::memory_order_seq_cst)) {
       // Draws come microseconds apart while a frame records: wait a little
-      // before sleeping, or the helper sleeps and is woken for every draw
-      // (300,000 wake-ups a second, measured; more CPU than the work).
+      // before sleeping. Woken for every draw it was 300,000 wake-ups a second
+      // (more CPU than the work); spinning 4,096 times before each sleep
+      // instead was an eighth of its time. It spins briefly, and a sleeping
+      // helper is woken for a batch of jobs (WakeBatch).
       bool arrived = false;
-      for (int spin = 0; spin < 4096 && !arrived; ++spin) {
+      for (int spin = 0; spin < 256 && !arrived; ++spin) {
 #if defined(__x86_64__) || defined(_M_X64)
         __builtin_ia32_pause();
 #elif defined(__aarch64__)
@@ -979,11 +1126,19 @@ uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw) {
   job.repeatsLastDraw = repeatsLastDraw;
   std::memcpy(&job.constants, &plan.constants, sizeof(plan.constants));
   h->produced.store(head + 1, std::memory_order_seq_cst);
-  if (h->sleeping.load(std::memory_order_seq_cst)) {
+  // Asleep, it consumes nothing: the jobs waiting reach WakeBatch exactly once.
+  if (h->sleeping.load(std::memory_order_seq_cst) &&
+      head + 1 - h->consumed.load(std::memory_order_acquire) >= InterpHelper::WakeBatch) {
     std::lock_guard lock{h->mutex};
     h->work.notify_one();
   }
   return h->jobs++;
+}
+
+// The job queue_interp_job gives the recording frame's next draw.
+uint32_t next_interp_job() {
+  const InterpHelper* h = g_interpHelper.load(std::memory_order_acquire);
+  return h == nullptr || h->packet != current_frame_id() ? 0u : h->jobs;
 }
 } // namespace
 
@@ -993,6 +1148,8 @@ void wait_interp_jobs() {
       h->consumed.load(std::memory_order_acquire) == h->produced.load(std::memory_order_acquire))
     return;
   std::unique_lock lock{h->mutex};
+  // The last jobs, fewer than a batch, are waiting on this.
+  h->work.notify_one();
   h->idle.wait(lock, [h] {
     return h->consumed.load(std::memory_order_acquire) == h->produced.load(std::memory_order_acquire);
   });
@@ -1007,8 +1164,8 @@ static Range push_uniform_dedup(UniformCache& cache, const uint8_t* data,
     return env == nullptr || env[0] != '0';
   }();
   const uint64_t frameId = current_frame_id();
-  if (enabled && frameId != 0 && cache.frameId == frameId && cache.bytes.size() == length &&
-      (known >= 0 ? known == 1 : std::memcmp(cache.bytes.data(), data, length) == 0)) {
+  if (enabled && frameId != 0 && cache.frameId == frameId && cache.range.size == length &&
+      (known >= 0 ? known == 1 : std::memcmp(uniform_bytes(cache.range), data, length) == 0)) {
     ++cache.hits;
     return cache.range;
   }
@@ -1017,15 +1174,80 @@ static Range push_uniform_dedup(UniformCache& cache, const uint8_t* data,
     Log.info("GXCore uniform reuse: {} of {} blocks reused",
              cache.hits, cache.hits + cache.pushes);
   cache.range = push_uniform(data, length);
-  cache.bytes.assign(data, data + length);
   cache.frameId = frameId;
   return cache.range;
+}
+
+// DOL_GXCORE_DRAW_DUMP=<game frame>: every draw of that frame, its TEV and
+// indirect stages, texgens, textures and blending, on stderr (debug).
+static void dump_draw(const gxc::DrawPlan& plan) {
+  static const uint64_t frame = [] {
+    const char* env = std::getenv("DOL_GXCORE_DRAW_DUMP");
+    return env != nullptr ? std::strtoull(env, nullptr, 10) : 0ull;
+  }();
+  if (frame == 0 || frame_interp::game_frame_number() != frame)
+    return;
+  static uint32_t index = 0;
+  const auto& key = plan.pipeline;
+  const auto& sh = key.shader;
+  const auto& m = plan.constants.posnormalmatrix;
+  std::fprintf(stderr,
+               "[draw-dump] #%u verts=%u prim=0x%02X t=(%.0f,%.0f,%.0f) blend=%u src=%u dst=%u z=%u/%u/%u tev=%u "
+               "stages=%u ind=%u texgens=%u chans=%u lit=%u alpha=%u/%u/%u fog=%u tag=%06X\n",
+               index++, plan.vertex_count, plan.match_primitive, m[0][3], m[1][3], m[2][3], key.blend_enable,
+               key.src_factor, key.dst_factor, key.depth_test, key.depth_func, key.depth_update, sh.tev_valid,
+               sh.num_tev_stages, sh.num_ind_stages, sh.num_tex_gens, sh.num_color_chans, sh.lit_valid,
+               sh.alpha_comp0, sh.alpha_comp1, sh.alpha_logic, sh.fog_fsel, plan.draw_tag);
+  for (uint32_t i = 0; i < sh.num_tev_stages && i < gxc::kMaxTevStages; ++i) {
+    const auto& t = sh.tev_stages[i];
+    std::fprintf(stderr,
+                 "[draw-dump]   s%u tc%u map%u en%u ras%u  C=%u,%u,%u,%u op%u b%u s%u cl%u ->%u  "
+                 "A=%u,%u,%u,%u op%u b%u s%u cl%u ->%u  k=%u/%u  ind: st%u fmt%u bias%u mtx%u id%u wrap%u,%u add%u\n",
+                 i, t.tevorders_texcoord, t.tevorders_texmap, t.tevorders_enable, t.tevorders_colorchan, t.cc_a,
+                 t.cc_b, t.cc_c, t.cc_d, t.cc_op, t.cc_bias, t.cc_scale, t.cc_clamp, t.cc_dest, t.ac_a, t.ac_b, t.ac_c,
+                 t.ac_d, t.ac_op, t.ac_bias, t.ac_scale, t.ac_clamp, t.ac_dest, t.ksel_kc, t.ksel_ka, t.ind_stage,
+                 t.ind_format, t.ind_bias, t.ind_matrix_index, t.ind_matrix_id, t.ind_wrap_s, t.ind_wrap_t,
+                 t.ind_add_prev);
+  }
+  for (uint32_t i = 0; i < sh.num_ind_stages && i < 4u; ++i)
+    std::fprintf(stderr, "[draw-dump]   ind%u map%u tc%u scale=%u,%u\n", i, sh.ind_stages[i].texmap,
+                 sh.ind_stages[i].texcoord, sh.ind_stages[i].scale_s, sh.ind_stages[i].scale_t);
+  for (uint32_t i = 0; i < sh.num_tex_gens && i < gxc::kMaxTexGens; ++i) {
+    std::fprintf(stderr, "[draw-dump]   tg%u type%u src%u form%u proj%u row%u (MatrixIndexA %08X)\n", i,
+                 sh.tex_gens[i].texgentype, sh.tex_gens[i].sourcerow, sh.tex_gens[i].inputform,
+                 sh.tex_gens[i].projection, plan.texgen_row[i], plan.matrix_index_a);
+    for (uint32_t r = 0; r < 3u; ++r) {
+      const float* row = plan.constants.texmatrices[i * 3u + r];
+      std::fprintf(stderr, "[draw-dump]     tm%u.%u %.4f %.4f %.4f %.4f\n", i, r, row[0], row[1], row[2], row[3]);
+    }
+  }
+  if (plan.vertices.size() >= 3)
+    std::fprintf(stderr, "[draw-dump]   v0 %.2f %.2f %.2f\n", plan.vertices[0], plan.vertices[1], plan.vertices[2]);
+  for (uint32_t r = 0; r < 3u; ++r)
+    std::fprintf(stderr, "[draw-dump]   pos%u %.4f %.4f %.4f %.4f\n", r, m[r][0], m[r][1], m[r][2], m[r][3]);
+  for (uint32_t i = 0; i < 8u; ++i)
+    if (plan.textures[i].valid)
+      std::fprintf(stderr, "[draw-dump]   tex%u @%08X fmt%u %ux%u dims=%d,%d,%d,%d\n", i, plan.textures[i].address,
+                   plan.textures[i].format, plan.textures[i].width, plan.textures[i].height,
+                   plan.pixel_constants.texdims[i][0], plan.pixel_constants.texdims[i][1],
+                   plan.pixel_constants.texdims[i][2], plan.pixel_constants.texdims[i][3]);
+  if (sh.num_ind_stages != 0)
+    for (uint32_t i = 0; i < 6u; ++i)
+      std::fprintf(stderr, "[draw-dump]   indmtx%u %d %d %d %d\n", i, plan.pixel_constants.indtexmtx[i][0],
+                   plan.pixel_constants.indtexmtx[i][1], plan.pixel_constants.indtexmtx[i][2],
+                   plan.pixel_constants.indtexmtx[i][3]);
+  for (uint32_t i = 0; i < 4u; ++i)
+    std::fprintf(stderr, "[draw-dump]   c%u=%d,%d,%d,%d k%u=%d,%d,%d,%d\n", i, plan.pixel_constants.colors[i][0],
+                 plan.pixel_constants.colors[i][1], plan.pixel_constants.colors[i][2], plan.pixel_constants.colors[i][3],
+                 i, plan.pixel_constants.kcolors[i][0], plan.pixel_constants.kcolors[i][1],
+                 plan.pixel_constants.kcolors[i][2], plan.pixel_constants.kcolors[i][3]);
 }
 
 bool submit_draw_plan(const gxc::DrawPlan& plan) {
   if (!plan.ok || plan.vertex_count == 0 || plan.indices.empty()) {
     return false;
   }
+  dump_draw(plan);
 
   if (plan.viewport_valid) {
     gx::set_logical_viewport(retail_viewport(plan.viewport));
@@ -1418,25 +1640,88 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                  plan.match_direct_position ? 1 : 0, plan.draw_tag, plan.draw_tag_age,
                  tracedPositions != nullptr ? 1 : 0);
   }
-  if (!staging_has_capacity(vertBytes, indexBytes, sizeof(plan.constants),
+  if (!staging_has_capacity(vertBytes + gxc::kVertexStrideBytes, indexBytes, sizeof(plan.constants),
                             pixelUniformBytes)) {
     if (!segment_frame() ||
-        !staging_has_capacity(vertBytes, indexBytes, sizeof(plan.constants),
+        !staging_has_capacity(vertBytes + gxc::kVertexStrideBytes, indexBytes, sizeof(plan.constants),
                               pixelUniformBytes)) {
       Log.error("GXCore draw exceeds an empty Aurora staging segment");
       return false;
     }
   }
 
-  const auto vertRange = push_verts(
-      reinterpret_cast<const uint8_t*>(plan.vertices.data()),
-      vertBytes, 4);
-  const auto idxRange = push_indices(
-      reinterpret_cast<const uint8_t*>(plan.indices.data()),
-      indexBytes, 4);
   const auto uniformRange = push_uniform_dedup(
       g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
       sizeof(plan.constants), repeatsLast ? 1 : 0);
+  Range pixelUniformRange{};
+  if (tev) {
+    pixelUniformRange = push_uniform_dedup(
+        g_pixelUniformCache,
+        reinterpret_cast<const uint8_t*>(&plan.pixel_constants),
+        sizeof(plan.pixel_constants));
+  }
+  const PipelineConfig colorConfig{
+      .version = GXCorePipelineConfigVersion,
+      .key = plan.pipeline,
+      .msaaSamples = get_sample_count(),
+  };
+  const PipelineRef pipeline = pipeline_ref(colorConfig);
+  PipelineRef depthPipeline = 0;
+  if (needs_early_depth_emulation(plan.pipeline)) {
+    PipelineConfig depthConfig = colorConfig;
+    depthConfig.depthOnly = 1u;
+    depthPipeline = pipeline_ref(depthConfig);
+  }
+  const bool ownVertices = plan.draw_tag != 0 || plan.draw_scope_part != 0;
+
+  // Batching: a draw of the state of the pass's last command (pipeline,
+  // constants, pixel constants, textures), with nothing between them, whose
+  // vertices and indices follow its, extends it, its indices counted from the
+  // batch's first vertex. Grass, rocks, a particle system's quads and a wake's
+  // strips are runs of such draws: 65 percent of Adanmae's 10,000 draws a
+  // frame repeat the constants of the draw before. In-between frames draw a
+  // batch as one where its draws' blocks came out the same (render()).
+  static const bool batching = [] {
+    const char* env = std::getenv("DOL_AURORA_GXCORE_BATCH");
+    return env == nullptr || env[0] != '0';
+  }();
+  const size_t vertexOffset = next_vertex_offset(gxc::kVertexStrideBytes);
+  DrawData* batch = nullptr;
+  uint32_t firstVertex = 0;
+  if (batching && !matchHere) {
+    DrawData* last = last_recorded_draw();
+    if (last != nullptr && last->pipeline == pipeline && last->depthPipeline == depthPipeline &&
+        last->uniformRange.offset == uniformRange.offset && last->tev == tev &&
+        (!tev || last->pixelUniformRange.offset == pixelUniformRange.offset) &&
+        last->textureBindGroup == textureBindGroup && last->ownVertices == ownVertices &&
+        last->interpUniformRange.size == 0 && last->interpVertRange.size == 0 &&
+        (interpolating ? last->interpJob != UINT32_MAX && last->interpJob + last->batchSize == next_interp_job()
+                       : last->interpJob == UINT32_MAX) &&
+        last->vertRange.offset % gxc::kVertexStrideBytes == 0 &&
+        last->vertRange.offset + last->vertRange.size == vertexOffset &&
+        last->idxRange.offset + last->idxRange.size == next_index_offset()) {
+      const size_t first = (vertexOffset - last->vertRange.offset) / gxc::kVertexStrideBytes;
+      if (first + plan.vertex_count <= 65536u) {
+        batch = last;
+        firstVertex = static_cast<uint32_t>(first);
+      }
+    }
+  }
+
+  // On a whole vertex: render() draws it at a base vertex of the whole buffer.
+  const auto vertRange = push_verts_strided(
+      reinterpret_cast<const uint8_t*>(plan.vertices.data()),
+      vertBytes, gxc::kVertexStrideBytes);
+  Range idxRange;
+  if (batch != nullptr) {
+    static std::vector<uint16_t> rebased;
+    rebased.resize(plan.indices.size());
+    for (size_t i = 0; i < rebased.size(); ++i)
+      rebased[i] = static_cast<uint16_t>(plan.indices[i] + firstVertex);
+    idxRange = push_indices(reinterpret_cast<const uint8_t*>(rebased.data()), indexBytes, 2);
+  } else {
+    idxRange = push_indices(reinterpret_cast<const uint8_t*>(plan.indices.data()), indexBytes, 2);
+  }
   Range interpUniformRange{};
   uint32_t interpJob = UINT32_MAX;
   if (interpConstants != nullptr)
@@ -1445,27 +1730,21 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         sizeof(*interpConstants), frame_interp::last_blend_repeated());
   else if (interpolating && !matchHere)
     interpJob = queue_interp_job(plan, repeatsLast);
-  Range pixelUniformRange{};
-  if (tev) {
-    pixelUniformRange = push_uniform_dedup(
-        g_pixelUniformCache,
-        reinterpret_cast<const uint8_t*>(&plan.pixel_constants),
-        sizeof(plan.pixel_constants));
-  }
 
-  const PipelineConfig colorConfig{
-      .version = GXCorePipelineConfigVersion,
-      .key = plan.pipeline,
-      .msaaSamples = get_sample_count(),
-  };
-  PipelineRef depthPipeline = 0;
-  if (needs_early_depth_emulation(plan.pipeline)) {
-    PipelineConfig depthConfig = colorConfig;
-    depthConfig.depthOnly = 1u;
-    depthPipeline = pipeline_ref(depthConfig);
+  const auto indexCount = static_cast<uint32_t>(plan.indices.size());
+  if (batch != nullptr) {
+    if (batch->batchSize == 1)
+      batch->batch = push_batch_draw({.indexCount = batch->indexCount, .firstVertex = 0});
+    push_batch_draw({.indexCount = indexCount, .firstVertex = firstVertex});
+    ++batch->batchSize;
+    batch->indexCount += indexCount;
+    batch->idxRange.size += idxRange.size;
+    batch->vertRange.size = static_cast<uint32_t>(vertRange.offset + vertRange.size - batch->vertRange.offset);
+    ++g_mergedDrawCallCount;
+    return true;
   }
   push_draw_command(DrawData{
-      .pipeline = pipeline_ref(colorConfig),
+      .pipeline = pipeline,
       .depthPipeline = depthPipeline,
       .vertRange = vertRange,
       .idxRange = idxRange,
@@ -1474,9 +1753,10 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .interpVertRange = interpVertRange,
       .interpJob = interpJob,
       .pixelUniformRange = pixelUniformRange,
-      .indexCount = static_cast<uint32_t>(plan.indices.size()),
+      .indexCount = indexCount,
       .textureBindGroup = textureBindGroup,
       .tev = tev,
+      .ownVertices = ownVertices,
   });
   return true;
 }

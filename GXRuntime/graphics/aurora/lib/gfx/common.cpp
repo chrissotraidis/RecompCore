@@ -256,18 +256,58 @@ static std::array<FramePacket, FrameSlotCount> g_framePackets;
 // blocks of a busy scene came to about 55 MB, and past 32 the rest did not
 // fit, so those draws kept the next frame's transforms in two of the three in-
 // between frames (the sea on a beach blinked out and back). The GPU buffer
-// grows to what a frame uses (upload_interp_uniforms).
+// grows to what a frame uses (upload_interp_data).
 constexpr uint64_t InterpUniformStepSize = 33554432; // 32mb
 constexpr uint64_t InterpUniformBufferSize = InterpUniformStepSize * 3;
 static uint64_t g_interpUniformBufferSize = 0; // the GPU buffer's size (render worker)
-static std::array<std::vector<uint8_t>, FrameSlotCount> g_interpUniformStaging;
 // Per frame slot, the range each in-between job resolved to, in job order
 // (gxcore_draw.cpp's helper writes them; end_frame waits for it).
 static std::array<std::vector<InterpRanges>, FrameSlotCount> g_interpJobRanges;
+// Per frame slot, the parts of its batched GXCore draws (push_batch_draw).
+static std::array<std::vector<BatchDraw>, FrameSlotCount> g_batchDraws;
 // A particle's blended vertices, per frame slot (see push_interp_vertices).
 constexpr uint64_t InterpVertexBufferSize = 8388608; // 8mb
-static std::array<std::vector<uint8_t>, FrameSlotCount> g_interpVertexStaging;
 wgpu::Buffer g_interpVertexBuffer;
+// Both are written, while a frame records, straight into a staging buffer
+// mapped for it, and copied to their GPU buffers on the GPU when the frame is
+// rendered (upload_interp_data). Staged in memory and sent with
+// queue.WriteBuffer before, a busy scene's 55 MB went past Dawn's 4 MB upload
+// ring, and every frame made and cleared an upload buffer that size: a fifth
+// of the render worker's time, and the GPU's memory swung by 350 MB. Three,
+// taken in turn: one recording, the others on their way through the GPU. A
+// frame that finds none back is more than a game frame ahead of the GPU; it
+// gets no in-between frames (frame_interp::note_overload), so they never make
+// the game wait.
+constexpr size_t InterpStagingCount = 3;
+enum class InterpStagingState : uint8_t {
+  Free,      // mapped, for the next frame
+  Recording, // a frame records into it
+  Mapping,   // copied from on the GPU; mapped again when that is done
+};
+struct InterpStaging {
+  wgpu::Buffer buffer;
+  uint64_t uniformCapacity = 0; // the constants' bytes, from 0; the vertices' follow
+  uint64_t vertexCapacity = 0;
+  uint8_t* data = nullptr;      // its mapping, while a frame records
+  std::atomic<InterpStagingState> state{InterpStagingState::Free};
+};
+static std::array<InterpStaging, InterpStagingCount> g_interpStaging;
+// Per frame slot: the staging its frame records into (none: no in-between
+// frames for it) and what it has used.
+struct InterpSlot {
+  InterpStaging* staging = nullptr;
+  uint64_t uniformUsed = 0;
+  uint64_t vertexUsed = 0;
+  bool overflowed = false; // some did not fit: this frame shows none
+};
+static std::array<InterpSlot, FrameSlotCount> g_interpSlots;
+// The capacities a new staging buffer gets: half of the most (32 MB for each
+// in-between frame, 8 MB of vertices) to start, doubled after a frame that
+// did not fit (recording thread). That frame shows no in-between frames:
+// with some of its draws left out of them, those would blink.
+static uint64_t g_interpUniformWant = 0;
+static uint64_t g_interpVertexWant = InterpVertexBufferSize / 2;
+static bool g_interpOverflowed = false; // helper thread, read after wait_interp_jobs
 static size_t g_replayFrameSlot = 0; // render worker: the frame whose in-between frame is encoded
 static int g_replayStep = 0;          // render worker: which of its in-between frames
 static uint64_t g_interpUniformOverflows = 0; // recording thread
@@ -1018,6 +1058,20 @@ void push_draw_command(gxcore::DrawData data) {
       ShaderDrawCommand{.type = ShaderType::GXCore, .gxcore = data});
 }
 
+namespace gxcore {
+DrawData* last_recorded_draw() noexcept {
+  if (g_currentRenderPass == UINT32_MAX)
+    return nullptr;
+  auto& pass = current_render_passes()[g_currentRenderPass];
+  if (pass.sealed || pass.commands.empty())
+    return nullptr;
+  auto& command = pass.commands.back();
+  if (command.type != CommandType::Draw || command.data.draw.type != ShaderType::GXCore)
+    return nullptr;
+  return &command.data.draw.gxcore;
+}
+} // namespace gxcore
+
 template <>
 PipelineRef pipeline_ref(const gxcore::PipelineConfig& config) {
   return find_pipeline(ShaderType::GXCore, config,
@@ -1199,9 +1253,16 @@ void shutdown() {
   g_interpUniformBuffer = {};
   g_interpUniformBufferSize = 0;
   g_interpVertexBuffer = {};
-  for (auto& staging : g_interpUniformStaging) {
-    staging = {};
+  for (auto& staging : g_interpStaging) {
+    staging.buffer = {};
+    staging.uniformCapacity = staging.vertexCapacity = 0;
+    staging.data = nullptr;
+    staging.state.store(InterpStagingState::Free, std::memory_order_release);
   }
+  g_interpSlots = {};
+  g_interpUniformWant = 0;
+  g_interpVertexWant = InterpVertexBufferSize / 2;
+  g_interpOverflowed = false;
   g_lastGameFrameEnd = {};
   g_gameFramePeriodNs = 0;
   g_processEventsQueued.store(false, std::memory_order_release);
@@ -1275,11 +1336,19 @@ static bool wait_for_staging_buffer(size_t slot) {
 static size_t acquire_frame_slot() {
   ZoneScopedN("Acquire frame slot");
   const auto waitStart = PresentClock::now();
+  // Frames coming faster than the game's own rate (a load's fast-forward)
+  // outrun the presents by design; waiting for them is no overload.
+  static PresentClock::time_point lastStart{};
+  const bool fastForward = waitStart - lastStart < std::chrono::milliseconds{20};
+  lastStart = waitStart;
   while (true) {
     if (const auto slot = g_frameSlots.try_acquire()) {
       const auto waitDuration = PresentClock::now() - waitStart;
       const double waitMs = std::chrono::duration<double, std::milli>{waitDuration}.count();
       TracyPlot("aurora: frameSlotWaitMs", waitMs);
+      // The game waited for the render worker: fewer in-between frames.
+      if (waitMs >= 3.0 && !fastForward)
+        frame_interp::note_overload("the game waited for the render worker");
       return *slot;
     }
     wait_for_gpu_progress(std::chrono::microseconds{100});
@@ -1288,9 +1357,14 @@ static size_t acquire_frame_slot() {
 
 static std::optional<size_t> acquire_mapped_staging_buffer() {
   ZoneScopedN("Acquire mapped staging buffer");
+  const auto waitStart = PresentClock::now();
   while (true) {
     if (auto slot = g_stagingSlots.try_acquire()) {
-      if (wait_for_staging_buffer(*slot)) {
+      const bool mapped = wait_for_staging_buffer(*slot);
+      // The game waited for the GPU.
+      if (PresentClock::now() - waitStart >= std::chrono::milliseconds{3})
+        frame_interp::note_overload("the game waited for the GPU");
+      if (mapped) {
         return *slot;
       }
       g_stagingSlots.release(*slot);
@@ -1298,6 +1372,96 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
     }
     wait_for_gpu_progress(std::chrono::microseconds{100});
   }
+}
+
+// Recording thread: a staging buffer back from the GPU, mapped (made, or made
+// bigger, here), or none.
+static InterpStaging* take_interp_staging() {
+  for (auto& staging : g_interpStaging) {
+    auto expected = InterpStagingState::Free;
+    if (!staging.state.compare_exchange_strong(expected, InterpStagingState::Recording, std::memory_order_acq_rel))
+      continue;
+    if (!staging.buffer || staging.uniformCapacity < g_interpUniformWant ||
+        staging.vertexCapacity < g_interpVertexWant) {
+      if (staging.buffer)
+        staging.buffer.Destroy();
+      staging.uniformCapacity = g_interpUniformWant;
+      staging.vertexCapacity = g_interpVertexWant;
+      const wgpu::BufferDescriptor descriptor{
+          .label = "In-between frame staging buffer",
+          .usage = wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc,
+          .size = staging.uniformCapacity + staging.vertexCapacity,
+          .mappedAtCreation = true,
+      };
+      staging.buffer = g_device.CreateBuffer(&descriptor);
+    }
+    staging.data = static_cast<uint8_t*>(
+        staging.buffer.GetMappedRange(0, staging.uniformCapacity + staging.vertexCapacity));
+    if (staging.data == nullptr) {
+      staging.state.store(InterpStagingState::Free, std::memory_order_release);
+      continue;
+    }
+    return &staging;
+  }
+  return nullptr;
+}
+
+// Recording thread, at a frame's start: a staging buffer for its in-between
+// frames' data, if one is back from the GPU.
+static void acquire_interp_staging(size_t frameSlot) {
+  auto& slot = g_interpSlots[frameSlot];
+  slot = {};
+  if (!frame_interp::enabled() || frame_interp::frame_skipped())
+    return;
+  const uint64_t perStep = InterpUniformStepSize / 2;
+  const uint64_t fewest = perStep * static_cast<uint64_t>(frame_interp::frame_steps());
+  if (g_interpOverflowed) {
+    g_interpOverflowed = false;
+    g_interpUniformWant = std::min(InterpUniformBufferSize, std::max(fewest, g_interpUniformWant) * 2);
+    g_interpVertexWant = std::min(InterpVertexBufferSize, g_interpVertexWant * 2);
+  }
+  g_interpUniformWant = std::max(g_interpUniformWant, fewest);
+  // A buffer the GPU is done with is back only once the render worker has
+  // processed its events (once a frame, at the end of each): one that looked
+  // busy for that alone was taken for an overload and dropped 120 Hz to 60.
+  // Up to 4 ms for it, with the worker asked to look.
+  const auto deadline = PresentClock::now() + std::chrono::milliseconds{4};
+  while (true) {
+    if ((slot.staging = take_interp_staging()) != nullptr)
+      return;
+    if (PresentClock::now() >= deadline)
+      break;
+    wait_for_gpu_progress(std::chrono::microseconds{250});
+  }
+  // All still on their way through the GPU: it is more than a game frame
+  // behind. This frame shows none, and the next ones fewer.
+  frame_interp::note_overload("the GPU is a game frame behind");
+}
+
+// Render worker, after a frame's in-between frames are submitted (or it had
+// none): its staging buffer back, mapped again once the GPU has copied from it.
+static void release_interp_staging(size_t frameSlot) {
+  auto& slot = g_interpSlots[frameSlot];
+  InterpStaging* staging = slot.staging;
+  slot = {};
+  if (staging == nullptr)
+    return;
+  if (staging->data != nullptr) {
+    // Not uploaded: still mapped, as it was.
+    staging->state.store(InterpStagingState::Free, std::memory_order_release);
+    return;
+  }
+  staging->state.store(InterpStagingState::Mapping, std::memory_order_release);
+  staging->buffer.MapAsync(wgpu::MapMode::Write, 0, staging->uniformCapacity + staging->vertexCapacity,
+                           wgpu::CallbackMode::AllowSpontaneous,
+                           [staging](wgpu::MapAsyncStatus status, wgpu::StringView message) {
+                             if (status != wgpu::MapAsyncStatus::Success) {
+                               Log.warn("In-between staging map {}: {}", magic_enum::enum_name(status), message);
+                               // Made again at its next use.
+                               staging->uniformCapacity = 0;
+                             }
+                             staging->state.store(InterpStagingState::Free, std::memory_order_release);
+                           });
 }
 
 bool begin_frame(bool preserveEfb) {
@@ -1316,9 +1480,13 @@ bool begin_frame(bool preserveEfb) {
   frame.frameIndex = g_frameIndex;
   frame.stagingBuffer = *stagingSlot;
   frame.continuation = preserveEfb;
-  g_interpUniformStaging[frameSlot].clear();
   g_interpJobRanges[frameSlot].clear();
-  g_interpVertexStaging[frameSlot].clear();
+  g_batchDraws[frameSlot].clear();
+  if (preserveEfb) {
+    g_interpSlots[frameSlot] = {}; // a continuation has no in-between frames
+  } else {
+    acquire_interp_staging(frameSlot);
+  }
   g_recordingFrame = &frame;
   g_recordingFrameSlot = frameSlot;
 
@@ -1460,11 +1628,15 @@ void end_frame(EndFrameCallback callback) {
   frame.stats.lastStorageSize = frame.storage.size();
   frame.stats.lastTextureUploadSize = frame.textureUpload.size();
   frame.presents = !g_segmentEnding;
-  frame.interpolate = frame.presents && !frame.continuation && frame_interp::frame_verdict();
+  const auto& interpSlot = g_interpSlots[g_recordingFrameSlot];
+  frame.interpolate = frame.presents && !frame.continuation && interpSlot.staging != nullptr &&
+                      !interpSlot.overflowed && frame_interp::frame_verdict();
   frame.interpSteps = frame_interp::frame_steps();
-  if (frame_interp::tracing() || (frame.interpolate && frame_interp::dump_frame(frame_interp::game_frame_number()))) {
-    Log.info("In-between uniforms for game frame {}: {} bytes, {} blocks did not fit; frame uniforms {} bytes",
-             frame_interp::game_frame_number(), g_interpUniformStaging[g_recordingFrameSlot].size(),
+  if (frame_interp::tracing() || g_presentLog ||
+      (frame.interpolate && frame_interp::dump_frame(frame_interp::game_frame_number()))) {
+    Log.info("In-between data for game frame {}: {} bytes of constants and {} of vertices, {} blocks did not fit; "
+             "frame uniforms {} bytes",
+             frame_interp::game_frame_number(), interpSlot.uniformUsed, interpSlot.vertexUsed,
              g_interpUniformOverflows, frame.uniforms.size());
   }
   g_interpUniformOverflows = 0;
@@ -1564,6 +1736,7 @@ void end_frame(EndFrameCallback callback) {
         g_heldShown = false;
       callback(encoder);
     }
+    release_interp_staging(frameSlot);
     g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
     map_staging_buffer(stagingSlot, true);
@@ -1921,11 +2094,17 @@ static void replay_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const Frame
   }
 }
 
-// Render worker: the frame's blended blocks into their GPU buffer, created at
-// first use.
-static void upload_interp_uniforms(size_t frameSlot) {
-  const uint64_t needed =
-      AURORA_ALIGN(g_interpUniformStaging[frameSlot].size(), 4) + gx::MaxUniformSize;
+// Render worker: the frame's blended blocks and vertices from its staging
+// buffer into their GPU buffers (created at first use), copied on the GPU
+// ahead of its in-between frames.
+static void upload_interp_data(size_t frameSlot) {
+  auto& slot = g_interpSlots[frameSlot];
+  InterpStaging* staging = slot.staging;
+  if (staging == nullptr || staging->data == nullptr)
+    return;
+  const uint64_t uniformBytes = AURORA_ALIGN(slot.uniformUsed, 4);
+  const uint64_t vertexBytes = AURORA_ALIGN(slot.vertexUsed, 4);
+  const uint64_t needed = uniformBytes + gx::MaxUniformSize;
   if (!g_interpUniformBuffer || g_interpUniformBufferSize < needed) {
     g_interpUniformBufferSize =
         std::min(InterpUniformBufferSize, AURORA_ALIGN(std::max(needed, InterpUniformStepSize), InterpUniformStepSize));
@@ -1950,22 +2129,24 @@ static void upload_interp_uniforms(size_t frameSlot) {
     };
     g_interpUniformBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
   }
-  const auto& staging = g_interpUniformStaging[frameSlot];
-  if (!staging.empty()) {
-    g_queue.WriteBuffer(g_interpUniformBuffer, 0, staging.data(), AURORA_ALIGN(staging.size(), 4));
+  if (vertexBytes != 0 && !g_interpVertexBuffer) {
+    const wgpu::BufferDescriptor descriptor{
+        .label = "In-between frame vertex buffer",
+        .usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
+        .size = InterpVertexBufferSize,
+    };
+    g_interpVertexBuffer = g_device.CreateBuffer(&descriptor);
   }
-  const auto& vertices = g_interpVertexStaging[frameSlot];
-  if (!vertices.empty()) {
-    if (!g_interpVertexBuffer) {
-      const wgpu::BufferDescriptor descriptor{
-          .label = "In-between frame vertex buffer",
-          .usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
-          .size = InterpVertexBufferSize,
-      };
-      g_interpVertexBuffer = g_device.CreateBuffer(&descriptor);
-    }
-    g_queue.WriteBuffer(g_interpVertexBuffer, 0, vertices.data(), AURORA_ALIGN(vertices.size(), 4));
-  }
+  staging->buffer.Unmap();
+  staging->data = nullptr;
+  static constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "In-between frame data encoder"};
+  auto encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
+  if (uniformBytes != 0)
+    encoder.CopyBufferToBuffer(staging->buffer, 0, g_interpUniformBuffer, 0, uniformBytes);
+  if (vertexBytes != 0)
+    encoder.CopyBufferToBuffer(staging->buffer, staging->uniformCapacity, g_interpVertexBuffer, 0, vertexBytes);
+  const auto commands = encoder.Finish();
+  g_queue.Submit(1, &commands);
 }
 
 static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::CommandEncoder& encoder,
@@ -1996,7 +2177,7 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
   // 2. The in-between frames: the same passes with each step's blended
   // transforms, into the EFB. The first is presented now; at 120 Hz the
   // others are kept aside and presented a quarter of a game frame apart.
-  upload_interp_uniforms(frameSlot);
+  upload_interp_data(frameSlot);
   static constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "In-between frame encoder"};
   auto between = g_device.CreateCommandEncoder(&EncoderDescriptor);
   g_replayFrameSlot = frameSlot;
@@ -2073,7 +2254,7 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
   deferred_present_tick();
 
   // 2. The in-between frames, each kept aside and scheduled.
-  upload_interp_uniforms(frameSlot);
+  upload_interp_data(frameSlot);
   g_replayFrameSlot = frameSlot;
   const auto interval = step_offset(1, steps);
   PresentClock::time_point base{};
@@ -2082,6 +2263,7 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
   for (int step = 0; step < steps; ++step) {
     auto between = g_device.CreateCommandEncoder(&EncoderDescriptor);
     g_replayStep = step;
+    const auto encodeStart = PresentClock::now();
     frame_interp::set_encoding_interpolated(true);
     for (const auto& op : frame.ops)
       replay_op(between, frame, op);
@@ -2089,6 +2271,9 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
     keep(between, held[step]);
     const auto buffer = between.Finish();
     g_queue.Submit(1, &buffer);
+    if (g_presentLog)
+      std::fprintf(stderr, "[encode-took] step=%d %.2f\n", step,
+                   std::chrono::duration<double, std::milli>(PresentClock::now() - encodeStart).count());
     if (dump) {
       dump_texture(held[step], kDumpNames[step], frame.gameFrame);
     }
@@ -2152,7 +2337,11 @@ static void present_deferred(DeferredPresent& present, const char* kind) {
   webgpu::set_present_source_override(present.source);
   static constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Held frame present encoder"};
   auto encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
+  const auto start = PresentClock::now();
   present.callback(encoder);
+  if (g_presentLog)
+    std::fprintf(stderr, "[present-took] %.2f\n",
+                 std::chrono::duration<double, std::milli>(PresentClock::now() - start).count());
   webgpu::set_present_source_override(nullptr);
   g_heldShown = present.source == &g_heldFrame;
 }
@@ -2198,6 +2387,8 @@ void after_submit() noexcept {
 
 void gpu_synchronize() { render_worker::synchronize(); }
 
+void note_render_overload() noexcept { frame_interp::note_overload("a drawable came late"); }
+
 static std::atomic<unsigned long long> g_shownFrames{0};
 
 void after_present() noexcept {
@@ -2241,6 +2432,9 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
   // Bind static bind group for the whole pass
   pass.SetBindGroup(0, g_staticBindGroup);
   pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
+#ifdef AURORA_ENABLE_GXCORE
+  gxcore::reset_pass_state();
+#endif
 
   size_t encoded = 0;
   for (const auto& cmd : passInfo.commands) {
@@ -2289,13 +2483,22 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
       switch (draw.type) {
       case ShaderType::Clear:
         clear::render(draw.clear, pass, passInfo.targetSize);
+#ifdef AURORA_ENABLE_GXCORE
+        gxcore::reset_pass_state();
+#endif
         break;
       case ShaderType::GX:
         gx::render(draw.gx, pass);
+#ifdef AURORA_ENABLE_GXCORE
+        gxcore::reset_pass_state();
+#endif
         break;
 #ifdef AURORA_ENABLE_RMLUI
       case ShaderType::Rml:
         rmlui::render(draw.rml, pass);
+#ifdef AURORA_ENABLE_GXCORE
+        gxcore::reset_pass_state();
+#endif
         break;
 #endif
 #ifdef AURORA_ENABLE_GXCORE
@@ -2368,6 +2571,14 @@ static Range map(ByteBuffer& target, size_t length, size_t alignment) {
   return {static_cast<uint32_t>(begin), static_cast<uint32_t>(length)};
 }
 
+Range push_verts_strided(const uint8_t* data, size_t length, size_t stride) {
+  auto& target = current_frame_packet().verts;
+  const size_t pad = (stride - target.size() % stride) % stride;
+  if (pad > 0)
+    target.append_zeroes(pad);
+  return push(target, data, length, 0);
+}
+
 Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
   ZoneScoped;
   return push(current_frame_packet().verts, data, length, alignment);
@@ -2381,35 +2592,55 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
 size_t recording_frame_slot() { return g_recordingFrameSlot; }
 
 Range push_interp_uniform(size_t slot, const uint8_t* data, size_t length) {
-  auto& staging = g_interpUniformStaging[slot];
-  const size_t offset = AURORA_ALIGN(staging.size(), g_cachedLimits.minUniformBufferOffsetAlignment);
+  auto& frame = g_interpSlots[slot];
+  if (frame.staging == nullptr)
+    return {};
+  const size_t offset = AURORA_ALIGN(frame.uniformUsed, g_cachedLimits.minUniformBufferOffsetAlignment);
   // The bind group reads MaxUniformSize from the offset.
-  if (offset + std::max<size_t>(length, gx::MaxUniformSize) > InterpUniformBufferSize) {
+  if (offset + std::max<size_t>(length, gx::MaxUniformSize) > frame.staging->uniformCapacity) {
     ++g_interpUniformOverflows;
+    frame.overflowed = g_interpOverflowed = true;
     return {};
   }
-  // Padded to the offset, then appended: resizing over the block would clear
-  // it before the copy, a second pass over 2.8 KB for every blended draw.
-  staging.resize(offset);
-  staging.insert(staging.end(), data, data + length);
+  std::memcpy(frame.staging->data + offset, data, length);
+  frame.uniformUsed = offset + length;
   return {static_cast<uint32_t>(offset), static_cast<uint32_t>(length)};
 }
 
 const uint8_t* interp_uniform_bytes(size_t slot, Range range) {
-  return g_interpUniformStaging[slot].data() + range.offset;
+  return g_interpSlots[slot].staging->data + range.offset;
 }
 
 Range push_interp_vertices(size_t slot, const uint8_t* data, size_t length) {
-  auto& staging = g_interpVertexStaging[slot];
-  const size_t offset = AURORA_ALIGN(staging.size(), 4);
-  if (offset + length > InterpVertexBufferSize)
+  auto& frame = g_interpSlots[slot];
+  if (frame.staging == nullptr)
     return {};
-  staging.resize(offset);
-  staging.insert(staging.end(), data, data + length);
+  const size_t offset = AURORA_ALIGN(frame.vertexUsed, 4);
+  if (offset + length > frame.staging->vertexCapacity) {
+    frame.overflowed = g_interpOverflowed = true;
+    return {};
+  }
+  std::memcpy(frame.staging->data + frame.staging->uniformCapacity + offset, data, length);
+  frame.vertexUsed = offset + length;
   return {static_cast<uint32_t>(offset), static_cast<uint32_t>(length)};
 }
 
 void resolve_interp_job(size_t slot, const InterpRanges& ranges) { g_interpJobRanges[slot].push_back(ranges); }
+
+uint32_t push_batch_draw(const BatchDraw& draw) {
+  auto& draws = g_batchDraws[g_recordingFrameSlot];
+  draws.push_back(draw);
+  return static_cast<uint32_t>(draws.size() - 1);
+}
+
+const BatchDraw& batch_draw(uint32_t index) { return g_batchDraws[g_replayFrameSlot][index]; }
+
+size_t next_vertex_offset(size_t stride) {
+  const size_t size = current_frame_packet().verts.size();
+  return size + (stride - size % stride) % stride; // as push_verts_strided pads
+}
+
+size_t next_index_offset() { return current_frame_packet().indices.size(); }
 
 const InterpRanges& interp_job_ranges(uint32_t job) {
   static const InterpRanges none{};
@@ -2423,6 +2654,8 @@ Range push_uniform(const uint8_t* data, size_t length) {
   ZoneScoped;
   return push(current_frame_packet().uniforms, data, length, g_cachedLimits.minUniformBufferOffsetAlignment);
 }
+
+const uint8_t* uniform_bytes(Range range) { return current_frame_packet().uniforms.data() + range.offset; }
 
 uint64_t current_frame_id() {
   return g_recordingFrame == nullptr ? 0 : current_frame_packet().frameId;

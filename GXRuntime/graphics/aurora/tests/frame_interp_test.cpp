@@ -1,9 +1,11 @@
 // Standalone checks for lib/gfx/frame_interp.cpp: draw matching across
-// frames, plausibility rejection, the halfway blend and the cut verdict.
+// frames, plausibility rejection, the halfway blend, the cut verdict and the
+// pacing of in-between frames.
 #include "../lib/gfx/frame_interp.hpp"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace fi = aurora::gfx::frame_interp;
@@ -102,6 +104,8 @@ static const gxc::VertexShaderConstants* blend_plan(const gxc::DrawPlan& plan, c
 }
 
 int main() {
+  // Pacing at 120 Hz as well, for its checks (unset, 120 Hz is never lowered).
+  setenv("DOL_AURORA_FRAME_INTERP_PACING", "1", 1);
   fi::set_enabled(true);
   const uint64_t kShip = 11, kTree = 22, kHud = 33;
 
@@ -972,6 +976,59 @@ int main() {
     CHECK(fi::draw_key(plan) != k1);
     plan.match_payload = nullptr;
     CHECK(fi::draw_key(plan) == 0);
+  }
+
+  // Pacing: overloads in 3 of 8 game frames take 120 Hz to 60, and more after
+  // the frames in flight to none; one now and then does nothing. 3 s of calm
+  // brings a level back, and an overload soon after coming back makes the
+  // next wait twice as long.
+  {
+    const auto overload_frames = [](int n) {
+      for (int i = 0; i < n; ++i) {
+        fi::note_overload("test");
+        fi::end_game_frame();
+      }
+    };
+    fi::set_steps(3);
+    fi::end_game_frame();
+    CHECK(fi::frame_steps() == 3 && !fi::frame_skipped());
+    // Now and then: never a drop.
+    for (int i = 0; i < 40; ++i) {
+      overload_frames(1);
+      for (int j = 0; j < 8; ++j)
+        fi::end_game_frame();
+    }
+    CHECK(fi::frame_steps() == 3);
+    overload_frames(2);
+    CHECK(fi::frame_steps() == 3);
+    overload_frames(1);
+    CHECK(fi::frame_steps() == 1 && !fi::frame_skipped());
+    overload_frames(3); // still the frames in flight: no second drop
+    CHECK(fi::frame_steps() == 1 && !fi::frame_skipped());
+    overload_frames(1); // with the three before: the next drop
+    CHECK(fi::frame_skipped());
+    for (int i = 0; i < 89; ++i)
+      fi::end_game_frame();
+    CHECK(fi::frame_skipped());
+    fi::end_game_frame();
+    CHECK(!fi::frame_skipped() && fi::frame_steps() == 1);
+    for (int i = 0; i < 90; ++i)
+      fi::end_game_frame();
+    CHECK(fi::frame_steps() == 3);
+    overload_frames(3);
+    CHECK(fi::frame_steps() == 1);
+    for (int i = 0; i < 90; ++i)
+      fi::end_game_frame();
+    CHECK(fi::frame_steps() == 1);
+    for (int i = 0; i < 90; ++i)
+      fi::end_game_frame();
+    CHECK(fi::frame_steps() == 3);
+    // A new setting starts over at it.
+    overload_frames(3);
+    CHECK(fi::frame_steps() == 1);
+    fi::set_steps(1);
+    fi::end_game_frame();
+    CHECK(fi::frame_steps() == 1 && !fi::frame_skipped());
   }
 
   if (g_failures == 0)

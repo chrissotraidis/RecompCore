@@ -40,6 +40,9 @@ SDL_Window* get_sdl_window();
 SDL_Renderer* get_sdl_renderer();
 bool is_paused() noexcept;
 bool is_presentable() noexcept;
+// macOS: the window is out of sight (another space, or ours sliding in or
+// out): it gets no drawables, so none is asked for.
+bool is_occluded() noexcept;
 void set_surface_ready(bool ready) noexcept;
 void set_title(const char* title);
 void set_fullscreen(bool fullscreen);

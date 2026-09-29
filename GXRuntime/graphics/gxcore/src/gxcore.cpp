@@ -6,6 +6,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <memory>
 
 namespace gxruntime::gxcore {
 
@@ -581,7 +582,11 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   {
     std::vector<float> vertices = std::move(plan.vertices);
     std::vector<std::uint16_t> indices = std::move(plan.indices);
-    plan = DrawPlan{};
+    // Re-constructed in place: assigning a DrawPlan{} built the zeroed
+    // temporary and then copied all of it (the shader constants are several
+    // KB) over the plan, at every draw.
+    std::destroy_at(&plan);
+    std::construct_at(&plan);
     vertices.clear();
     indices.clear();
     plan.vertices = std::move(vertices);
@@ -1392,7 +1397,10 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     }
     for (std::uint32_t k = 0; k < 3u; ++k)
       std::memcpy(c.texmatrices[3u * i + k], rows[k], sizeof rows[k]);
+    if (i < kMaxTexGens)
+      plan.texgen_row[i] = static_cast<std::uint8_t>(resolved ? row : 0xFFu);
   }
+  plan.matrix_index_a = mat_idx_a_valid ? mat_idx_a : 0xFFFFFFFFu;
 
   // Viewport + texture.
   if ((draw.transform_flags & ar::kDrawTransformViewportValid) != 0u) {

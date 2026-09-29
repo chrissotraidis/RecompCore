@@ -315,9 +315,11 @@ void end_frame() noexcept {
     // Read once: a suppressed present takes no texture, and its status (left
     // at Error) must not be taken for the surface's.
     const bool suppressed = g_presentSuppressed.load(std::memory_order_relaxed);
+    // Out of sight, no texture is asked for either (window::is_occluded).
+    const bool occluded = window::is_occluded();
     {
       window::SurfaceLock surfaceLock;
-      if (!suppressed && window::is_presentable() && g_surface) {
+      if (!suppressed && !occluded && window::is_presentable() && g_surface) {
         ZoneScopedN("Acquire texture");
         wgpu::SurfaceTexture surfaceTexture;
         const auto acquireStart = std::chrono::steady_clock::now();
@@ -327,6 +329,9 @@ void end_frame() noexcept {
                                    .count();
         if (acquireMs >= 30)
           std::fprintf(stderr, "[render-slow] acquire-drawable ms=%lld\n", static_cast<long long>(acquireMs));
+        // Every drawable still queued behind the GPU's work: fewer in-between frames.
+        if (acquireMs >= 20)
+          gfx::note_render_overload();
         surfaceStatus = surfaceTexture.status;
         if (surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal) {
           currentTexture = std::move(surfaceTexture.texture);
@@ -425,11 +430,12 @@ void end_frame() noexcept {
         Log.warn("Surface present failed");
         webgpu::release_surface();
       }
-    } else if (g_surface && !suppressed) {
-      // With the present suppressed the status is not the surface's: taking it
-      // for Error dropped a working surface, and on Direct3D 12 the swapchain
-      // made in its place for the same window failed (E_ACCESSDENIED) and lost
-      // the device at the first fast-forwarded scene change.
+    } else if (g_surface && !suppressed && !occluded) {
+      // With the present suppressed (or the window out of sight) the status is
+      // not the surface's: taking it for Error dropped a working surface, and
+      // on Direct3D 12 the swapchain made in its place for the same window
+      // failed (E_ACCESSDENIED) and lost the device at the first fast-forwarded
+      // scene change.
       switch (surfaceStatus) {
       case wgpu::SurfaceGetCurrentTextureStatus::Timeout:
         Log.warn("Surface texture acquisition timed out");

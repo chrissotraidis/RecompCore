@@ -521,6 +521,9 @@ struct DrawPlan {
   std::uint32_t texmap_mask = 0;
   PlanSampler samplers[8]{};
   PlanTexture textures[8]{};
+  // Diagnostics: each texgen's XF matrix row, and MatrixIndexA as captured.
+  std::uint8_t texgen_row[kMaxTexGens]{};
+  std::uint32_t matrix_index_a = 0;
 };
 
 // --- EFB copy-to-texture (S16) ------------------------------------------------

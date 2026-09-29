@@ -48,6 +48,7 @@ float g_frameBufferAspectOverride = 0.f;
 AuroraWindowSize g_windowSize;
 std::vector<AuroraEvent> g_events;
 std::atomic_bool g_backgrounded = false;
+std::atomic_bool g_occluded = false; // macOS: out of sight (lifecycle_event_watch)
 #if defined(SDL_PLATFORM_ANDROID)
 std::atomic_bool g_surfaceReady = false;
 #else
@@ -127,6 +128,32 @@ bool SDLCALL lifecycle_event_watch(void*, SDL_Event* event) {
   case SDL_EVENT_WINDOW_RESTORED:
     g_backgrounded.store(false, std::memory_order_relaxed);
     break;
+#endif
+#if defined(SDL_PLATFORM_MACOS)
+  // A window out of sight (another app's full-screen space, or ours sliding
+  // in or out) gets no drawables: nextDrawable blocked for its whole second,
+  // or half, and the game with it, every time the game was switched away
+  // from or back to in full screen. No presents until it is seen again
+  // (is_occluded); the game goes on.
+  case SDL_EVENT_WINDOW_OCCLUDED:
+  case SDL_EVENT_WINDOW_EXPOSED:
+  case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
+  case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+  case SDL_EVENT_WINDOW_FOCUS_LOST:
+  case SDL_EVENT_WINDOW_FOCUS_GAINED: {
+    const char* name = event->type == SDL_EVENT_WINDOW_OCCLUDED           ? "occluded"
+                       : event->type == SDL_EVENT_WINDOW_EXPOSED          ? "exposed"
+                       : event->type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN ? "entered full screen"
+                       : event->type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN ? "left full screen"
+                       : event->type == SDL_EVENT_WINDOW_FOCUS_LOST       ? "lost focus"
+                                                                          : "gained focus";
+    if (event->type == SDL_EVENT_WINDOW_OCCLUDED)
+      g_occluded.store(true, std::memory_order_relaxed);
+    else if (event->type == SDL_EVENT_WINDOW_EXPOSED)
+      g_occluded.store(false, std::memory_order_relaxed);
+    std::fprintf(stderr, "[window] %s\n", name);
+    break;
+  }
 #endif
   default:
     break;
@@ -501,6 +528,8 @@ bool is_presentable() noexcept {
   return g_window != nullptr && !g_backgrounded.load(std::memory_order_acquire) &&
          g_surfaceReady.load(std::memory_order_acquire);
 }
+
+bool is_occluded() noexcept { return g_occluded.load(std::memory_order_acquire); }
 
 void set_surface_ready(bool ready) noexcept { g_surfaceReady.store(ready, std::memory_order_release); }
 
