@@ -310,6 +310,18 @@ bool dol_aurora_initialize(int argc, char** argv,
         if (scale >= 0.f && scale <= 8.f)
             aurora_set_frame_buffer_scale(scale);
     }
+    // Settings the Aurora library read when it was loaded, before the host
+    // applied its saved options to the environment (a menu's choices would be
+    // lost at the next launch: Smooth Motion at 120 came back at 60). Read
+    // again now.
+    if (const char* v = std::getenv("DOL_AURORA_FRAME_INTERP"); v != nullptr && v[0] != '\0')
+        aurora_set_frame_interpolation(v[0] != '0');
+    if (const char* v = std::getenv("DOL_AURORA_FRAME_INTERP_STEPS"); v != nullptr && v[0] != '\0')
+        aurora_set_frame_interp_steps(std::atoi(v));
+    if (const char* v = std::getenv("DOL_AURORA_SHOW_FPS"); v != nullptr && v[0] != '\0')
+        aurora_set_fps_overlay(v[0] != '0');
+    if (const char* v = std::getenv("DOL_AURORA_FORCE_ANISO"); v != nullptr && v[0] != '\0')
+        aurora_set_forced_anisotropy(static_cast<unsigned>(std::strtoul(v, nullptr, 10)));
     // DOL_AURORA_TEXTURE_PACK: a folder of Dolphin-format replacement
     // textures (tex1_WxH_hash[_tlut]_fmt.png or .dds, searched recursively,
     // with _mipN sidecars), such as an HD texture pack's GZL folder.
