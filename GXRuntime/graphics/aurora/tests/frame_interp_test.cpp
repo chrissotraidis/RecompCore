@@ -275,6 +275,43 @@ int main() {
     fi::end_game_frame();
   }
 
+  // A model's parts repeat the constants of the part before them, and the
+  // caller says so: the in-between block is reused, and it is the one blending
+  // them again gives. A draw with per-vertex matrix indices has the matrices it
+  // reads blended and the others left as they are now.
+  {
+    fi::end_game_frame();
+    const auto part = draw_at(0, 0, -400);
+    auto indexed = draw_at(0, 0, -400);
+    fi::blend_draw(7001, 0, part, false);
+    fi::blend_draw(7002, 0, part, true);
+    fi::blend_draw(7003, 0, part, true);
+    fi::blend_draw(7004, 1ull << 3, indexed, false);
+    fi::end_game_frame();
+
+    const auto moved = draw_at(10, 0, -400, 5.f);
+    const auto* first = fi::blend_draw(7001, 0, moved, false);
+    CHECK(first != nullptr && !fi::last_blend_repeated());
+    const gxc::VertexShaderConstants fresh = first != nullptr ? *first : gxc::VertexShaderConstants{};
+    const auto* second = fi::blend_draw(7002, 0, moved, true);
+    CHECK(second != nullptr && fi::last_blend_repeated());
+    CHECK(second != nullptr && std::memcmp(second, &fresh, sizeof(fresh)) == 0);
+    const auto* third = fi::blend_draw(7003, 0, moved, false); // not told: blended again, the same
+    CHECK(third != nullptr && !fi::last_blend_repeated());
+    CHECK(third != nullptr && std::memcmp(third, &fresh, sizeof(fresh)) == 0);
+    CHECK(near(fresh.posnormalmatrix[0][3], 5.f));
+
+    indexed.transformmatrices[3][3] = 20.f; // the matrix at row 3, which it reads
+    indexed.transformmatrices[6][3] = 40.f; // the one at row 6, which it does not
+    const auto* blendedIndexed = fi::blend_draw(7004, 1ull << 3, indexed, false);
+    CHECK(blendedIndexed != nullptr);
+    if (blendedIndexed != nullptr) {
+      CHECK(near(blendedIndexed->transformmatrices[3][3], 10.f));
+      CHECK(near(blendedIndexed->transformmatrices[6][3], 40.f));
+    }
+    fi::end_game_frame();
+  }
+
   // Draw keys: the same payload gives the same key; another primitive does not.
   {
     const uint8_t payload[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
