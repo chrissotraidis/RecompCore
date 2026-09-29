@@ -21,6 +21,11 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <execinfo.h>
+#include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
+#include "../../graphics/aurora/lib/gfx/render_worker.hpp"
 
 #if GXRUNTIME_HAS_AURORA_RECOMP
 // gxcore substrate submission lives in the Aurora fork (lib/gfx/gxcore_draw.cpp),
@@ -483,7 +488,63 @@ void g_fifo_translate(std::vector<std::uint8_t>& batch) {
     }
 }
 
+// DOL_GX_STALL_STACKS=1: a watchdog that, when a batch has been in the
+// translation worker for more than 200 ms, has the worker and the render
+// worker write their call stacks to stderr ([gx-stall-stack]), so what a long
+// stall waits on is in the session log.
+std::atomic<long long> g_batch_start_ns{0};
+std::atomic<pthread_t> g_fifo_pthread{};
+
+void stall_stack_handler(int) {
+    void* frames[48];
+    const int n = backtrace(frames, 48);
+    static const char kHeader[] = "[gx-stall-stack] begin\n";
+    (void)!write(2, kHeader, sizeof kHeader - 1);
+    backtrace_symbols_fd(frames, n, 2);
+    static const char kFooter[] = "[gx-stall-stack] end\n";
+    (void)!write(2, kFooter, sizeof kFooter - 1);
+}
+
+long long monotonic_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+void start_stall_watchdog() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("DOL_GX_STALL_STACKS");
+        return env != nullptr && env[0] == '1';
+    }();
+    static std::once_flag once;
+    if (!enabled)
+        return;
+    std::call_once(once, [] {
+        signal(SIGUSR2, stall_stack_handler);
+        std::thread([] {
+            long long reported = 0;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                const long long start = g_batch_start_ns.load(std::memory_order_acquire);
+                if (start == 0 || start == reported || monotonic_ns() - start < 200000000ll)
+                    continue;
+                reported = start;
+                std::fprintf(stderr, "[gx-stall] a batch has run 200 ms: the translation worker's stack\n");
+                pthread_kill(g_fifo_pthread.load(std::memory_order_acquire), SIGUSR2);
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                const pthread_t render = aurora::gfx::render_worker::native_thread();
+                if (render != pthread_t{}) {
+                    std::fprintf(stderr, "[gx-stall] the render worker's stack\n");
+                    pthread_kill(render, SIGUSR2);
+                }
+            }
+        }).detach();
+    });
+}
+
 void g_fifo_worker_main() {
+    g_fifo_pthread.store(pthread_self(), std::memory_order_release);
+    start_stall_watchdog();
     for (;;) {
         std::vector<std::uint8_t> batch;
         std::uint64_t parsed = 0;
@@ -510,14 +571,27 @@ void g_fifo_worker_main() {
         const auto t0 = std::chrono::steady_clock::now();
         const uint32_t pipelines0 = aurora_get_stats()->createdPipelines;
         const unsigned long long uploads0 = aurora::gfx::gxcore::texture_upload_count();
+        g_batch_start_ns.store(monotonic_ns(), std::memory_order_release);
         g_fifo_translate(batch);
+        g_batch_start_ns.store(0, std::memory_order_release);
         const long ms = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                               std::chrono::steady_clock::now() - t0)
                                               .count());
-        if (slow_ms > 0 && ms >= slow_ms)
+        if (slow_ms > 0 && ms >= slow_ms) {
             std::fprintf(stderr, "[gx-slow] batch_ms=%ld bytes=%zu pipelines=%u textures=%llu\n", ms,
                          batch.size(), aurora_get_stats()->createdPipelines - pipelines0,
                          aurora::gfx::gxcore::texture_upload_count() - uploads0);
+            // A batch that held the game for a tenth of a second or more: its
+            // first bytes (the GX commands), so what it waited on can be told.
+            if (ms >= 100) {
+                char hex[3 * 256 + 1];
+                size_t n = 0;
+                for (size_t i = 0; i < batch.size() && i < 256; ++i)
+                    n += static_cast<size_t>(std::snprintf(hex + n, sizeof hex - n, "%02X ", batch[i]));
+                hex[n] = '\0';
+                std::fprintf(stderr, "[gx-slow-bytes] %s\n", hex);
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
             g_fifo_parsed = parsed;
@@ -1177,6 +1251,14 @@ void dol_aurora_frame_timing(DolAuroraFrameTiming* out) {
     out->draws = gx_aurora::g_timing_draws;
     out->audio_throttles = gx_aurora::g_audio_throttle_count;
     out->audio_dropped = gx_aurora::g_audio_dropped_count;
+    out->shown = aurora_get_shown_frames();
+    AuroraFrameInterpTotals interp{};
+    aurora_get_frame_interp_totals(&interp);
+    out->interp_frames = interp.frames;
+    out->interp_interpolated = interp.interpolated;
+    out->interp_draws = interp.draws;
+    out->interp_rejected = interp.rejected;
+    out->interp_unmatched = interp.unmatched;
     out->audio_queued_ms = 0;
     if (gx_aurora::g_audio_stream != nullptr && gx_aurora::g_audio_sample_rate != 0u) {
         const int queued = SDL_GetAudioStreamQueued(gx_aurora::g_audio_stream);
@@ -1458,7 +1540,16 @@ static void aurora_backend_present_impl(void) {
         std::fprintf(stderr, "[gfx] guest held by the host at present=%llu\n",
                      gx_aurora::g_present_count);
         while (!gx_aurora::g_should_quit && gx_aurora::host_wants_hold()) {
-            SDL_Delay(16);
+            // dol_aurora_set_hold_redraw: a frame with no game drawing presents
+            // the last picture, and the host overlay (a menu) is drawn over
+            // it. The worker records nothing meanwhile (recording is closed
+            // until the begin_frame below) and the display paces the loop.
+            if (gx_aurora::g_hold_redraw && aurora_begin_frame()) {
+                gx_aurora::run_host_overlay();
+                aurora_end_frame();
+            } else {
+                SDL_Delay(16);
+            }
             gx_aurora::poll_events();
         }
         std::fprintf(stderr, "[gfx] guest released after %.1f s\n",

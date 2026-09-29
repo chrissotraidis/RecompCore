@@ -1,4 +1,5 @@
 #pragma once
+#include <pthread.h>
 
 #include <condition_variable>
 #include <cstddef>
@@ -13,6 +14,9 @@
 #include <vector>
 
 namespace aurora::gfx::render_worker {
+
+// The worker's thread (0 before it starts), for diagnostics.
+pthread_t native_thread();
 
 enum class ItemType : uint8_t {
   BeginFrame,
