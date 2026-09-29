@@ -802,12 +802,21 @@ static UniformCache g_vertexUniformCache;
 static UniformCache g_interpUniformCache;
 static UniformCache g_pixelUniformCache;
 
-// The in-between frame's blocks, de-duplicated the same way.
-static Range push_interp_uniform_dedup(const uint8_t* data, size_t length) {
+// Whether `data` is the block the cache last took, in this frame packet.
+static bool repeats_cached(const UniformCache& cache, const uint8_t* data, size_t length) {
+  const uint64_t frameId = current_frame_id();
+  return frameId != 0 && cache.frameId == frameId && cache.bytes.size() == length &&
+         std::memcmp(cache.bytes.data(), data, length) == 0;
+}
+
+// The in-between frame's blocks, de-duplicated the same way. repeated: the
+// in-between frame made this block the way it made the last one, from the same
+// constants (frame_interp::last_blend_repeated), so its bytes are the same.
+static Range push_interp_uniform_dedup(const uint8_t* data, size_t length, bool repeated) {
   UniformCache& cache = g_interpUniformCache;
   const uint64_t frameId = current_frame_id();
   if (frameId != 0 && cache.frameId == frameId && cache.range.size != 0 && cache.bytes.size() == length &&
-      std::memcmp(cache.bytes.data(), data, length) == 0) {
+      (repeated || std::memcmp(cache.bytes.data(), data, length) == 0)) {
     ++cache.hits;
     return cache.range;
   }
@@ -818,15 +827,17 @@ static Range push_interp_uniform_dedup(const uint8_t* data, size_t length) {
   return cache.range;
 }
 
+// known: 1 or 0 when the caller has already compared `data` with the cache's
+// block (repeats_cached), -1 to compare here.
 static Range push_uniform_dedup(UniformCache& cache, const uint8_t* data,
-                                size_t length) {
+                                size_t length, int known = -1) {
   static const bool enabled = [] {
     const char* env = std::getenv("DOL_AURORA_UNIFORM_DEDUP");
     return env == nullptr || env[0] != '0';
   }();
   const uint64_t frameId = current_frame_id();
   if (enabled && frameId != 0 && cache.frameId == frameId && cache.bytes.size() == length &&
-      std::memcmp(cache.bytes.data(), data, length) == 0) {
+      (known >= 0 ? known == 1 : std::memcmp(cache.bytes.data(), data, length) == 0)) {
     ++cache.hits;
     return cache.range;
   }
@@ -1200,12 +1211,18 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const size_t vertBytes = plan.vertices.size() * sizeof(float);
   const size_t indexBytes = plan.indices.size() * sizeof(uint16_t);
   const size_t pixelUniformBytes = tev ? sizeof(plan.pixel_constants) : 0;
+  // One comparison for the three de-duplications below (the vertex block, the
+  // in-between frame's pool and its block): most draws repeat the constants of
+  // the draw before them, 96 percent of the Forsaken Fortress's 17,500 a frame,
+  // and each comparison of equal blocks reads all 2.8 KB of both.
+  const bool repeatsLast = repeats_cached(g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
+                                          sizeof(plan.constants));
   // Matched before a staging segment can split the frame; a split frame is
   // not interpolated.
   const gxc::VertexShaderConstants* interpConstants =
       frame_interp::enabled()
           ? frame_interp::blend_draw(frame_interp::draw_key(plan), frame_interp::used_matrix_rows(plan),
-                                     plan.constants)
+                                     plan.constants, repeatsLast)
           : nullptr;
   if (frame_interp::tracing()) {
     const auto& m = plan.constants.posnormalmatrix;
@@ -1242,10 +1259,11 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       indexBytes, 4);
   const auto uniformRange = push_uniform_dedup(
       g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
-      sizeof(plan.constants));
+      sizeof(plan.constants), repeatsLast ? 1 : 0);
   const auto interpUniformRange =
       interpConstants != nullptr
-          ? push_interp_uniform_dedup(reinterpret_cast<const uint8_t*>(interpConstants), sizeof(*interpConstants))
+          ? push_interp_uniform_dedup(reinterpret_cast<const uint8_t*>(interpConstants), sizeof(*interpConstants),
+                                      frame_interp::last_blend_repeated())
           : Range{};
   Range pixelUniformRange{};
   if (tev) {

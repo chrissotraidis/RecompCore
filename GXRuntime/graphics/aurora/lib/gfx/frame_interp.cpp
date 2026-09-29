@@ -68,6 +68,27 @@ struct KeyState {
 absl::flat_hash_map<uint64_t, KeyState> g_keys;
 gxc::VertexShaderConstants g_blended;
 
+// Most draws repeat the constants of the draw before them (a model's parts,
+// copies drawn with one matrix): 96 percent in the Forsaken Fortress, where a
+// frame has 17,500 draws. For those the caller's comparison is enough: the
+// pool entry is not compared again, and an in-between block made from the same
+// match the same way is the one g_blended already holds.
+uint64_t g_drawSerial = 0;
+uint64_t g_pooledSerial = 0; // the draw whose constants are the current pool's last
+uint64_t g_motionGeneration = 0; // bumped when any motion's values change
+enum class BlendPath { Main, OwnMotion, StoodBefore };
+struct LastBlend {
+  uint64_t serial = 0; // 0: none
+  BlendPath path = BlendPath::Main;
+  const void* previous = nullptr;
+  const void* motion = nullptr;
+  uint64_t motionGeneration = 0;
+  uint64_t rows = 0;
+  bool identical = false;
+};
+LastBlend g_lastBlend;
+bool g_blendRepeated = false;
+
 // Motions seen this frame (see vote_motion()): M_now * M_before^-1 of the
 // draws matched without ambiguity, and how many draws agree with each.
 struct Motion {
@@ -348,6 +369,7 @@ void vote_motion(const float current[][4], const float previous[][4]) {
     }
     g_motions[agreed].votes = 1;
     g_motions[agreed].derived = false;
+    ++g_motionGeneration;
   }
   // The motion most draws agree with is the camera's.
   if (g_leadingMotion < 0 || g_motions[agreed].votes > g_motions[g_leadingMotion].votes)
@@ -433,6 +455,7 @@ float blend_weight();
 bool derive(Motion& motion) {
   if (motion.derived)
     return motion.bounded;
+  ++g_motionGeneration;
   motion.derived = true;
   motion.bounded = false;
   const double(*m)[4] = motion.m;
@@ -633,8 +656,24 @@ float blend_weight() {
   return weight;
 }
 
+// Which of the ten indexed position matrices (XF rows 0-29, and their normal
+// matrices) a draw reads, from used_matrix_rows(): none for a draw without
+// per-vertex matrix indices, which reads only the current matrix; all of them
+// for one that indexes rows past them. The rest of the out block keeps the
+// current frame's values, which the draw does not read.
+inline unsigned used_matrices(uint64_t rows) {
+  if ((rows >> 30) != 0)
+    return 0x3FFu;
+  unsigned matrices = 0;
+  for (int m = 0; m < 10; ++m) {
+    if (((rows >> (m * 3)) & 7u) != 0)
+      matrices |= 1u << m;
+  }
+  return matrices;
+}
+
 void blend(const gxc::VertexShaderConstants& previous, const gxc::VertexShaderConstants& current, float t,
-           gxc::VertexShaderConstants& out) {
+           gxc::VertexShaderConstants& out, uint64_t rows) {
   std::memcpy(&out, &current, sizeof(out));
   lerp_rows(out.posnormalmatrix, previous.posnormalmatrix, current.posnormalmatrix, 6, t);
   lerp_rows(out.projection, previous.projection, current.projection, 4, t);
@@ -642,14 +681,22 @@ void blend(const gxc::VertexShaderConstants& previous, const gxc::VertexShaderCo
     lerp_texture_rows(&out.texmatrices[m * 3], &previous.texmatrices[m * 3], &current.texmatrices[m * 3], t);
   // XF matrix memory: position matrices in rows 0-29, texture matrices in
   // 30-59, and the identity rows after them.
-  lerp_rows(out.transformmatrices, previous.transformmatrices, current.transformmatrices, 30, t);
+  const unsigned matrices = used_matrices(rows);
+  for (int m = 0; m < 10; ++m) {
+    if ((matrices >> m) & 1u) {
+      lerp_rows(&out.transformmatrices[m * 3], &previous.transformmatrices[m * 3],
+                &current.transformmatrices[m * 3], 3, t);
+      lerp_rows(&out.normalmatrices[m * 3], &previous.normalmatrices[m * 3], &current.normalmatrices[m * 3], 3, t);
+    }
+  }
   for (int m = 0; m < 10; ++m) {
     const int row = 30 + m * 3;
     lerp_texture_rows(&out.transformmatrices[row], &previous.transformmatrices[row],
                       &current.transformmatrices[row], t);
   }
   lerp_rows(&out.transformmatrices[60], &previous.transformmatrices[60], &current.transformmatrices[60], 4, t);
-  lerp_rows(out.normalmatrices, previous.normalmatrices, current.normalmatrices, 32, t);
+  if ((rows >> 30) != 0)
+    lerp_rows(&out.normalmatrices[30], &previous.normalmatrices[30], &current.normalmatrices[30], 2, t);
   // Lights are in view space and move with the camera.
   for (int l = 0; l < 8; ++l) {
     for (int c = 0; c < 4; ++c) {
@@ -666,8 +713,9 @@ void blend(const gxc::VertexShaderConstants& previous, const gxc::VertexShaderCo
 // two views turned far apart shrinks them), and what moves keeps its place
 // against it.
 void blend_relative(const Motion& camera, const gxc::VertexShaderConstants& previous,
-                    const gxc::VertexShaderConstants& current, float t, gxc::VertexShaderConstants& out) {
-  blend(previous, current, t, out);
+                    const gxc::VertexShaderConstants& current, float t, gxc::VertexShaderConstants& out,
+                    uint64_t rows) {
+  blend(previous, current, t, out, rows);
   const auto place = [&](const float from[][4], const float to[][4], float result[][4], bool affine) {
     double seen[3][4];
     affine_multiply(camera.inverse, to, seen);
@@ -691,10 +739,14 @@ void blend_relative(const Motion& camera, const gxc::VertexShaderConstants& prev
   place(previous.posnormalmatrix, current.posnormalmatrix, out.posnormalmatrix, true);
   // Normal matrices turn with the camera's rotation only (it is rigid).
   place(&previous.posnormalmatrix[3], &current.posnormalmatrix[3], &out.posnormalmatrix[3], false);
-  for (int m = 0; m < 10; ++m)
-    place(&previous.transformmatrices[m * 3], &current.transformmatrices[m * 3], &out.transformmatrices[m * 3], true);
-  for (int m = 0; m < 10; ++m)
-    place(&previous.normalmatrices[m * 3], &current.normalmatrices[m * 3], &out.normalmatrices[m * 3], false);
+  const unsigned matrices = used_matrices(rows);
+  for (int m = 0; m < 10; ++m) {
+    if ((matrices >> m) & 1u) {
+      place(&previous.transformmatrices[m * 3], &current.transformmatrices[m * 3], &out.transformmatrices[m * 3],
+            true);
+      place(&previous.normalmatrices[m * 3], &current.normalmatrices[m * 3], &out.normalmatrices[m * 3], false);
+    }
+  }
   // Lights in view space: positions carried, directions turned.
   for (int l = 0; l < 8; ++l) {
     double pos[3], dir[3];
@@ -784,14 +836,38 @@ uint64_t used_matrix_rows(const gxc::DrawPlan& plan) noexcept {
 }
 
 const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRows,
-                                             const gxc::VertexShaderConstants& current) {
+                                             const gxc::VertexShaderConstants& current, bool repeatsLastDraw) {
   g_outcome = "no key";
+  g_blendRepeated = false;
+  const uint64_t serial = ++g_drawSerial;
   if (!enabled() || key == 0)
     return nullptr;
   const float (*here)[4] = position_signature(current, usedMatrixRows);
   FrameRecords& frame = g_frames[g_current];
-  if (frame.pool.empty() || std::memcmp(&frame.pool.back(), &current, sizeof(current)) != 0)
+  // The pool keeps a run of identical blocks once. When the draw before this
+  // one put its block there, the caller's comparison says whether this is it.
+  const bool lastPooled = !frame.pool.empty() && g_pooledSerial + 1 == serial;
+  if (frame.pool.empty() ||
+      (lastPooled ? !repeatsLastDraw : std::memcmp(&frame.pool.back(), &current, sizeof(current)) != 0))
     frame.pool.push_back(current);
+  g_pooledSerial = serial;
+  // An in-between block made the way the draw before this one's was (same
+  // path, same previous block, same motion, same matrices) from the same
+  // constants is the one g_blended holds.
+  const auto repeat = [&](BlendPath path, const void* previousBlock, const void* motion) {
+    const bool same = repeatsLastDraw && g_lastBlend.serial + 1 == serial && g_lastBlend.path == path &&
+                      g_lastBlend.previous == previousBlock && g_lastBlend.motion == motion &&
+                      g_lastBlend.motionGeneration == g_motionGeneration && g_lastBlend.rows == usedMatrixRows;
+    g_lastBlend.serial = serial;
+    if (same)
+      return true;
+    g_lastBlend.path = path;
+    g_lastBlend.previous = previousBlock;
+    g_lastBlend.motion = motion;
+    g_lastBlend.motionGeneration = g_motionGeneration;
+    g_lastBlend.rows = usedMatrixRows;
+    return false;
+  };
   const auto constantsIndex = static_cast<uint32_t>(frame.pool.size() - 1);
   frame.records.push_back({key, constantsIndex, false, {here[0][3], here[1][3], here[2][3]}});
   ++g_frameCounts.draws;
@@ -931,10 +1007,14 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
       if (usedMatrixRows != 0 || !stood_before(*camera, current, g_stoodBefore) ||
           !plausible_relative(view, current, g_stoodBefore, 0))
         return nullptr;
+      if (repeat(BlendPath::StoodBefore, camera, view)) {
+        g_blendRepeated = true;
+        return &g_blended;
+      }
       if (view != nullptr)
-        blend_relative(*view, g_stoodBefore, current, blend_weight(), g_blended);
+        blend_relative(*view, g_stoodBefore, current, blend_weight(), g_blended, 0);
       else
-        blend(g_stoodBefore, current, blend_weight(), g_blended);
+        blend(g_stoodBefore, current, blend_weight(), g_blended, 0);
       return &g_blended;
     }
   }
@@ -946,14 +1026,22 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
     // sky, the first rooms of a fast turn), one whose change is rigid and a
     // turn rather than a cut is blended by half of its own motion, which for
     // scenery is the camera's.
+    ++g_frameCounts.matched;
+    if (repeat(BlendPath::OwnMotion, &constantsOf(0), nullptr)) {
+      ++g_frameCounts.blended;
+      g_outcome = "blended by its own motion";
+      g_blendRepeated = true;
+      return &g_blended;
+    }
     Motion own{};
     if (own_motion(constantsOf(0).posnormalmatrix, current.posnormalmatrix, own) && derive(own)) {
-      ++g_frameCounts.matched;
-      blend_relative(own, constantsOf(0), current, blend_weight(), g_blended);
+      blend_relative(own, constantsOf(0), current, blend_weight(), g_blended, usedMatrixRows);
       ++g_frameCounts.blended;
       g_outcome = "blended by its own motion";
       return &g_blended;
     }
+    --g_frameCounts.matched;
+    g_lastBlend.serial = 0;
   }
   if (previous == nullptr) {
     ++g_frameCounts.rejected;
@@ -961,19 +1049,34 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
     return nullptr;
   }
   ++g_frameCounts.matched;
-  if (std::memcmp(previous, &current, sizeof(current)) == 0) {
+  const bool relative = view != nullptr && previous->projection[3][2] != 0.f;
+  if (repeat(BlendPath::Main, previous, relative ? view : nullptr)) {
+    if (g_lastBlend.identical) {
+      ++g_frameCounts.identical;
+      g_outcome = "identical";
+      return nullptr;
+    }
+    ++g_frameCounts.blended;
+    g_outcome = "blended";
+    g_blendRepeated = true;
+    return &g_blended;
+  }
+  g_lastBlend.identical = std::memcmp(previous, &current, sizeof(current)) == 0;
+  if (g_lastBlend.identical) {
     ++g_frameCounts.identical;
     g_outcome = "identical";
     return nullptr;
   }
-  if (view != nullptr && previous->projection[3][2] != 0.f)
-    blend_relative(*view, *previous, current, blend_weight(), g_blended);
+  if (relative)
+    blend_relative(*view, *previous, current, blend_weight(), g_blended, usedMatrixRows);
   else
-    blend(*previous, current, blend_weight(), g_blended);
+    blend(*previous, current, blend_weight(), g_blended, usedMatrixRows);
   ++g_frameCounts.blended;
   g_outcome = "blended";
   return &g_blended;
 }
+
+bool last_blend_repeated() noexcept { return g_blendRepeated; }
 
 bool frame_verdict() noexcept {
   g_lastVerdict = false;

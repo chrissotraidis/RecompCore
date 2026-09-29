@@ -43,10 +43,15 @@ uint64_t used_matrix_rows(const gxruntime::gxcore::DrawPlan& plan) noexcept;
 // Recording thread, once per submitted gxcore draw. Returns the constants the
 // draw uses in the in-between frame, or nullptr when they are its own (no
 // match, an implausible match, or nothing moved). The pointer is valid until
-// the next call.
+// the next call. repeats_last_draw: `current` is the constants of the draw
+// before this one (the caller already compared them), so they are not
+// compared again, and an in-between block made from the same match is reused.
 const gxruntime::gxcore::VertexShaderConstants* blend_draw(
     uint64_t key, uint64_t used_matrix_rows,
-    const gxruntime::gxcore::VertexShaderConstants& current);
+    const gxruntime::gxcore::VertexShaderConstants& current, bool repeats_last_draw = false);
+// Whether the last blend_draw() returned the same in-between block as the call
+// before it (its bytes unchanged), so the caller need not compare them.
+bool last_blend_repeated() noexcept;
 
 // Why the last blend_draw() returned what it did, for the per-draw trace
 // (DOL_AURORA_FRAME_INTERP_TRACE=game frame number).
