@@ -77,9 +77,18 @@ static bool halfway(const Result& result, const Camera& before, const Camera& no
     return false;
   const auto a = seen(before.yaw, before.x, before.z, x, yBefore, -800.f);
   const auto b = seen(now.yaw, now.x, now.z, x, y, -800.f);
+  // Halfway along the camera's turn: the straight midpoint of the two places,
+  // within the arc's bulge (about a unit at these distances and turns); a clump
+  // paired with its neighbour is off by tens of units.
+  float length = 0.f;
   for (int r = 0; r < 3; ++r) {
     const float expected = (a.posnormalmatrix[r][3] + b.posnormalmatrix[r][3]) / 2.f;
-    if (std::fabs(result.constants.posnormalmatrix[r][3] - expected) > 0.01f)
+    length += expected * expected;
+  }
+  const float tolerance = 0.003f * std::sqrt(length) + 0.05f;
+  for (int r = 0; r < 3; ++r) {
+    const float expected = (a.posnormalmatrix[r][3] + b.posnormalmatrix[r][3]) / 2.f;
+    if (std::fabs(result.constants.posnormalmatrix[r][3] - expected) > tolerance)
       return false;
   }
   return true;
@@ -201,6 +210,68 @@ int main() {
     fi::end_game_frame();
     draw_scene(f, third, 6, r, 60.f, 30.f);
     CHECK(halfway(r[3], e, f, 60, 15.f, 30.f));
+    fi::end_game_frame();
+  }
+
+  // A fast turn (50 degrees in one game frame, a flick of the mouse camera):
+  // distant scenery moves far past the plausibility bounds, but the rooms'
+  // shared motion is the camera's, so the frame is still interpolated, each
+  // room is drawn exactly where the halfway camera sees it (no shrink from
+  // blending two views far apart), and a character walking meanwhile is
+  // halfway along its own path in that view.
+  {
+    fi::end_game_frame();
+    fi::end_game_frame(); // no previous frame, no prediction
+    const Camera a{0.f, 0.f, 0.f}, b{50.f, 0.f, 0.f}, mid{25.f, 0.f, 0.f};
+    const auto frame = [](const Camera& c, float walker, Result* rooms, Result& link) {
+      for (int room = 0; room < 12; ++room) {
+        const auto* r = fi::blend_draw(700 + room, 0,
+                                       seen(c.yaw, c.x, c.z, room * 400.f - 2200.f, -80.f, -2500.f - room * 90.f));
+        rooms[room].blended = r != nullptr;
+        if (r != nullptr)
+          rooms[room].constants = *r;
+      }
+      const auto* l = fi::blend_draw(799, 0, seen(c.yaw, c.x, c.z, walker, 0.f, -300.f));
+      link.blended = l != nullptr;
+      if (l != nullptr)
+        link.constants = *l;
+    };
+    Result rooms[12], link;
+    frame(a, 0.f, rooms, link);
+    fi::end_game_frame();
+    frame(b, 20.f, rooms, link);
+    CHECK(fi::frame_verdict());
+    bool exact = true;
+    for (int room = 0; room < 12; ++room) {
+      const auto want = seen(mid.yaw, 0.f, 0.f, room * 400.f - 2200.f, -80.f, -2500.f - room * 90.f);
+      exact = exact && rooms[room].blended;
+      for (int r = 0; r < 3 && exact; ++r)
+        for (int c = 0; c < 4; ++c)
+          exact = exact && std::fabs(rooms[room].constants.posnormalmatrix[r][c] - want.posnormalmatrix[r][c]) <
+                               (c == 3 ? 0.05f : 1e-4f);
+    }
+    CHECK(exact);
+    const auto walking = seen(mid.yaw, 0.f, 0.f, 10.f, 0.f, -300.f);
+    CHECK(link.blended && std::fabs(link.constants.posnormalmatrix[0][3] - walking.posnormalmatrix[0][3]) < 0.05f &&
+          std::fabs(link.constants.posnormalmatrix[2][3] - walking.posnormalmatrix[2][3]) < 0.05f);
+    fi::end_game_frame();
+    // Most of the view new at once (a field of grass swung into view): still
+    // a turn, not a cut.
+    {
+      frame(b, 20.f, rooms, link);
+      for (int clump = 0; clump < 4; ++clump) // the model's copies elsewhere, far behind
+        fi::blend_draw(900, 0, seen(b.yaw, b.x, b.z, 5000.f + clump * 30.f, 0.f, 4000.f));
+      fi::end_game_frame();
+      const Camera c{70.f, 0.f, 0.f};
+      frame(c, 20.f, rooms, link);
+      for (int clump = 0; clump < 40; ++clump)
+        fi::blend_draw(900, 0, seen(c.yaw, c.x, c.z, -600.f + clump * 30.f, 0.f, -700.f));
+      CHECK(fi::frame_verdict());
+      fi::end_game_frame();
+    }
+    // A cut (the camera across the island) is still not interpolated.
+    frame(Camera{140.f, 3000.f, -4000.f}, 20.f, rooms, link);
+    CHECK(!fi::frame_verdict());
     fi::end_game_frame();
   }
 
