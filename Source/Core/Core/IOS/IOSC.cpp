@@ -573,6 +573,21 @@ void IOSC::LoadDefaultEntries()
                                   std::vector<u8>(AES128_KEY_SIZE), 5};
   m_key_entries[HANDLE_FS_MAC] = {TYPE_SECRET_KEY, ObjectSubType::MAC, std::vector<u8>(20), 5};
 
+#ifdef PADFORGE_PUBLIC_APP
+  // Published apps carry no Nintendo keys. GameCube games never use these; a Wii title would
+  // need the player's own keys.bin (LoadEntries below).
+  const IOSC::KeyEntry no_key{TYPE_SECRET_KEY, ObjectSubType::AES128,
+                              std::vector<u8>(AES128_KEY_SIZE), 3};
+  m_key_entries[HANDLE_COMMON_KEY] = no_key;
+  m_key_entries[HANDLE_NEW_COMMON_KEY] = no_key;
+  m_key_entries[HANDLE_PRNG_KEY] = no_key;
+  m_key_entries[HANDLE_SD_KEY] = no_key;
+  m_root_key_entry = {TYPE_PUBLIC_KEY, ObjectSubType::RSA4096,
+                      std::vector<u8>(ROOT_PUBLIC_KEY.begin(), ROOT_PUBLIC_KEY.end()),
+                      Common::swap32(0x00010001), 0};
+  m_ms_id = 2;
+  m_ca_id = 1;
+#else
   switch (m_console_type)
   {
   case ConsoleType::Retail:
@@ -611,17 +626,20 @@ void IOSC::LoadDefaultEntries()
                                   {{0xab, 0x01, 0xb9, 0xd8, 0xe1, 0x62, 0x2b, 0x08, 0xaf, 0xba,
                                     0xd8, 0x4d, 0xbf, 0xc2, 0xa5, 0x5d}},
                                   3};
+#endif
 
   m_key_entries[HANDLE_BOOT2_VERSION] = {TYPE_DATA, ObjectSubType::Version, {}, 3};
   m_key_entries[HANDLE_UNKNOWN_8] = {TYPE_DATA, ObjectSubType::Version, {}, 3};
   m_key_entries[HANDLE_UNKNOWN_9] = {TYPE_DATA, ObjectSubType::Version, {}, 3};
   m_key_entries[HANDLE_FS_VERSION] = {TYPE_DATA, ObjectSubType::Version, {}, 3};
 
+#ifndef PADFORGE_PUBLIC_APP
   m_key_entries[HANDLE_NEW_COMMON_KEY] = {TYPE_SECRET_KEY,
                                           ObjectSubType::AES128,
                                           {{0x63, 0xb8, 0x2b, 0xb4, 0xf4, 0x61, 0x4e, 0x2e, 0x13,
                                             0xf2, 0xfe, 0xfb, 0xba, 0x4c, 0x9b, 0x7e}},
                                           3};
+#endif
 }
 
 void IOSC::LoadEntries()
