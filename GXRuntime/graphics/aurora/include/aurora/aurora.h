@@ -140,6 +140,9 @@ void aurora_set_resampler(AuroraSampler sampler);
    buffer (3 renders 1920x1440 and scales the result to the window); 0 renders
    at the window's native pixel size. Takes effect at the next frame. */
 void aurora_set_frame_buffer_scale(float scale);
+/* While set, frames are rendered but not presented: no drawable is taken, so
+   nothing waits for the display. The screen keeps the last presented frame. */
+void aurora_set_present_suppressed(bool suppressed);
 /* Anisotropic filtering for every mipmapped, linearly filtered texture, as
    Dolphin's "Anisotropic Filtering" enhancement: 1 (or 0) leaves the game's
    own sampler settings, 2-16 forces that many samples. Takes effect at the

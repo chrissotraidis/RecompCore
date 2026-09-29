@@ -38,6 +38,11 @@ void dol_aurora_set_event_observer(DolAuroraEventObserverFn observe, void* user)
 // it pumps events and sleeps on the main thread until the predicate clears.
 typedef bool (*DolAuroraHoldFn)(void* user);
 void dol_aurora_set_hold(DolAuroraHoldFn should_hold, void* user);
+// Fast-forward, for stretches with nothing to see or hear (a scene change's
+// black): frames are rendered but not presented, and audio pushes are
+// dropped, so neither the display nor the audio queue holds the guest to real
+// time. The screen keeps the last presented frame.
+void dol_aurora_set_fast_forward(bool on);
 
 /* Cumulative main-thread frame timing, for per-second diagnostics: time spent
    waiting for the FIFO translation worker at the guest's GX barriers, time in

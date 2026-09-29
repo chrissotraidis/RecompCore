@@ -282,6 +282,8 @@ static void draw_fps_overlay() {
 }
 #endif
 
+static std::atomic_bool g_presentSuppressed{false};
+
 void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
@@ -312,7 +314,7 @@ void end_frame() noexcept {
     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
     {
       window::SurfaceLock surfaceLock;
-      if (window::is_presentable() && g_surface) {
+      if (!g_presentSuppressed.load(std::memory_order_relaxed) && window::is_presentable() && g_surface) {
         ZoneScopedN("Acquire texture");
         wgpu::SurfaceTexture surfaceTexture;
         g_surface.GetCurrentTexture(&surfaceTexture);
@@ -382,7 +384,7 @@ void end_frame() noexcept {
         imgui::render(pass, imguiDrawData);
         pass.End();
       }
-    } else {
+    } else if (!g_presentSuppressed.load(std::memory_order_relaxed)) {
       Log.info("Skipping present; window not presentable");
     }
     webgpu::gpu_prof::frame_end(encoder);
@@ -488,6 +490,13 @@ void aurora_set_background_input(bool value) {
   aurora::window::set_background_input(value);
 }
 void aurora_set_frame_buffer_scale(float scale) { aurora::window::set_frame_buffer_scale(scale); }
+void aurora_set_present_suppressed(bool suppressed) {
+#ifdef AURORA_ENABLE_GX
+  aurora::g_presentSuppressed.store(suppressed, std::memory_order_relaxed);
+#else
+  (void)suppressed;
+#endif
+}
 void aurora_set_resampler(AuroraSampler sampler) {
 #ifdef AURORA_ENABLE_GX
   aurora::webgpu::set_resampler(sampler);

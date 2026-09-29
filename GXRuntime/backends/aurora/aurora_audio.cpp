@@ -73,6 +73,14 @@ void aurora_backend_audio_push(const s16* samples, u32 frames) {
     }
 
     int queued = SDL_GetAudioStreamQueued(gx_aurora::g_audio_stream);
+    // Fast-forward (dol_aurora_set_fast_forward): the sound made faster than
+    // real time is kept only up to the stretcher's target, so the queue neither
+    // holds it late after the fast-forward nor runs dry during it.
+    if (gx_aurora::g_audio_discard.load(std::memory_order_relaxed) &&
+        queued >= bytes_per_second * static_cast<int>(kStretchTargetMs) / 1000) {
+        gx_aurora::g_audio_dropped_count++;
+        return;
+    }
     // With the host pacing retraces by the wall clock (BlueWake's
     // BLUEWAKE_WALL_PACE), the queue must not pace the game as well: its 1 ms
     // waits added up to about 35 ms whenever the device drained a buffer, and
