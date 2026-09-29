@@ -21,10 +21,12 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#if !defined(_WIN32)
 #include <execinfo.h>
 #include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
+#endif
 #include "../../graphics/aurora/lib/gfx/render_worker.hpp"
 
 #if GXRUNTIME_HAS_AURORA_RECOMP
@@ -493,6 +495,7 @@ void g_fifo_translate(std::vector<std::uint8_t>& batch) {
 // worker write their call stacks to stderr ([gx-stall-stack]), so what a long
 // stall waits on is in the session log.
 std::atomic<long long> g_batch_start_ns{0};
+#if !defined(_WIN32)
 std::atomic<pthread_t> g_fifo_pthread{};
 
 void stall_stack_handler(int) {
@@ -505,12 +508,19 @@ void stall_stack_handler(int) {
     (void)!write(2, kFooter, sizeof kFooter - 1);
 }
 
+#endif
+
 long long monotonic_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
 
+#if defined(_WIN32)
+// Windows has no backtrace() or thread signals: DOL_GX_STALL_STACKS is a
+// Mac and Linux diagnostic.
+void start_stall_watchdog() {}
+#else
 void start_stall_watchdog() {
     static const bool enabled = [] {
         const char* env = std::getenv("DOL_GX_STALL_STACKS");
@@ -541,9 +551,12 @@ void start_stall_watchdog() {
         }).detach();
     });
 }
+#endif
 
 void g_fifo_worker_main() {
+#if !defined(_WIN32)
     g_fifo_pthread.store(pthread_self(), std::memory_order_release);
+#endif
     start_stall_watchdog();
     // Kept across batches: the swap below hands its capacity back to the
     // handoff, so the game thread's appends reuse it instead of growing a new

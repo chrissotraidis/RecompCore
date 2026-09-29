@@ -6,12 +6,16 @@
 
 #include <tracy/Tracy.hpp>
 
+#if !defined(_WIN32)
 #include <pthread.h>
+#endif
 
 namespace aurora::gfx::render_worker {
-// The worker's thread, for the GX stall watchdog's stack dumps.
+#if !defined(_WIN32)
+// The worker's thread, for the GX stall watchdog's stack dumps (not on Windows).
 std::atomic<pthread_t> g_renderPthread{};
 pthread_t native_thread() { return g_renderPthread.load(std::memory_order_acquire); }
+#endif
 namespace {
 constexpr size_t QueueCapacity = 256;
 constexpr auto IdlePumpInterval = std::chrono::milliseconds{1};
@@ -40,7 +44,9 @@ void worker_main() {
   tracy::SetThreadName("Aurora render worker");
 #endif
   g_workerThreadId = std::this_thread::get_id();
+#if !defined(_WIN32)
   g_renderPthread.store(pthread_self(), std::memory_order_release);
+#endif
 
   while (true) {
     if (g_idleHook) {
