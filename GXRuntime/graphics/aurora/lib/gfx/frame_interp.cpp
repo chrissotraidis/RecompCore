@@ -32,6 +32,10 @@ uint64_t env_u64(const char* name, uint64_t fallback) {
 }
 
 std::atomic_bool g_enabled{env_flag("DOL_AURORA_FRAME_INTERP", false)};
+// In-between frames per game frame (1: 60 Hz, 3: 120 Hz; DOL_AURORA_FRAME_INTERP_STEPS),
+// asked for at any time and taken at a game frame's start (g_frameSteps).
+std::atomic<int> g_steps{static_cast<int>(std::clamp<uint64_t>(env_u64("DOL_AURORA_FRAME_INTERP_STEPS", 1), 1, 3))};
+int g_frameSteps = g_steps.load(std::memory_order_relaxed);
 std::atomic_bool g_encodingInterpolated{false};
 std::atomic<uint64_t> g_gameFrame{1};
 
@@ -70,8 +74,8 @@ struct FrameRecords {
 
 // At most this many vertices per draw are kept and blended.
 constexpr uint32_t kMaxBlendedVertices = 1024;
-// blend_draw()'s in-between positions for its draw (x, y, z per vertex).
-std::vector<float> g_blendedPositions;
+// blend_draw()'s in-between positions for its draw (x, y, z per vertex), per step.
+std::vector<float> g_blendedPositions[kMaxSteps];
 bool g_haveBlendedPositions = false;
 
 FrameRecords g_frames[2];
@@ -86,7 +90,8 @@ struct KeyState {
   uint32_t next = 0;
 };
 absl::flat_hash_map<uint64_t, KeyState> g_keys;
-gxc::VertexShaderConstants g_blended;
+// The in-between blocks blend_draw() made, one per step.
+gxc::VertexShaderConstants g_blended[kMaxSteps];
 
 // Most draws repeat the constants of the draw before them (a model's parts,
 // copies drawn with one matrix): 96 percent in the Forsaken Fortress, where a
@@ -117,12 +122,12 @@ struct Motion {
   uint32_t votes;
   double weight;
   // For the camera's motion (see camera_motion()): its inverse, and the part
-  // of it the in-between frame is at (D^t: the rotation turned by t of its
-  // angle, and exactly half of D at t = 0.5, so D^0.5 * D^0.5 = D).
+  // of it each in-between frame is at (D^t: the rotation turned by t of its
+  // angle about the same screw axis, so D^0.5 * D^0.5 = D).
   bool derived;
   bool bounded;
   double inverse[3][4];
-  double part[3][4];
+  double part[kMaxSteps][3][4];
 };
 constexpr int kMaxMotions = 6;
 constexpr uint32_t kMinMotionVotes = 4;
@@ -514,7 +519,7 @@ size_t find_carried(uint64_t key, const float here[][4], size_t first, size_t co
   return pick;
 }
 
-float blend_weight();
+double step_weight(int step);
 
 // The inverse of a camera motion and its part at the blend weight, once; a
 // motion that turns or shifts too far to be a turn is not used (a cut).
@@ -573,40 +578,57 @@ bool derive(Motion& motion) {
   const double shift = std::sqrt(m[0][3] * m[0][3] + m[1][3] * m[1][3] + m[2][3] * m[2][3]);
   if (angle > kMaxCameraTurn || shift > kMaxCameraShift)
     return false;
-  // The rotation by t of the angle about the same axis.
-  const double t = blend_weight();
   const double axis = std::sqrt(x * x + y * y + z * z);
-  double pw = 1.0, px = 0.0, py = 0.0, pz = 0.0;
-  if (axis > 1e-12) {
-    const double half = 0.5 * angle * t;
-    pw = std::cos(half);
-    const double k = std::sin(half) / axis;
-    px = x * k, py = y * k, pz = z * k;
-  }
-  double r[3][3] = {
-      {1 - 2 * (py * py + pz * pz), 2 * (px * py - pz * pw), 2 * (px * pz + py * pw)},
-      {2 * (px * py + pz * pw), 1 - 2 * (px * px + pz * pz), 2 * (py * pz - px * pw)},
-      {2 * (px * pz - py * pw), 2 * (py * pz + px * pw), 1 - 2 * (px * px + py * py)},
-  };
-  // The translation: at t = 0.5 exactly half of D, (R_h + I) t_h = t, so
-  // that the half applied twice is D; otherwise t of it.
-  double shiftPart[3] = {m[0][3] * t, m[1][3] * t, m[2][3] * t};
-  if (t == 0.5f) {
-    const float sum[3][4] = {
-        {float(r[0][0] + 1.0), float(r[0][1]), float(r[0][2]), 0.f},
-        {float(r[1][0]), float(r[1][1] + 1.0), float(r[1][2]), 0.f},
-        {float(r[2][0]), float(r[2][1]), float(r[2][2] + 1.0), 0.f},
-    };
-    double solve[3][4];
-    if (affine_inverse(sum, solve)) {
-      for (int i = 0; i < 3; ++i)
-        shiftPart[i] = solve[i][0] * m[0][3] + solve[i][1] * m[1][3] + solve[i][2] * m[2][3];
+  for (int step = 0; step < g_frameSteps; ++step) {
+    // The rotation by t of the angle about the same axis.
+    const double t = step_weight(step);
+    double pw = 1.0, px = 0.0, py = 0.0, pz = 0.0;
+    if (axis > 1e-12) {
+      const double half = 0.5 * angle * t;
+      pw = std::cos(half);
+      const double k = std::sin(half) / axis;
+      px = x * k, py = y * k, pz = z * k;
     }
-  }
-  for (int i = 0; i < 3; ++i) {
-    for (int k = 0; k < 3; ++k)
-      motion.part[i][k] = r[i][k];
-    motion.part[i][3] = shiftPart[i];
+    double r[3][3] = {
+        {1 - 2 * (py * py + pz * pz), 2 * (px * py - pz * pw), 2 * (px * pz + py * pw)},
+        {2 * (px * py + pz * pw), 1 - 2 * (px * px + pz * pz), 2 * (py * pz - px * pw)},
+        {2 * (px * pz - py * pw), 2 * (py * pz + px * pw), 1 - 2 * (px * px + py * py)},
+    };
+    // The translation: at t = 0.5 exactly half of D, (R_h + I) t_h = t, so
+    // that the half applied twice is D. At another t, the screw motion's: D
+    // turns about an axis through c (with c = (v + cot(angle/2) u x v) / 2
+    // for the part v of its shift across the axis u) and slides along it, so
+    // D^t = R^t (x - c) + c + t (the slide).
+    double shiftPart[3] = {m[0][3] * t, m[1][3] * t, m[2][3] * t};
+    if (t == 0.5) {
+      const float sum[3][4] = {
+          {float(r[0][0] + 1.0), float(r[0][1]), float(r[0][2]), 0.f},
+          {float(r[1][0]), float(r[1][1] + 1.0), float(r[1][2]), 0.f},
+          {float(r[2][0]), float(r[2][1]), float(r[2][2] + 1.0), 0.f},
+      };
+      double solve[3][4];
+      if (affine_inverse(sum, solve)) {
+        for (int i = 0; i < 3; ++i)
+          shiftPart[i] = solve[i][0] * m[0][3] + solve[i][1] * m[1][3] + solve[i][2] * m[2][3];
+      }
+    } else if (axis > 1e-12 && angle > 1e-6) {
+      const double u[3] = {x / axis, y / axis, z / axis};
+      const double v[3] = {m[0][3], m[1][3], m[2][3]};
+      const double along = u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+      const double across[3] = {v[0] - along * u[0], v[1] - along * u[1], v[2] - along * u[2]};
+      const double cross[3] = {u[1] * across[2] - u[2] * across[1], u[2] * across[0] - u[0] * across[2],
+                               u[0] * across[1] - u[1] * across[0]};
+      const double cot = 1.0 / std::tan(0.5 * angle);
+      const double c[3] = {0.5 * (across[0] + cot * cross[0]), 0.5 * (across[1] + cot * cross[1]),
+                           0.5 * (across[2] + cot * cross[2])};
+      for (int i = 0; i < 3; ++i)
+        shiftPart[i] = c[i] - (r[i][0] * c[0] + r[i][1] * c[1] + r[i][2] * c[2]) + t * along * u[i];
+    }
+    for (int i = 0; i < 3; ++i) {
+      for (int k = 0; k < 3; ++k)
+        motion.part[step][i][k] = r[i][k];
+      motion.part[step][i][3] = shiftPart[i];
+    }
   }
   motion.bounded = true;
   return true;
@@ -851,13 +873,15 @@ inline void lerp_texture_rows(float out[][4], const float from[][4], const float
   lerp_rows(out, from, to, 3, t);
 }
 
-// DOL_AURORA_FRAME_INTERP_T: the blend weight toward this frame (debug; 0.5).
-float blend_weight() {
-  static const float weight = [] {
+// Each in-between frame's blend weight toward this frame: step / (steps + 1)
+// from the frame before (0.5 for one; 0.25, 0.5 and 0.75 for three).
+// DOL_AURORA_FRAME_INTERP_T sets the one step's (debug).
+double step_weight(int step) {
+  static const double weight = [] {
     const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_T");
-    return env != nullptr && env[0] != '\0' ? std::strtof(env, nullptr) : 0.5f;
+    return env != nullptr && env[0] != '\0' ? std::strtod(env, nullptr) : 0.5;
   }();
-  return weight;
+  return g_frameSteps == 1 ? weight : double(step + 1) / double(g_frameSteps + 1);
 }
 
 // Which of the ten indexed position matrices (XF rows 0-29, and their normal
@@ -1045,9 +1069,11 @@ void blend(const gxc::VertexShaderConstants& previous, const gxc::VertexShaderCo
 // two views turned far apart shrinks them), and what moves keeps its place
 // against it.
 void blend_relative(const Motion& camera, const gxc::VertexShaderConstants& previous,
-                    const gxc::VertexShaderConstants& current, float t, gxc::VertexShaderConstants& out,
+                    const gxc::VertexShaderConstants& current, int step, gxc::VertexShaderConstants& out,
                     uint64_t rows) {
-  blend(previous, current, t, out, rows);
+  const double t = step_weight(step);
+  const double(*part)[4] = camera.part[step];
+  blend(previous, current, float(t), out, rows);
   const auto place = [&](const float from[][4], const float to[][4], float result[][4], bool affine) {
     double seen[3][4];
     affine_multiply(camera.inverse, to, seen);
@@ -1061,11 +1087,11 @@ void blend_relative(const Motion& camera, const gxc::VertexShaderConstants& prev
     blend_linear(from, seen, t, mid);
     for (int r = 0; r < 3; ++r) {
       for (int c = 0; c < 3; ++c)
-        result[r][c] = static_cast<float>(camera.part[r][0] * mid[0][c] + camera.part[r][1] * mid[1][c] +
-                                          camera.part[r][2] * mid[2][c]);
+        result[r][c] = static_cast<float>(part[r][0] * mid[0][c] + part[r][1] * mid[1][c] +
+                                          part[r][2] * mid[2][c]);
       result[r][3] = static_cast<float>(
-          affine ? camera.part[r][0] * mid[0][3] + camera.part[r][1] * mid[1][3] + camera.part[r][2] * mid[2][3] +
-                       camera.part[r][3]
+          affine ? part[r][0] * mid[0][3] + part[r][1] * mid[1][3] + part[r][2] * mid[2][3] +
+                       part[r][3]
                  : mid[r][3]);
     }
   };
@@ -1095,10 +1121,10 @@ void blend_relative(const Motion& camera, const gxc::VertexShaderConstants& prev
       midDir[r] = previous.lights[l].dir[r] + (dir[r] - previous.lights[l].dir[r]) * t;
     }
     for (int r = 0; r < 3; ++r) {
-      out.lights[l].pos[r] = static_cast<float>(camera.part[r][0] * midPos[0] + camera.part[r][1] * midPos[1] +
-                                                camera.part[r][2] * midPos[2] + camera.part[r][3]);
-      out.lights[l].dir[r] = static_cast<float>(camera.part[r][0] * midDir[0] + camera.part[r][1] * midDir[1] +
-                                                camera.part[r][2] * midDir[2]);
+      out.lights[l].pos[r] = static_cast<float>(part[r][0] * midPos[0] + part[r][1] * midPos[1] +
+                                                part[r][2] * midPos[2] + part[r][3]);
+      out.lights[l].dir[r] = static_cast<float>(part[r][0] * midDir[0] + part[r][1] * midDir[1] +
+                                                part[r][2] * midDir[2]);
     }
   }
 }
@@ -1139,8 +1165,8 @@ uint32_t g_currentAge = 0;
 // moves from where it is drawn now, or one moved implausibly far for a frame
 // (a pair that is not the same thing).
 bool blend_positions(const float* before, const float* now, uint32_t count, const float previousMatrix[][4],
-                     const float currentMatrix[][4], const Motion* motion, const float inBetween[][4], double t,
-                     bool tagged, std::vector<float>& out) {
+                     const float currentMatrix[][4], const Motion* motion, int step, const float inBetween[][4],
+                     double t, bool tagged, std::vector<float>& out) {
   double back[3][4];
   if (!affine_inverse(inBetween, back))
     return false;
@@ -1158,9 +1184,9 @@ bool blend_positions(const float* before, const float* now, uint32_t count, cons
   double b0[3][4], b1[3][4];
   if (motion != nullptr) {
     double placed[3][4];
-    affine_multiply(motion->part, a0, placed);
+    affine_multiply(motion->part[step], a0, placed);
     affine_multiply(back, placed, b0);
-    affine_multiply(motion->part, a1, placed);
+    affine_multiply(motion->part[step], a1, placed);
     affine_multiply(back, placed, b1);
   } else {
     affine_multiply(back, a0, b0);
@@ -1183,8 +1209,10 @@ bool blend_positions(const float* before, const float* now, uint32_t count, cons
     const double moved = std::sqrt((u1[0] - u0[0]) * (u1[0] - u0[0]) + (u1[1] - u0[1]) * (u1[1] - u0[1]) +
                                    (u1[2] - u0[2]) * (u1[2] - u0[2]));
     const double distance = std::sqrt(u0[0] * u0[0] + u0[1] * u0[1] + u0[2] * u0[2]);
-    if (moved > (tagged ? 0.5 * distance + 300.0 : 0.2 * distance + 100.0))
+    if (moved > (tagged ? 0.5 * distance + 300.0 : 0.2 * distance + 100.0)) {
+      out.clear(); // implausible, not merely still
       return false;
+    }
     double q0[3], q1[3];
     apply(b0, p0, q0);
     apply(b1, p1, q1);
@@ -1405,15 +1433,16 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
     if (repeat(BlendPath::Unmatched, view, nullptr)) {
       g_outcome = "unmatched, stood still";
       g_blendRepeated = true;
-      return &g_blended;
+      return &g_blended[0];
     }
     if (!stood_before(*view, current, g_stoodBefore)) {
       g_lastBlend.serial = 0;
       return nullptr;
     }
-    blend_relative(*view, g_stoodBefore, current, blend_weight(), g_blended, 0);
+    for (int step = 0; step < g_frameSteps; ++step)
+      blend_relative(*view, g_stoodBefore, current, step, g_blended[step], 0);
     g_outcome = "unmatched, stood still";
-    return &g_blended;
+    return &g_blended[0];
   }
   g_rejectReason = "";
   const FrameRecords& previousFrame = g_frames[g_current ^ 1u];
@@ -1612,13 +1641,15 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
         return nullptr;
       if (repeat(BlendPath::StoodBefore, camera, view)) {
         g_blendRepeated = true;
-        return &g_blended;
+        return &g_blended[0];
       }
-      if (view != nullptr)
-        blend_relative(*view, g_stoodBefore, current, blend_weight(), g_blended, 0);
-      else
-        blend(g_stoodBefore, current, blend_weight(), g_blended, 0);
-      return &g_blended;
+      for (int step = 0; step < g_frameSteps; ++step) {
+        if (view != nullptr)
+          blend_relative(*view, g_stoodBefore, current, step, g_blended[step], 0);
+        else
+          blend(g_stoodBefore, current, float(step_weight(step)), g_blended[step], 0);
+      }
+      return &g_blended[0];
     }
   }
   if (previous == nullptr && candidates == 1 && occurrence == 0 && usedMatrixRows == 0 && perspective &&
@@ -1635,16 +1666,17 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
       g_outcome = "blended by its own motion";
       g_blendRepeated = true;
       g_match = {&copies[0], &constantsOf(0), &g_ownMotion}; // made for the same draw before this one
-      return &g_blended;
+      return &g_blended[0];
     }
     Motion& own = g_ownMotion;
     own = Motion{};
     if (own_motion(constantsOf(0).posnormalmatrix, current.posnormalmatrix, own) && derive(own)) {
       g_match = {&copies[0], &constantsOf(0), &g_ownMotion};
-      blend_relative(own, constantsOf(0), current, blend_weight(), g_blended, usedMatrixRows);
+      for (int step = 0; step < g_frameSteps; ++step)
+        blend_relative(own, constantsOf(0), current, step, g_blended[step], usedMatrixRows);
       ++g_frameCounts.blended;
       g_outcome = "blended by its own motion";
-      return &g_blended;
+      return &g_blended[0];
     }
     --g_frameCounts.matched;
     g_lastBlend.serial = 0;
@@ -1666,7 +1698,7 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
     ++g_frameCounts.blended;
     g_outcome = "blended";
     g_blendRepeated = true;
-    return &g_blended;
+    return &g_blended[0];
   }
   g_lastBlend.identical = std::memcmp(previous, &current, sizeof(current)) == 0;
   if (g_lastBlend.identical) {
@@ -1674,13 +1706,15 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
     g_outcome = "identical";
     return nullptr;
   }
-  if (relative)
-    blend_relative(*view, *previous, current, blend_weight(), g_blended, usedMatrixRows);
-  else
-    blend(*previous, current, blend_weight(), g_blended, usedMatrixRows);
+  for (int step = 0; step < g_frameSteps; ++step) {
+    if (relative)
+      blend_relative(*view, *previous, current, step, g_blended[step], usedMatrixRows);
+    else
+      blend(*previous, current, float(step_weight(step)), g_blended[step], usedMatrixRows);
+  }
   ++g_frameCounts.blended;
   g_outcome = "blended";
-  return &g_blended;
+  return &g_blended[0];
 }
 
 const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::VertexShaderConstants& current,
@@ -1712,10 +1746,19 @@ const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::
   const FrameRecords& previousFrame = g_frames[g_current ^ 1u];
   const float* now = frame.positions.data() + static_cast<size_t>(record.positions) * 3u;
   const float* then = previousFrame.positions.data() + static_cast<size_t>(before->positions) * 3u;
-  const float(*inBetween)[4] = result != nullptr ? result->posnormalmatrix : current.posnormalmatrix;
-  g_haveBlendedPositions =
-      blend_positions(then, now, count, g_match.block->posnormalmatrix, current.posnormalmatrix, g_match.motion,
-                      inBetween, blend_weight(), true, g_blendedPositions);
+  // Each step's, through that step's in-between matrix; none unless every
+  // step's is plausible and one moves.
+  bool moves = false;
+  for (int step = 0; step < g_frameSteps; ++step) {
+    const float(*inBetween)[4] = result != nullptr ? g_blended[step].posnormalmatrix : current.posnormalmatrix;
+    const bool moved = blend_positions(then, now, count, g_match.block->posnormalmatrix, current.posnormalmatrix,
+                                       g_match.motion, step, inBetween, step_weight(step), true,
+                                       g_blendedPositions[step]);
+    if (!moved && g_blendedPositions[step].size() != static_cast<size_t>(count) * 3u)
+      return result; // implausible
+    moves = moves || moved;
+  }
+  g_haveBlendedPositions = moves;
   if (g_haveBlendedPositions)
     ++g_frameCounts.positions;
   return result;
@@ -1729,7 +1772,17 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
   return blend_draw(input, current, repeatsLastDraw);
 }
 
-const float* blended_positions() noexcept { return g_haveBlendedPositions ? g_blendedPositions.data() : nullptr; }
+const float* blended_positions(int step) noexcept {
+  return g_haveBlendedPositions && step < g_frameSteps ? g_blendedPositions[step].data() : nullptr;
+}
+
+const gxc::VertexShaderConstants* blended_step(int step) noexcept {
+  return &g_blended[std::clamp(step, 0, kMaxSteps - 1)];
+}
+
+int frame_steps() noexcept { return g_frameSteps; }
+void set_steps(int steps) noexcept { g_steps.store(std::clamp(steps, 1, kMaxSteps), std::memory_order_relaxed); }
+int steps() noexcept { return g_steps.load(std::memory_order_relaxed); }
 
 bool last_blend_repeated() noexcept { return g_blendRepeated; }
 
@@ -1815,8 +1868,11 @@ void end_game_frame() noexcept {
   g_cellHead.clear();
   g_griddedKeys.clear();
   g_havePredicted = g_leadingMotion >= 0 && g_motions[g_leadingMotion].votes >= kMinMotionVotes;
-  if (g_havePredicted)
+  if (g_havePredicted) {
     g_predicted = g_motions[g_leadingMotion];
+    g_predicted.derived = false; // its parts again, for the next frame's steps
+  }
+  g_frameSteps = g_steps.load(std::memory_order_relaxed);
   g_motionCount = 0;
   g_leadingMotion = -1;
   g_newInView = UINT32_MAX;
@@ -1859,3 +1915,5 @@ void aurora_get_frame_interp_totals(AuroraFrameInterpTotals* out) {
   out->unmatched = g_totalCounts.unmatched;
 }
 bool aurora_get_frame_interpolation() { return aurora::gfx::frame_interp::enabled(); }
+void aurora_set_frame_interp_steps(int steps) { aurora::gfx::frame_interp::set_steps(steps); }
+int aurora_get_frame_interp_steps() { return aurora::gfx::frame_interp::steps(); }

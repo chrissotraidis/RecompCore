@@ -645,17 +645,27 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     return;
   // The in-between frame reads a moved draw's blended constants from their
   // own area; every other draw keeps its own.
-  const bool interpolated = frame_interp::encoding_interpolated();
-  const InterpRanges interp = !interpolated                    ? InterpRanges{}
-                              : data.interpJob != UINT32_MAX ? interp_job_ranges(data.interpJob)
-                                                               : InterpRanges{data.interpUniformRange, data.interpVertRange};
-  const bool blended = interp.uniform.size != 0;
+  // The in-between frame being encoded: its step's block and vertices (a
+  // traced frame's own, matched while recording, are one step's).
+  Range interpUniform{}, interpVerts{};
+  if (frame_interp::encoding_interpolated()) {
+    const int step = interp_replay_step();
+    if (data.interpJob != UINT32_MAX) {
+      const InterpRanges& job = interp_job_ranges(data.interpJob);
+      interpUniform = job.uniform[step];
+      interpVerts = job.verts[step];
+    } else if (step == 0) {
+      interpUniform = data.interpUniformRange;
+      interpVerts = data.interpVertRange;
+    }
+  }
+  const bool blended = interpUniform.size != 0;
   const auto& vsGroup = blended ? g_interpUniformBindGroup : g_uniformBindGroup;
-  const std::array vsOffsets{blended ? interp.uniform.offset : data.uniformRange.offset};
+  const std::array vsOffsets{blended ? interpUniform.offset : data.uniformRange.offset};
   pass.SetBindGroup(1, vsGroup, vsOffsets.size(), vsOffsets.data());
   // A particle's vertices, blended, from the in-between vertex area.
-  if (interp.verts.size != 0)
-    pass.SetVertexBuffer(0, g_interpVertexBuffer, interp.verts.offset, interp.verts.size);
+  if (interpVerts.size != 0)
+    pass.SetVertexBuffer(0, g_interpVertexBuffer, interpVerts.offset, interpVerts.size);
   else
     pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset, data.vertRange.size);
   pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16,
@@ -887,8 +897,8 @@ struct InterpHelper {
   // Recording thread: the frame packet being queued and its job count.
   uint64_t packet = 0;
   uint32_t jobs = 0;
-  // Helper thread: the last block it staged, and a particle's vertices.
-  UniformCache cache;
+  // Helper thread: the last block it staged per step, and a particle's vertices.
+  UniformCache cache[frame_interp::kMaxSteps];
   std::vector<float> vertices;
 };
 
@@ -925,12 +935,19 @@ void interp_helper_main(InterpHelper* h) {
     }
     const InterpJob& job = h->ring[tail % InterpHelper::Capacity];
     InterpRanges ranges{};
-    if (const auto* blended = frame_interp::blend_draw(job.input, job.constants, job.repeatsLastDraw))
-      ranges.uniform = push_interp_uniform_dedup(h->cache, job.frameId, job.slot,
-                                                 reinterpret_cast<const uint8_t*>(blended), sizeof(*blended),
-                                                 frame_interp::last_blend_repeated());
-    if (const float* positions = frame_interp::blended_positions())
-      ranges.verts = push_blended_vertices(job.slot, job.vertices, positions, h->vertices);
+    const int steps = frame_interp::frame_steps();
+    if (frame_interp::blend_draw(job.input, job.constants, job.repeatsLastDraw) != nullptr) {
+      const bool repeated = frame_interp::last_blend_repeated();
+      for (int step = 0; step < steps; ++step)
+        ranges.uniform[step] =
+            push_interp_uniform_dedup(h->cache[step], job.frameId, job.slot,
+                                      reinterpret_cast<const uint8_t*>(frame_interp::blended_step(step)),
+                                      sizeof(gxc::VertexShaderConstants), repeated);
+    }
+    for (int step = 0; step < steps; ++step) {
+      if (const float* positions = frame_interp::blended_positions(step))
+        ranges.verts[step] = push_blended_vertices(job.slot, job.vertices, positions, h->vertices);
+    }
     resolve_interp_job(job.slot, ranges);
     h->consumed.store(tail + 1, std::memory_order_release);
   }

@@ -159,6 +159,11 @@ void aurora_set_frame_interpolation(bool enabled);
    the starting value. */
 void aurora_set_fps_overlay(bool enabled);
 bool aurora_get_frame_interpolation(void);
+/* In-between frames per game frame: 1 (60 FPS from the game's 30) or 3
+   (120 FPS, for a 120 Hz display). DOL_AURORA_FRAME_INTERP_STEPS sets the
+   starting value; a change takes effect at the next game frame. */
+void aurora_set_frame_interp_steps(int steps);
+int aurora_get_frame_interp_steps(void);
 /* Frames presented to the window so far, in-between frames included (what
    the frames-a-second counter counts). */
 unsigned long long aurora_get_shown_frames(void);
