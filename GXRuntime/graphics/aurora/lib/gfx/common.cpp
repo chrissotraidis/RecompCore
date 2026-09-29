@@ -243,14 +243,23 @@ struct FramePacket {
   bool continuation = false;
   // Ends a game frame (not a staging segment), so its callback presents.
   bool presents = false;
-  // Gets an in-between frame (frame_interp.hpp), and its game frame number.
+  // Gets in-between frames (frame_interp.hpp), how many (one per step), and
+  // its game frame number.
   bool interpolate = false;
+  int interpSteps = 1;
   uint64_t gameFrame = 0;
 };
 
 static std::array<FramePacket, FrameSlotCount> g_framePackets;
 // In-between frame uniforms, per frame slot (see push_interp_uniform).
-constexpr uint64_t InterpUniformBufferSize = 33554432; // 32mb
+// 32 MB for each in-between frame of a game frame: at 120 Hz (three) the
+// blocks of a busy scene came to about 55 MB, and past 32 the rest did not
+// fit, so those draws kept the next frame's transforms in two of the three in-
+// between frames (the sea on a beach blinked out and back). The GPU buffer
+// grows to what a frame uses (upload_interp_uniforms).
+constexpr uint64_t InterpUniformStepSize = 33554432; // 32mb
+constexpr uint64_t InterpUniformBufferSize = InterpUniformStepSize * 3;
+static uint64_t g_interpUniformBufferSize = 0; // the GPU buffer's size (render worker)
 static std::array<std::vector<uint8_t>, FrameSlotCount> g_interpUniformStaging;
 // Per frame slot, the range each in-between job resolved to, in job order
 // (gxcore_draw.cpp's helper writes them; end_frame waits for it).
@@ -260,6 +269,7 @@ constexpr uint64_t InterpVertexBufferSize = 8388608; // 8mb
 static std::array<std::vector<uint8_t>, FrameSlotCount> g_interpVertexStaging;
 wgpu::Buffer g_interpVertexBuffer;
 static size_t g_replayFrameSlot = 0; // render worker: the frame whose in-between frame is encoded
+static int g_replayStep = 0;          // render worker: which of its in-between frames
 static uint64_t g_interpUniformOverflows = 0; // recording thread
 static wgpu::Buffer g_interpUniformBuffer;
 wgpu::BindGroup g_interpUniformBindGroup;
@@ -295,13 +305,42 @@ static constexpr auto FrameStartSafetyMargin = std::chrono::milliseconds{2};
 // its packet.
 static bool g_segmentEnding = false;
 static webgpu::TextureWithSampler g_heldFrame; // the real frame, kept for its later present
+// 120 Hz (three in-between frames a game frame, present_steps): each game
+// frame's in-between frames (0-2) and its real frame (3), kept until their
+// presents, in two sets that alternate between game frames so a new frame
+// never has to show the one before's early; and the time the last present
+// was scheduled for, the clock the next frame's continue.
+static webgpu::TextureWithSampler g_heldSteps[2][4];
+static int g_heldSet = 0;
+static PresentClock::time_point g_lastDue{};
 static bool g_heldShown = false;                 // the screen shows g_heldFrame (render worker)
+// Presents waiting for their time, in time order (render worker): the real
+// frame after its in-between frames, and at 120 Hz the later in-between
+// frames.
 struct DeferredPresent {
-  bool active = false;
   PresentClock::time_point due;
+  const webgpu::TextureWithSampler* source = nullptr;
   EndFrameCallback callback;
+  uint64_t gameFrame = 0; // for DOL_AURORA_PRESENT_LOG
+  int step = 0;           // the in-between frame's step, or -1 for the real frame
 };
-static DeferredPresent g_deferredPresent;
+// DOL_AURORA_PRESENT_LOG=1: a line per present (debug), what and when.
+static const bool g_presentLog = [] {
+  const char* env = std::getenv("DOL_AURORA_PRESENT_LOG");
+  return env != nullptr && env[0] == '1';
+}();
+static void log_present(const char* kind, uint64_t gameFrame, int step, PresentClock::time_point due) {
+  if (!g_presentLog)
+    return;
+  const auto now = PresentClock::now();
+  const auto ms = [](PresentClock::duration d) {
+    return std::chrono::duration<double, std::milli>(d).count();
+  };
+  std::fprintf(stderr, "[present] %s frame=%llu step=%d t=%.2f late=%.2f\n", kind,
+               static_cast<unsigned long long>(gameFrame), step, ms(now.time_since_epoch()),
+               due.time_since_epoch().count() == 0 ? 0.0 : ms(now - due));
+}
+static std::deque<DeferredPresent> g_deferredPresents;
 static PresentClock::time_point g_lastGameFrameEnd;
 static int64_t g_gameFramePeriodNs = 0;
 static void run_deferred_present();
@@ -309,7 +348,10 @@ static void deferred_present_tick();
 static bool note_game_frame_end();
 static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::CommandEncoder& encoder,
                                     const EndFrameCallback& callback);
-static void present_held(wgpu::CommandEncoder& encoder, const EndFrameCallback& callback);
+static void present_held(wgpu::CommandEncoder& encoder, const EndFrameCallback& callback, int steps);
+static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEncoder& encoder,
+                          const EndFrameCallback& callback, int steps);
+static void flush_presents_from(const webgpu::TextureWithSampler* first, const webgpu::TextureWithSampler* last);
 static constexpr auto MaxPacingSample = std::chrono::milliseconds{250};
 static constexpr uint32_t PacingEmaWeight = 8;
 
@@ -1147,10 +1189,15 @@ void shutdown() {
 #endif
   render_worker::synchronize();
   render_worker::shutdown();
-  g_deferredPresent = {};
+  g_deferredPresents.clear();
   g_heldFrame = {};
+  for (auto& set : g_heldSteps)
+    for (auto& held : set)
+      held = {};
+  g_lastDue = {};
   g_interpUniformBindGroup = {};
   g_interpUniformBuffer = {};
+  g_interpUniformBufferSize = 0;
   g_interpVertexBuffer = {};
   for (auto& staging : g_interpUniformStaging) {
     staging = {};
@@ -1414,6 +1461,7 @@ void end_frame(EndFrameCallback callback) {
   frame.stats.lastTextureUploadSize = frame.textureUpload.size();
   frame.presents = !g_segmentEnding;
   frame.interpolate = frame.presents && !frame.continuation && frame_interp::frame_verdict();
+  frame.interpSteps = frame_interp::frame_steps();
   if (frame_interp::tracing() || (frame.interpolate && frame_interp::dump_frame(frame_interp::game_frame_number()))) {
     Log.info("In-between uniforms for game frame {}: {} bytes, {} blocks did not fit; frame uniforms {} bytes",
              frame_interp::game_frame_number(), g_interpUniformStaging[g_recordingFrameSlot].size(),
@@ -1471,10 +1519,8 @@ void end_frame(EndFrameCallback callback) {
     s_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
     auto encoder = std::move(packet.encoder);
     const auto stats = packet.stats;
-    // A real frame still waiting behind its in-between frame is shown first:
-    // presents stay in order, and this frame may overwrite the held copy.
-    run_deferred_present();
     const bool presents = packet.presents;
+    const int steps = packet.interpSteps;
     bool interpolate = false;
     bool hold = false;
     if (presents) {
@@ -1494,11 +1540,25 @@ void end_frame(EndFrameCallback callback) {
     g_stats.lastIndexSize = stats.lastIndexSize;
     g_stats.lastStorageSize = stats.lastStorageSize;
     g_stats.lastTextureUploadSize = stats.lastTextureUploadSize;
-    if (interpolate) {
+    // At 120 Hz the frame before's presents keep their times (present_steps).
+    // Otherwise a real frame still waiting behind its in-between frames is
+    // shown first: presents stay in order, and this frame may overwrite the
+    // held copy.
+    static const bool steadyClock = [] {
+      const char* env = std::getenv("DOL_AURORA_PRESENT_CLOCK");
+      return env == nullptr || env[0] != '0';
+    }();
+    const bool clocked = interpolate && (steps > 1 || steadyClock);
+    if (!clocked)
+      run_deferred_present();
+    if (clocked) {
+      present_steps(packet, frameSlot, encoder, callback, steps);
+      packet = {};
+    } else if (interpolate) {
       present_with_in_between(packet, frameSlot, encoder, callback);
       packet = {};
     } else if (hold) {
-      present_held(encoder, callback);
+      present_held(encoder, callback, steps);
     } else if (callback) {
       if (presents)
         g_heldShown = false;
@@ -1744,9 +1804,9 @@ static bool note_game_frame_end() {
   return usable;
 }
 
-static void ensure_held_frame(const webgpu::TextureWithSampler& source) {
-  if (g_heldFrame.texture && g_heldFrame.size.width == source.size.width &&
-      g_heldFrame.size.height == source.size.height && g_heldFrame.format == source.format) {
+static void ensure_held_texture(webgpu::TextureWithSampler& held, const webgpu::TextureWithSampler& source) {
+  if (held.texture && held.size.width == source.size.width && held.size.height == source.size.height &&
+      held.format == source.format) {
     return;
   }
   const wgpu::TextureDescriptor textureDescriptor{
@@ -1759,11 +1819,26 @@ static void ensure_held_frame(const webgpu::TextureWithSampler& source) {
       .mipLevelCount = 1,
       .sampleCount = 1,
   };
-  g_heldFrame.texture = g_device.CreateTexture(&textureDescriptor);
-  g_heldFrame.view = g_heldFrame.texture.CreateView();
-  g_heldFrame.size = source.size;
-  g_heldFrame.format = source.format;
-  g_heldFrame.sampler = source.sampler;
+  held.texture = g_device.CreateTexture(&textureDescriptor);
+  held.view = held.texture.CreateView();
+  held.size = source.size;
+  held.format = source.format;
+  held.sampler = source.sampler;
+}
+
+static void ensure_held_frame(const webgpu::TextureWithSampler& source) { ensure_held_texture(g_heldFrame, source); }
+
+// Where step k of a game frame's presents goes, after the first: k / (steps +
+// 1) of the game frame's period (half of it for one in-between frame).
+static std::chrono::nanoseconds step_offset(int k, int steps) {
+  const int64_t ns = g_gameFramePeriodNs * k / (steps + 1);
+  return std::chrono::nanoseconds{std::clamp<int64_t>(ns, 3'000'000ll * k, 40'000'000)};
+}
+
+static void defer_present(PresentClock::time_point due, const webgpu::TextureWithSampler* source,
+                          const EndFrameCallback& callback, uint64_t gameFrame = 0, int step = -1) {
+  g_deferredPresents.push_back(
+      DeferredPresent{.due = due, .source = source, .callback = callback, .gameFrame = gameFrame, .step = step});
 }
 
 // Debug: write a texture as a binary PPM (blocking readback on the worker).
@@ -1849,11 +1924,15 @@ static void replay_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const Frame
 // Render worker: the frame's blended blocks into their GPU buffer, created at
 // first use.
 static void upload_interp_uniforms(size_t frameSlot) {
-  if (!g_interpUniformBuffer) {
+  const uint64_t needed =
+      AURORA_ALIGN(g_interpUniformStaging[frameSlot].size(), 4) + gx::MaxUniformSize;
+  if (!g_interpUniformBuffer || g_interpUniformBufferSize < needed) {
+    g_interpUniformBufferSize =
+        std::min(InterpUniformBufferSize, AURORA_ALIGN(std::max(needed, InterpUniformStepSize), InterpUniformStepSize));
     const wgpu::BufferDescriptor descriptor{
         .label = "In-between frame uniform buffer",
         .usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
-        .size = InterpUniformBufferSize,
+        .size = g_interpUniformBufferSize,
     };
     g_interpUniformBuffer = g_device.CreateBuffer(&descriptor);
     const std::array entries{
@@ -1914,12 +1993,14 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
     dump_texture(g_heldFrame, "real", frame.gameFrame);
   }
 
-  // 2. The in-between frame: the same passes with blended transforms, into
-  // the EFB, and presented now.
+  // 2. The in-between frames: the same passes with each step's blended
+  // transforms, into the EFB. The first is presented now; at 120 Hz the
+  // others are kept aside and presented a quarter of a game frame apart.
   upload_interp_uniforms(frameSlot);
   static constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "In-between frame encoder"};
   auto between = g_device.CreateCommandEncoder(&EncoderDescriptor);
   g_replayFrameSlot = frameSlot;
+  g_replayStep = 0;
   frame_interp::set_encoding_interpolated(true);
   static const bool dumpPasses = std::getenv("DOL_AURORA_FRAME_INTERP_DUMP_PASSES") != nullptr;
   for (size_t i = 0; i < frame.ops.size(); ++i) {
@@ -1938,18 +2019,94 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
     }
   }
   frame_interp::set_encoding_interpolated(false);
+  log_present("in-between", frame.gameFrame, 0, {});
   callback(between);
+  const auto shown = PresentClock::now();
   if (dump) {
     dump_texture(webgpu::present_source(), "between", frame.gameFrame);
   }
 
   // 3. The real frame half a game frame later (deferred_present_tick).
-  const int64_t halfNs = std::clamp<int64_t>(g_gameFramePeriodNs / 2, 6'000'000, 40'000'000);
-  g_deferredPresent = DeferredPresent{
-      .active = true,
-      .due = PresentClock::now() + std::chrono::nanoseconds{halfNs},
-      .callback = callback,
+  defer_present(shown + step_offset(1, 1), &g_heldFrame, callback, frame.gameFrame, -1);
+  g_lastDue = {};
+}
+
+// 120 Hz: three in-between frames a game frame, each a full replay of its
+// passes (about 6 ms to encode in a busy scene). Presenting the first at once
+// and the others a quarter of a game frame after it put the second late (the
+// third was still encoding) and the third and the real frame back to back,
+// flushed when the next game frame came: the frames came in bursts, and the
+// sea shimmered. Every frame is kept aside instead (g_heldSteps) and presented
+// on one clock, a quarter of a game frame apart and continuing from the frame
+// before's last, with what is due presented between the replays.
+static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEncoder& encoder,
+                          const EndFrameCallback& callback, int steps) {
+  ZoneScopedN("Present with in-between frames");
+  steps = std::clamp(steps, 1, 3);
+  g_heldSet ^= 1;
+  auto& held = g_heldSteps[g_heldSet];
+  // The set this frame takes was the one two frames ago: anything of it still
+  // waiting is shown now.
+  flush_presents_from(&held[0], &held[3]);
+  const auto keep = [](wgpu::CommandEncoder& commands, webgpu::TextureWithSampler& copy) {
+    const auto& source = webgpu::present_source();
+    ensure_held_texture(copy, source);
+    const wgpu::TexelCopyTextureInfo src{.texture = source.texture};
+    const wgpu::TexelCopyTextureInfo dst{.texture = copy.texture};
+    const wgpu::Extent3D extent{source.size.width, source.size.height, 1};
+    commands.CopyTextureToTexture(&src, &dst, &extent);
   };
+  // 1. The real frame, kept aside.
+  keep(encoder, held[3]);
+  webgpu::gpu_prof::frame_end(encoder);
+  {
+    const wgpu::CommandBufferDescriptor descriptor{.label = "Real frame command buffer"};
+    const auto buffer = encoder.Finish(&descriptor);
+    g_queue.Submit(1, &buffer);
+  }
+  webgpu::gpu_prof::after_submit();
+  after_submit();
+  const bool dump = frame_interp::dump_frame(frame.gameFrame);
+  if (dump) {
+    dump_texture(held[3], "real", frame.gameFrame);
+  }
+  deferred_present_tick();
+
+  // 2. The in-between frames, each kept aside and scheduled.
+  upload_interp_uniforms(frameSlot);
+  g_replayFrameSlot = frameSlot;
+  const auto interval = step_offset(1, steps);
+  PresentClock::time_point base{};
+  static constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "In-between frame encoder"};
+  static const char* const kDumpNames[] = {"between", "between2", "between3"};
+  for (int step = 0; step < steps; ++step) {
+    auto between = g_device.CreateCommandEncoder(&EncoderDescriptor);
+    g_replayStep = step;
+    frame_interp::set_encoding_interpolated(true);
+    for (const auto& op : frame.ops)
+      replay_op(between, frame, op);
+    frame_interp::set_encoding_interpolated(false);
+    keep(between, held[step]);
+    const auto buffer = between.Finish();
+    g_queue.Submit(1, &buffer);
+    if (dump) {
+      dump_texture(held[step], kDumpNames[step], frame.gameFrame);
+    }
+    if (step == 0) {
+      // On from the frame before's last present; now if that is past, and
+      // never more than a step ahead of now (the clock would drift late).
+      const auto now = PresentClock::now();
+      base = g_lastDue.time_since_epoch().count() != 0 ? g_lastDue + interval : now;
+      base = std::clamp(base, now, now + interval);
+    }
+    defer_present(base + interval * step, &held[step], callback, frame.gameFrame, step);
+    deferred_present_tick();
+  }
+  g_replayStep = 0;
+  // 3. The real frame after them.
+  g_lastDue = base + interval * steps;
+  defer_present(g_lastDue, &held[3], callback, frame.gameFrame, -1);
+  deferred_present_tick();
 }
 
 // A frame with nothing to blend while in-between frames are on (a still scene,
@@ -1959,7 +2116,7 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
 // Presenting it at once instead put it on screen half a frame early at every
 // cut (a judder where the blended frames stop and start), and the frame rate
 // read 30 in every menu.
-static void present_held(wgpu::CommandEncoder& encoder, const EndFrameCallback& callback) {
+static void present_held(wgpu::CommandEncoder& encoder, const EndFrameCallback& callback, int steps) {
   ZoneScopedN("Present held frame");
   if (g_heldShown) {
     webgpu::set_present_source_override(&g_heldFrame);
@@ -1984,32 +2141,53 @@ static void present_held(wgpu::CommandEncoder& encoder, const EndFrameCallback& 
   }
   webgpu::gpu_prof::after_submit();
   after_submit();
-  const int64_t halfNs = std::clamp<int64_t>(g_gameFramePeriodNs / 2, 6'000'000, 40'000'000);
-  g_deferredPresent = DeferredPresent{
-      .active = true,
-      .due = PresentClock::now() + std::chrono::nanoseconds{halfNs},
-      .callback = callback,
-  };
+  steps = std::clamp(steps, 1, 3);
+  defer_present(PresentClock::now() + step_offset(steps, steps), &g_heldFrame, callback);
+  g_lastDue = {};
 }
 
-static void run_deferred_present() {
-  if (!g_deferredPresent.active) {
-    return;
-  }
-  ZoneScopedN("Deferred real frame present");
-  auto callback = std::move(g_deferredPresent.callback);
-  g_deferredPresent = {};
-  webgpu::set_present_source_override(&g_heldFrame);
+static void present_deferred(DeferredPresent& present, const char* kind) {
+  ZoneScopedN("Deferred present");
+  log_present(kind, present.gameFrame, present.step, present.due);
+  webgpu::set_present_source_override(present.source);
   static constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Held frame present encoder"};
   auto encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
-  callback(encoder);
+  present.callback(encoder);
   webgpu::set_present_source_override(nullptr);
-  g_heldShown = true;
+  g_heldShown = present.source == &g_heldFrame;
+}
+
+// Every present still waiting, in order (a new game frame is ready).
+static void run_deferred_present() {
+  while (!g_deferredPresents.empty()) {
+    DeferredPresent present = std::move(g_deferredPresents.front());
+    g_deferredPresents.pop_front();
+    present_deferred(present, "flushed");
+  }
 }
 
 static void deferred_present_tick() {
-  if (g_deferredPresent.active && PresentClock::now() >= g_deferredPresent.due) {
-    run_deferred_present();
+  while (!g_deferredPresents.empty() && PresentClock::now() >= g_deferredPresents.front().due) {
+    DeferredPresent present = std::move(g_deferredPresents.front());
+    g_deferredPresents.pop_front();
+    present_deferred(present, "due");
+  }
+}
+
+// The presents waiting on textures first..last (and everything before them,
+// to keep the order): now.
+static void flush_presents_from(const webgpu::TextureWithSampler* first, const webgpu::TextureWithSampler* last) {
+  size_t through = 0;
+  for (size_t i = 0; i < g_deferredPresents.size(); ++i) {
+    const auto* source = g_deferredPresents[i].source;
+    for (const auto* held = first; held <= last; ++held)
+      if (source == held)
+        through = i + 1;
+  }
+  for (size_t i = 0; i < through; ++i) {
+    DeferredPresent present = std::move(g_deferredPresents.front());
+    g_deferredPresents.pop_front();
+    present_deferred(present, "flushed");
   }
 }
 
@@ -2064,7 +2242,14 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
   pass.SetBindGroup(0, g_staticBindGroup);
   pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
 
+  size_t encoded = 0;
   for (const auto& cmd : passInfo.commands) {
+    // A busy pass takes milliseconds to encode: a present that falls due
+    // meanwhile (at 120 Hz, the frame before's real frame) goes out on time,
+    // from its own encoder.
+    if ((++encoded & 511u) == 0 && !g_deferredPresents.empty() &&
+        PresentClock::now() >= g_deferredPresents.front().due)
+      deferred_present_tick();
 #ifdef AURORA_GFX_DEBUG_GROUPS
     {
       size_t firstDiff = lastDebugGroupStack.size();
@@ -2224,12 +2409,15 @@ Range push_interp_vertices(size_t slot, const uint8_t* data, size_t length) {
   return {static_cast<uint32_t>(offset), static_cast<uint32_t>(length)};
 }
 
-void resolve_interp_job(size_t slot, InterpRanges ranges) { g_interpJobRanges[slot].push_back(ranges); }
+void resolve_interp_job(size_t slot, const InterpRanges& ranges) { g_interpJobRanges[slot].push_back(ranges); }
 
-InterpRanges interp_job_ranges(uint32_t job) {
+const InterpRanges& interp_job_ranges(uint32_t job) {
+  static const InterpRanges none{};
   const auto& ranges = g_interpJobRanges[g_replayFrameSlot];
-  return job < ranges.size() ? ranges[job] : InterpRanges{};
+  return job < ranges.size() ? ranges[job] : none;
 }
+
+int interp_replay_step() { return g_replayStep; }
 
 Range push_uniform(const uint8_t* data, size_t length) {
   ZoneScoped;

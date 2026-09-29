@@ -318,15 +318,18 @@ const uint8_t* interp_uniform_bytes(size_t slot, Range range);
 // A particle's blended vertices for the in-between frame, in their own area
 // (g_interpVertexBuffer); an empty range when it is full.
 Range push_interp_vertices(size_t slot, const uint8_t* data, size_t length);
-// A job's in-between block and vertices (either empty when the draw keeps
-// its own).
+// A job's in-between blocks and vertices, one per in-between frame of the
+// game frame (frame_interp::frame_steps; either empty when the draw keeps its
+// own).
 struct InterpRanges {
-  Range uniform;
-  Range verts;
+  Range uniform[3];
+  Range verts[3];
 };
-void resolve_interp_job(size_t slot, InterpRanges ranges);
-// Render worker, while the in-between frame is encoded: a job's ranges.
-InterpRanges interp_job_ranges(uint32_t job);
+void resolve_interp_job(size_t slot, const InterpRanges& ranges);
+// Render worker, while an in-between frame is encoded: a job's ranges, and
+// which of the game frame's in-between frames it is.
+const InterpRanges& interp_job_ranges(uint32_t job);
+int interp_replay_step();
 extern wgpu::Buffer g_interpVertexBuffer;
 template <typename T>
 static Range push_uniform(const T& data) {

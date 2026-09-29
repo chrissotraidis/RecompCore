@@ -846,6 +846,118 @@ int main() {
     CHECK(front != nullptr && near(front[2], -30.f) && near(front[3 * 3 + 2], 30.f));
   }
 
+  // 120 Hz: three in-between frames at a quarter, half and three quarters of
+  // the way. A draw moving at 40 units a frame is at 10, 20 and 30; a turn of
+  // the camera by 24 degrees puts what stands still at 6, 12 and 18 degrees
+  // of it; a particle's corners move in quarters too.
+  {
+    fi::set_steps(3);
+    fi::end_game_frame();
+    fi::end_game_frame();
+    CHECK(fi::frame_steps() == 3);
+    const auto rooms = [](float yaw, int skip) {
+      for (int room = 0; room < 8; ++room)
+        if (room != skip)
+          fi::blend_draw(1100 + room, 0, seen(yaw, 0, 0, room * 300.f - 1000.f, -50.f, -900.f - room * 40.f));
+    };
+    static const uint8_t payload[48] = {4};
+    const auto spark = [](float x) {
+      gxc::DrawPlan plan;
+      plan.match_payload = payload;
+      plan.match_payload_size = sizeof(payload);
+      plan.match_primitive = 0x80;
+      plan.match_direct_position = true;
+      plan.vertex_count = 4;
+      plan.draw_tag = 0x777;
+      plan.vertices.assign(4 * gxc::kVertexFloats, 0.f);
+      for (int i = 0; i < 4; ++i) {
+        plan.vertices[i * gxc::kVertexFloats] = x + (i & 1) * 5.f;
+        plan.vertices[i * gxc::kVertexFloats + 2] = -400.f;
+      }
+      return plan;
+    };
+    // A moving draw and a spark, the camera still.
+    fi::blend_draw(1150, 0, draw_at(0, 0, -400));
+    auto p0 = spark(0.f);
+    blend_plan(p0, draw_at(0, 0, 0));
+    fi::end_game_frame();
+    const auto* moving = fi::blend_draw(1150, 0, draw_at(40, 0, -400));
+    CHECK(moving != nullptr);
+    if (moving != nullptr) {
+      for (int step = 0; step < 3; ++step)
+        CHECK(near(fi::blended_step(step)->posnormalmatrix[0][3], 10.f * (step + 1)));
+    }
+    auto p1 = spark(40.f);
+    p1.draw_tag_age = 1;
+    blend_plan(p1, draw_at(0, 0, 0));
+    for (int step = 0; step < 3; ++step) {
+      const float* corners = fi::blended_positions(step);
+      CHECK(corners != nullptr && near(corners[0], 10.f * (step + 1)));
+    }
+    // The camera turns 24 degrees; the rooms stand still.
+    fi::end_game_frame();
+    fi::end_game_frame();
+    rooms(0.f, -1);
+    fi::end_game_frame();
+    rooms(24.f, 3);
+    const auto* room = fi::blend_draw(1100 + 3, 0, seen(24.f, 0, 0, 3 * 300.f - 1000.f, -50.f, -900.f - 3 * 40.f));
+    CHECK(room != nullptr);
+    if (room != nullptr) {
+      for (int step = 0; step < 3; ++step) {
+        const float yaw = 6.f * (step + 1);
+        const auto expected = seen(yaw, 0, 0, 3 * 300.f - 1000.f, -50.f, -900.f - 3 * 40.f);
+        const auto* got = fi::blended_step(step);
+        CHECK(std::fabs(got->posnormalmatrix[0][0] - expected.posnormalmatrix[0][0]) < 1e-3f);
+        CHECK(std::fabs(got->posnormalmatrix[0][3] - expected.posnormalmatrix[0][3]) < 0.5f &&
+              std::fabs(got->posnormalmatrix[2][3] - expected.posnormalmatrix[2][3]) < 0.5f);
+      }
+    }
+    // The camera turns 24 degrees and moves: each quarter step is the same
+    // motion (the screw motion's power), so the frames advance evenly.
+    fi::end_game_frame();
+    fi::end_game_frame();
+    const auto moved_rooms = [](float yaw, float cx, float cz, int skip) {
+      for (int room = 0; room < 8; ++room)
+        if (room != skip)
+          fi::blend_draw(1200 + room, 0, seen(yaw, cx, cz, room * 300.f - 1000.f, -50.f, -900.f - room * 40.f));
+    };
+    moved_rooms(0.f, 0.f, 0.f, -1);
+    fi::end_game_frame();
+    moved_rooms(24.f, 60.f, -40.f, 5);
+    const auto* far = fi::blend_draw(1205, 0, seen(24.f, 60.f, -40.f, 5 * 300.f - 1000.f, -50.f, -900.f - 5 * 40.f));
+    CHECK(far != nullptr);
+    if (far != nullptr) {
+      // The step-to-step motion S = M_{k+1} M_k^-1, for rows of 3x4.
+      const auto inverse = [](const float m[][4], double out[3][4]) {
+        // Rigid with unit scale here: the inverse is the transpose.
+        for (int r = 0; r < 3; ++r) {
+          for (int c = 0; c < 3; ++c)
+            out[r][c] = m[c][r];
+          out[r][3] = -(m[0][r] * m[0][3] + m[1][r] * m[1][3] + m[2][r] * m[2][3]);
+        }
+      };
+      const auto step_motion = [&](int k, double out[3][4]) {
+        double inv[3][4];
+        inverse(fi::blended_step(k)->posnormalmatrix, inv);
+        const auto& next = fi::blended_step(k + 1)->posnormalmatrix;
+        for (int r = 0; r < 3; ++r) {
+          for (int c = 0; c < 4; ++c)
+            out[r][c] = next[r][0] * inv[0][c] + next[r][1] * inv[1][c] + next[r][2] * inv[2][c];
+          out[r][3] += next[r][3];
+        }
+      };
+      double first[3][4], second[3][4];
+      step_motion(0, first);
+      step_motion(1, second);
+      for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c)
+          CHECK(std::fabs(first[r][c] - second[r][c]) < (c == 3 ? 0.05 : 1e-4));
+    }
+    fi::set_steps(1);
+    fi::end_game_frame();
+    CHECK(fi::frame_steps() == 1);
+  }
+
   // Draw keys: the same payload gives the same key; another primitive does not.
   {
     const uint8_t payload[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};

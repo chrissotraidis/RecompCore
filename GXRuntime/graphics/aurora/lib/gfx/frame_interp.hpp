@@ -35,6 +35,14 @@ namespace aurora::gfx::frame_interp {
 bool enabled() noexcept;
 void set_enabled(bool enabled) noexcept;
 
+// In-between frames per game frame: 1 (60 Hz from 30) or 3 (120 Hz), at
+// t = step / (steps + 1). A change takes effect at the next game frame;
+// frame_steps() is the recording frame's.
+constexpr int kMaxSteps = 3;
+void set_steps(int steps) noexcept;
+int steps() noexcept;
+int frame_steps() noexcept;
+
 // The key for a draw's vertex stream; 0 when the plan carries no payload.
 uint64_t draw_key(const gxruntime::gxcore::DrawPlan& plan) noexcept;
 
@@ -71,10 +79,14 @@ const gxruntime::gxcore::VertexShaderConstants* blend_draw(const DrawInput& inpu
 const gxruntime::gxcore::VertexShaderConstants* blend_draw(
     uint64_t key, uint64_t used_matrix_rows,
     const gxruntime::gxcore::VertexShaderConstants& current, bool repeats_last_draw = false);
+// After a blend_draw() that returned a block: each step's (the returned
+// pointer is step 0's), valid until the next call.
+const gxruntime::gxcore::VertexShaderConstants* blended_step(int step) noexcept;
+
 // For a draw whose positions came in its payload (particles, the sword's
-// trail): after blend_draw(), the in-between frame's positions (x, y, z per
+// trail): after blend_draw(), a step's in-between positions (x, y, z per
 // decoded vertex), valid until the next call, or nullptr when it draws its own.
-const float* blended_positions() noexcept;
+const float* blended_positions(int step = 0) noexcept;
 
 // Whether the last blend_draw() returned the same in-between block as the call
 // before it (its bytes unchanged), so the caller need not compare them.
