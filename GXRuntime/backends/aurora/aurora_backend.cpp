@@ -39,6 +39,7 @@ unsigned long long g_fifo_bytes = 0;
 unsigned long long g_audio_push_count = 0;
 unsigned long long g_audio_throttle_count = 0;
 unsigned long long g_audio_dropped_count = 0;
+std::atomic_bool g_audio_discard{false};
 unsigned long long g_audio_low_log_push = 0;
 u32 g_audio_sample_rate = 32000;
 SDL_AudioStream* g_audio_stream = nullptr;
@@ -500,6 +501,11 @@ void dol_aurora_set_overlay(DolAuroraOverlayFn draw, void* user) {
 void dol_aurora_set_event_observer(DolAuroraEventObserverFn observe, void* user) {
     gx_aurora::g_host_event_observer = observe;
     gx_aurora::g_host_event_user = user;
+}
+
+void dol_aurora_set_fast_forward(bool on) {
+    gx_aurora::g_audio_discard.store(on, std::memory_order_relaxed);
+    aurora_set_present_suppressed(on);
 }
 
 void dol_aurora_set_hold(DolAuroraHoldFn should_hold, void* user) {
