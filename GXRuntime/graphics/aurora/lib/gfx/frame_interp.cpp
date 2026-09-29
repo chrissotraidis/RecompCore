@@ -1150,7 +1150,11 @@ void end_game_frame() noexcept {
   g_havePrevious = !finished.records.empty();
   g_current ^= 1u;
   g_frames[g_current].clear();
+  // A large table's clear() frees it, and the next frame grew it back through
+  // a dozen rehashes; room for as many keys as this frame had is one allocation.
+  const size_t keys = g_keys.size();
   g_keys.clear();
+  g_keys.reserve(keys);
   g_cellHead.clear();
   g_griddedKeys.clear();
   g_havePredicted = g_leadingMotion >= 0 && g_motions[g_leadingMotion].votes >= kMinMotionVotes;

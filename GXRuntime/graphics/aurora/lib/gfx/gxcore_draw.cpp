@@ -17,8 +17,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace aurora::gfx::gxcore {
@@ -262,6 +266,10 @@ struct TextureAddressState {
   // palette as last decoded, and the frame in which they were last compared.
   uint64_t small_hash = 0;
   uint64_t verified_frame = ~0ull;
+  // The texture cached under `key`, so an unchanged texture takes one lookup
+  // instead of two (the second, by the whole key, was a tenth of the FIFO
+  // worker's time on Outset); empty once that entry is evicted.
+  TextureHandle handle;
 };
 absl::flat_hash_map<uint32_t, TextureAddressState> g_textureAddrKey;
 // Counts presented frames; a small texture is re-hashed at most once in each.
@@ -637,9 +645,12 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     return;
   // The in-between frame reads a moved draw's blended constants from their
   // own area; every other draw keeps its own.
-  const bool blended = frame_interp::encoding_interpolated() && data.interpUniformRange.size != 0;
+  const bool interpolated = frame_interp::encoding_interpolated();
+  const Range interpRange =
+      interpolated && data.interpJob != UINT32_MAX ? interp_job_range(data.interpJob) : data.interpUniformRange;
+  const bool blended = interpolated && interpRange.size != 0;
   const auto& vsGroup = blended ? g_interpUniformBindGroup : g_uniformBindGroup;
-  const std::array vsOffsets{blended ? data.interpUniformRange.offset : data.uniformRange.offset};
+  const std::array vsOffsets{blended ? interpRange.offset : data.uniformRange.offset};
   pass.SetBindGroup(1, vsGroup, vsOffsets.size(), vsOffsets.data());
   pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset,
                        data.vertRange.size);
@@ -809,22 +820,144 @@ static bool repeats_cached(const UniformCache& cache, const uint8_t* data, size_
          std::memcmp(cache.bytes.data(), data, length) == 0;
 }
 
-// The in-between frame's blocks, de-duplicated the same way. repeated: the
-// in-between frame made this block the way it made the last one, from the same
-// constants (frame_interp::last_blend_repeated), so its bytes are the same.
-static Range push_interp_uniform_dedup(const uint8_t* data, size_t length, bool repeated) {
-  UniformCache& cache = g_interpUniformCache;
-  const uint64_t frameId = current_frame_id();
-  if (frameId != 0 && cache.frameId == frameId && cache.range.size != 0 && cache.bytes.size() == length &&
-      (repeated || std::memcmp(cache.bytes.data(), data, length) == 0)) {
+// The in-between frame's blocks, de-duplicated the same way. Their staging is
+// plain memory, so the last block is compared where it was staged rather than
+// copied aside as well. repeated: the in-between frame made this block the way
+// it made the last one, from the same constants (frame_interp::last_blend_repeated),
+// so its bytes are the same.
+static Range push_interp_uniform_dedup(UniformCache& cache, uint64_t frameId, size_t slot, const uint8_t* data,
+                                       size_t length, bool repeated) {
+  if (frameId != 0 && cache.frameId == frameId && cache.range.size == length &&
+      (repeated || std::memcmp(interp_uniform_bytes(slot, cache.range), data, length) == 0)) {
     ++cache.hits;
     return cache.range;
   }
   ++cache.pushes;
-  cache.range = push_interp_uniform(data, length);
-  cache.bytes.assign(data, data + length);
+  cache.range = push_interp_uniform(slot, data, length);
   cache.frameId = frameId;
   return cache.range;
+}
+
+// --- In-between frames on a helper thread -----------------------------------
+//
+// Matching each draw to its counterpart in the frame before and blending its
+// constants (frame_interp::blend_draw), then staging the blended block, was a
+// fifth of the FIFO worker's time. That worker is what holds the game below
+// 30 FPS in the busiest scenes (Outset's village, 10,000 draws a frame, on a
+// Windows PC: 2026-09-29), so a helper thread does it, in draw order, while
+// the worker goes on. Each draw records its job; end_frame waits for the
+// helper before a frame packet is handed on, and the render worker reads the
+// finished ranges (interp_job_range). One recording thread at a time queues
+// jobs (the recording lock serialises them), so the queue is single-producer.
+namespace {
+struct InterpJob {
+  uint64_t key;
+  uint64_t usedMatrixRows;
+  uint64_t frameId;
+  size_t slot;
+  bool repeatsLastDraw; // the constants are the draw before's (repeats_cached)
+  gxc::VertexShaderConstants constants;
+};
+
+struct InterpHelper {
+  static constexpr uint64_t Capacity = 1024;
+  std::unique_ptr<InterpJob[]> ring{new InterpJob[Capacity]};
+  std::atomic<uint64_t> produced{0};
+  std::atomic<uint64_t> consumed{0};
+  std::atomic<bool> sleeping{false};
+  std::mutex mutex;
+  std::condition_variable work;
+  std::condition_variable idle;
+  // Recording thread: the frame packet being queued and its job count.
+  uint64_t packet = 0;
+  uint32_t jobs = 0;
+  // Helper thread: the last block it staged.
+  UniformCache cache;
+};
+
+// Made with the thread and never destroyed: the detached thread may still be
+// waiting on it while statics are torn down at exit.
+std::atomic<InterpHelper*> g_interpHelper{nullptr};
+
+void interp_helper_main(InterpHelper* h) {
+  for (;;) {
+    const uint64_t tail = h->consumed.load(std::memory_order_relaxed);
+    if (tail == h->produced.load(std::memory_order_seq_cst)) {
+      // Draws come microseconds apart while a frame records: wait a little
+      // before sleeping, or the helper sleeps and is woken for every draw
+      // (300,000 wake-ups a second, measured; more CPU than the work).
+      bool arrived = false;
+      for (int spin = 0; spin < 4096 && !arrived; ++spin) {
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#elif defined(__aarch64__)
+        __asm__ __volatile__("yield");
+#endif
+        arrived = h->produced.load(std::memory_order_acquire) != tail;
+      }
+      if (arrived)
+        continue;
+      std::unique_lock lock{h->mutex};
+      h->sleeping.store(true, std::memory_order_seq_cst);
+      h->idle.notify_all();
+      h->work.wait(lock, [h] {
+        return h->produced.load(std::memory_order_seq_cst) != h->consumed.load(std::memory_order_relaxed);
+      });
+      h->sleeping.store(false, std::memory_order_relaxed);
+      continue;
+    }
+    const InterpJob& job = h->ring[tail % InterpHelper::Capacity];
+    Range range{};
+    if (const auto* blended =
+            frame_interp::blend_draw(job.key, job.usedMatrixRows, job.constants, job.repeatsLastDraw))
+      range = push_interp_uniform_dedup(h->cache, job.frameId, job.slot, reinterpret_cast<const uint8_t*>(blended),
+                                        sizeof(*blended), frame_interp::last_blend_repeated());
+    resolve_interp_job(job.slot, range);
+    h->consumed.store(tail + 1, std::memory_order_release);
+  }
+}
+
+uint32_t queue_interp_job(uint64_t key, uint64_t usedMatrixRows, const gxc::VertexShaderConstants& constants,
+                          bool repeatsLastDraw) {
+  InterpHelper* h = g_interpHelper.load(std::memory_order_acquire);
+  if (h == nullptr) {
+    h = new InterpHelper;
+    g_interpHelper.store(h, std::memory_order_release);
+    std::thread(interp_helper_main, h).detach();
+  }
+  const uint64_t frameId = current_frame_id();
+  if (h->packet != frameId) {
+    h->packet = frameId;
+    h->jobs = 0;
+  }
+  const uint64_t head = h->produced.load(std::memory_order_relaxed);
+  while (head - h->consumed.load(std::memory_order_acquire) >= InterpHelper::Capacity)
+    std::this_thread::yield();
+  InterpJob& job = h->ring[head % InterpHelper::Capacity];
+  job.key = key;
+  job.usedMatrixRows = usedMatrixRows;
+  job.frameId = frameId;
+  job.slot = recording_frame_slot();
+  job.repeatsLastDraw = repeatsLastDraw;
+  std::memcpy(&job.constants, &constants, sizeof(constants));
+  h->produced.store(head + 1, std::memory_order_seq_cst);
+  if (h->sleeping.load(std::memory_order_seq_cst)) {
+    std::lock_guard lock{h->mutex};
+    h->work.notify_one();
+  }
+  return h->jobs++;
+}
+} // namespace
+
+void wait_interp_jobs() {
+  InterpHelper* h = g_interpHelper.load(std::memory_order_acquire);
+  if (h == nullptr ||
+      h->consumed.load(std::memory_order_acquire) == h->produced.load(std::memory_order_acquire))
+    return;
+  std::unique_lock lock{h->mutex};
+  h->idle.wait(lock, [h] {
+    return h->consumed.load(std::memory_order_acquire) == h->produced.load(std::memory_order_acquire);
+  });
 }
 
 // known: 1 or 0 when the caller has already compared `data` with the cache's
@@ -971,8 +1104,12 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       if (sameIdentity && !small_changed && previous.texel_epoch_valid &&
           previous.tlut_epoch_valid && previous.texel_epoch == texelEpoch &&
           previous.tlut_epoch == tlutEpoch) {
-        auto cached = g_textureCache.find(priorKey);
-        if (cached != g_textureCache.end()) {
+        const TextureHandle* cached = previous.handle ? &previous.handle : nullptr;
+        if (cached == nullptr) {
+          if (auto found = g_textureCache.find(priorKey); found != g_textureCache.end())
+            cached = &found->second;
+        }
+        if (cached != nullptr) {
           // DOL_GXCORE_TEX_VERIFY=1: re-hash every generation hit and report the
           // ones whose texels changed without a dirty mark (a write path the
           // dirty tracking does not see).
@@ -988,7 +1125,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
           }
           ++g_textureCacheStats.hits;
           ++g_textureCacheStats.generation_hits;
-          return cached->second;
+          return *cached;
         }
       }
     } else if (!texelEpochValid || !tlutEpochValid) {
@@ -1015,14 +1152,16 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       ++g_textureCacheStats.hits;
       g_textureAddrKey[address] = TextureAddressState{
           key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid,
-          small_hash, verify_frame};
+          small_hash, verify_frame, it->second};
       return it->second;
     }
     // New content for this identity: evict any prior entry cached at the same
     // guest address (its buffer was overwritten) to keep the cache bounded.
     addrIt = g_textureAddrKey.find(address);
-    if (addrIt != g_textureAddrKey.end())
+    if (addrIt != g_textureAddrKey.end()) {
       g_textureCache.erase(addrIt->second.key);
+      addrIt->second.handle = {};
+    }
     // HD texture packs (Dolphin's tex1_WxH_hash[_tlut]_fmt names): the first
     // time these guest bytes are seen, look for a replacement before decoding.
     // The handle is cached under the same content key as a decode would be,
@@ -1050,7 +1189,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         g_textureCache.emplace(key, *replacement);
         g_textureAddrKey[address] = TextureAddressState{
             key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid,
-            small_hash, verify_frame};
+            small_hash, verify_frame, *replacement};
         return *replacement;
       }
       if (replacementPending) {
@@ -1129,7 +1268,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     g_textureCache.emplace(key, handle);
     g_textureAddrKey[address] = TextureAddressState{
         key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid,
-        small_hash, verify_frame};
+        small_hash, verify_frame, handle};
     return handle;
   };
 
@@ -1217,13 +1356,18 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // and each comparison of equal blocks reads all 2.8 KB of both.
   const bool repeatsLast = repeats_cached(g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
                                           sizeof(plan.constants));
-  // Matched before a staging segment can split the frame; a split frame is
-  // not interpolated.
+  // In-between frames: matched on the helper thread (queued below), or here
+  // while a traced frame reports each draw's outcome. Here it is matched
+  // before a staging segment can split the frame; a split frame is not
+  // interpolated.
+  const bool interpolating = frame_interp::enabled();
+  const bool matchHere = interpolating && frame_interp::tracing();
+  if (matchHere)
+    wait_interp_jobs();
   const gxc::VertexShaderConstants* interpConstants =
-      frame_interp::enabled()
-          ? frame_interp::blend_draw(frame_interp::draw_key(plan), frame_interp::used_matrix_rows(plan),
-                                     plan.constants, repeatsLast)
-          : nullptr;
+      matchHere ? frame_interp::blend_draw(frame_interp::draw_key(plan), frame_interp::used_matrix_rows(plan),
+                                           plan.constants, repeatsLast)
+                : nullptr;
   if (frame_interp::tracing()) {
     const auto& m = plan.constants.posnormalmatrix;
     std::fprintf(stderr,
@@ -1260,11 +1404,15 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const auto uniformRange = push_uniform_dedup(
       g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
       sizeof(plan.constants), repeatsLast ? 1 : 0);
-  const auto interpUniformRange =
-      interpConstants != nullptr
-          ? push_interp_uniform_dedup(reinterpret_cast<const uint8_t*>(interpConstants), sizeof(*interpConstants),
-                                      frame_interp::last_blend_repeated())
-          : Range{};
+  Range interpUniformRange{};
+  uint32_t interpJob = UINT32_MAX;
+  if (interpConstants != nullptr)
+    interpUniformRange = push_interp_uniform_dedup(
+        g_interpUniformCache, current_frame_id(), recording_frame_slot(), reinterpret_cast<const uint8_t*>(interpConstants),
+        sizeof(*interpConstants), frame_interp::last_blend_repeated());
+  else if (interpolating && !matchHere)
+    interpJob = queue_interp_job(frame_interp::draw_key(plan), frame_interp::used_matrix_rows(plan), plan.constants,
+                                 repeatsLast);
   Range pixelUniformRange{};
   if (tev) {
     pixelUniformRange = push_uniform_dedup(
@@ -1291,6 +1439,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .idxRange = idxRange,
       .uniformRange = uniformRange,
       .interpUniformRange = interpUniformRange,
+      .interpJob = interpJob,
       .pixelUniformRange = pixelUniformRange,
       .indexCount = static_cast<uint32_t>(plan.indices.size()),
       .textureBindGroup = textureBindGroup,
