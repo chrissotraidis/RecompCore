@@ -592,6 +592,10 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   plan.match_primitive = draw.primitive;
   plan.match_vtx_fmt = draw.vtx_fmt;
   plan.match_vertex_stride = draw.vertex_size;
+  if (bp_valid_[kDrawTagRegister]) {
+    plan.draw_tag = bp_regs_[kDrawTagRegister];
+    plan.draw_tag_age = bp_valid_[kDrawTagAgeRegister] ? bp_regs_[kDrawTagAgeRegister] : 0u;
+  }
   auto skip = [&](const char* reason) {
     plan.ok = false;
     plan.skip_reason = reason;
@@ -1668,6 +1672,25 @@ void GxCoreSink::on_consumed_draw(const ar::ConsumedDraw& draw,
   DrawPlan& plan = self->scratch_plan_;
   self->pending_state_.build_draw_plan_into(draw, self->counters_,
                                             &self->cached_attrs_, plan);
+  // A draw scope: the next draws with positions of their own, up to its
+  // count, are its emitter's; any other draw ends it.
+  const GxCoreState& state = self->pending_state_;
+  if (state.bp_valid(GxCoreState::kDrawScopeRegister)) {
+    self->scope_ = state.bp(GxCoreState::kDrawScopeRegister);
+    self->scope_left_ = state.bp_valid(GxCoreState::kDrawScopeCountRegister)
+                            ? state.bp(GxCoreState::kDrawScopeCountRegister)
+                            : 0u;
+    self->scope_part_ = 1;
+  }
+  if (self->scope_left_ != 0u) {
+    if (plan.ok && plan.match_direct_position) {
+      plan.draw_scope = self->scope_;
+      plan.draw_scope_part = self->scope_part_++;
+      --self->scope_left_;
+    } else {
+      self->scope_left_ = 0;
+    }
+  }
   self->plan_observer_(plan, self->plan_observer_user_);
 }
 
@@ -1751,9 +1774,11 @@ bool GxCoreSink::submit_packet(const ar::RenderPacket& packet) {
       pending_state_ = live_state_;
       replay_overflow_ = false;
     } else {
+      pending_state_.forget_draw_tag(); // unless written again since
       for (const auto& state : since_draw_)
         pending_state_.apply(state);
     }
+    live_state_.forget_draw_tag();
     since_draw_.clear();
   }
   return ok;

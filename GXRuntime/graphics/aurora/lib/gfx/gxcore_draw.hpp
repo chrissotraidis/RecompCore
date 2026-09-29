@@ -22,7 +22,11 @@ struct DrawData {
   // The constants blended toward the previous frame, used while the
   // in-between frame is encoded (frame_interp.hpp); uniformRange otherwise.
   Range interpUniformRange;
-  // Or the helper thread's job that makes them (interp_job_range), when the
+  // And its vertices, for a particle whose positions came in its payload,
+  // blended toward the previous frame's (in the in-between vertex area);
+  // vertRange otherwise.
+  Range interpVertRange;
+  // Or the helper thread's job that makes both (interp_job_ranges), when the
   // draw was matched off the recording thread; UINT32_MAX when not.
   uint32_t interpJob = UINT32_MAX;
   Range pixelUniformRange;  // PixelShaderConstants (group 2), TEV path only

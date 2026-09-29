@@ -646,14 +646,18 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   // The in-between frame reads a moved draw's blended constants from their
   // own area; every other draw keeps its own.
   const bool interpolated = frame_interp::encoding_interpolated();
-  const Range interpRange =
-      interpolated && data.interpJob != UINT32_MAX ? interp_job_range(data.interpJob) : data.interpUniformRange;
-  const bool blended = interpolated && interpRange.size != 0;
+  const InterpRanges interp = !interpolated                    ? InterpRanges{}
+                              : data.interpJob != UINT32_MAX ? interp_job_ranges(data.interpJob)
+                                                               : InterpRanges{data.interpUniformRange, data.interpVertRange};
+  const bool blended = interp.uniform.size != 0;
   const auto& vsGroup = blended ? g_interpUniformBindGroup : g_uniformBindGroup;
-  const std::array vsOffsets{blended ? interpRange.offset : data.uniformRange.offset};
+  const std::array vsOffsets{blended ? interp.uniform.offset : data.uniformRange.offset};
   pass.SetBindGroup(1, vsGroup, vsOffsets.size(), vsOffsets.data());
-  pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset,
-                       data.vertRange.size);
+  // A particle's vertices, blended, from the in-between vertex area.
+  if (interp.verts.size != 0)
+    pass.SetVertexBuffer(0, g_interpVertexBuffer, interp.verts.offset, interp.verts.size);
+  else
+    pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset, data.vertRange.size);
   pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16,
                       data.idxRange.offset, data.idxRange.size);
   if (data.depthPipeline != 0) {
@@ -847,17 +851,29 @@ static Range push_interp_uniform_dedup(UniformCache& cache, uint64_t frameId, si
 // Windows PC: 2026-09-29), so a helper thread does it, in draw order, while
 // the worker goes on. Each draw records its job; end_frame waits for the
 // helper before a frame packet is handed on, and the render worker reads the
-// finished ranges (interp_job_range). One recording thread at a time queues
+// finished ranges (interp_job_ranges). One recording thread at a time queues
 // jobs (the recording lock serialises them), so the queue is single-producer.
 namespace {
 struct InterpJob {
-  uint64_t key;
-  uint64_t usedMatrixRows;
+  frame_interp::DrawInput input; // its key, samples and a particle's positions
+  std::vector<float> vertices;   // a particle's decoded vertices, for its blended copy
   uint64_t frameId;
   size_t slot;
   bool repeatsLastDraw; // the constants are the draw before's (repeats_cached)
   gxc::VertexShaderConstants constants;
 };
+
+// A particle's in-between vertices: its own, with the blended positions, in
+// the in-between vertex area of `slot`.
+Range push_blended_vertices(size_t slot, const std::vector<float>& vertices, const float* positions,
+                            std::vector<float>& scratch) {
+  scratch.assign(vertices.begin(), vertices.end());
+  const size_t count = scratch.size() / gxc::kVertexFloats;
+  for (size_t i = 0; i < count; ++i)
+    std::memcpy(scratch.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float), positions + i * 3u,
+                sizeof(float) * 3u);
+  return push_interp_vertices(slot, reinterpret_cast<const uint8_t*>(scratch.data()), scratch.size() * sizeof(float));
+}
 
 struct InterpHelper {
   static constexpr uint64_t Capacity = 1024;
@@ -871,8 +887,9 @@ struct InterpHelper {
   // Recording thread: the frame packet being queued and its job count.
   uint64_t packet = 0;
   uint32_t jobs = 0;
-  // Helper thread: the last block it staged.
+  // Helper thread: the last block it staged, and a particle's vertices.
   UniformCache cache;
+  std::vector<float> vertices;
 };
 
 // Made with the thread and never destroyed: the detached thread may still be
@@ -907,18 +924,19 @@ void interp_helper_main(InterpHelper* h) {
       continue;
     }
     const InterpJob& job = h->ring[tail % InterpHelper::Capacity];
-    Range range{};
-    if (const auto* blended =
-            frame_interp::blend_draw(job.key, job.usedMatrixRows, job.constants, job.repeatsLastDraw))
-      range = push_interp_uniform_dedup(h->cache, job.frameId, job.slot, reinterpret_cast<const uint8_t*>(blended),
-                                        sizeof(*blended), frame_interp::last_blend_repeated());
-    resolve_interp_job(job.slot, range);
+    InterpRanges ranges{};
+    if (const auto* blended = frame_interp::blend_draw(job.input, job.constants, job.repeatsLastDraw))
+      ranges.uniform = push_interp_uniform_dedup(h->cache, job.frameId, job.slot,
+                                                 reinterpret_cast<const uint8_t*>(blended), sizeof(*blended),
+                                                 frame_interp::last_blend_repeated());
+    if (const float* positions = frame_interp::blended_positions())
+      ranges.verts = push_blended_vertices(job.slot, job.vertices, positions, h->vertices);
+    resolve_interp_job(job.slot, ranges);
     h->consumed.store(tail + 1, std::memory_order_release);
   }
 }
 
-uint32_t queue_interp_job(uint64_t key, uint64_t usedMatrixRows, const gxc::VertexShaderConstants& constants,
-                          bool repeatsLastDraw) {
+uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw) {
   InterpHelper* h = g_interpHelper.load(std::memory_order_acquire);
   if (h == nullptr) {
     h = new InterpHelper;
@@ -934,12 +952,15 @@ uint32_t queue_interp_job(uint64_t key, uint64_t usedMatrixRows, const gxc::Vert
   while (head - h->consumed.load(std::memory_order_acquire) >= InterpHelper::Capacity)
     std::this_thread::yield();
   InterpJob& job = h->ring[head % InterpHelper::Capacity];
-  job.key = key;
-  job.usedMatrixRows = usedMatrixRows;
+  frame_interp::capture_draw(plan, job.input);
+  if (job.input.positions.empty())
+    job.vertices.clear();
+  else
+    job.vertices.assign(plan.vertices.begin(), plan.vertices.end());
   job.frameId = frameId;
   job.slot = recording_frame_slot();
   job.repeatsLastDraw = repeatsLastDraw;
-  std::memcpy(&job.constants, &constants, sizeof(constants));
+  std::memcpy(&job.constants, &plan.constants, sizeof(plan.constants));
   h->produced.store(head + 1, std::memory_order_seq_cst);
   if (h->sleeping.load(std::memory_order_seq_cst)) {
     std::lock_guard lock{h->mutex};
@@ -1364,16 +1385,26 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const bool matchHere = interpolating && frame_interp::tracing();
   if (matchHere)
     wait_interp_jobs();
+  static frame_interp::DrawInput tracedInput;
+  if (matchHere)
+    frame_interp::capture_draw(plan, tracedInput);
   const gxc::VertexShaderConstants* interpConstants =
-      matchHere ? frame_interp::blend_draw(frame_interp::draw_key(plan), frame_interp::used_matrix_rows(plan),
-                                           plan.constants, repeatsLast)
-                : nullptr;
+      matchHere ? frame_interp::blend_draw(tracedInput, plan.constants, repeatsLast) : nullptr;
+  // The helper is idle while a frame is traced, so its areas are ours.
+  static std::vector<float> tracedVertices;
+  const float* tracedPositions = matchHere ? frame_interp::blended_positions() : nullptr;
+  const Range interpVertRange =
+      tracedPositions != nullptr
+          ? push_blended_vertices(recording_frame_slot(), plan.vertices, tracedPositions, tracedVertices)
+          : Range{};
   if (frame_interp::tracing()) {
     const auto& m = plan.constants.posnormalmatrix;
     std::fprintf(stderr,
-                 "[frame-interp-trace] %s key=%016llx prim=0x%02X fmt=%u verts=%u payload=%u idx=%d "
-                 "t=(%.1f,%.1f,%.1f) s=%.3f proj00=%.3f proj32=%.1f tex=%08X bt=(%.1f,%.1f,%.1f) bt0=(%.1f,%.1f,%.1f)\n",
-                 frame_interp::last_outcome(), static_cast<unsigned long long>(frame_interp::draw_key(plan)),
+                 "[frame-interp-trace] frame=%llu %s key=%016llx prim=0x%02X fmt=%u verts=%u payload=%u idx=%d "
+                 "t=(%.1f,%.1f,%.1f) s=%.3f proj00=%.3f proj32=%.1f tex=%08X bt=(%.1f,%.1f,%.1f) bt0=(%.1f,%.1f,%.1f) "
+                 "direct=%d tag=%06X age=%u positions=%d\n",
+                 static_cast<unsigned long long>(frame_interp::game_frame_number()), frame_interp::last_outcome(),
+                 static_cast<unsigned long long>(frame_interp::draw_key(plan)),
                  plan.match_primitive, plan.match_vtx_fmt, plan.vertex_count, plan.match_payload_size,
                  plan.pipeline.shader.has_pos_mtx_idx, m[0][3], m[1][3], m[2][3],
                  std::sqrt(m[0][0] * m[0][0] + m[1][0] * m[1][0] + m[2][0] * m[2][0]), plan.constants.projection[0][0],
@@ -1383,7 +1414,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                  interpConstants ? interpConstants->posnormalmatrix[2][3] : 0.f,
                  interpConstants ? interpConstants->transformmatrices[0][3] - plan.constants.transformmatrices[0][3] : 0.f,
                  interpConstants ? interpConstants->transformmatrices[1][3] - plan.constants.transformmatrices[1][3] : 0.f,
-                 interpConstants ? interpConstants->transformmatrices[2][3] - plan.constants.transformmatrices[2][3] : 0.f);
+                 interpConstants ? interpConstants->transformmatrices[2][3] - plan.constants.transformmatrices[2][3] : 0.f,
+                 plan.match_direct_position ? 1 : 0, plan.draw_tag, plan.draw_tag_age,
+                 tracedPositions != nullptr ? 1 : 0);
   }
   if (!staging_has_capacity(vertBytes, indexBytes, sizeof(plan.constants),
                             pixelUniformBytes)) {
@@ -1411,8 +1444,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         g_interpUniformCache, current_frame_id(), recording_frame_slot(), reinterpret_cast<const uint8_t*>(interpConstants),
         sizeof(*interpConstants), frame_interp::last_blend_repeated());
   else if (interpolating && !matchHere)
-    interpJob = queue_interp_job(frame_interp::draw_key(plan), frame_interp::used_matrix_rows(plan), plan.constants,
-                                 repeatsLast);
+    interpJob = queue_interp_job(plan, repeatsLast);
   Range pixelUniformRange{};
   if (tev) {
     pixelUniformRange = push_uniform_dedup(
@@ -1439,6 +1471,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .idxRange = idxRange,
       .uniformRange = uniformRange,
       .interpUniformRange = interpUniformRange,
+      .interpVertRange = interpVertRange,
       .interpJob = interpJob,
       .pixelUniformRange = pixelUniformRange,
       .indexCount = static_cast<uint32_t>(plan.indices.size()),

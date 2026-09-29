@@ -24,7 +24,9 @@
 // passes are encoded once more with the blended blocks and presented at once,
 // and the real frame follows half a game frame later.
 
+#include <array>
 #include <cstdint>
+#include <vector>
 
 #include <gxruntime/gxcore/shader.hpp>
 
@@ -40,15 +42,40 @@ uint64_t draw_key(const gxruntime::gxcore::DrawPlan& plan) noexcept;
 // a vertex uses the position matrix starting at XF row r. 0 otherwise.
 uint64_t used_matrix_rows(const gxruntime::gxcore::DrawPlan& plan) noexcept;
 
-// Recording thread, once per submitted gxcore draw. Returns the constants the
-// draw uses in the in-between frame, or nullptr when they are its own (no
-// match, an implausible match, or nothing moved). The pointer is valid until
-// the next call. repeats_last_draw: `current` is the constants of the draw
-// before this one (the caller already compared them), so they are not
-// compared again, and an in-between block made from the same match is reused.
+// What blend_draw() needs of a draw besides its constants, captured from its
+// plan on the recording thread (the draw may be matched later, on another
+// thread): its key and indexed matrix rows, three of its vertices (for a
+// model the game skins on the CPU; see vertex_motion()), and a tagged
+// particle's positions (x, y, z per decoded vertex) and age.
+struct DrawInput {
+  uint64_t key = 0;
+  uint64_t usedMatrixRows = 0;
+  bool haveSamples = false;
+  std::array<float, 9> samples{};
+  std::vector<float> positions;
+  uint32_t age = 0;
+};
+void capture_draw(const gxruntime::gxcore::DrawPlan& plan, DrawInput& out) noexcept;
+
+// Once per submitted gxcore draw, in draw order, on one thread at a time.
+// Returns the constants the draw uses in the in-between frame, or nullptr
+// when they are its own (no match, an implausible match, or nothing moved).
+// The pointer is valid until the next call. repeats_last_draw: `current` is
+// the constants of the draw before this one (the caller already compared
+// them), so they are not compared again, and an in-between block made from
+// the same match is reused.
+const gxruntime::gxcore::VertexShaderConstants* blend_draw(const DrawInput& input,
+                                                           const gxruntime::gxcore::VertexShaderConstants& current,
+                                                           bool repeats_last_draw = false);
+// A draw known by its key and rows alone (no samples or positions).
 const gxruntime::gxcore::VertexShaderConstants* blend_draw(
     uint64_t key, uint64_t used_matrix_rows,
     const gxruntime::gxcore::VertexShaderConstants& current, bool repeats_last_draw = false);
+// For a draw whose positions came in its payload (particles, the sword's
+// trail): after blend_draw(), the in-between frame's positions (x, y, z per
+// decoded vertex), valid until the next call, or nullptr when it draws its own.
+const float* blended_positions() noexcept;
+
 // Whether the last blend_draw() returned the same in-between block as the call
 // before it (its bytes unchanged), so the caller need not compare them.
 bool last_blend_repeated() noexcept;

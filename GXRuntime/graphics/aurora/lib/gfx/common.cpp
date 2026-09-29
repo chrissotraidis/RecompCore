@@ -254,7 +254,11 @@ constexpr uint64_t InterpUniformBufferSize = 33554432; // 32mb
 static std::array<std::vector<uint8_t>, FrameSlotCount> g_interpUniformStaging;
 // Per frame slot, the range each in-between job resolved to, in job order
 // (gxcore_draw.cpp's helper writes them; end_frame waits for it).
-static std::array<std::vector<Range>, FrameSlotCount> g_interpJobRanges;
+static std::array<std::vector<InterpRanges>, FrameSlotCount> g_interpJobRanges;
+// A particle's blended vertices, per frame slot (see push_interp_vertices).
+constexpr uint64_t InterpVertexBufferSize = 8388608; // 8mb
+static std::array<std::vector<uint8_t>, FrameSlotCount> g_interpVertexStaging;
+wgpu::Buffer g_interpVertexBuffer;
 static size_t g_replayFrameSlot = 0; // render worker: the frame whose in-between frame is encoded
 static uint64_t g_interpUniformOverflows = 0; // recording thread
 static wgpu::Buffer g_interpUniformBuffer;
@@ -1147,6 +1151,7 @@ void shutdown() {
   g_heldFrame = {};
   g_interpUniformBindGroup = {};
   g_interpUniformBuffer = {};
+  g_interpVertexBuffer = {};
   for (auto& staging : g_interpUniformStaging) {
     staging = {};
   }
@@ -1266,6 +1271,7 @@ bool begin_frame(bool preserveEfb) {
   frame.continuation = preserveEfb;
   g_interpUniformStaging[frameSlot].clear();
   g_interpJobRanges[frameSlot].clear();
+  g_interpVertexStaging[frameSlot].clear();
   g_recordingFrame = &frame;
   g_recordingFrameSlot = frameSlot;
 
@@ -1869,6 +1875,18 @@ static void upload_interp_uniforms(size_t frameSlot) {
   if (!staging.empty()) {
     g_queue.WriteBuffer(g_interpUniformBuffer, 0, staging.data(), AURORA_ALIGN(staging.size(), 4));
   }
+  const auto& vertices = g_interpVertexStaging[frameSlot];
+  if (!vertices.empty()) {
+    if (!g_interpVertexBuffer) {
+      const wgpu::BufferDescriptor descriptor{
+          .label = "In-between frame vertex buffer",
+          .usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
+          .size = InterpVertexBufferSize,
+      };
+      g_interpVertexBuffer = g_device.CreateBuffer(&descriptor);
+    }
+    g_queue.WriteBuffer(g_interpVertexBuffer, 0, vertices.data(), AURORA_ALIGN(vertices.size(), 4));
+  }
 }
 
 static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::CommandEncoder& encoder,
@@ -2196,11 +2214,21 @@ const uint8_t* interp_uniform_bytes(size_t slot, Range range) {
   return g_interpUniformStaging[slot].data() + range.offset;
 }
 
-void resolve_interp_job(size_t slot, Range range) { g_interpJobRanges[slot].push_back(range); }
+Range push_interp_vertices(size_t slot, const uint8_t* data, size_t length) {
+  auto& staging = g_interpVertexStaging[slot];
+  const size_t offset = AURORA_ALIGN(staging.size(), 4);
+  if (offset + length > InterpVertexBufferSize)
+    return {};
+  staging.resize(offset);
+  staging.insert(staging.end(), data, data + length);
+  return {static_cast<uint32_t>(offset), static_cast<uint32_t>(length)};
+}
 
-Range interp_job_range(uint32_t job) {
+void resolve_interp_job(size_t slot, InterpRanges ranges) { g_interpJobRanges[slot].push_back(ranges); }
+
+InterpRanges interp_job_ranges(uint32_t job) {
   const auto& ranges = g_interpJobRanges[g_replayFrameSlot];
-  return job < ranges.size() ? ranges[job] : Range{};
+  return job < ranges.size() ? ranges[job] : InterpRanges{};
 }
 
 Range push_uniform(const uint8_t* data, size_t length) {

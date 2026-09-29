@@ -36,23 +36,43 @@ std::atomic_bool g_encodingInterpolated{false};
 std::atomic<uint64_t> g_gameFrame{1};
 
 // One game frame's draws: their constants (a consecutive run of identical
-// blocks is stored once) and, per draw, its key and block, where its position
-// matrix put it, and whether it stood still (the camera's motion carried a
-// copy from the frame before onto it; see blend_draw).
+// blocks is stored once) and, per draw, its key and block, a few of its
+// vertices (see draw_key), where its position matrix put it, and whether it
+// stood still (the camera's motion carried a copy from the frame before onto
+// it; see blend_draw).
+constexpr uint32_t kNoSamples = UINT32_MAX;
+using VertexSamples = std::array<float, 9>;
 struct Record {
   uint64_t key;
   uint32_t constants;
-  bool still;
+  uint32_t samples; // index in FrameRecords::samples, or kNoSamples
   float position[3];
+  bool still;
+  // A draw whose positions came in its payload (see blend_positions()): its
+  // first position in FrameRecords::positions (kNoSamples: not kept), how
+  // many, and a tagged draw's age.
+  uint32_t positions;
+  uint32_t positionCount;
+  uint32_t age;
 };
 struct FrameRecords {
   std::vector<gxc::VertexShaderConstants> pool;
   std::vector<Record> records;
+  std::vector<VertexSamples> samples;
+  std::vector<float> positions; // x, y, z per vertex
   void clear() {
     pool.clear();
     records.clear();
+    samples.clear();
+    positions.clear();
   }
 };
+
+// At most this many vertices per draw are kept and blended.
+constexpr uint32_t kMaxBlendedVertices = 1024;
+// blend_draw()'s in-between positions for its draw (x, y, z per vertex).
+std::vector<float> g_blendedPositions;
+bool g_haveBlendedPositions = false;
 
 FrameRecords g_frames[2];
 unsigned g_current = 0;
@@ -76,7 +96,7 @@ gxc::VertexShaderConstants g_blended;
 uint64_t g_drawSerial = 0;
 uint64_t g_pooledSerial = 0; // the draw whose constants are the current pool's last
 uint64_t g_motionGeneration = 0; // bumped when any motion's values change
-enum class BlendPath { Main, OwnMotion, StoodBefore };
+enum class BlendPath { Main, OwnMotion, StoodBefore, Unmatched };
 struct LastBlend {
   uint64_t serial = 0; // 0: none
   BlendPath path = BlendPath::Main;
@@ -90,10 +110,12 @@ LastBlend g_lastBlend;
 bool g_blendRepeated = false;
 
 // Motions seen this frame (see vote_motion()): M_now * M_before^-1 of the
-// draws matched without ambiguity, and how many draws agree with each.
+// draws matched without ambiguity, how many draws agree with each, and how
+// much their votes weigh.
 struct Motion {
   double m[3][4];
   uint32_t votes;
+  double weight;
   // For the camera's motion (see camera_motion()): its inverse, and the part
   // of it the in-between frame is at (D^t: the rotation turned by t of its
   // angle, and exactly half of D at t = 0.5, so D^0.5 * D^0.5 = D).
@@ -104,6 +126,12 @@ struct Motion {
 };
 constexpr int kMaxMotions = 6;
 constexpr uint32_t kMinMotionVotes = 4;
+// A vote weighs one per this many units of its draw's distance, and at least
+// one (see vote_motion()).
+constexpr double kVoteReach = 1000.0;
+// At most this many copies of a model, none standing still, are one moving
+// model drawn more than once (see blend_draw).
+constexpr size_t kFewCopies = 4;
 Motion g_motions[kMaxMotions];
 int g_motionCount = 0;
 int g_leadingMotion = -1;
@@ -137,6 +165,8 @@ struct Counts {
   uint64_t rejected = 0;  // counterparts exist, none plausible (with the new in view)
   uint64_t fresh = 0;     // of those, copies just come into view (blended from where they stood)
   uint64_t unmatched = 0; // no counterpart
+  uint64_t moved = 0;     // matched draws whose vertices the game moved (see vertex_motion())
+  uint64_t positions = 0; // particles whose positions were blended (see blend_positions())
 };
 Counts g_frameCounts;
 Counts g_totalCounts;
@@ -147,7 +177,21 @@ bool g_lastVerdict = false;
 const bool g_log = env_flag("DOL_AURORA_FRAME_INTERP_LOG", false);
 // DOL_AURORA_FRAME_INTERP_LOG_FRAMES: a line per game frame (debug).
 const bool g_logFrames = env_flag("DOL_AURORA_FRAME_INTERP_LOG_FRAMES", false);
-const uint64_t g_traceFrame = env_u64("DOL_AURORA_FRAME_INTERP_TRACE", 0);
+// DOL_AURORA_FRAME_INTERP_TRACE=frame or first-last: a line per draw (debug).
+struct TraceRange {
+  uint64_t first = 0, last = 0;
+};
+const TraceRange g_trace = [] {
+  TraceRange range;
+  const char* value = std::getenv("DOL_AURORA_FRAME_INTERP_TRACE");
+  if (value == nullptr || value[0] == '\0')
+    return range;
+  char* end = nullptr;
+  range.first = range.last = std::strtoull(value, &end, 10);
+  if (end != nullptr && *end == '-')
+    range.last = std::strtoull(end + 1, nullptr, 10);
+  return range;
+}();
 const char* g_outcome = "";
 const char* g_rejectReason = "";
 
@@ -158,13 +202,24 @@ double translation_length(const float rows[][4]) {
                    double(rows[2][3]) * rows[2][3]);
 }
 
+// How far plausible_matrix() lets a linear part turn from one frame to the
+// next, as |A - B|^2 / k^2 = 4 (1 - cos t) for a rotation by t at scale k.
+// Copies of one model: 41 degrees, since a turning camera must not pair a
+// copy with the next one along. A draw with a key of its own is the same
+// object as its counterpart whatever it did: 150 degrees. The bones of
+// Link's sword arm turn 90 degrees and more in one game frame of a swing; at
+// 41 degrees his arm and sword were drawn where the next frame has them
+// while the rest of him was halfway, and stepped at 30 FPS.
+constexpr double kTurnLimit = 1.0;
+constexpr double kOwnTurnLimit = 7.46;
+
 // Whether two 3x4 matrices can be one object's transform a frame apart. A
 // camera cut or a reused draw for another object fails at least one bound:
-// scale within 1.5x, the linear part within about 40 degrees of rotation, and
-// the translation within a fifth of its distance from the camera plus 100
-// units (a camera turning 10 degrees a frame moves a point about 0.17 of its
+// scale within 1.5x, the linear part within the turn limit, and the
+// translation within a fifth of its distance from the camera plus 100 units
+// (a camera turning 10 degrees a frame moves a point about 0.17 of its
 // distance; the boat at full sail covers about 60 units a frame).
-bool plausible_matrix(const float current[][4], const float previous[][4]) {
+bool plausible_matrix(const float current[][4], const float previous[][4], double turnLimit) {
   if (std::memcmp(current, previous, sizeof(float) * 12) == 0)
     return true;
   double currentScale = 0.0, previousScale = 0.0, difference = 0.0;
@@ -188,7 +243,7 @@ bool plausible_matrix(const float current[][4], const float previous[][4]) {
   }
   // For a rotation by t at scale k, |A-B|^2 = 4 k^2 (1 - cos t): 1.0 is 41 deg.
   const double axisScale = std::max(currentScale, previousScale) / 3.0;
-  if (difference / axisScale > 1.0) {
+  if (difference / axisScale > turnLimit) {
     g_rejectReason = "rotation";
     return false;
   }
@@ -234,16 +289,16 @@ bool plausible_projection(const float current[4][4], const float previous[4][4])
 }
 
 bool plausible(const gxc::VertexShaderConstants& current, const gxc::VertexShaderConstants& previous,
-               uint64_t usedMatrixRows) {
+               uint64_t usedMatrixRows, double turnLimit) {
   if (!plausible_projection(current.projection, previous.projection))
     return false;
   if (usedMatrixRows == 0)
-    return plausible_matrix(current.posnormalmatrix, previous.posnormalmatrix);
+    return plausible_matrix(current.posnormalmatrix, previous.posnormalmatrix, turnLimit);
   // Per-vertex matrices (skinned models): the bank slots this draw's vertices
   // use. The other slots hold whatever other models loaded last.
   for (uint64_t rows = usedMatrixRows; rows != 0; rows &= rows - 1) {
     const int row = __builtin_ctzll(rows);
-    if (!plausible_matrix(&current.transformmatrices[row], &previous.transformmatrices[row]))
+    if (!plausible_matrix(&current.transformmatrices[row], &previous.transformmatrices[row], turnLimit))
       return false;
   }
   return true;
@@ -334,7 +389,16 @@ bool motion_agrees(const double motion[3][4], const float current[][4], const fl
   return linear <= 1e-6 * scale && moved <= tolerance * tolerance;
 }
 
+// The camera's motion is the one the scenery shares, and what stands farthest
+// pins it down: a vote weighs as much as its draw is far from the camera, in
+// thousands of units (one at least, so near the camera every draw counts the
+// same). At sea the camera follows the boat, and the boat and Link are drawn
+// before the scenery: their hundred parts, all moving with the boat, agreed
+// on its motion before the islands and the sea voted, so the boat's motion
+// was taken for the camera's through most of the frame. The sky, drawn around
+// the camera, turns with it but does not move with it, and weighs little too.
 void vote_motion(const float current[][4], const float previous[][4]) {
+  const double weight = std::max(1.0, translation_length(current) / kVoteReach);
   int agreed = -1;
   if (g_leadingMotion >= 0 && motion_agrees(g_motions[g_leadingMotion].m, current, previous))
     agreed = g_leadingMotion;
@@ -344,17 +408,18 @@ void vote_motion(const float current[][4], const float previous[][4]) {
   }
   if (agreed >= 0) {
     ++g_motions[agreed].votes;
+    g_motions[agreed].weight += weight;
   } else {
     double inverse[3][4];
     if (!affine_inverse(previous, inverse))
       return;
-    // A new motion, in place of the one fewest draws agreed with.
+    // A new motion, in place of the one with the least weight.
     agreed = 0;
     if (g_motionCount < kMaxMotions) {
       agreed = g_motionCount++;
     } else {
       for (int i = 1; i < kMaxMotions; ++i) {
-        if (g_motions[i].votes < g_motions[agreed].votes)
+        if (g_motions[i].weight < g_motions[agreed].weight)
           agreed = i;
       }
       if (agreed == g_leadingMotion)
@@ -368,11 +433,12 @@ void vote_motion(const float current[][4], const float previous[][4]) {
       m[r][3] += current[r][3];
     }
     g_motions[agreed].votes = 1;
+    g_motions[agreed].weight = weight;
     g_motions[agreed].derived = false;
     ++g_motionGeneration;
   }
-  // The motion most draws agree with is the camera's.
-  if (g_leadingMotion < 0 || g_motions[agreed].votes > g_motions[g_leadingMotion].votes)
+  // The motion with the most weight is the camera's.
+  if (g_leadingMotion < 0 || g_motions[agreed].weight > g_motions[g_leadingMotion].weight)
     g_leadingMotion = agreed;
 }
 
@@ -558,6 +624,7 @@ bool own_motion(const float previous[][4], const float current[][4], Motion& out
     out.m[r][3] += current[r][3];
   }
   out.votes = 1;
+  out.weight = 1.0;
   out.derived = false;
   return true;
 }
@@ -583,22 +650,22 @@ void as_previous_camera(const Motion& camera, const float rows[][4], float out[]
 }
 
 bool plausible_relative(const Motion* camera, const gxc::VertexShaderConstants& current,
-                        const gxc::VertexShaderConstants& previous, uint64_t usedMatrixRows) {
+                        const gxc::VertexShaderConstants& previous, uint64_t usedMatrixRows, double turnLimit) {
   if (camera == nullptr || previous.projection[3][2] == 0.f || current.projection[3][2] == 0.f)
-    return plausible(current, previous, usedMatrixRows);
+    return plausible(current, previous, usedMatrixRows, turnLimit);
   if (!plausible_projection(current.projection, previous.projection))
     return false;
   float relative[3][4];
   if (usedMatrixRows == 0) {
     as_previous_camera(*camera, current.posnormalmatrix, relative);
-    return plausible_matrix(relative, previous.posnormalmatrix);
+    return plausible_matrix(relative, previous.posnormalmatrix, turnLimit);
   }
   for (uint64_t rows = usedMatrixRows; rows != 0; rows &= rows - 1) {
     const int row = __builtin_ctzll(rows);
     if (row > 61)
       continue;
     as_previous_camera(*camera, &current.transformmatrices[row], relative);
-    if (!plausible_matrix(relative, &previous.transformmatrices[row]))
+    if (!plausible_matrix(relative, &previous.transformmatrices[row], turnLimit))
       return false;
   }
   return true;
@@ -629,6 +696,143 @@ bool stood_before(const Motion& camera, const gxc::VertexShaderConstants& curren
 gxc::VertexShaderConstants g_stoodBefore;
 
 // --- Blending -----------------------------------------------------------------
+
+// A straight blend of two matrices turned far apart shrinks what they draw
+// halfway (to 71 percent of its size at 90 degrees) and pulls it inward. A
+// linear part that turned more than about 15 degrees is blended as what it
+// is, a rotation times a scale per axis (J3D's joint matrices are R * S): the
+// rotation by slerp, the scales straight. A normal matrix, R * S^-1, is the
+// same kind.
+constexpr double kTurnedFar = 0.136; // 4 (1 - cos 15 degrees)
+
+template <typename A, typename B>
+bool turned_far(const A from[][4], const B to[][4]) {
+  double difference = 0.0, size = 0.0;
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      const double a = from[r][c], b = to[r][c];
+      difference += (b - a) * (b - a);
+      size += a * a + b * b;
+    }
+  }
+  // size / 6 is the mean of the two k^2.
+  return difference * 6.0 > kTurnedFar * size && size > 1e-12;
+}
+
+// A linear part's rotation, as a unit quaternion (w, x, y, z), and its scale
+// per axis; false when it is not a rotation times a scale (sheared or
+// collapsed). A mirror has its last scale negative.
+template <typename A>
+bool rotation_and_scale(const A m[][4], double q[4], double scale[3]) {
+  double r[3][3];
+  for (int c = 0; c < 3; ++c) {
+    const double s = std::sqrt(double(m[0][c]) * m[0][c] + double(m[1][c]) * m[1][c] + double(m[2][c]) * m[2][c]);
+    if (s < 1e-9)
+      return false;
+    for (int i = 0; i < 3; ++i)
+      r[i][c] = m[i][c] / s;
+    scale[c] = s;
+  }
+  for (int a = 0; a < 3; ++a) {
+    for (int b = a + 1; b < 3; ++b) {
+      if (std::fabs(r[0][a] * r[0][b] + r[1][a] * r[1][b] + r[2][a] * r[2][b]) > 0.02)
+        return false;
+    }
+  }
+  const double det = r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1]) -
+                     r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0]) +
+                     r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]);
+  if (det < 0.0) {
+    scale[2] = -scale[2];
+    for (int i = 0; i < 3; ++i)
+      r[i][2] = -r[i][2];
+  }
+  double w, x, y, z;
+  const double trace = r[0][0] + r[1][1] + r[2][2];
+  if (trace > 0.0) {
+    const double s = std::sqrt(trace + 1.0) * 2.0;
+    w = 0.25 * s;
+    x = (r[2][1] - r[1][2]) / s;
+    y = (r[0][2] - r[2][0]) / s;
+    z = (r[1][0] - r[0][1]) / s;
+  } else if (r[0][0] > r[1][1] && r[0][0] > r[2][2]) {
+    const double s = std::sqrt(1.0 + r[0][0] - r[1][1] - r[2][2]) * 2.0;
+    w = (r[2][1] - r[1][2]) / s;
+    x = 0.25 * s;
+    y = (r[0][1] + r[1][0]) / s;
+    z = (r[0][2] + r[2][0]) / s;
+  } else if (r[1][1] > r[2][2]) {
+    const double s = std::sqrt(1.0 + r[1][1] - r[0][0] - r[2][2]) * 2.0;
+    w = (r[0][2] - r[2][0]) / s;
+    x = (r[0][1] + r[1][0]) / s;
+    y = 0.25 * s;
+    z = (r[1][2] + r[2][1]) / s;
+  } else {
+    const double s = std::sqrt(1.0 + r[2][2] - r[0][0] - r[1][1]) * 2.0;
+    w = (r[1][0] - r[0][1]) / s;
+    x = (r[0][2] + r[2][0]) / s;
+    y = (r[1][2] + r[2][1]) / s;
+    z = 0.25 * s;
+  }
+  const double norm = std::sqrt(w * w + x * x + y * y + z * z);
+  if (!(norm > 1e-9))
+    return false;
+  q[0] = w / norm, q[1] = x / norm, q[2] = y / norm, q[3] = z / norm;
+  return true;
+}
+
+// out's linear part (the first three columns of three rows): from's and to's
+// blended by t as a rotation and scales, or straight when either is not a
+// rotation times a scale.
+template <typename A, typename B, typename O>
+void blend_turn(const A from[][4], const B to[][4], double t, O out[][4]) {
+  double q0[4], q1[4], s0[3], s1[3];
+  if (!rotation_and_scale(from, q0, s0) || !rotation_and_scale(to, q1, s1) || (s0[2] < 0.0) != (s1[2] < 0.0)) {
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 3; ++c)
+        out[r][c] = static_cast<O>(from[r][c] + (double(to[r][c]) - from[r][c]) * t);
+    return;
+  }
+  double dot = q0[0] * q1[0] + q0[1] * q1[1] + q0[2] * q1[2] + q0[3] * q1[3];
+  if (dot < 0.0) {
+    dot = -dot;
+    for (double& v : q1)
+      v = -v;
+  }
+  double w0 = 1.0 - t, w1 = t;
+  if (dot < 0.9995) {
+    const double angle = std::acos(dot);
+    const double sine = std::sin(angle);
+    w0 = std::sin((1.0 - t) * angle) / sine;
+    w1 = std::sin(t * angle) / sine;
+  }
+  double q[4];
+  double norm = 0.0;
+  for (int k = 0; k < 4; ++k) {
+    q[k] = w0 * q0[k] + w1 * q1[k];
+    norm += q[k] * q[k];
+  }
+  norm = std::sqrt(norm);
+  const double w = q[0] / norm, x = q[1] / norm, y = q[2] / norm, z = q[3] / norm;
+  const double r[3][3] = {
+      {1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)},
+      {2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)},
+      {2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)},
+  };
+  for (int c = 0; c < 3; ++c) {
+    const double scale = s0[c] + (s1[c] - s0[c]) * t;
+    for (int i = 0; i < 3; ++i)
+      out[i][c] = static_cast<O>(r[i][c] * scale);
+  }
+}
+
+// After a straight blend of the rows into out: its linear part blended as a
+// rotation when it turned far.
+template <typename A, typename B, typename O>
+inline void blend_linear(const A from[][4], const B to[][4], double t, O out[][4]) {
+  if (turned_far(from, to))
+    blend_turn(from, to, t, out);
+}
 
 inline void lerp_rows(float out[][4], const float from[][4], const float to[][4], int rows, float t) {
   for (int r = 0; r < rows; ++r)
@@ -672,10 +876,135 @@ inline unsigned used_matrices(uint64_t rows) {
   return matrices;
 }
 
+// Vertices the game moves itself. A model skinned on the CPU (J3D's
+// J3DSkinDeform: the boat's hull) has its vertices rewritten every frame in
+// world space and is drawn with the bare view matrix. Its key and matrices
+// match the frame before, but the in-between frame draws this frame's
+// vertices, so blending the matrices alone leaves it where it is now: under
+// full sail the hull and its shadow were drawn half a frame (50 units) ahead
+// of the boat's head, Link and the sail, a second hull flickering in front.
+//
+// The rigid motion E that carries three of the frame before's vertices onto
+// this frame's (the same vertices: the key is the same index stream) makes
+// the frame before's matrices M * E^-1 for these vertices, and those are
+// blended. A mesh that did not move rigidly (cloth) is left as it was.
+bool vertex_motion(const VertexSamples& before, const VertexSamples& now, const gxc::VertexShaderConstants& previous,
+                   uint64_t rows, gxc::VertexShaderConstants& out) {
+  if (std::memcmp(before.data(), now.data(), sizeof(float) * 9) == 0)
+    return false;
+  double p[3][3], q[3][3], moved = 0.0, extent = 0.0;
+  for (int i = 0; i < 3; ++i) {
+    double d = 0.0;
+    for (int k = 0; k < 3; ++k) {
+      p[i][k] = before[i * 3 + k];
+      q[i][k] = now[i * 3 + k];
+      d += (q[i][k] - p[i][k]) * (q[i][k] - p[i][k]);
+    }
+    moved = std::max(moved, std::sqrt(d));
+  }
+  if (moved < 0.01)
+    return false;
+  // An orthonormal frame on each triangle of samples; the rotation carries
+  // one onto the other (none when the samples are in a line).
+  const auto frame = [&](const double v[3][3], double f[3][3]) {
+    double a[3], b[3];
+    for (int k = 0; k < 3; ++k) {
+      a[k] = v[1][k] - v[0][k];
+      b[k] = v[2][k] - v[0][k];
+    }
+    const double la = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+    extent = std::max(extent, la);
+    if (la < 1e-3)
+      return false;
+    for (int k = 0; k < 3; ++k)
+      a[k] /= la;
+    const double along = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    for (int k = 0; k < 3; ++k)
+      b[k] -= along * a[k];
+    const double lb = std::sqrt(b[0] * b[0] + b[1] * b[1] + b[2] * b[2]);
+    if (lb < 1e-3 * la)
+      return false;
+    for (int k = 0; k < 3; ++k)
+      b[k] /= lb;
+    const double c[3] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    for (int k = 0; k < 3; ++k) { // columns a, b, c
+      f[k][0] = a[k];
+      f[k][1] = b[k];
+      f[k][2] = c[k];
+    }
+    return true;
+  };
+  double fp[3][3], fq[3][3], r[3][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+  if (frame(p, fp) && frame(q, fq)) {
+    for (int i = 0; i < 3; ++i)
+      for (int k = 0; k < 3; ++k)
+        r[i][k] = fq[i][0] * fp[k][0] + fq[i][1] * fp[k][1] + fq[i][2] * fp[k][2];
+  }
+  double cp[3], cq[3], t[3];
+  for (int k = 0; k < 3; ++k) {
+    cp[k] = (p[0][k] + p[1][k] + p[2][k]) / 3.0;
+    cq[k] = (q[0][k] + q[1][k] + q[2][k]) / 3.0;
+  }
+  for (int i = 0; i < 3; ++i)
+    t[i] = cq[i] - (r[i][0] * cp[0] + r[i][1] * cp[1] + r[i][2] * cp[2]);
+  for (int i = 0; i < 3; ++i) {
+    double d = 0.0;
+    for (int k = 0; k < 3; ++k) {
+      const double carried = r[k][0] * p[i][0] + r[k][1] * p[i][1] + r[k][2] * p[i][2] + t[k];
+      d += (carried - q[i][k]) * (carried - q[i][k]);
+    }
+    if (std::sqrt(d) > 0.05 * moved + 0.01 * extent + 0.1)
+      return false; // not rigid
+  }
+  // E^-1 = [R^T | -R^T t].
+  double inverse[3][4];
+  for (int i = 0; i < 3; ++i) {
+    for (int k = 0; k < 3; ++k)
+      inverse[i][k] = r[k][i];
+    inverse[i][3] = -(r[0][i] * t[0] + r[1][i] * t[1] + r[2][i] * t[2]);
+  }
+  std::memcpy(&out, &previous, sizeof(out));
+  const auto place = [&](const float from[][4], float to[][4]) {
+    for (int i = 0; i < 3; ++i) {
+      double row[4];
+      for (int c = 0; c < 4; ++c)
+        row[c] = from[i][0] * inverse[0][c] + from[i][1] * inverse[1][c] + from[i][2] * inverse[2][c];
+      row[3] += from[i][3];
+      for (int c = 0; c < 4; ++c)
+        to[i][c] = static_cast<float>(row[c]);
+    }
+  };
+  const auto turn = [&](const float from[][4], float to[][4]) {
+    for (int i = 0; i < 3; ++i) {
+      double row[3];
+      for (int c = 0; c < 3; ++c)
+        row[c] = from[i][0] * inverse[0][c] + from[i][1] * inverse[1][c] + from[i][2] * inverse[2][c];
+      for (int c = 0; c < 3; ++c)
+        to[i][c] = static_cast<float>(row[c]);
+    }
+  };
+  if (rows == 0) {
+    place(previous.posnormalmatrix, out.posnormalmatrix);
+    turn(&previous.posnormalmatrix[3], &out.posnormalmatrix[3]);
+  } else {
+    const unsigned matrices = used_matrices(rows);
+    for (int m = 0; m < 10; ++m) {
+      if ((matrices >> m) & 1u) {
+        place(&previous.transformmatrices[m * 3], &out.transformmatrices[m * 3]);
+        turn(&previous.normalmatrices[m * 3], &out.normalmatrices[m * 3]);
+      }
+    }
+  }
+  return true;
+}
+gxc::VertexShaderConstants g_movedPrevious;
+
 void blend(const gxc::VertexShaderConstants& previous, const gxc::VertexShaderConstants& current, float t,
            gxc::VertexShaderConstants& out, uint64_t rows) {
   std::memcpy(&out, &current, sizeof(out));
   lerp_rows(out.posnormalmatrix, previous.posnormalmatrix, current.posnormalmatrix, 6, t);
+  blend_linear(previous.posnormalmatrix, current.posnormalmatrix, t, out.posnormalmatrix);
+  blend_linear(&previous.posnormalmatrix[3], &current.posnormalmatrix[3], t, &out.posnormalmatrix[3]);
   lerp_rows(out.projection, previous.projection, current.projection, 4, t);
   for (int m = 0; m < 8; ++m)
     lerp_texture_rows(&out.texmatrices[m * 3], &previous.texmatrices[m * 3], &current.texmatrices[m * 3], t);
@@ -686,7 +1015,10 @@ void blend(const gxc::VertexShaderConstants& previous, const gxc::VertexShaderCo
     if ((matrices >> m) & 1u) {
       lerp_rows(&out.transformmatrices[m * 3], &previous.transformmatrices[m * 3],
                 &current.transformmatrices[m * 3], 3, t);
+      blend_linear(&previous.transformmatrices[m * 3], &current.transformmatrices[m * 3], t,
+                   &out.transformmatrices[m * 3]);
       lerp_rows(&out.normalmatrices[m * 3], &previous.normalmatrices[m * 3], &current.normalmatrices[m * 3], 3, t);
+      blend_linear(&previous.normalmatrices[m * 3], &current.normalmatrices[m * 3], t, &out.normalmatrices[m * 3]);
     }
   }
   for (int m = 0; m < 10; ++m) {
@@ -726,6 +1058,7 @@ void blend_relative(const Motion& camera, const gxc::VertexShaderConstants& prev
         mid[r][c] = from[r][c] + (value - from[r][c]) * t;
       }
     }
+    blend_linear(from, seen, t, mid);
     for (int r = 0; r < 3; ++r) {
       for (int c = 0; c < 3; ++c)
         result[r][c] = static_cast<float>(camera.part[r][0] * mid[0][c] + camera.part[r][1] * mid[1][c] +
@@ -779,6 +1112,91 @@ inline uint64_t mix64(uint64_t h) {
   return h;
 }
 
+// What blend_draw() matched its draw to: the counterpart's record and block,
+// and the motion the matrices were blended in (see blend_relative()), or none
+// for a straight blend. No record: nothing matched.
+struct Match {
+  const Record* record = nullptr;
+  const gxc::VertexShaderConstants* block = nullptr;
+  const Motion* motion = nullptr;
+};
+Match g_match;
+Motion g_ownMotion; // the "blended by its own motion" path's
+// The draw being matched is a particle the host tagged, and its age.
+bool g_currentTagged = false;
+uint32_t g_currentAge = 0;
+
+// A draw whose positions the game sends itself (particles, the sword's
+// trail): its matrices say nothing of how it moved, so the in-between frame
+// drew it where the next frame has it, at 30 FPS. Each vertex is taken
+// halfway from where it was drawn in the frame before to where it is now, in
+// the previous camera's view and carried by the camera's part motion as the
+// matrices are (blend_relative()), then back through the in-between frame's
+// matrix into the space the draw's matrix takes its positions from:
+//   q = Mh^-1 P ((1 - t) M0 p0 + t D^-1 M1 p1)
+// for the previous and current matrices M0 and M1, the motion D and its part
+// P (none: D = P = I) and the in-between matrix Mh. False when no vertex
+// moves from where it is drawn now, or one moved implausibly far for a frame
+// (a pair that is not the same thing).
+bool blend_positions(const float* before, const float* now, uint32_t count, const float previousMatrix[][4],
+                     const float currentMatrix[][4], const Motion* motion, const float inBetween[][4], double t,
+                     bool tagged, std::vector<float>& out) {
+  double back[3][4];
+  if (!affine_inverse(inBetween, back))
+    return false;
+  double a0[3][4], a1[3][4];
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 4; ++c)
+      a0[r][c] = previousMatrix[r][c];
+  if (motion != nullptr) {
+    affine_multiply(motion->inverse, currentMatrix, a1);
+  } else {
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 4; ++c)
+        a1[r][c] = currentMatrix[r][c];
+  }
+  double b0[3][4], b1[3][4];
+  if (motion != nullptr) {
+    double placed[3][4];
+    affine_multiply(motion->part, a0, placed);
+    affine_multiply(back, placed, b0);
+    affine_multiply(motion->part, a1, placed);
+    affine_multiply(back, placed, b1);
+  } else {
+    affine_multiply(back, a0, b0);
+    affine_multiply(back, a1, b1);
+  }
+  const auto apply = [](const double m[3][4], const float* p, double result[3]) {
+    for (int r = 0; r < 3; ++r)
+      result[r] = m[r][0] * p[0] + m[r][1] * p[1] + m[r][2] * p[2] + m[r][3];
+  };
+  out.resize(static_cast<size_t>(count) * 3u);
+  bool moves = false;
+  for (uint32_t i = 0; i < count; ++i) {
+    const float* p0 = before + i * 3u;
+    const float* p1 = now + i * 3u;
+    // How far it moved, in the previous camera's view: a particle flies at
+    // most a few hundred units a frame.
+    double u0[3], u1[3];
+    apply(a0, p0, u0);
+    apply(a1, p1, u1);
+    const double moved = std::sqrt((u1[0] - u0[0]) * (u1[0] - u0[0]) + (u1[1] - u0[1]) * (u1[1] - u0[1]) +
+                                   (u1[2] - u0[2]) * (u1[2] - u0[2]));
+    const double distance = std::sqrt(u0[0] * u0[0] + u0[1] * u0[1] + u0[2] * u0[2]);
+    if (moved > (tagged ? 0.5 * distance + 300.0 : 0.2 * distance + 100.0))
+      return false;
+    double q0[3], q1[3];
+    apply(b0, p0, q0);
+    apply(b1, p1, q1);
+    for (int k = 0; k < 3; ++k) {
+      const double q = q0[k] + (q1[k] - q0[k]) * t;
+      out[i * 3u + k] = static_cast<float>(q);
+      moves = moves || std::fabs(q - p1[k]) > 1e-3 * (1.0 + std::fabs(p1[k]));
+    }
+  }
+  return moves;
+}
+
 void log_counts() {
   const auto& c = g_totalCounts;
   std::fprintf(stderr,
@@ -796,15 +1214,38 @@ void log_counts() {
 bool enabled() noexcept { return g_enabled.load(std::memory_order_relaxed); }
 void set_enabled(bool enabled) noexcept { g_enabled.store(enabled, std::memory_order_relaxed); }
 
-uint64_t draw_key(const gxc::DrawPlan& plan) noexcept {
+static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
   if (plan.match_payload == nullptr || plan.match_payload_size == 0)
     return 0;
+  if (plan.match_direct_position && plan.draw_scope_part != 0) {
+    // One of the draws a wake's emitter makes (its fans and strips), by its
+    // place among them: its vertices are the wake's particles in order (see
+    // blend_positions()).
+    const uint64_t h = mix64(0x5C0Au ^ (uint64_t(plan.draw_scope) << 8) ^ (uint64_t(plan.draw_scope_part) << 40));
+    return h == 0 ? 1 : h;
+  }
+  if (plan.match_direct_position && plan.draw_tag == 0 && plan.match_primitive == 0x90 && plan.tex_address != 0 &&
+      plan.constants.projection[3][2] != 0.f) {
+    // A textured list of triangles in the scene: a real shadow cast onto the
+    // triangles of the ground or sea under its object, in its own texture.
+    // As many as lie there: a different count every few frames as the boat
+    // sails, so the draw had a new key, went unmatched and kept the next
+    // frame's shadow projection in the in-between frame while the boat was
+    // halfway, and the shadow flickered at its edges. Paired by its texture
+    // whatever the count (its triangles are not the same points from one
+    // frame to the next, so only its matrices are blended).
+    const uint64_t h = mix64(0x0B7Eu ^ (uint64_t(plan.tex_address) << 16) ^ (uint64_t(plan.match_vtx_fmt) << 8) ^
+                             (uint64_t(plan.texmap_mask) << 48));
+    return h == 0 ? 1 : h;
+  }
   uint64_t h = mix64((uint64_t(plan.match_primitive) << 40) ^ (uint64_t(plan.match_vtx_fmt) << 32) ^
                      plan.vertex_count ^ (uint64_t(plan.match_payload_size) << 48));
   if (plan.match_direct_position) {
-    // New positions every frame: the same shape with the same texture. Its
-    // matrices (usually the camera's) are blended, its vertices are not.
+    // New positions every frame: the same shape with the same texture, and
+    // for a particle the host tagged, that particle (see blend_positions()).
     h = mix64(h ^ 0xD1u ^ (uint64_t(plan.tex_address) << 8) ^ (uint64_t(plan.texmap_mask) << 40));
+    if (plan.draw_tag != 0)
+      h = mix64(h ^ (uint64_t(plan.draw_tag) << 20) ^ 0x7A6u);
     return h == 0 ? 1 : h;
   }
   const uint8_t* bytes = plan.match_payload;
@@ -822,6 +1263,47 @@ uint64_t draw_key(const gxc::DrawPlan& plan) noexcept {
   return h == 0 ? 1 : h;
 }
 
+uint64_t draw_key(const gxc::DrawPlan& plan) noexcept { return draw_key_of(plan); }
+
+void capture_draw(const gxc::DrawPlan& plan, DrawInput& out) noexcept {
+  out.key = draw_key_of(plan);
+  out.usedMatrixRows = used_matrix_rows(plan);
+  out.haveSamples = false;
+  out.positions.clear();
+  out.age = 0;
+  if (out.key == 0)
+    return;
+  // Only the positions of particles the host tagged: an untagged draw of one
+  // shape is not the same points from one frame to the next (the boat's
+  // shadow is cast on the sea's triangles under it, a different list as it
+  // moves), and blending one list toward the other drew the shadow torn.
+  const size_t decoded = plan.vertices.size() / gxc::kVertexFloats;
+  if (plan.match_direct_position) {
+    if ((plan.draw_tag != 0 || plan.draw_scope_part != 0) && decoded > 0 && decoded <= kMaxBlendedVertices) {
+      out.positions.resize(decoded * 3u);
+      for (size_t i = 0; i < decoded; ++i)
+        std::memcpy(out.positions.data() + i * 3u,
+                    plan.vertices.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float),
+                    sizeof(float) * 3);
+      out.age = plan.draw_scope_part != 0 ? 0u : plan.draw_tag_age;
+    }
+    return;
+  }
+  // Three vertices, first, middle and last, as decoded (in the space the
+  // position matrix takes them from), for blend_draw() to see whether the
+  // game moved them itself (see vertex_motion()).
+  const uint32_t count = plan.vertex_count;
+  if (count >= 3 && plan.vertices.size() >= static_cast<size_t>(count) * gxc::kVertexFloats) {
+    const uint32_t picks[3] = {0, count / 2, count - 1};
+    for (int i = 0; i < 3; ++i)
+      std::memcpy(&out.samples[i * 3],
+                  plan.vertices.data() + static_cast<size_t>(picks[i]) * gxc::kVertexFloats +
+                      gxc::kVertexPosOffset / sizeof(float),
+                  sizeof(float) * 3);
+    out.haveSamples = true;
+  }
+}
+
 uint64_t used_matrix_rows(const gxc::DrawPlan& plan) noexcept {
   if (!plan.pipeline.shader.has_pos_mtx_idx || plan.match_payload == nullptr || plan.match_vertex_stride == 0)
     return 0;
@@ -835,13 +1317,22 @@ uint64_t used_matrix_rows(const gxc::DrawPlan& plan) noexcept {
   return rows;
 }
 
-const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRows,
-                                             const gxc::VertexShaderConstants& current, bool repeatsLastDraw) {
+static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedMatrixRows,
+                                                   const gxc::VertexShaderConstants& current, bool repeatsLastDraw,
+                                                   const VertexSamples* samples) {
   g_outcome = "no key";
   g_blendRepeated = false;
   const uint64_t serial = ++g_drawSerial;
   if (!enabled() || key == 0)
     return nullptr;
+  const bool haveSamples = samples != nullptr;
+  // A model drawn into a shadow map (an orthographic projection) and into the
+  // scene sends the same vertices twice. They are not copies of one another:
+  // the boat's hull, one draw of each in the shadow pass and the scene, was
+  // two copies of itself, matched as copies are (see below).
+  const bool perspective = current.projection[3][2] != 0.f;
+  if (!perspective)
+    key = mix64(key ^ 0x6F7274686F677261ull) | 1u;
   const float (*here)[4] = position_signature(current, usedMatrixRows);
   FrameRecords& frame = g_frames[g_current];
   // The pool keeps a run of identical blocks once. When the draw before this
@@ -855,9 +1346,11 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
   // path, same previous block, same motion, same matrices) from the same
   // constants is the one g_blended holds.
   const auto repeat = [&](BlendPath path, const void* previousBlock, const void* motion) {
-    const bool same = repeatsLastDraw && g_lastBlend.serial + 1 == serial && g_lastBlend.path == path &&
-                      g_lastBlend.previous == previousBlock && g_lastBlend.motion == motion &&
-                      g_lastBlend.motionGeneration == g_motionGeneration && g_lastBlend.rows == usedMatrixRows;
+    // g_movedPrevious is made anew for each draw whose vertices moved.
+    const bool same = previousBlock != &g_movedPrevious && repeatsLastDraw && g_lastBlend.serial + 1 == serial &&
+                      g_lastBlend.path == path && g_lastBlend.previous == previousBlock &&
+                      g_lastBlend.motion == motion && g_lastBlend.motionGeneration == g_motionGeneration &&
+                      g_lastBlend.rows == usedMatrixRows;
     g_lastBlend.serial = serial;
     if (same)
       return true;
@@ -869,7 +1362,13 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
     return false;
   };
   const auto constantsIndex = static_cast<uint32_t>(frame.pool.size() - 1);
-  frame.records.push_back({key, constantsIndex, false, {here[0][3], here[1][3], here[2][3]}});
+  uint32_t samplesIndex = kNoSamples;
+  if (haveSamples) {
+    samplesIndex = static_cast<uint32_t>(frame.samples.size());
+    frame.samples.push_back(*samples);
+  }
+  frame.records.push_back(
+      {key, constantsIndex, samplesIndex, {here[0][3], here[1][3], here[2][3]}, false, kNoSamples, 0, g_currentAge});
   ++g_frameCounts.draws;
   KeyState& state = g_keys[key];
   const uint32_t occurrence = state.occurrence++;
@@ -879,29 +1378,75 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
     return nullptr;
   }
 
-  const auto range = std::equal_range(g_previousIndex.begin(), g_previousIndex.end(), Record{key, 0, false, {}},
-                                      [](const Record& a, const Record& b) { return a.key < b.key; });
+  auto range =
+      std::equal_range(g_previousIndex.begin(), g_previousIndex.end(), Record{key, 0, kNoSamples, {}, false, 0, 0, 0},
+                       [](const Record& a, const Record& b) { return a.key < b.key; });
+  // A particle's address is reused for a new one once it dies: a counterpart
+  // older than it, or more than two game frames younger, is another particle.
+  if (g_currentTagged && range.first != range.second &&
+      (range.first->age > g_currentAge || g_currentAge - range.first->age > 2u))
+    range.second = range.first;
   if (range.first == range.second) {
     ++g_frameCounts.unmatched;
     g_outcome = "unmatched";
-    return nullptr;
+    // No counterpart: a model come into view, or geometry whose vertex
+    // stream changes every frame. The sea is 64 strips of the view matrix
+    // whose texture coordinates follow the player's position (the grid moves
+    // with him, even as the boat bobs), so no strip keeps its key. Drawn as it
+    // is now, the whole sea would stay on the real frame's camera while the
+    // boat, the islands and the sky are on the in-between camera: at sea the
+    // waves step at 30 FPS when the camera turns, and the boat, which the
+    // camera follows, stutters against the water. What stood still in the
+    // world was where the camera's motion carries it from, so it is blended
+    // from there.
+    Motion* const view = perspective && usedMatrixRows == 0 ? camera_motion() : nullptr;
+    if (view == nullptr)
+      return nullptr;
+    if (repeat(BlendPath::Unmatched, view, nullptr)) {
+      g_outcome = "unmatched, stood still";
+      g_blendRepeated = true;
+      return &g_blended;
+    }
+    if (!stood_before(*view, current, g_stoodBefore)) {
+      g_lastBlend.serial = 0;
+      return nullptr;
+    }
+    blend_relative(*view, g_stoodBefore, current, blend_weight(), g_blended, 0);
+    g_outcome = "unmatched, stood still";
+    return &g_blended;
   }
   g_rejectReason = "";
   const FrameRecords& previousFrame = g_frames[g_current ^ 1u];
   const Record* copies = &*range.first;
+  const gxc::VertexShaderConstants* movedPrevious = nullptr; // copy 0 as this frame's vertices see it
   const auto constantsOf = [&](size_t copy) -> const gxc::VertexShaderConstants& {
-    return previousFrame.pool[copies[copy].constants];
+    return copy == 0 && movedPrevious != nullptr ? *movedPrevious : previousFrame.pool[copies[copy].constants];
   };
   const size_t candidates = static_cast<size_t>(range.second - range.first);
-  const bool perspective = current.projection[3][2] != 0.f;
+  const double turnLimit = candidates == 1 && occurrence == 0 ? kOwnTurnLimit : kTurnLimit;
   const gxc::VertexShaderConstants* previous = nullptr;
+  size_t chosen = 0; // previous's copy
   // A draw with a key of its own is the same object as its counterpart, so
   // it votes for the camera's motion whether or not the pair looks plausible
   // yet: a fast turn makes the scenery implausible until the camera's motion
-  // is known.
-  if (candidates == 1 && occurrence == 0 && usedMatrixRows == 0 && perspective &&
+  // is known. So do copies that all had one block (effects drawn with the
+  // view matrix, like the wave crests at sea): whichever this one was, it
+  // moved the same way. Their first copy votes, as the key's one draw would.
+  const bool uniformCopies = candidates > 1 && copies[0].constants == copies[candidates - 1].constants;
+  // Not a tagged particle: a key of its own each, and a billboard's matrix is
+  // the identity, whose votes would outweigh the camera's.
+  if ((candidates == 1 || uniformCopies) && occurrence == 0 && usedMatrixRows == 0 && perspective && !g_currentTagged &&
       constantsOf(0).projection[3][2] != 0.f)
     vote_motion(current.posnormalmatrix, constantsOf(0).posnormalmatrix);
+  // A draw of its own whose vertices the game moved itself: the in-between
+  // frame keeps this frame's vertices, so the frame before's matrices are
+  // taken as they would place them (see vertex_motion()).
+  if (candidates == 1 && occurrence == 0 && samplesIndex != kNoSamples && copies[0].samples != kNoSamples &&
+      vertex_motion(previousFrame.samples[copies[0].samples], frame.samples[samplesIndex],
+                    previousFrame.pool[copies[0].constants], usedMatrixRows, g_movedPrevious)) {
+    movedPrevious = &g_movedPrevious;
+    ++g_frameCounts.moved;
+  }
   Motion* const view = perspective ? camera_motion() : nullptr;
 
   // Copies of one model (grass, bushes, trees): the copy that a motion several
@@ -928,6 +1473,44 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
     }
     return false;
   };
+  // A copy the same size as this draw to within two percent, the nearest of
+  // those to it in the view and near enough for a frame, is this one, and may
+  // turn as far as a draw of its own. A broken pot's shards are one model
+  // drawn at random sizes, flying apart and tumbling faster than copies are
+  // let turn (kTurnLimit), so each was drawn where the next frame has it.
+  size_t nearestCopy = SIZE_MAX;
+  const auto size_of = [&](const float(*m)[4]) {
+    double size = 0.0;
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 3; ++c)
+        size += double(m[r][c]) * m[r][c];
+    return size;
+  };
+  const auto same_copy = [&](size_t copy) {
+    if (nearestCopy == SIZE_MAX) {
+      nearestCopy = candidates;
+      const double size = size_of(here);
+      double best = HUGE_VAL;
+      for (size_t i = 0; i < std::min<size_t>(candidates, 256); ++i) {
+        const double other = size_of(position_signature(constantsOf(i), usedMatrixRows));
+        if (!(other > 1e-12) || std::fabs(size / other - 1.0) >= 0.04) // squared sizes: 2 percent
+          continue;
+        const double d = translation_distance2(here, copies[i].position);
+        if (d < best) {
+          best = d;
+          nearestCopy = i;
+        }
+      }
+    }
+    const double reach = 40.0 + 0.01 * translation_length(here);
+    return copy == nearestCopy && translation_distance2(here, copies[copy].position) <= reach * reach;
+  };
+  const auto plausible_copy = [&](size_t copy) {
+    if (plausible_relative(view, current, constantsOf(copy), usedMatrixRows, turnLimit))
+      return true;
+    return turnLimit < kOwnTurnLimit && same_copy(copy) &&
+           plausible_relative(view, current, constantsOf(copy), usedMatrixRows, kOwnTurnLimit);
+  };
   size_t pick = candidates;
   // How far the camera's motion puts the nearest copy that stood still.
   double nearestStill = HUGE_VAL;
@@ -949,8 +1532,10 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
     state.next = static_cast<uint32_t>(pick + 1);
     frame.records.back().still = motion_error(*camera, here, copies[pick].position) <= tolerance;
     const auto& candidate = constantsOf(pick);
-    if (plausible_relative(view, current, candidate, usedMatrixRows))
+    if (plausible_copy(pick)) {
       previous = &candidate;
+      chosen = pick;
+    }
   } else {
     // Without such a copy, a copy that stood still would have been carried
     // here had it been this one, unless it has just started to move (an idle
@@ -958,15 +1543,31 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
     // (grass, pots), one that moved is this draw only if it moved at an
     // actor's pace (a pot Link carries) and no copy that stood still is
     // nearer; otherwise this draw is a copy that has just come into view.
+    // A few copies none of which stood still are one moving model drawn more
+    // than once (the same parts in two passes): they move as fast as it
+    // does, the boat under full sail 100 units a frame, so a plausible one
+    // is usable at any pace.
+    bool fewMoving = candidates <= kFewCopies;
+    for (size_t i = 0; fewMoving && i < candidates; ++i)
+      fewMoving = !copies[i].still;
     const auto usable = [&](size_t copy) {
       if (camera == nullptr)
         return true;
       const double moved = motion_error(*camera, here, copies[copy].position);
       if (copies[copy].still)
         return moved <= 4.0 * tolerance;
+      // One that kept its place in the view: it moves with the camera, which
+      // follows it (the boat's shadow volume, the same box for every real
+      // shadow, as the boat sails 60 units a frame).
+      const double reach = 40.0 + 0.01 * translation_length(here);
+      if (translation_distance2(here, copies[copy].position) <= reach * reach)
+        return true;
       // A copy that moved at an actor's pace (a pot Link carries), when no
       // copy that stood still is nearer.
-      return moved < nearestStill && moved <= 40.0 + 0.01 * translation_length(here);
+      if (!(moved < nearestStill))
+        return false;
+      return moved <= 40.0 + 0.01 * translation_length(here) ||
+             (fewMoving && plausible_relative(view, current, constantsOf(copy), usedMatrixRows, turnLimit));
     };
     bool anyUsable = false;
     // The same occurrence of the key: a model drawn from a fixed list (a
@@ -974,8 +1575,10 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
     if (occurrence < candidates && usable(occurrence)) {
       anyUsable = true;
       const auto& candidate = constantsOf(occurrence);
-      if (plausible_relative(view, current, candidate, usedMatrixRows))
+      if (plausible_copy(occurrence)) {
         previous = &candidate;
+        chosen = occurrence;
+      }
     }
     if (previous == nullptr && candidates > 1) {
       // Copies that changed places (a depth-sorted list): the nearest plausible.
@@ -986,9 +1589,9 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
           continue;
         anyUsable = true;
         const double d = translation_distance2(here, copies[i].position);
-        if ((previous == nullptr || d < bestDistance) &&
-            plausible_relative(view, current, constantsOf(i), usedMatrixRows)) {
+        if ((previous == nullptr || d < bestDistance) && plausible_copy(i)) {
           previous = &constantsOf(i);
+          chosen = i;
           bestDistance = d;
         }
       }
@@ -1005,7 +1608,7 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
       // turns). It stood where the camera's motion carries it from, so it is
       // blended from there.
       if (usedMatrixRows != 0 || !stood_before(*camera, current, g_stoodBefore) ||
-          !plausible_relative(view, current, g_stoodBefore, 0))
+          !plausible_relative(view, current, g_stoodBefore, 0, kTurnLimit))
         return nullptr;
       if (repeat(BlendPath::StoodBefore, camera, view)) {
         g_blendRepeated = true;
@@ -1031,10 +1634,13 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
       ++g_frameCounts.blended;
       g_outcome = "blended by its own motion";
       g_blendRepeated = true;
+      g_match = {&copies[0], &constantsOf(0), &g_ownMotion}; // made for the same draw before this one
       return &g_blended;
     }
-    Motion own{};
+    Motion& own = g_ownMotion;
+    own = Motion{};
     if (own_motion(constantsOf(0).posnormalmatrix, current.posnormalmatrix, own) && derive(own)) {
+      g_match = {&copies[0], &constantsOf(0), &g_ownMotion};
       blend_relative(own, constantsOf(0), current, blend_weight(), g_blended, usedMatrixRows);
       ++g_frameCounts.blended;
       g_outcome = "blended by its own motion";
@@ -1050,6 +1656,7 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
   }
   ++g_frameCounts.matched;
   const bool relative = view != nullptr && previous->projection[3][2] != 0.f;
+  g_match = {&copies[chosen], previous, relative ? view : nullptr};
   if (repeat(BlendPath::Main, previous, relative ? view : nullptr)) {
     if (g_lastBlend.identical) {
       ++g_frameCounts.identical;
@@ -1075,6 +1682,54 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
   g_outcome = "blended";
   return &g_blended;
 }
+
+const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::VertexShaderConstants& current,
+                                             bool repeatsLastDraw) {
+  g_haveBlendedPositions = false;
+  g_match = {};
+  const bool havePositions = !input.positions.empty();
+  const uint32_t count = static_cast<uint32_t>(input.positions.size() / 3u);
+  g_currentTagged = havePositions;
+  g_currentAge = havePositions ? input.age : 0u;
+  FrameRecords& frame = g_frames[g_current];
+  const size_t recorded = frame.records.size();
+  const gxc::VertexShaderConstants* result = match_draw(input.key, input.usedMatrixRows, current, repeatsLastDraw,
+                                                        input.haveSamples ? &input.samples : nullptr);
+  g_currentTagged = false;
+  g_currentAge = 0;
+  // A particle's positions: kept for the next frame, and blended when the
+  // draw was matched (in 3D or 2D, with one matrix).
+  if (!havePositions || frame.records.size() == recorded || input.usedMatrixRows != 0)
+    return result;
+  Record& record = frame.records.back();
+  record.positions = static_cast<uint32_t>(frame.positions.size() / 3u);
+  record.positionCount = count;
+  frame.positions.insert(frame.positions.end(), input.positions.begin(), input.positions.end());
+  const Record* before = g_match.record;
+  if (before == nullptr || g_match.block == nullptr || before->positions == kNoSamples ||
+      before->positionCount != count)
+    return result;
+  const FrameRecords& previousFrame = g_frames[g_current ^ 1u];
+  const float* now = frame.positions.data() + static_cast<size_t>(record.positions) * 3u;
+  const float* then = previousFrame.positions.data() + static_cast<size_t>(before->positions) * 3u;
+  const float(*inBetween)[4] = result != nullptr ? result->posnormalmatrix : current.posnormalmatrix;
+  g_haveBlendedPositions =
+      blend_positions(then, now, count, g_match.block->posnormalmatrix, current.posnormalmatrix, g_match.motion,
+                      inBetween, blend_weight(), true, g_blendedPositions);
+  if (g_haveBlendedPositions)
+    ++g_frameCounts.positions;
+  return result;
+}
+
+const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRows,
+                                             const gxc::VertexShaderConstants& current, bool repeatsLastDraw) {
+  DrawInput input;
+  input.key = key;
+  input.usedMatrixRows = usedMatrixRows;
+  return blend_draw(input, current, repeatsLastDraw);
+}
+
+const float* blended_positions() noexcept { return g_haveBlendedPositions ? g_blendedPositions.data() : nullptr; }
 
 bool last_blend_repeated() noexcept { return g_blendRepeated; }
 
@@ -1132,14 +1787,16 @@ void end_game_frame() noexcept {
               180.0 / M_PI;
     std::fprintf(stderr,
                  "[frame-interp-frame] frame=%llu verdict=%d draws=%llu blended=%llu rejected=%llu unmatched=%llu "
-                 "camera=%s turn=%.1f votes=%u fresh=%llu\n",
+                 "camera=%s turn=%.1f votes=%u fresh=%llu moved=%llu positions=%llu\n",
                  static_cast<unsigned long long>(g_gameFrame.load(std::memory_order_relaxed)), g_lastVerdictSeen,
                  static_cast<unsigned long long>(g_frameCounts.draws),
                  static_cast<unsigned long long>(g_frameCounts.blended),
                  static_cast<unsigned long long>(g_frameCounts.rejected),
                  static_cast<unsigned long long>(g_frameCounts.unmatched),
                  camera == nullptr ? "none" : (camera == &g_predicted ? "predicted" : "voted"), angle,
-                 camera == nullptr ? 0u : camera->votes, static_cast<unsigned long long>(g_frameCounts.fresh));
+                 camera == nullptr ? 0u : camera->votes, static_cast<unsigned long long>(g_frameCounts.fresh),
+                 static_cast<unsigned long long>(g_frameCounts.moved),
+                 static_cast<unsigned long long>(g_frameCounts.positions));
   }
   g_frameCounts = {};
 
@@ -1182,7 +1839,10 @@ bool dump_frame(uint64_t frame) noexcept {
 }
 
 const char* last_outcome() noexcept { return g_outcome; }
-bool tracing() noexcept { return g_traceFrame != 0 && g_gameFrame.load(std::memory_order_relaxed) == g_traceFrame; }
+bool tracing() noexcept {
+  const uint64_t frame = g_gameFrame.load(std::memory_order_relaxed);
+  return g_trace.first != 0 && frame >= g_trace.first && frame <= g_trace.last;
+}
 
 uint64_t game_frame_number() noexcept { return g_gameFrame.load(std::memory_order_relaxed); }
 
