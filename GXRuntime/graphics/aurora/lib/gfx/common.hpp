@@ -304,12 +304,21 @@ static Range push_indices(ArrayRef<T> data, size_t alignment) {
   return push_indices(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T), alignment);
 }
 Range push_uniform(const uint8_t* data, size_t length);
-// A block for the in-between frame; an empty range when the area is full
-// (the draw then keeps its own constants there).
-Range push_interp_uniform(const uint8_t* data, size_t length);
 // Identifies the frame packet (a new one per frame and per staging segment)
 // that staging ranges belong to; 0 when no frame is recording.
 uint64_t current_frame_id();
+// In-between blocks made off the recording thread (gxcore_draw.cpp matches and
+// blends draws on a helper thread): the recording frame's slot, a block pushed
+// into a given slot's area and its bytes there (plain memory, unlike the
+// mapped staging buffers), and each job's range, recorded in job order.
+size_t recording_frame_slot();
+// An empty range when the area is full (the draw then keeps its own constants).
+Range push_interp_uniform(size_t slot, const uint8_t* data, size_t length);
+const uint8_t* interp_uniform_bytes(size_t slot, Range range);
+void resolve_interp_job(size_t slot, Range range);
+// Render worker, while the in-between frame is encoded: a job's range (empty
+// when the draw keeps its own constants).
+Range interp_job_range(uint32_t job);
 template <typename T>
 static Range push_uniform(const T& data) {
   return push_uniform(reinterpret_cast<const uint8_t*>(&data), sizeof(T));

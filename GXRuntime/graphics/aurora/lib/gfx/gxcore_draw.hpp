@@ -22,6 +22,9 @@ struct DrawData {
   // The constants blended toward the previous frame, used while the
   // in-between frame is encoded (frame_interp.hpp); uniformRange otherwise.
   Range interpUniformRange;
+  // Or the helper thread's job that makes them (interp_job_range), when the
+  // draw was matched off the recording thread; UINT32_MAX when not.
+  uint32_t interpJob = UINT32_MAX;
   Range pixelUniformRange;  // PixelShaderConstants (group 2), TEV path only
   uint32_t indexCount;
   BindGroupRef textureBindGroup; // 0 when untextured
@@ -68,6 +71,9 @@ void copy_efb_to_texture(const gxruntime::gxcore::EfbCopyCommand& cmd);
 // format to RGBA8, S13 A3), viewport state, and a queued draw command on the
 // current pass. False = plan not drawable.
 bool submit_draw_plan(const gxruntime::gxcore::DrawPlan& plan);
+// Waits until the helper thread has matched and blended every draw submitted
+// so far (end_frame calls it before a frame packet is handed on).
+void wait_interp_jobs();
 // Drop the texture cache + reset its stats (start of a replay run).
 void reset_texture_cache();
 // Once per presented frame: small textures are re-hashed at most once a frame.

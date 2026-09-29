@@ -252,6 +252,10 @@ static std::array<FramePacket, FrameSlotCount> g_framePackets;
 // In-between frame uniforms, per frame slot (see push_interp_uniform).
 constexpr uint64_t InterpUniformBufferSize = 33554432; // 32mb
 static std::array<std::vector<uint8_t>, FrameSlotCount> g_interpUniformStaging;
+// Per frame slot, the range each in-between job resolved to, in job order
+// (gxcore_draw.cpp's helper writes them; end_frame waits for it).
+static std::array<std::vector<Range>, FrameSlotCount> g_interpJobRanges;
+static size_t g_replayFrameSlot = 0; // render worker: the frame whose in-between frame is encoded
 static uint64_t g_interpUniformOverflows = 0; // recording thread
 static wgpu::Buffer g_interpUniformBuffer;
 wgpu::BindGroup g_interpUniformBindGroup;
@@ -287,6 +291,7 @@ static constexpr auto FrameStartSafetyMargin = std::chrono::milliseconds{2};
 // its packet.
 static bool g_segmentEnding = false;
 static webgpu::TextureWithSampler g_heldFrame; // the real frame, kept for its later present
+static bool g_heldShown = false;                 // the screen shows g_heldFrame (render worker)
 struct DeferredPresent {
   bool active = false;
   PresentClock::time_point due;
@@ -300,6 +305,7 @@ static void deferred_present_tick();
 static bool note_game_frame_end();
 static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::CommandEncoder& encoder,
                                     const EndFrameCallback& callback);
+static void present_held(wgpu::CommandEncoder& encoder, const EndFrameCallback& callback);
 static constexpr auto MaxPacingSample = std::chrono::milliseconds{250};
 static constexpr uint32_t PacingEmaWeight = 8;
 
@@ -1132,6 +1138,9 @@ void initialize() {
 }
 
 void shutdown() {
+#ifdef AURORA_ENABLE_GXCORE
+  gxcore::wait_interp_jobs();
+#endif
   render_worker::synchronize();
   render_worker::shutdown();
   g_deferredPresent = {};
@@ -1256,6 +1265,7 @@ bool begin_frame(bool preserveEfb) {
   frame.stagingBuffer = *stagingSlot;
   frame.continuation = preserveEfb;
   g_interpUniformStaging[frameSlot].clear();
+  g_interpJobRanges[frameSlot].clear();
   g_recordingFrame = &frame;
   g_recordingFrameSlot = frameSlot;
 
@@ -1377,6 +1387,11 @@ void end_frame(EndFrameCallback callback) {
   ZoneScoped;
   ASSERT(!g_inOffscreen, "end_frame called while offscreen rendering is active");
   ASSERT(g_currentRenderPass == UINT32_MAX, "end_frame called before finish finalized the current render pass");
+#ifdef AURORA_ENABLE_GXCORE
+  // The frame's in-between blocks, matched and blended on the helper thread,
+  // are complete before its verdict and before the render worker sees it.
+  gxcore::wait_interp_jobs();
+#endif
   if (g_cpuFrameStart.time_since_epoch().count() != 0) {
     const auto cpuFrameTime = PresentClock::now() - g_cpuFrameStart;
     update_ema(g_cpuFrameTimeNs, duration_ns(cpuFrameTime));
@@ -1453,10 +1468,15 @@ void end_frame(EndFrameCallback callback) {
     // A real frame still waiting behind its in-between frame is shown first:
     // presents stay in order, and this frame may overwrite the held copy.
     run_deferred_present();
+    const bool presents = packet.presents;
     bool interpolate = false;
-    if (packet.presents) {
+    bool hold = false;
+    if (presents) {
       const bool periodKnown = note_game_frame_end();
       interpolate = packet.interpolate && callback && periodKnown;
+      // In-between frames on, but nothing in this frame to blend (a still
+      // scene, a menu, a cut): the same cadence (present_held).
+      hold = !interpolate && callback && periodKnown && frame_interp::enabled();
     }
     if (!interpolate) {
       packet = {};
@@ -1471,7 +1491,11 @@ void end_frame(EndFrameCallback callback) {
     if (interpolate) {
       present_with_in_between(packet, frameSlot, encoder, callback);
       packet = {};
+    } else if (hold) {
+      present_held(encoder, callback);
     } else if (callback) {
+      if (presents)
+        g_heldShown = false;
       callback(encoder);
     }
     g_frameSlots.release(frameSlot);
@@ -1877,6 +1901,7 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
   upload_interp_uniforms(frameSlot);
   static constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "In-between frame encoder"};
   auto between = g_device.CreateCommandEncoder(&EncoderDescriptor);
+  g_replayFrameSlot = frameSlot;
   frame_interp::set_encoding_interpolated(true);
   static const bool dumpPasses = std::getenv("DOL_AURORA_FRAME_INTERP_DUMP_PASSES") != nullptr;
   for (size_t i = 0; i < frame.ops.size(); ++i) {
@@ -1909,6 +1934,46 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
   };
 }
 
+// A frame with nothing to blend while in-between frames are on (a still scene,
+// a menu, a cut the verdict turned down) keeps their cadence: the frame on
+// screen is shown again now, where an in-between frame would go, and this one
+// half a game frame later, where an interpolated frame's real frame goes.
+// Presenting it at once instead put it on screen half a frame early at every
+// cut (a judder where the blended frames stop and start), and the frame rate
+// read 30 in every menu.
+static void present_held(wgpu::CommandEncoder& encoder, const EndFrameCallback& callback) {
+  ZoneScopedN("Present held frame");
+  if (g_heldShown) {
+    webgpu::set_present_source_override(&g_heldFrame);
+    static constexpr wgpu::CommandEncoderDescriptor RepeatDescriptor{.label = "Repeated frame present encoder"};
+    auto repeat = g_device.CreateCommandEncoder(&RepeatDescriptor);
+    callback(repeat);
+    webgpu::set_present_source_override(nullptr);
+  }
+  const auto& source = webgpu::present_source();
+  ensure_held_frame(source);
+  {
+    const wgpu::TexelCopyTextureInfo src{.texture = source.texture};
+    const wgpu::TexelCopyTextureInfo dst{.texture = g_heldFrame.texture};
+    const wgpu::Extent3D extent{source.size.width, source.size.height, 1};
+    encoder.CopyTextureToTexture(&src, &dst, &extent);
+  }
+  webgpu::gpu_prof::frame_end(encoder);
+  {
+    const wgpu::CommandBufferDescriptor descriptor{.label = "Held frame command buffer"};
+    const auto buffer = encoder.Finish(&descriptor);
+    g_queue.Submit(1, &buffer);
+  }
+  webgpu::gpu_prof::after_submit();
+  after_submit();
+  const int64_t halfNs = std::clamp<int64_t>(g_gameFramePeriodNs / 2, 6'000'000, 40'000'000);
+  g_deferredPresent = DeferredPresent{
+      .active = true,
+      .due = PresentClock::now() + std::chrono::nanoseconds{halfNs},
+      .callback = callback,
+  };
+}
+
 static void run_deferred_present() {
   if (!g_deferredPresent.active) {
     return;
@@ -1921,6 +1986,7 @@ static void run_deferred_present() {
   auto encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
   callback(encoder);
   webgpu::set_present_source_override(nullptr);
+  g_heldShown = true;
 }
 
 static void deferred_present_tick() {
@@ -2106,17 +2172,32 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
   return push(current_frame_packet().indices, data, length, alignment);
 }
 
-Range push_interp_uniform(const uint8_t* data, size_t length) {
-  auto& staging = g_interpUniformStaging[g_recordingFrameSlot];
+size_t recording_frame_slot() { return g_recordingFrameSlot; }
+
+Range push_interp_uniform(size_t slot, const uint8_t* data, size_t length) {
+  auto& staging = g_interpUniformStaging[slot];
   const size_t offset = AURORA_ALIGN(staging.size(), g_cachedLimits.minUniformBufferOffsetAlignment);
   // The bind group reads MaxUniformSize from the offset.
   if (offset + std::max<size_t>(length, gx::MaxUniformSize) > InterpUniformBufferSize) {
     ++g_interpUniformOverflows;
     return {};
   }
-  staging.resize(offset + length);
-  std::memcpy(staging.data() + offset, data, length);
+  // Padded to the offset, then appended: resizing over the block would clear
+  // it before the copy, a second pass over 2.8 KB for every blended draw.
+  staging.resize(offset);
+  staging.insert(staging.end(), data, data + length);
   return {static_cast<uint32_t>(offset), static_cast<uint32_t>(length)};
+}
+
+const uint8_t* interp_uniform_bytes(size_t slot, Range range) {
+  return g_interpUniformStaging[slot].data() + range.offset;
+}
+
+void resolve_interp_job(size_t slot, Range range) { g_interpJobRanges[slot].push_back(range); }
+
+Range interp_job_range(uint32_t job) {
+  const auto& ranges = g_interpJobRanges[g_replayFrameSlot];
+  return job < ranges.size() ? ranges[job] : Range{};
 }
 
 Range push_uniform(const uint8_t* data, size_t length) {
