@@ -116,3 +116,12 @@ target_include_directories(os_alloc_tests PRIVATE
 target_compile_definitions(os_alloc_tests PRIVATE AURORA TARGET_PC)
 target_link_libraries(os_alloc_tests PRIVATE gtest gtest_main fmt::fmt)
 gtest_discover_tests(os_alloc_tests)
+
+if (TARGET GXRuntime::gxcore)
+  add_executable(gxcore_viewport_tests gxcore_viewport_test.cpp)
+  target_include_directories(gxcore_viewport_tests PRIVATE ../include ../lib)
+  target_compile_definitions(gxcore_viewport_tests PRIVATE AURORA TARGET_PC)
+  target_link_libraries(gxcore_viewport_tests PRIVATE GXRuntime::gxcore gtest gtest_main
+    fmt::fmt xxhash absl::flat_hash_map dawn::dawncpp_headers TracyClient ${AURORA_SDL3_TARGET})
+  gtest_discover_tests(gxcore_viewport_tests)
+endif()
