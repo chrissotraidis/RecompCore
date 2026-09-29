@@ -475,6 +475,17 @@ struct DrawPlan {
   // payload differs every frame, so such a draw is matched by its shape.
   bool match_direct_position = false;
   std::uint32_t match_vertex_stride = 0; // payload bytes per vertex
+  // The host's tag for the object this draw is, written just before it to
+  // BP registers the retail GX never uses (kDrawTagRegister and
+  // kDrawTagAgeRegister): the game's particle drawn here and its age in game
+  // frames, so frame interpolation can pair it with itself. 0: none.
+  std::uint32_t draw_tag = 0;
+  std::uint32_t draw_tag_age = 0;
+  // Or, for one of the draws an emitter's callback makes (kDrawScopeRegister:
+  // a wake's fans and strips), that emitter and the draw's place among them
+  // (from 1). 0: none.
+  std::uint32_t draw_scope = 0;
+  std::uint32_t draw_scope_part = 0;
   // Viewport, raw XF values (wd/2, -ht/2, zmax*2^24, xorig+342, yorig+342,
   // farz*2^24) — the submission layer maps these through the substrate's
   // logical-viewport scaling.

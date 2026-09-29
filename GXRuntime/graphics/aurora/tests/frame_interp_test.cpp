@@ -94,6 +94,13 @@ static bool halfway(const Result& result, const Camera& before, const Camera& no
   return true;
 }
 
+// A draw submitted as gxcore_draw.cpp does: its inputs captured from the plan.
+static const gxc::VertexShaderConstants* blend_plan(const gxc::DrawPlan& plan, const gxc::VertexShaderConstants& c) {
+  static fi::DrawInput input;
+  fi::capture_draw(plan, input);
+  return fi::blend_draw(input, c);
+}
+
 int main() {
   fi::set_enabled(true);
   const uint64_t kShip = 11, kTree = 22, kHud = 33;
@@ -310,6 +317,533 @@ int main() {
       CHECK(near(blendedIndexed->transformmatrices[6][3], 40.f));
     }
     fi::end_game_frame();
+  }
+
+  // Sailing: the camera follows the boat. The sea is strips drawn with the
+  // view matrix whose texture coordinates follow the player, so each strip's
+  // key is new every frame (no counterpart). In the in-between frame the sea
+  // must still be seen from the in-between camera, like the islands and the
+  // boat, or the water steps at 30 FPS under a boat that moves at 60.
+  {
+    fi::end_game_frame();
+    fi::end_game_frame();
+    const auto near_translation = [](const gxc::VertexShaderConstants& got, const gxc::VertexShaderConstants& a,
+                                     const gxc::VertexShaderConstants& b) {
+      float length = 0.f;
+      for (int r = 0; r < 3; ++r) {
+        const float expected = (a.posnormalmatrix[r][3] + b.posnormalmatrix[r][3]) / 2.f;
+        length += expected * expected;
+      }
+      const float tolerance = 0.003f * std::sqrt(length) + 0.05f;
+      for (int r = 0; r < 3; ++r) {
+        const float expected = (a.posnormalmatrix[r][3] + b.posnormalmatrix[r][3]) / 2.f;
+        if (std::fabs(got.posnormalmatrix[r][3] - expected) > tolerance)
+          return false;
+      }
+      return true;
+    };
+    // The boat sails 30 units a frame along -z; the camera 600 units behind it
+    // turns a degree a frame.
+    const auto camera_at = [](int frame) { return Camera{float(frame), 0.f, 600.f - 30.f * frame}; };
+    const auto boat_z = [](int frame) { return -30.f * frame; };
+    uint64_t seaKey = 5000;
+    const auto sail = [&](int frame, Result* sea, Result& boat, Result* rooms) {
+      const Camera c = camera_at(frame);
+      for (int room = 0; room < 8; ++room) {
+        const auto* r = fi::blend_draw(8100 + room, 0,
+                                       seen(c.yaw, c.x, c.z, room * 500.f - 2000.f, -60.f, -6000.f - room * 70.f));
+        rooms[room].blended = r != nullptr;
+        if (r != nullptr)
+          rooms[room].constants = *r;
+      }
+      const auto* b = fi::blend_draw(8200, 0, seen(c.yaw, c.x, c.z, 0.f, 20.f, boat_z(frame)));
+      boat.blended = b != nullptr;
+      if (b != nullptr)
+        boat.constants = *b;
+      for (int strip = 0; strip < 8; ++strip) {
+        const auto* s = fi::blend_draw(++seaKey, 0, seen(c.yaw, c.x, c.z, 0.f, 0.f, 0.f), strip > 0);
+        sea[strip].blended = s != nullptr;
+        if (s != nullptr)
+          sea[strip].constants = *s;
+      }
+    };
+    Result sea[8], boat, rooms[8];
+    sail(0, sea, boat, rooms);
+    fi::end_game_frame();
+    sail(1, sea, boat, rooms);
+    fi::end_game_frame();
+    sail(2, sea, boat, rooms);
+    CHECK(fi::frame_verdict());
+    const auto viewBefore = seen(camera_at(1).yaw, camera_at(1).x, camera_at(1).z, 0.f, 0.f, 0.f);
+    const auto viewNow = seen(camera_at(2).yaw, camera_at(2).x, camera_at(2).z, 0.f, 0.f, 0.f);
+    bool seaHalfway = true;
+    for (int strip = 0; strip < 8; ++strip)
+      seaHalfway = seaHalfway && sea[strip].blended && near_translation(sea[strip].constants, viewBefore, viewNow);
+    CHECK(seaHalfway);
+    // Every strip the same: the in-between block of the first is reused.
+    CHECK(sea[7].blended && std::memcmp(&sea[7].constants, &sea[0].constants, sizeof(sea[0].constants)) == 0);
+    const auto boatBefore = seen(camera_at(1).yaw, camera_at(1).x, camera_at(1).z, 0.f, 20.f, boat_z(1));
+    const auto boatNow = seen(camera_at(2).yaw, camera_at(2).x, camera_at(2).z, 0.f, 20.f, boat_z(2));
+    CHECK(boat.blended && near_translation(boat.constants, boatBefore, boatNow));
+    fi::end_game_frame();
+
+    // Turning at open sea, in the game's order: a few draws with the view
+    // matrix (effects, some of them copies), the sky around the camera, then
+    // the boat's many parts, then distant copies (rocks, clouds), the wave
+    // crests (copies drawn with the view matrix) and the far islands last.
+    // The boat's parts, which hardly move in the camera's view, outnumber
+    // everything drawn before the scenery, but the camera's motion must still
+    // be the one that carries the distant copies and the crests.
+    fi::end_game_frame();
+    fi::end_game_frame();
+    const auto turning = [](int frame) { return Camera{2.f * frame, 0.f, 600.f - 30.f * frame}; };
+    // The camera follows the boat as it turns: the boat stays in front of it,
+    // bobbing a little.
+    const auto boat_part = [](int part, int frame) {
+      return draw_at(part * 2.f, 20.f + part + 0.5f * (frame % 2), -600.f - part);
+    };
+    Result far[5], crests[10], boatParts[20];
+    const auto open_sea = [&](int frame, bool check) {
+      const Camera c = turning(frame);
+      fi::blend_draw(9001, 0, seen(c.yaw, c.x, c.z, 0.f, 0.f, 0.f));
+      fi::blend_draw(9002, 0, seen(c.yaw, c.x, c.z, 0.f, 0.f, 0.f), true);
+      for (int effect = 0; effect < 3; ++effect)
+        for (int copy = 0; copy < 12; ++copy)
+          fi::blend_draw(9010 + effect, 0, seen(c.yaw, c.x, c.z, 0.f, 0.f, 0.f), true);
+      for (int sky = 0; sky < 8; ++sky)
+        fi::blend_draw(9020 + sky, 0, seen(c.yaw, c.x, c.z, c.x + sky * 3.f, 40.f * sky, c.z - 5.f * sky));
+      for (int part = 0; part < 20; ++part) {
+        const auto* p = fi::blend_draw(9100 + part, 0, boat_part(part, frame));
+        boatParts[part].blended = p != nullptr;
+        if (p != nullptr)
+          boatParts[part].constants = *p;
+      }
+      for (int copy = 0; copy < 5; ++copy) {
+        const auto* p = fi::blend_draw(9200, 0, seen(c.yaw, c.x, c.z, -4000.f + copy * 2000.f, 300.f, -30000.f));
+        far[copy].blended = p != nullptr;
+        if (p != nullptr)
+          far[copy].constants = *p;
+      }
+      for (int copy = 0; copy < 10; ++copy) {
+        const auto* p = fi::blend_draw(9300, 0, seen(c.yaw, c.x, c.z, 0.f, 0.f, 0.f), copy > 0);
+        crests[copy].blended = p != nullptr;
+        if (p != nullptr)
+          crests[copy].constants = *p;
+      }
+      for (int island = 0; island < 6; ++island)
+        fi::blend_draw(9400 + island, 0,
+                       seen(c.yaw, c.x, c.z, island * 20000.f - 50000.f, -100.f, -80000.f - island * 5000.f));
+      if (!check)
+        return;
+      const Camera b = turning(frame - 1);
+      bool farHalfway = true;
+      for (int copy = 0; copy < 5; ++copy) {
+        const float x = -4000.f + copy * 2000.f;
+        farHalfway = farHalfway && far[copy].blended &&
+                     near_translation(far[copy].constants, seen(b.yaw, b.x, b.z, x, 300.f, -30000.f),
+                                      seen(c.yaw, c.x, c.z, x, 300.f, -30000.f));
+      }
+      CHECK(farHalfway);
+      bool crestsHalfway = true;
+      for (int copy = 0; copy < 10; ++copy)
+        crestsHalfway = crestsHalfway && crests[copy].blended &&
+                        near_translation(crests[copy].constants, seen(b.yaw, b.x, b.z, 0.f, 0.f, 0.f),
+                                         seen(c.yaw, c.x, c.z, 0.f, 0.f, 0.f));
+      CHECK(crestsHalfway);
+      bool boatHalfway = true;
+      for (int part = 0; part < 20; ++part)
+        boatHalfway = boatHalfway && boatParts[part].blended &&
+                      near_translation(boatParts[part].constants, boat_part(part, frame - 1), boat_part(part, frame));
+      CHECK(boatHalfway);
+    };
+    open_sea(0, false);
+    fi::end_game_frame();
+    open_sea(1, false);
+    fi::end_game_frame();
+    open_sea(2, true);
+    CHECK(fi::frame_verdict());
+    fi::end_game_frame();
+    open_sea(3, true);
+    fi::end_game_frame();
+  }
+
+  // Under full sail (100 units a frame, the camera following): the hull is
+  // skinned and each of its parts is drawn twice, into the shadow map (an
+  // orthographic projection) and into the scene, and some parts twice into
+  // the scene. None of these draws is a copy come into view: each must be
+  // drawn halfway, or the in-between frame shows a second hull ahead of it.
+  {
+    fi::end_game_frame();
+    fi::end_game_frame();
+    const auto camera_at = [](int frame) { return Camera{1.f * frame, 0.f, 700.f - 100.f * frame}; };
+    // A skinned draw of a model at world (x, y, z): its matrix in XF row 0.
+    const auto skinned = [](const Camera& c, float x, float y, float z, bool shadowMap) {
+      auto constants = seen(c.yaw, c.x, c.z, 0.f, 0.f, 0.f);
+      const auto model = seen(c.yaw, c.x, c.z, x, y, z);
+      std::memcpy(constants.transformmatrices[0], model.posnormalmatrix, sizeof(float) * 12);
+      if (shadowMap) {
+        std::memset(constants.projection, 0, sizeof(constants.projection));
+        constants.projection[0][0] = constants.projection[1][1] = 0.002f;
+        constants.projection[2][2] = -0.001f;
+        constants.projection[3][3] = 1.f;
+      }
+      return constants;
+    };
+    const auto hull_z = [](int frame) { return 100.f - 100.f * frame; };
+    const auto halfway_row0 = [](const gxc::VertexShaderConstants* got, const gxc::VertexShaderConstants& a,
+                                 const gxc::VertexShaderConstants& b) {
+      if (got == nullptr)
+        return false;
+      for (int r = 0; r < 3; ++r) {
+        const float expected = (a.transformmatrices[r][3] + b.transformmatrices[r][3]) / 2.f;
+        if (std::fabs(got->transformmatrices[r][3] - expected) > 0.5f)
+          return false;
+      }
+      return true;
+    };
+    bool hullHalfway = true, twiceHalfway = true;
+    for (int frame = 0; frame < 4; ++frame) {
+      const Camera c = camera_at(frame), b = camera_at(frame - 1);
+      for (int room = 0; room < 8; ++room)
+        fi::blend_draw(9500 + room, 0, seen(c.yaw, c.x, c.z, room * 700.f - 2500.f, -60.f, -5000.f - room * 90.f));
+      for (int part = 0; part < 3; ++part)
+        fi::blend_draw(9600 + part, 1, skinned(c, part * 30.f, 0.f, hull_z(frame), true));
+      for (int part = 0; part < 3; ++part) {
+        const auto* got = fi::blend_draw(9600 + part, 1, skinned(c, part * 30.f, 0.f, hull_z(frame), false));
+        if (frame >= 2)
+          hullHalfway = hullHalfway && halfway_row0(got, skinned(b, part * 30.f, 0.f, hull_z(frame - 1), false),
+                                                    skinned(c, part * 30.f, 0.f, hull_z(frame), false));
+      }
+      for (int copy = 0; copy < 2; ++copy) {
+        const auto* got = fi::blend_draw(9700, 1, skinned(c, 0.f, 40.f, hull_z(frame), false), copy == 1);
+        if (frame >= 2)
+          twiceHalfway = twiceHalfway && halfway_row0(got, skinned(b, 0.f, 40.f, hull_z(frame - 1), false),
+                                                      skinned(c, 0.f, 40.f, hull_z(frame), false));
+      }
+      if (frame >= 2)
+        CHECK(fi::frame_verdict());
+      fi::end_game_frame();
+    }
+    CHECK(hullHalfway);
+    CHECK(twiceHalfway);
+  }
+
+  // The boat's hull is skinned on the CPU: the game rewrites its vertices in
+  // world space every frame and draws them with the view matrix, so its key
+  // and matrices match the frame before while its vertices moved 100 units.
+  // The in-between frame draws this frame's vertices: with the view blended
+  // alone, the hull would be where it is now, half a frame ahead of the rest
+  // of the boat. Its vertices must land halfway between the two frames.
+  {
+    fi::end_game_frame();
+    fi::end_game_frame();
+    const uint8_t payload[] = {0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5};
+    const float local[6][3] = {{-40, 0, -90}, {40, 0, -90}, {-45, 30, 0}, {45, 30, 0}, {-30, 10, 80}, {30, 10, 80}};
+    const auto camera_at = [](int frame) { return Camera{0.f, 0.f, 700.f - 100.f * frame}; };
+    // The boat turns 3 degrees a frame about its middle, 100 units ahead.
+    const auto world = [&](int frame, int v, float out[3]) {
+      const float a = 3.f * frame * 3.14159265f / 180.f, cs = std::cos(a), sn = std::sin(a);
+      out[0] = cs * local[v][0] + sn * local[v][2];
+      out[1] = local[v][1];
+      out[2] = -sn * local[v][0] + cs * local[v][2] - 100.f * frame;
+    };
+    const auto seen_at = [](const float m[][4], const float p[3], float out[3]) {
+      for (int r = 0; r < 3; ++r)
+        out[r] = m[r][0] * p[0] + m[r][1] * p[1] + m[r][2] * p[2] + m[r][3];
+    };
+    float drawn[3][6][3]; // each real frame's view-space vertices
+    bool hullHalfway = true;
+    for (int frame = 0; frame < 3; ++frame) {
+      const Camera c = camera_at(frame);
+      for (int room = 0; room < 8; ++room)
+        fi::blend_draw(9800 + room, 0, seen(c.yaw, c.x, c.z, room * 700.f - 2500.f, -60.f, -5000.f - room * 90.f));
+      gxc::DrawPlan plan;
+      plan.match_payload = payload;
+      plan.match_payload_size = sizeof(payload);
+      plan.match_primitive = 0x98;
+      plan.match_vertex_stride = 2;
+      plan.vertex_count = 6;
+      plan.vertices.assign(6 * gxc::kVertexFloats, 0.f);
+      for (int v = 0; v < 6; ++v)
+        world(frame, v, &plan.vertices[v * gxc::kVertexFloats]);
+      const auto view = seen(c.yaw, c.x, c.z, 0.f, 0.f, 0.f);
+      for (int v = 0; v < 6; ++v)
+        seen_at(view.posnormalmatrix, &plan.vertices[v * gxc::kVertexFloats], drawn[frame][v]);
+      const auto* got = blend_plan(plan, view);
+      if (frame == 2) {
+        hullHalfway = got != nullptr;
+        for (int v = 0; hullHalfway && v < 6; ++v) {
+          float at[3];
+          seen_at(got->posnormalmatrix, &plan.vertices[v * gxc::kVertexFloats], at);
+          for (int r = 0; r < 3; ++r)
+            hullHalfway = hullHalfway && std::fabs(at[r] - (drawn[1][v][r] + drawn[2][v][r]) / 2.f) < 1.f;
+        }
+        CHECK(fi::frame_verdict());
+      }
+      fi::end_game_frame();
+    }
+    CHECK(hullHalfway);
+  }
+
+  // A bone of Link's sword arm turns 100 degrees in one game frame: a draw
+  // with a key of its own is still blended, halfway along the turn (50
+  // degrees, its size kept, not a straight blend shrunk to 64 percent), with
+  // its scale blended straight.
+  {
+    fi::end_game_frame();
+    fi::end_game_frame();
+    const auto scaled = [](gxc::VertexShaderConstants c, float k) {
+      for (int r = 0; r < 3; ++r)
+        for (int col = 0; col < 3; ++col)
+          c.posnormalmatrix[r][col] *= k;
+      return c;
+    };
+    fi::blend_draw(8001, 0, draw_at(10, 0, -400, 0.f));
+    fi::blend_draw(8002, 0, scaled(draw_at(-10, 0, -400, 0.f), 1.f));
+    fi::blend_draw(8003, 0, draw_at(30, 0, -400, 0.f));
+    fi::blend_draw(8003, 0, draw_at(60, 0, -400, 0.f));
+    fi::end_game_frame();
+    const auto* bone = fi::blend_draw(8001, 0, draw_at(10, 0, -400, 100.f));
+    CHECK(bone != nullptr);
+    if (bone != nullptr) {
+      const float c50 = std::cos(50.f * 3.14159265f / 180.f), s50 = std::sin(50.f * 3.14159265f / 180.f);
+      CHECK(std::fabs(bone->posnormalmatrix[0][0] - c50) < 1e-3f && std::fabs(bone->posnormalmatrix[0][2] - s50) < 1e-3f);
+      CHECK(std::fabs(bone->posnormalmatrix[2][0] + s50) < 1e-3f && std::fabs(bone->posnormalmatrix[1][1] - 1.f) < 1e-3f);
+      CHECK(near(bone->posnormalmatrix[0][3], 10.f) && near(bone->posnormalmatrix[2][3], -400.f));
+    }
+    const auto* grown = fi::blend_draw(8002, 0, scaled(draw_at(-10, 0, -400, 90.f), 1.3f));
+    CHECK(grown != nullptr);
+    if (grown != nullptr) {
+      const float c45 = std::cos(45.f * 3.14159265f / 180.f);
+      CHECK(std::fabs(grown->posnormalmatrix[0][0] - 1.15f * c45) < 1e-3f);
+      CHECK(std::fabs(grown->posnormalmatrix[1][1] - 1.15f) < 1e-3f);
+    }
+    // Two copies that changed places in the list, each turning 100 degrees
+    // where it stands: each pairs with the one nearest it, itself, not with
+    // the one at its place in the list.
+    const auto* swappedA = fi::blend_draw(8003, 0, draw_at(60, 0, -400, 100.f));
+    CHECK(swappedA != nullptr && near(swappedA->posnormalmatrix[0][3], 60.f));
+    const auto* swappedB = fi::blend_draw(8003, 0, draw_at(30, 0, -400, 100.f));
+    CHECK(swappedB != nullptr && near(swappedB->posnormalmatrix[0][3], 30.f));
+    // A small turn is still a straight blend (the same to within float).
+    fi::end_game_frame();
+    fi::blend_draw(8001, 0, draw_at(10, 0, -400, 110.f));
+    fi::end_game_frame();
+    const auto* small = fi::blend_draw(8001, 0, draw_at(10, 0, -400, 106.f));
+    CHECK(small != nullptr && std::fabs(small->posnormalmatrix[0][0] - (std::cos(1.91986f) + std::cos(1.85005f)) / 2.f) < 1e-5f);
+  }
+
+  // Particles: the game sends each one's corners as positions, and the host
+  // tags each draw with its particle and age. Each is drawn halfway between
+  // its own two places, even when the list's order changes; a new particle at
+  // a dead one's address, or a jump no particle makes, keeps its own.
+  {
+    static const uint8_t payload[48] = {1};
+    const auto particle = [](uint32_t tag, uint32_t age, float x, float y) {
+      gxc::DrawPlan plan;
+      plan.match_payload = payload;
+      plan.match_payload_size = sizeof(payload);
+      plan.match_primitive = 0x80;
+      plan.match_direct_position = true;
+      plan.vertex_count = 4;
+      plan.draw_tag = tag;
+      plan.draw_tag_age = age;
+      plan.tex_address = 0x1234;
+      plan.vertices.assign(4 * gxc::kVertexFloats, 0.f);
+      const float corners[4][2] = {{-5, 5}, {5, 5}, {5, -5}, {-5, -5}};
+      for (int i = 0; i < 4; ++i) {
+        float* v = plan.vertices.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float);
+        v[0] = x + corners[i][0];
+        v[1] = y + corners[i][1];
+        v[2] = -400.f;
+      }
+      return plan;
+    };
+    // A billboard: view-space corners and the identity matrix.
+    const auto identity = draw_at(0, 0, 0);
+    const auto submit = [&](const gxc::DrawPlan& plan) {
+      blend_plan(plan, identity);
+      return fi::blended_positions();
+    };
+    fi::end_game_frame();
+    fi::end_game_frame();
+    submit(particle(100, 3, 0, 0));
+    submit(particle(101, 7, 50, 0));
+    submit(particle(102, 9, -50, 0));
+    submit(particle(103, 2, 0, 80));
+    fi::end_game_frame();
+    // The list's order changed (a new particle first); each still pairs with
+    // itself.
+    CHECK(submit(particle(104, 0, 200, 0)) == nullptr); // new
+    const float* second = submit(particle(101, 8, 70, 10));
+    CHECK(second != nullptr && near(second[0], 60.f - 5.f) && near(second[1], 5.f + 5.f) && near(second[2], -400.f));
+    const float* first = submit(particle(100, 4, 10, 0));
+    CHECK(first != nullptr && near(first[0], 5.f - 5.f) && near(first[1], 5.f));
+    CHECK(submit(particle(102, 0, -50, 20)) == nullptr);   // a new particle at a dead one's address
+    CHECK(submit(particle(103, 3, 900, 80)) == nullptr);   // too far for a frame
+    // Untagged, one of its shape (the boat's shadow on the sea's triangles
+    // under it): not the same points, so drawn as it is.
+    fi::end_game_frame();
+    auto trail = particle(0, 0, 0, 0);
+    trail.match_primitive = 0x98;
+    blend_plan(trail, identity);
+    fi::end_game_frame();
+    auto moved = particle(0, 0, 8, 0);
+    moved.match_primitive = 0x98;
+    blend_plan(moved, identity);
+    const float* halfway = fi::blended_positions();
+    CHECK(halfway == nullptr);
+
+    // The camera turns 12 degrees past a spark that hangs still: its corners,
+    // sent in the camera's view, change every frame. It is drawn where the
+    // halfway camera sees it, as the rooms around it are.
+    const auto frame = [&](float yaw) {
+      for (int room = 0; room < 8; ++room)
+        fi::blend_draw(900 + room, 0, seen(yaw, 0, 0, room * 300.f - 1000.f, -50.f, -900.f - room * 40.f));
+      const auto at = seen(yaw, 0, 0, 100.f, 20.f, -600.f);
+      auto spark = particle(300, 0, at.posnormalmatrix[0][3], at.posnormalmatrix[1][3]);
+      for (int i = 0; i < 4; ++i)
+        spark.vertices[i * gxc::kVertexFloats + 2] = at.posnormalmatrix[2][3];
+      return spark;
+    };
+    fi::end_game_frame();
+    fi::end_game_frame();
+    submit(frame(0.f));
+    fi::end_game_frame();
+    auto spark = frame(12.f);
+    spark.draw_tag_age = 1;
+    const float* hung = submit(spark);
+    const auto mid = seen(6.f, 0, 0, 100.f, 20.f, -600.f);
+    CHECK(hung != nullptr && std::fabs(hung[0] - (mid.posnormalmatrix[0][3] - 5.f)) < 0.5f &&
+          std::fabs(hung[2] - mid.posnormalmatrix[2][3]) < 0.5f);
+  }
+
+  // The boat's real shadow at full sail. Its volume is one box for every real
+  // shadow (copies of a key), carried along by the boat 60 units a frame, and
+  // the camera follows it: the copies keep their place in the view and pair
+  // with themselves. Its receiving triangles, in the shadow's own texture,
+  // pair with the frame before's though their count changed; their positions
+  // are the next frame's (not the same points).
+  {
+    fi::end_game_frame();
+    fi::end_game_frame();
+    static const uint8_t payload[48] = {2};
+    const auto receiver = [](uint32_t triangles, const gxc::VertexShaderConstants& view) {
+      gxc::DrawPlan plan;
+      plan.constants = view;
+      plan.match_payload = payload;
+      plan.match_payload_size = triangles * 36u;
+      plan.match_primitive = 0x90;
+      plan.match_direct_position = true;
+      plan.vertex_count = triangles * 3u;
+      plan.tex_address = 0x5678;
+      plan.vertices.assign(plan.vertex_count * gxc::kVertexFloats, 0.f);
+      return plan;
+    };
+    const char* outcomes[8] = {};
+    const auto frame = [&](float cameraX, uint32_t triangles, Result* volume, bool& receiverBlended) {
+      for (int room = 0; room < 8; ++room)
+        fi::blend_draw(960 + room, 0, seen(0.f, cameraX, 0, room * 300.f - 1000.f, -50.f, -900.f - room * 40.f));
+      for (int copy = 0; copy < 8; ++copy) {
+        // Bobbing a little with the boat.
+        const auto* r = fi::blend_draw(950, 0, seen(0.f, cameraX, 0, cameraX + copy * 3.f, cameraX * 0.01f - 20.f, -700.f));
+        outcomes[copy] = fi::last_outcome();
+        volume[copy].blended = r != nullptr;
+        if (r != nullptr)
+          volume[copy].constants = *r;
+      }
+      const auto plan = receiver(triangles, seen(0.f, cameraX, 0, 0.f, 0.f, 0.f));
+      receiverBlended = blend_plan(plan, plan.constants) != nullptr;
+      CHECK(fi::blended_positions() == nullptr);
+    };
+    Result volume[8];
+    bool receiverBlended = false;
+    frame(0.f, 18, volume, receiverBlended);
+    fi::end_game_frame();
+    frame(60.f, 18, volume, receiverBlended);
+    fi::end_game_frame();
+    frame(120.f, 16, volume, receiverBlended);
+    CHECK(fi::frame_verdict());
+    CHECK(receiverBlended);
+    for (int copy = 0; copy < 8; ++copy) {
+      CHECK(volume[copy].blended && std::fabs(volume[copy].constants.posnormalmatrix[0][3] - copy * 3.f) < 0.5f &&
+            std::fabs(volume[copy].constants.posnormalmatrix[1][3] - (0.9f - 20.f)) < 0.05f);
+      if (!volume[copy].blended)
+        std::fprintf(stderr, "copy %d: %s\n", copy, outcomes[copy]);
+    }
+  }
+
+  // A broken pot: its shards are one model drawn five times at random sizes,
+  // each flying off and tumbling 70 degrees a frame. Each pairs with itself
+  // (the same place in the list, the same size) and is blended halfway along
+  // its turn.
+  {
+    fi::end_game_frame();
+    fi::end_game_frame();
+    const float sizes[5] = {1.f, 0.575f, 1.389f, 1.298f, 0.775f};
+    const auto shard = [&](int i, int frame) {
+      auto c = draw_at(20.f * i + 3.f * frame, 100.f + 5.f * frame, -480.f, 70.f * frame + 13.f * i);
+      for (int r = 0; r < 3; ++r)
+        for (int col = 0; col < 3; ++col)
+          c.posnormalmatrix[r][col] *= sizes[i];
+      return c;
+    };
+    const auto rooms = [](int) {
+      for (int room = 0; room < 6; ++room)
+        fi::blend_draw(980 + room, 0, draw_at(room * 300.f - 750.f, -50.f, -900.f - room * 40.f));
+    };
+    rooms(0);
+    for (int i = 0; i < 5; ++i)
+      fi::blend_draw(990, 0, shard(i, 0));
+    fi::end_game_frame();
+    rooms(1);
+    for (int i = 0; i < 5; ++i) {
+      const auto* r = fi::blend_draw(990, 0, shard(i, 1));
+      CHECK(r != nullptr);
+      if (r != nullptr) {
+        const float turn = (35.f + 13.f * i) * 3.14159265f / 180.f;
+        CHECK(std::fabs(r->posnormalmatrix[0][0] - sizes[i] * std::cos(turn)) < 2e-3f);
+        CHECK(std::fabs(r->posnormalmatrix[0][3] - (20.f * i + 1.5f)) < 1e-3f);
+      }
+    }
+  }
+
+  // The boat's trail, drawn by its emitter as strips through its particles:
+  // each strip pairs with the one at its place the frame before, and its
+  // vertices blend in order. A steady trail's particles move one place a
+  // frame, so that is the trail half a frame later, and its front stays at
+  // the boat (halfway) instead of half a frame ahead of it.
+  {
+    fi::end_game_frame();
+    fi::end_game_frame();
+    static const uint8_t payload[48] = {3};
+    const auto strip = [](uint32_t part, float boatZ) {
+      gxc::DrawPlan plan;
+      plan.match_payload = payload;
+      plan.match_payload_size = sizeof(payload);
+      plan.match_primitive = 0x98;
+      plan.match_direct_position = true;
+      plan.vertex_count = 6;
+      plan.draw_scope = 0x4321;
+      plan.draw_scope_part = part;
+      plan.vertices.assign(6 * gxc::kVertexFloats, 0.f);
+      for (int i = 0; i < 6; ++i) {
+        float* v = plan.vertices.data() + i * gxc::kVertexFloats;
+        v[0] = (i % 3) * 10.f - 10.f;
+        v[2] = boatZ + 60.f * (part - 1 + i / 3); // a row every 60 units behind the boat
+      }
+      return plan;
+    };
+    const auto view = draw_at(0, -50, -400);
+    const auto s1 = strip(1, 0.f);
+    blend_plan(s1, view);
+    const auto s2 = strip(2, 0.f);
+    blend_plan(s2, view);
+    fi::end_game_frame();
+    const auto n1 = strip(1, -60.f); // the boat sailed 60 units on
+    blend_plan(n1, view);
+    const float* front = fi::blended_positions();
+    CHECK(front != nullptr && near(front[2], -30.f) && near(front[3 * 3 + 2], 30.f));
   }
 
   // Draw keys: the same payload gives the same key; another primitive does not.

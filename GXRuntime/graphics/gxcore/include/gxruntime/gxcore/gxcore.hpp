@@ -125,6 +125,16 @@ public:
 
   std::uint32_t bp(std::uint8_t reg) const { return bp_regs_[reg]; }
   bool bp_valid(std::uint8_t reg) const { return bp_valid_[reg]; }
+  // The draw tag goes with one draw (DrawPlan::draw_tag); a scope starts at
+  // one draw and covers the count of draws it gives (GxCoreSink).
+  void forget_draw_tag() {
+    bp_valid_[kDrawTagRegister] = bp_valid_[kDrawTagAgeRegister] = false;
+    bp_valid_[kDrawScopeRegister] = bp_valid_[kDrawScopeCountRegister] = false;
+  }
+  static constexpr std::uint8_t kDrawTagRegister = 0x7Eu;
+  static constexpr std::uint8_t kDrawTagAgeRegister = 0x7Du;
+  static constexpr std::uint8_t kDrawScopeRegister = 0x7Cu;
+  static constexpr std::uint8_t kDrawScopeCountRegister = 0x7Bu;
 
 private:
   std::uint32_t bp_regs_[256]{};
@@ -198,6 +208,10 @@ private:
   bool replay_overflow_ = false;
   CachedVertexAttrs cached_attrs_{}; // cross-draw N/B/T fallback (stream order)
   DrawPlan scratch_plan_{};          // reused by on_consumed_draw
+  // The draw scope under way: its emitter, the draws left and the next's place.
+  std::uint32_t scope_ = 0;
+  std::uint32_t scope_left_ = 0;
+  std::uint32_t scope_part_ = 0;
   PlanObserver plan_observer_ = nullptr;
   void* plan_observer_user_ = nullptr;
   CopyObserver copy_observer_ = nullptr;
