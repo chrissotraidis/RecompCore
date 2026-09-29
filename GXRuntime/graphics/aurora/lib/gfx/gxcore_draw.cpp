@@ -957,24 +957,58 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
 // filled Aurora's 24 MB uniform staging area in the middle of Wind Waker's
 // Outset frames, and each split waited on the GPU. A draw whose block matches
 // the previous draw's, within the same frame packet, reuses that range.
-// The block a cache last took is compared where it was staged (uniform_bytes,
-// or interp_uniform_bytes for the in-between frames'): a copy of each block
-// kept aside for the comparison was a tenth of the FIFO worker's copying.
+// On Apple GPUs the block a cache last took is compared where it was staged
+// (uniform_bytes, or interp_uniform_bytes for the in-between frames'): the
+// staging area is ordinary memory there, and a copy of each block kept aside
+// for the comparison was a tenth of the FIFO worker's copying. Elsewhere
+// (Direct3D 12, Vulkan) the staging area is the GPU's upload memory, which the
+// CPU reads uncached: comparing there took Wind Waker's Outset frames (14,000
+// draws) 400 ms on the FIFO worker, so the block is kept aside.
+#if defined(__APPLE__)
+#define AURORA_UNIFORM_COMPARE_STAGED 1
+#else
+#define AURORA_UNIFORM_COMPARE_STAGED 0
+#endif
 struct UniformCache {
   Range range{};
   uint64_t frameId = 0;
   uint64_t hits = 0;
   uint64_t pushes = 0;
+#if !AURORA_UNIFORM_COMPARE_STAGED
+  std::vector<uint8_t> bytes; // the block range holds
+#endif
 };
 static UniformCache g_vertexUniformCache;
 static UniformCache g_interpUniformCache;
 static UniformCache g_pixelUniformCache;
 
+// The block the cache last took: `staged` where it was staged, or the copy.
+static const uint8_t* cached_bytes(const UniformCache& cache, const uint8_t* staged) {
+#if AURORA_UNIFORM_COMPARE_STAGED
+  return staged;
+#else
+  (void)staged;
+  return cache.bytes.data();
+#endif
+}
+
+// The cache took `data` (staged at cache.range).
+static void keep_cached(UniformCache& cache, const uint8_t* data, size_t length) {
+#if AURORA_UNIFORM_COMPARE_STAGED
+  (void)cache;
+  (void)data;
+  (void)length;
+#else
+  cache.bytes.assign(data, data + length);
+#endif
+}
+
 // Whether `data` is the block the cache last took, in this frame packet.
 static bool repeats_cached(const UniformCache& cache, const uint8_t* data, size_t length) {
   const uint64_t frameId = current_frame_id();
   return frameId != 0 && cache.frameId == frameId && cache.range.size == length &&
-         std::memcmp(uniform_bytes(cache.range), data, length) == 0;
+         std::memcmp(cached_bytes(cache, AURORA_UNIFORM_COMPARE_STAGED ? uniform_bytes(cache.range) : nullptr), data,
+                     length) == 0;
 }
 
 // The in-between frame's blocks, de-duplicated the same way. repeated: the
@@ -984,13 +1018,17 @@ static bool repeats_cached(const UniformCache& cache, const uint8_t* data, size_
 static Range push_interp_uniform_dedup(UniformCache& cache, uint64_t frameId, size_t slot, const uint8_t* data,
                                        size_t length, bool repeated) {
   if (frameId != 0 && cache.frameId == frameId && cache.range.size == length &&
-      (repeated || std::memcmp(interp_uniform_bytes(slot, cache.range), data, length) == 0)) {
+      (repeated ||
+       std::memcmp(cached_bytes(cache, AURORA_UNIFORM_COMPARE_STAGED ? interp_uniform_bytes(slot, cache.range)
+                                                                     : nullptr),
+                   data, length) == 0)) {
     ++cache.hits;
     return cache.range;
   }
   ++cache.pushes;
   cache.range = push_interp_uniform(slot, data, length);
   cache.frameId = frameId;
+  keep_cached(cache, data, length);
   return cache.range;
 }
 
@@ -1165,7 +1203,9 @@ static Range push_uniform_dedup(UniformCache& cache, const uint8_t* data,
   }();
   const uint64_t frameId = current_frame_id();
   if (enabled && frameId != 0 && cache.frameId == frameId && cache.range.size == length &&
-      (known >= 0 ? known == 1 : std::memcmp(uniform_bytes(cache.range), data, length) == 0)) {
+      (known >= 0 ? known == 1
+                  : std::memcmp(cached_bytes(cache, AURORA_UNIFORM_COMPARE_STAGED ? uniform_bytes(cache.range) : nullptr),
+                                data, length) == 0)) {
     ++cache.hits;
     return cache.range;
   }
@@ -1175,6 +1215,7 @@ static Range push_uniform_dedup(UniformCache& cache, const uint8_t* data,
              cache.hits, cache.hits + cache.pushes);
   cache.range = push_uniform(data, length);
   cache.frameId = frameId;
+  keep_cached(cache, data, length);
   return cache.range;
 }
 
