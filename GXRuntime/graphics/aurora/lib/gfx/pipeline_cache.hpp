@@ -22,6 +22,9 @@ using NewPipelineCallback = std::function<wgpu::RenderPipeline()>;
 
 void initialize_pipeline_cache();
 void shutdown_pipeline_cache();
+// Changes each time the cache is initialized or shut down: a pipeline reference
+// remembered from before names nothing the cache still knows.
+uint32_t pipeline_cache_generation();
 void begin_pipeline_frame();
 void end_pipeline_frame();
 

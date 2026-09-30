@@ -1152,7 +1152,12 @@ PipelineRef find_pipeline(ShaderType type, const gxcore::PipelineConfig& config,
 }
 #endif
 
+static std::atomic<uint32_t> g_pipelineCacheGeneration{0};
+
+uint32_t pipeline_cache_generation() { return g_pipelineCacheGeneration.load(std::memory_order_acquire); }
+
 void initialize_pipeline_cache() {
+  g_pipelineCacheGeneration.fetch_add(1, std::memory_order_acq_rel);
   g_pipelineCacheBroken = false;
   g_pipelineCacheWriterStop = false;
   g_pipelineThreadEnd = false;
@@ -1176,6 +1181,7 @@ void initialize_pipeline_cache() {
 }
 
 void shutdown_pipeline_cache() {
+  g_pipelineCacheGeneration.fetch_add(1, std::memory_order_acq_rel);
   if (g_hasPipelineThread) {
     g_pipelineThreadEnd = true;
     g_pipelineQueueCv.notify_all();

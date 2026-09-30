@@ -1074,8 +1074,28 @@ DrawData* last_recorded_draw() noexcept {
 
 template <>
 PipelineRef pipeline_ref(const gxcore::PipelineConfig& config) {
-  return find_pipeline(ShaderType::GXCore, config,
-                       [=] { return gxcore::create_pipeline(config); });
+  // Most draws use the pipeline of the draw before them (a draw with early
+  // depth looks up its depth pipeline too, so one entry for each). A lookup
+  // built a std::function holding a copy of the whole config - a heap
+  // allocation - and hashed the config before find_pipeline's own check of the
+  // last pipeline, at every draw. A config find_pipeline has seen stays known
+  // to it (queued, compiling or ready) until the cache is shut down.
+  struct Memo {
+    gxcore::PipelineConfig config{};
+    PipelineRef ref = 0;
+    uint32_t generation = 0;
+    bool valid = false;
+  };
+  thread_local Memo memo[2];
+  Memo& m = memo[config.depthOnly != 0 ? 1 : 0];
+  const uint32_t generation = pipeline_cache_generation();
+  if (m.valid && m.generation == generation && std::memcmp(&m.config, &config, sizeof config) == 0)
+    return m.ref;
+  m.ref = find_pipeline(ShaderType::GXCore, config, [=] { return gxcore::create_pipeline(config); });
+  m.config = config;
+  m.generation = generation;
+  m.valid = true;
+  return m.ref;
 }
 #endif
 
