@@ -5,6 +5,7 @@
 #include "gxruntime/platform.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,6 +77,20 @@ void dol_aurora_frame_timing(DolAuroraFrameTiming* out);
    request is otherwise taken only at the next GX write; the host calls this
    at each retrace so a frame finished while the guest idles is not held. */
 void aurora_backend_service_present(void);
+
+/* Save states (debugging). dol_aurora_gx_save_state drains the FIFO worker and
+   returns, in a malloc'd blob (free it), the retail GX front end's register
+   model with the bytes of any command the guest has not finished writing, and
+   the gxcore sink's register state; 0 when there is nothing to save (the
+   recomp path is off, or the front end has failed). dol_aurora_gx_load_state
+   puts one back: resolved texture ranges are resolved again against the
+   current guest memory and the texture cache is emptied. Renderer caches and
+   EFB copies are not saved; they are rebuilt as the game draws. */
+size_t dol_aurora_gx_save_state(void** out);
+bool dol_aurora_gx_load_state(const void* data, size_t size);
+/* Waits for the FIFO worker to finish what the guest has written: before a
+   load replaces guest memory the worker must not still be reading it. */
+void dol_aurora_gx_drain(void);
 
 #ifdef __cplusplus
 }

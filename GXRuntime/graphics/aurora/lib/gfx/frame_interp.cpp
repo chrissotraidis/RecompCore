@@ -1801,6 +1801,9 @@ int frame_steps() noexcept { return g_frameSteps; }
 void set_steps(int steps) noexcept { g_steps.store(std::clamp(steps, 1, kMaxSteps), std::memory_order_relaxed); }
 int steps() noexcept { return g_steps.load(std::memory_order_relaxed); }
 bool frame_skipped() noexcept { return g_frameSkipped; }
+
+std::atomic<bool> g_cutRequested{false};
+void request_cut() noexcept { g_cutRequested.store(true, std::memory_order_release); }
 void note_overload(const char* why) noexcept {
   g_overloadWhy.store(why, std::memory_order_relaxed);
   g_overloaded.store(true, std::memory_order_relaxed);
@@ -1873,6 +1876,8 @@ bool last_blend_repeated() noexcept { return g_blendRepeated; }
 
 bool frame_verdict() noexcept {
   g_lastVerdict = false;
+  if (g_cutRequested.exchange(false, std::memory_order_acq_rel))
+    return false;
   if (!enabled() || g_frameSkipped || !g_havePrevious || g_frameCounts.blended == 0)
     return false;
   // A cut: most draws have a counterpart that is not plausibly the same thing.

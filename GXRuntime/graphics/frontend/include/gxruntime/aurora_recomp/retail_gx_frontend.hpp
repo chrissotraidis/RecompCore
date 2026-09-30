@@ -95,6 +95,15 @@ public:
   const DolGxRecompState& state() const { return state_; }
   DolGxRecompState& state() { return state_; }
 
+  // Save states. save_state is the register model (CP/XF/BP, TMEM palettes,
+  // texture and copy bindings) plus the bytes of a command the guest has not
+  // finished writing; take it with every buffered byte parsed (the backend
+  // drains its worker first). load_state puts it back under this front end's
+  // own resolver, resolving the texture, palette and copy ranges again against
+  // the (restored) guest memory; a range that no longer resolves is dropped.
+  std::vector<std::uint8_t> save_state() const;
+  bool load_state(const std::uint8_t* data, std::size_t size);
+
   std::span<const DolGxRecompTraceEvent> trace_events() const;
   // Cumulative zero-vertex draw headers consumed as no-ops (s56 conformance:
   // the frontend emits no Draw packet for them, but Aurora's live decoder

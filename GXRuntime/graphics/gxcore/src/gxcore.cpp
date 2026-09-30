@@ -7,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <type_traits>
 
 namespace gxruntime::gxcore {
 
@@ -1793,5 +1794,46 @@ bool GxCoreSink::submit_packet(const ar::RenderPacket& packet) {
 }
 
 void GxCoreSink::flush_frame() { consumer_.flush_assembly(); }
+
+namespace {
+constexpr std::uint32_t kSinkStateMagic = 0x47585343u; // "GXSC"
+static_assert(std::is_trivially_copyable_v<GxCoreState>);
+static_assert(std::is_trivially_copyable_v<CachedVertexAttrs>);
+} // namespace
+
+std::vector<std::uint8_t> GxCoreSink::save_state() const {
+  const std::uint32_t header[3] = {kSinkStateMagic,
+                                   static_cast<std::uint32_t>(sizeof(GxCoreState)),
+                                   static_cast<std::uint32_t>(sizeof(CachedVertexAttrs))};
+  std::vector<std::uint8_t> out(sizeof header + sizeof(GxCoreState) +
+                                sizeof(CachedVertexAttrs));
+  std::uint8_t* at = out.data();
+  std::memcpy(at, header, sizeof header);
+  at += sizeof header;
+  std::memcpy(at, &live_state_, sizeof(GxCoreState));
+  at += sizeof(GxCoreState);
+  std::memcpy(at, &cached_attrs_, sizeof(CachedVertexAttrs));
+  return out;
+}
+
+bool GxCoreSink::load_state(const std::uint8_t* data, std::size_t size) {
+  std::uint32_t header[3];
+  if (data == nullptr ||
+      size != sizeof header + sizeof(GxCoreState) + sizeof(CachedVertexAttrs))
+    return false;
+  std::memcpy(header, data, sizeof header);
+  if (header[0] != kSinkStateMagic || header[1] != sizeof(GxCoreState) ||
+      header[2] != sizeof(CachedVertexAttrs))
+    return false;
+  consumer_.flush_assembly();
+  std::memcpy(&live_state_, data + sizeof header, sizeof(GxCoreState));
+  std::memcpy(&cached_attrs_, data + sizeof header + sizeof(GxCoreState),
+              sizeof(CachedVertexAttrs));
+  pending_state_ = live_state_;
+  since_draw_.clear();
+  replay_overflow_ = false;
+  scope_ = scope_left_ = scope_part_ = 0u;
+  return true;
+}
 
 } // namespace gxruntime::gxcore

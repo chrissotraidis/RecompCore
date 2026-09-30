@@ -160,6 +160,10 @@ bool dol_hle_poll_callback(CPUState* cpu) {
     return true;
 }
 
+bool dol_hle_callback_idle(void) {
+    return !g_callback_active && g_callback_count == 0u;
+}
+
 bool dol_hle_handle_callback_return(CPUState* cpu, u32 address) {
     if (address == HLE_CALLBACK_RETURN && g_callback_active) {
         restore_callback_context(cpu, &g_callback_context);

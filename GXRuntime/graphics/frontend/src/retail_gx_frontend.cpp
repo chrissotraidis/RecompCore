@@ -4,6 +4,7 @@
 
 #include <cstring>
 #include <cstdio>
+#include <memory>
 #include <new>
 
 namespace gxruntime::aurora_recomp {
@@ -328,6 +329,85 @@ void RetailGxFrontend::reset(const DolGuestAddressResolver* resolver) {
   last_error_b_ = 0u;
   last_error_c_ = 0u;
   last_error_d_ = 0u;
+}
+
+namespace {
+
+constexpr std::uint32_t kFrontendStateMagic = 0x47585346u; // "GXSF"
+
+void resolve_saved_range(const DolGuestAddressResolver& resolver,
+                         DolGuestResolvedRange& range, bool& valid) {
+  if (!valid)
+    return;
+  DolGuestResolvedRange out{};
+  if (dol_guest_address_resolver_resolve(&resolver, range.address, range.size,
+                                         range.space, range.resource, &out)) {
+    range = out;
+  } else {
+    range = DolGuestResolvedRange{};
+    valid = false;
+  }
+}
+
+} // namespace
+
+std::vector<std::uint8_t> RetailGxFrontend::save_state() const {
+  // Header, the register model with its host-only parts (resolver, the C
+  // parser's FIFO copy, the per-flush event trace) cleared, the stale-palette
+  // mask and the unparsed tail.
+  const std::uint32_t header[3] = {
+      kFrontendStateMagic, static_cast<std::uint32_t>(sizeof(DolGxRecompState)),
+      static_cast<std::uint32_t>(fifo_buffer_.size())};
+  std::vector<std::uint8_t> out(sizeof header + sizeof(DolGxRecompState) + 1u +
+                                fifo_buffer_.size());
+  std::uint8_t* at = out.data();
+  std::memcpy(at, header, sizeof header);
+  at += sizeof header;
+  // On the heap: the state is most of a megabyte.
+  auto saved = std::make_unique<DolGxRecompState>(state_);
+  std::memset(&saved->resolver, 0, sizeof saved->resolver);
+  saved->fifo.size = 0u;
+  std::memset(saved->fifo.bytes, 0, sizeof saved->fifo.bytes);
+  saved->trace_count = 0u;
+  std::memset(saved->trace, 0, sizeof saved->trace);
+  std::memcpy(at, saved.get(), sizeof(DolGxRecompState));
+  at += sizeof(DolGxRecompState);
+  *at++ = tlut_stale_mask_;
+  if (!fifo_buffer_.empty())
+    std::memcpy(at, fifo_buffer_.data(), fifo_buffer_.size());
+  return out;
+}
+
+bool RetailGxFrontend::load_state(const std::uint8_t* data, std::size_t size) {
+  std::uint32_t header[3];
+  if (data == nullptr || size < sizeof header + sizeof(DolGxRecompState) + 1u)
+    return false;
+  std::memcpy(header, data, sizeof header);
+  if (header[0] != kFrontendStateMagic || header[1] != sizeof(DolGxRecompState) ||
+      size != sizeof header + sizeof(DolGxRecompState) + 1u + header[2])
+    return false;
+  const DolGuestAddressResolver resolver = state_.resolver;
+  // The packet sequence keeps counting: a sink that has seen packets from this
+  // front end requires it to rise.
+  const std::uint64_t sequence = next_packet_sequence_;
+  reset(&resolver);
+  next_packet_sequence_ = sequence;
+  const std::uint8_t* at = data + sizeof header;
+  std::memcpy(&state_, at, sizeof(DolGxRecompState));
+  at += sizeof(DolGxRecompState);
+  state_.resolver = resolver;
+  state_.fifo.size = 0u;
+  state_.trace_count = 0u;
+  for (auto& texture : state_.textures)
+    resolve_saved_range(resolver, texture.range, texture.valid);
+  for (auto& tlut : state_.tluts)
+    resolve_saved_range(resolver, tlut.range, tlut.valid);
+  for (auto& tlut : state_.tmem_tluts)
+    resolve_saved_range(resolver, tlut.range, tlut.valid);
+  resolve_saved_range(resolver, state_.copy.range, state_.copy.range_valid);
+  tlut_stale_mask_ = *at++;
+  fifo_buffer_.assign(at, at + header[2]);
+  return true;
 }
 
 bool RetailGxFrontend::set_vertex_layout(std::uint8_t vtx_fmt,

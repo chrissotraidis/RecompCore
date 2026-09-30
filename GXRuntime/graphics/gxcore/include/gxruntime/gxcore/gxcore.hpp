@@ -184,6 +184,13 @@ public:
   // Frame boundary: plan the final pending draw of the frame.
   void flush_frame();
 
+  // Save states: the register model the next draws are planned against and
+  // the cross-draw attribute cache. A state is taken with the front end
+  // drained; a draw still pending in the consumer is not carried (load plans
+  // it first, then starts the next draw from the saved registers).
+  std::vector<std::uint8_t> save_state() const;
+  bool load_state(const std::uint8_t* data, std::size_t size);
+
   const GapCounters& counters() const { return counters_; }
   GapCounters& counters() { return counters_; }
   const gxruntime::aurora_recomp::ConsumingAuroraRenderSink& consumer() const {

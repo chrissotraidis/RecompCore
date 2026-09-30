@@ -47,6 +47,9 @@ int frame_steps() noexcept;
 // in-between frames, or none (frame_skipped), until it has been calm a while.
 void note_overload(const char* why) noexcept;
 bool frame_skipped() noexcept;
+// A save state was loaded: the next game frame gets no in-between frames, as
+// the frame before it is not the one it follows.
+void request_cut() noexcept;
 
 // The key for a draw's vertex stream; 0 when the plan carries no payload.
 uint64_t draw_key(const gxruntime::gxcore::DrawPlan& plan) noexcept;

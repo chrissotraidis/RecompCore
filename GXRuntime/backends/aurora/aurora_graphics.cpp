@@ -26,6 +26,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include "../../graphics/aurora/lib/gfx/render_worker.hpp"
+#include "../../graphics/aurora/lib/gfx/frame_interp.hpp"
 
 #if GXRUNTIME_HAS_AURORA_RECOMP
 // gxcore substrate submission lives in the Aurora fork (lib/gfx/gxcore_draw.cpp),
@@ -1910,6 +1911,76 @@ void aurora_backend_set_guest_address_resolver(
     } else {
         aurora::gx::recomp::clear_guest_address_resolver();
     }
+}
+
+// Save states (debugging). The blob: a magic, the front end's and the gxcore
+// sink's sizes, then their states. The worker is drained on both sides, so the
+// front end has parsed every byte the guest wrote and nothing is in flight.
+size_t dol_aurora_gx_save_state(void** out) {
+    if (out == nullptr)
+        return 0;
+    *out = nullptr;
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    if (!gx_aurora::g_initialized || !gx_aurora::g_shadow_frontend_enabled)
+        return 0;
+    gx_aurora::shadow_frontend_flush_pending();
+    if (gx_aurora::g_shadow_frontend_failed)
+        return 0;
+    const std::vector<std::uint8_t> front = gx_aurora::g_shadow_frontend.save_state();
+    const std::vector<std::uint8_t> sink = gx_aurora::g_core_sink.save_state();
+    const std::uint32_t header[3] = {0x47585354u /* "GXST" */,
+                                     static_cast<std::uint32_t>(front.size()),
+                                     static_cast<std::uint32_t>(sink.size())};
+    const size_t size = sizeof header + front.size() + sink.size();
+    auto* blob = static_cast<std::uint8_t*>(std::malloc(size));
+    if (blob == nullptr)
+        return 0;
+    std::memcpy(blob, header, sizeof header);
+    std::memcpy(blob + sizeof header, front.data(), front.size());
+    std::memcpy(blob + sizeof header + front.size(), sink.data(), sink.size());
+    *out = blob;
+    return size;
+#else
+    return 0;
+#endif
+}
+
+void dol_aurora_gx_drain(void) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    if (gx_aurora::g_initialized && gx_aurora::g_shadow_frontend_enabled)
+        gx_aurora::shadow_frontend_flush_pending();
+#endif
+}
+
+bool dol_aurora_gx_load_state(const void* data, size_t size) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    if (!gx_aurora::g_initialized || !gx_aurora::g_shadow_frontend_enabled || data == nullptr)
+        return false;
+    std::uint32_t header[3];
+    if (size < sizeof header)
+        return false;
+    std::memcpy(header, data, sizeof header);
+    if (header[0] != 0x47585354u || size != sizeof header + (size_t)header[1] + header[2])
+        return false;
+    // Whatever this run had buffered belongs to the frame being replaced.
+    gx_aurora::shadow_frontend_flush_pending();
+    const auto* bytes = static_cast<const std::uint8_t*>(data) + sizeof header;
+    if (!gx_aurora::g_shadow_frontend.load_state(bytes, header[1]))
+        return false;
+    if (gx_aurora::g_gx_core_enabled &&
+        !gx_aurora::g_core_sink.load_state(bytes + header[1], header[2]))
+        return false;
+    // Textures decoded from this run's memory are not the state's, and the
+    // frame before the next is not the one it follows (no in-between frame).
+    aurora::gfx::gxcore::reset_texture_cache();
+    aurora::gfx::frame_interp::request_cut();
+    gx_aurora::g_shadow_frontend_failed = false;
+    return true;
+#else
+    (void)data;
+    (void)size;
+    return false;
+#endif
 }
 
 void aurora_backend_configure_vi(u32 tv_mode, u16 fb_width, u16 efb_height,

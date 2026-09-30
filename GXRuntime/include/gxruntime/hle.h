@@ -34,6 +34,9 @@ void dol_hle_card_close(void);
 bool dol_hle_poll_callback(CPUState* cpu);
 bool dol_hle_queue_guest_callback(u32 address, s32 channel, s32 result);
 bool dol_hle_handle_callback_return(CPUState* cpu, u32 address);
+// True when no completion callback is queued or running: a save state taken
+// then has none of the HLE card's asynchronous work in flight.
+bool dol_hle_callback_idle(void);
 bool dol_hle_handle_gx_return(CPUState* cpu, u32 address);
 
 // ---------------------------------------------------------------------------
