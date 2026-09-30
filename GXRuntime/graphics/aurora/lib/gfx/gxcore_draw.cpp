@@ -5,6 +5,8 @@
 #include "../webgpu/gpu.hpp"
 #include "../gx/gx.hpp" // UseReversedZ + set_logical_viewport (substrate glue)
 #include "frame_interp.hpp"
+#include "pipeline_cache.hpp"
+#include "thread_cpu.hpp"
 #include "texture.hpp"
 #include "tex_copy_conv.hpp" // EFB-copy format conversion (63/S16)
 #include "texture_replacement.hpp" // Dolphin-format HD texture packs
@@ -957,24 +959,58 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
 // filled Aurora's 24 MB uniform staging area in the middle of Wind Waker's
 // Outset frames, and each split waited on the GPU. A draw whose block matches
 // the previous draw's, within the same frame packet, reuses that range.
-// The block a cache last took is compared where it was staged (uniform_bytes,
-// or interp_uniform_bytes for the in-between frames'): a copy of each block
-// kept aside for the comparison was a tenth of the FIFO worker's copying.
+// On Apple GPUs the block a cache last took is compared where it was staged
+// (uniform_bytes, or interp_uniform_bytes for the in-between frames'): the
+// staging area is ordinary memory there, and a copy of each block kept aside
+// for the comparison was a tenth of the FIFO worker's copying. Elsewhere
+// (Direct3D 12, Vulkan) the staging area is the GPU's upload memory, which the
+// CPU reads uncached: comparing there took Wind Waker's Outset frames (14,000
+// draws) 400 ms on the FIFO worker, so the block is kept aside.
+#if defined(__APPLE__)
+#define AURORA_UNIFORM_COMPARE_STAGED 1
+#else
+#define AURORA_UNIFORM_COMPARE_STAGED 0
+#endif
 struct UniformCache {
   Range range{};
   uint64_t frameId = 0;
   uint64_t hits = 0;
   uint64_t pushes = 0;
+#if !AURORA_UNIFORM_COMPARE_STAGED
+  std::vector<uint8_t> bytes; // the block range holds
+#endif
 };
 static UniformCache g_vertexUniformCache;
 static UniformCache g_interpUniformCache;
 static UniformCache g_pixelUniformCache;
 
+// The block the cache last took: `staged` where it was staged, or the copy.
+static const uint8_t* cached_bytes(const UniformCache& cache, const uint8_t* staged) {
+#if AURORA_UNIFORM_COMPARE_STAGED
+  return staged;
+#else
+  (void)staged;
+  return cache.bytes.data();
+#endif
+}
+
+// The cache took `data` (staged at cache.range).
+static void keep_cached(UniformCache& cache, const uint8_t* data, size_t length) {
+#if AURORA_UNIFORM_COMPARE_STAGED
+  (void)cache;
+  (void)data;
+  (void)length;
+#else
+  cache.bytes.assign(data, data + length);
+#endif
+}
+
 // Whether `data` is the block the cache last took, in this frame packet.
 static bool repeats_cached(const UniformCache& cache, const uint8_t* data, size_t length) {
   const uint64_t frameId = current_frame_id();
   return frameId != 0 && cache.frameId == frameId && cache.range.size == length &&
-         std::memcmp(uniform_bytes(cache.range), data, length) == 0;
+         std::memcmp(cached_bytes(cache, AURORA_UNIFORM_COMPARE_STAGED ? uniform_bytes(cache.range) : nullptr), data,
+                     length) == 0;
 }
 
 // The in-between frame's blocks, de-duplicated the same way. repeated: the
@@ -984,13 +1020,17 @@ static bool repeats_cached(const UniformCache& cache, const uint8_t* data, size_
 static Range push_interp_uniform_dedup(UniformCache& cache, uint64_t frameId, size_t slot, const uint8_t* data,
                                        size_t length, bool repeated) {
   if (frameId != 0 && cache.frameId == frameId && cache.range.size == length &&
-      (repeated || std::memcmp(interp_uniform_bytes(slot, cache.range), data, length) == 0)) {
+      (repeated ||
+       std::memcmp(cached_bytes(cache, AURORA_UNIFORM_COMPARE_STAGED ? interp_uniform_bytes(slot, cache.range)
+                                                                     : nullptr),
+                   data, length) == 0)) {
     ++cache.hits;
     return cache.range;
   }
   ++cache.pushes;
   cache.range = push_interp_uniform(slot, data, length);
   cache.frameId = frameId;
+  keep_cached(cache, data, length);
   return cache.range;
 }
 
@@ -1012,6 +1052,10 @@ struct InterpJob {
   uint64_t frameId;
   size_t slot;
   bool repeatsLastDraw; // the constants are the draw before's (repeats_cached)
+  // The constants, copied only where they differ from the job before's
+  // (constantsCopied); a job that repeats them leaves the 2.8 KB copy to the
+  // helper, which keeps the last it was given (InterpHelper::constants).
+  bool constantsCopied;
   gxc::VertexShaderConstants constants;
 };
 
@@ -1045,6 +1089,9 @@ struct InterpHelper {
   // Helper thread: the last block it staged per step, and a particle's vertices.
   UniformCache cache[frame_interp::kMaxSteps];
   std::vector<float> vertices;
+  // Helper thread: the constants of the last job that carried them, which the
+  // jobs after it that repeat them use.
+  gxc::VertexShaderConstants constants;
 };
 
 // Made with the thread and never destroyed: the detached thread may still be
@@ -1052,6 +1099,7 @@ struct InterpHelper {
 std::atomic<InterpHelper*> g_interpHelper{nullptr};
 
 void interp_helper_main(InterpHelper* h) {
+  thread_cpu::register_current(thread_cpu::Role::InterpHelper);
   for (;;) {
     const uint64_t tail = h->consumed.load(std::memory_order_relaxed);
     if (tail == h->produced.load(std::memory_order_seq_cst)) {
@@ -1083,7 +1131,9 @@ void interp_helper_main(InterpHelper* h) {
     const InterpJob& job = h->ring[tail % InterpHelper::Capacity];
     InterpRanges ranges{};
     const int steps = frame_interp::frame_steps();
-    if (frame_interp::blend_draw(job.input, job.constants, job.repeatsLastDraw) != nullptr) {
+    if (job.constantsCopied)
+      std::memcpy(&h->constants, &job.constants, sizeof(h->constants));
+    if (frame_interp::blend_draw(job.input, h->constants, job.repeatsLastDraw) != nullptr) {
       const bool repeated = frame_interp::last_blend_repeated();
       for (int step = 0; step < steps; ++step)
         ranges.uniform[step] =
@@ -1124,13 +1174,26 @@ uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw) {
   job.frameId = frameId;
   job.slot = recording_frame_slot();
   job.repeatsLastDraw = repeatsLastDraw;
-  std::memcpy(&job.constants, &plan.constants, sizeof(plan.constants));
-  h->produced.store(head + 1, std::memory_order_seq_cst);
-  // Asleep, it consumes nothing: the jobs waiting reach WakeBatch exactly once.
-  if (h->sleeping.load(std::memory_order_seq_cst) &&
-      head + 1 - h->consumed.load(std::memory_order_acquire) >= InterpHelper::WakeBatch) {
-    std::lock_guard lock{h->mutex};
-    h->work.notify_one();
+  // repeatsLastDraw: the constants are those last pushed in this frame packet,
+  // and every push while frames are interpolated here queues a job, so they
+  // are those of this packet's job before (the helper's copy). The first job
+  // of a packet carries its own.
+  job.constantsCopied = !repeatsLastDraw || h->jobs == 0u;
+  if (job.constantsCopied)
+    std::memcpy(&job.constants, &plan.constants, sizeof(plan.constants));
+  h->produced.store(head + 1, std::memory_order_release);
+  // Asleep, it consumes nothing, so a sleeping helper has WakeBatch or more
+  // waiting before it is woken. Only then is `sleeping` read, after a full
+  // fence: the helper sets it before its last look at `produced`, so one of
+  // the two sees the other. Every job paid for a sequentially consistent store
+  // and load here, which waited for the job's copies to leave the store buffer
+  // (4 percent of the translation worker).
+  if (head + 1 - h->consumed.load(std::memory_order_acquire) >= InterpHelper::WakeBatch) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (h->sleeping.load(std::memory_order_relaxed)) {
+      std::lock_guard lock{h->mutex};
+      h->work.notify_one();
+    }
   }
   return h->jobs++;
 }
@@ -1165,7 +1228,9 @@ static Range push_uniform_dedup(UniformCache& cache, const uint8_t* data,
   }();
   const uint64_t frameId = current_frame_id();
   if (enabled && frameId != 0 && cache.frameId == frameId && cache.range.size == length &&
-      (known >= 0 ? known == 1 : std::memcmp(uniform_bytes(cache.range), data, length) == 0)) {
+      (known >= 0 ? known == 1
+                  : std::memcmp(cached_bytes(cache, AURORA_UNIFORM_COMPARE_STAGED ? uniform_bytes(cache.range) : nullptr),
+                                data, length) == 0)) {
     ++cache.hits;
     return cache.range;
   }
@@ -1175,6 +1240,7 @@ static Range push_uniform_dedup(UniformCache& cache, const uint8_t* data,
              cache.hits, cache.hits + cache.pushes);
   cache.range = push_uniform(data, length);
   cache.frameId = frameId;
+  keep_cached(cache, data, length);
   return cache.range;
 }
 
@@ -1526,21 +1592,42 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
             plan.tlut_address, plan.tlut_format, plan.tlut_entries,
             plan.tlut_data, plan.tlut_available);
         if (bound) {
-          const auto sampler =
-              sampler_ref(sampler_descriptor(plan.samplers[plan.tex_slot & 7u]));
-          const std::array entries{
-              WGPUBindGroupEntry{.binding = 0,
-                                 .textureView =
-                                     bound->sampleTextureView.Get()},
-              WGPUBindGroupEntry{.binding = 1, .sampler = sampler.Get()},
+          // Draws mostly bind the texture and sampler of the draw before. In
+          // one frame (the bind group cache keeps what a frame used) the same
+          // view and sampler state are the same bind group, without the
+          // layout's, the sampler's and the bind group's hash and lock. The
+          // generation changes when the renderer is set up again, whose frame
+          // count starts over.
+          struct LastBind {
+            WGPUTextureView view = nullptr;
+            gxc::PlanSampler sampler{};
+            uint32_t frame = UINT32_MAX;
+            uint32_t generation = 0;
+            BindGroupRef ref = 0;
           };
-          const WGPUBindGroupDescriptor descriptor{
-              .label = {"GXCore Texture Bind Group", WGPU_STRLEN},
-              .layout = texture_bind_group_layout(1u).Get(),
-              .entryCount = entries.size(),
-              .entries = entries.data(),
-          };
-          textureBindGroup = bind_group_ref(descriptor);
+          thread_local LastBind s_last;
+          const gxc::PlanSampler& samplerState = plan.samplers[plan.tex_slot & 7u];
+          const WGPUTextureView view = bound->sampleTextureView.Get();
+          const uint32_t frame = current_frame();
+          const uint32_t generation = pipeline_cache_generation();
+          if (s_last.frame == frame && s_last.generation == generation && s_last.view == view &&
+              std::memcmp(&s_last.sampler, &samplerState, sizeof samplerState) == 0) {
+            textureBindGroup = s_last.ref;
+          } else {
+            const auto sampler = sampler_ref(sampler_descriptor(samplerState));
+            const std::array entries{
+                WGPUBindGroupEntry{.binding = 0, .textureView = view},
+                WGPUBindGroupEntry{.binding = 1, .sampler = sampler.Get()},
+            };
+            const WGPUBindGroupDescriptor descriptor{
+                .label = {"GXCore Texture Bind Group", WGPU_STRLEN},
+                .layout = texture_bind_group_layout(1u).Get(),
+                .entryCount = entries.size(),
+                .entries = entries.data(),
+            };
+            textureBindGroup = bind_group_ref(descriptor);
+            s_last = LastBind{view, samplerState, frame, generation, textureBindGroup};
+          }
         }
       }
     } else {

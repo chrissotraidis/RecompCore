@@ -301,6 +301,16 @@ bool ConsumingAuroraRenderSink::resolve_array_input(
 void ConsumingAuroraRenderSink::accumulate_assembly(const ConsumedDraw& draw) {
   if (back_assembled_)
     return;
+  // The gxcore renderer's consumer reports none of the totals below; the
+  // shadow packet sink's frame comparison and the replay tools read them.
+  // Walking every vertex's indices for them was about 2 percent of the
+  // translation worker at 14,000 draws a frame.
+  if (!assembly_totals_) {
+    if (draw_observer_ != nullptr)
+      draw_observer_(draw, total_draws_, draw_observer_user_);
+    back_assembled_ = true;
+    return;
+  }
   // Count-only (nullptr): the live path does not retain per-vertex elements.
   const AssembledDrawStats stats = assemble_consumed_draw(draw, nullptr);
   ++assembled_draws_;

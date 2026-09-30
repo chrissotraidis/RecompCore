@@ -1,4 +1,7 @@
 #include "system_info.hpp"
+
+#include <cstring>
+#include <string>
 #include "internal.hpp"
 
 #if _WIN32
@@ -9,6 +12,8 @@
 #include <comutil.h>
 #include <dxgi.h>
 #include <wrl/client.h>
+#include <intrin.h>
+#include <vector>
 
 template<typename T>
 using ComPtr = Microsoft::WRL::ComPtr<T>;
@@ -89,7 +94,76 @@ static std::string wideStringToUtf8(std::wstring_view str) {
   return result;
 }
 
+static std::string GetCpuModelWmi();
+
+// The processor's own brand string (CPUID 0x80000002-4): no COM, so it works
+// after something else in the process (the first launch's disc picker) has
+// already set up COM security, which made the WMI query below fail.
+static std::string GetCpuBrand() {
+#if defined(_M_X64) || defined(__x86_64__)
+  int regs[4]{};
+  __cpuid(regs, static_cast<int>(0x80000000u));
+  if (static_cast<unsigned>(regs[0]) < 0x80000004u)
+    return {};
+  char brand[49]{};
+  for (unsigned i = 0; i < 3; ++i) {
+    __cpuid(regs, static_cast<int>(0x80000002u + i));
+    std::memcpy(brand + 16 * i, regs, 16);
+  }
+  std::string result(brand);
+  const auto first = result.find_first_not_of(' ');
+  const auto last = result.find_last_not_of(' ');
+  return first == std::string::npos ? std::string{} : result.substr(first, last - first + 1);
+#else
+  return {};
+#endif
+}
+
 std::string GetCpuModel() {
+  if (std::string brand = GetCpuBrand(); !brand.empty())
+    return brand;
+  return GetCpuModelWmi();
+}
+
+// Cores and threads, for telling a slower PC's limits apart in a session log:
+// "6 cores, 12 threads", or on a hybrid CPU "24 cores (8 performance, 16
+// efficiency), 32 threads".
+static std::string GetCpuTopology() {
+  DWORD length = 0;
+  GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &length);
+  if (length == 0)
+    return Unknown;
+  std::vector<std::uint8_t> buffer(length);
+  auto* info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data());
+  if (!GetLogicalProcessorInformationEx(RelationProcessorCore, info, &length))
+    return Unknown;
+  unsigned cores = 0, threads = 0, efficient = 0;
+  BYTE top_class = 0;
+  for (DWORD offset = 0; offset < length;) {
+    const auto* entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+    if (entry->Relationship == RelationProcessorCore) {
+      ++cores;
+      if (entry->Processor.EfficiencyClass > top_class)
+        top_class = entry->Processor.EfficiencyClass;
+      for (WORD g = 0; g < entry->Processor.GroupCount; ++g)
+        threads += static_cast<unsigned>(__popcnt64(entry->Processor.GroupMask[g].Mask));
+    }
+    offset += entry->Size;
+  }
+  if (top_class != 0) {
+    for (DWORD offset = 0; offset < length;) {
+      const auto* entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
+      if (entry->Relationship == RelationProcessorCore && entry->Processor.EfficiencyClass < top_class)
+        ++efficient;
+      offset += entry->Size;
+    }
+    return std::to_string(cores) + " cores (" + std::to_string(cores - efficient) + " performance, " +
+           std::to_string(efficient) + " efficiency), " + std::to_string(threads) + " threads";
+  }
+  return std::to_string(cores) + " cores, " + std::to_string(threads) + " threads";
+}
+
+static std::string GetCpuModelWmi() {
   // Good fucking lord Microsoft, what the fuck is this?
   // https://learn.microsoft.com/en-us/windows/win32/wmisdk/example--getting-wmi-data-from-the-local-computer
 
@@ -110,7 +184,9 @@ std::string GetCpuModel() {
                               NULL                         // Reserved
   );
 
-  if (FAILED(hres)) {
+  // RPC_E_TOO_LATE: the process set up COM security already (the disc
+  // picker's file dialog does), which serves this query as well.
+  if (FAILED(hres) && hres != RPC_E_TOO_LATE) {
     Log.error("COM security initialization failed");
     return Unknown;
   }
@@ -238,6 +314,7 @@ static void LogGpus() {
 }
 
 void LogMisc() {
+  Log.info("CPU cores: {}", GetCpuTopology());
   LogGpus();
 }
 

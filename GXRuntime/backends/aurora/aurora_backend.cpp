@@ -9,6 +9,7 @@
 #include <gfx/gxcore_draw.hpp>
 #endif
 #include <SDL3/SDL_init.h>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -157,14 +158,32 @@ void log_callback(AuroraLogLevel level, const char* module, const char* message,
 }
 
 void poll_events() {
+    // An event pump that holds the game thread 100 ms or more says whether
+    // SDL's pump (window messages, device detection) or the host's handlers
+    // took the time, and the last event type ([events-slow]).
+    using clock = std::chrono::steady_clock;
+    const clock::time_point start = clock::now();
     const AuroraEvent* event = aurora_update();
+    const clock::time_point pumped = clock::now();
+    clock::duration observers{};
+    unsigned count = 0;
+    unsigned last_type = 0;
     while (event != nullptr && event->type != AURORA_NONE) {
         if (event->type == AURORA_EXIT)
             g_should_quit = true;
-        if (event->type == AURORA_SDL_EVENT && g_host_event_observer != nullptr)
+        if (event->type == AURORA_SDL_EVENT && g_host_event_observer != nullptr) {
+            const clock::time_point before = clock::now();
             g_host_event_observer(&event->sdl, g_host_event_user);
+            observers += clock::now() - before;
+            last_type = event->sdl.type;
+        }
+        ++count;
         ++event;
     }
+    const auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    if (clock::now() - start >= std::chrono::milliseconds(100))
+        std::fprintf(stderr, "[events-slow] pump=%.0f ms host=%.0f ms events=%u last=0x%X\n", ms(pumped - start),
+                     ms(observers), count, last_type);
 }
 
 void run_host_overlay() {
@@ -184,6 +203,9 @@ void install_platform_ops() {
         .present = aurora_backend_present,
         .mark_gx_begin = aurora_backend_mark_gx_begin,
         .gx_write = aurora_backend_gx_write,
+        // The FIFO is a byte stream only through the GX core, and a trace
+        // records each write with its size.
+        .gx_write_bytes = g_gx_core_enabled && !g_trace_armed ? aurora_backend_gx_write_bytes : nullptr,
         .gx_flush = aurora_backend_gx_flush,
         .call_display_list = aurora_backend_call_display_list,
         .set_array = aurora_backend_set_array,
@@ -241,6 +263,12 @@ bool dol_aurora_initialize(int argc, char** argv,
         backend_config->app_name != nullptr ? backend_config->app_name
                                             : defaults.app_name;
     config.desiredBackend = BACKEND_AUTO;
+    // DOL_AURORA_CACHE_DIR: where the shader and pipeline caches live
+    // (default: SDL's preference folder for the app name). A host that keeps
+    // several data folders points each at its own, so two copies running at
+    // once never write one SQLite file together.
+    if (const char* cache_dir = std::getenv("DOL_AURORA_CACHE_DIR"); cache_dir != nullptr && cache_dir[0] != '\0')
+        config.cachePath = strdup(cache_dir);
     config.vsync = backend_config->vsync;
     config.windowWidth = backend_config->window_width != 0
                              ? backend_config->window_width

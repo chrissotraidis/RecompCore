@@ -303,6 +303,10 @@ public:
   // accumulate. The immediately-following INDEXED_SPAN packets still patch the
   // retained draw. Tests leave this off to inspect the full draw list.
   void set_streaming(bool streaming) { streaming_ = streaming; }
+  // Whether each span-complete draw is also walked for the assembly totals
+  // (assembled_draws(), topology_index_bytes(), storage_bytes(), ...). A
+  // consumer whose totals nothing reads turns it off.
+  void set_assembly_totals(bool enabled) { assembly_totals_ = enabled; }
   // Optional observer called exactly once when a draw becomes span-complete:
   // either when the next draw arrives or when flush_assembly() is called at a
   // frame boundary. This lets a live backend export focused diagnostics without
@@ -400,6 +404,7 @@ private:
 
   const DolGuestAddressResolver* resolver_ = nullptr;
   bool streaming_ = false;
+  bool assembly_totals_ = true;
   ConsumedDrawObserver draw_observer_ = nullptr;
   void* draw_observer_user_ = nullptr;
   ConsumedArrayBinding arrays_[kArrayCount]{};

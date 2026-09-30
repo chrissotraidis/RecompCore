@@ -1,5 +1,7 @@
 #pragma once
+#if !defined(_WIN32)
 #include <pthread.h>
+#endif
 
 #include <condition_variable>
 #include <cstddef>
@@ -15,8 +17,10 @@
 
 namespace aurora::gfx::render_worker {
 
+#if !defined(_WIN32)
 // The worker's thread (0 before it starts), for diagnostics.
 pthread_t native_thread();
+#endif
 
 enum class ItemType : uint8_t {
   BeginFrame,
