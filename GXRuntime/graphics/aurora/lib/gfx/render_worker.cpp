@@ -1,4 +1,5 @@
 #include "render_worker.hpp"
+#include "thread_cpu.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -43,6 +44,7 @@ void worker_main() {
 #ifdef TRACY_ENABLE
   tracy::SetThreadName("Aurora render worker");
 #endif
+  thread_cpu::register_current(thread_cpu::Role::RenderWorker);
   g_workerThreadId = std::this_thread::get_id();
 #if !defined(_WIN32)
   g_renderPthread.store(pthread_self(), std::memory_order_release);

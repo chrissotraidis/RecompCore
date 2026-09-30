@@ -28,6 +28,7 @@
 #include <unistd.h>
 #endif
 #include "../../graphics/aurora/lib/gfx/render_worker.hpp"
+#include "../../graphics/aurora/lib/gfx/thread_cpu.hpp"
 
 #if GXRUNTIME_HAS_AURORA_RECOMP
 // gxcore substrate submission lives in the Aurora fork (lib/gfx/gxcore_draw.cpp),
@@ -558,6 +559,7 @@ void g_fifo_worker_main() {
     g_fifo_pthread.store(pthread_self(), std::memory_order_release);
 #endif
     start_stall_watchdog();
+    aurora::gfx::thread_cpu::register_current(aurora::gfx::thread_cpu::Role::GxWorker);
     // Kept across batches: the swap below hands its capacity back to the
     // handoff, so the game thread's appends reuse it instead of growing a new
     // vector (and this thread freeing the old one) every batch.
@@ -1333,6 +1335,12 @@ void dol_aurora_frame_timing(DolAuroraFrameTiming* out) {
     out->interp_draws = interp.draws;
     out->interp_rejected = interp.rejected;
     out->interp_unmatched = interp.unmatched;
+    {
+        using aurora::gfx::thread_cpu::Role;
+        out->gx_worker_cpu_us = aurora::gfx::thread_cpu::cpu_us(Role::GxWorker);
+        out->interp_helper_cpu_us = aurora::gfx::thread_cpu::cpu_us(Role::InterpHelper);
+        out->render_worker_cpu_us = aurora::gfx::thread_cpu::cpu_us(Role::RenderWorker);
+    }
     out->audio_queued_ms = 0;
     if (gx_aurora::g_audio_stream != nullptr && gx_aurora::g_audio_sample_rate != 0u) {
         const int queued = SDL_GetAudioStreamQueued(gx_aurora::g_audio_stream);
@@ -1365,12 +1373,19 @@ void aurora_backend_service_present(void) {
 static void aurora_backend_present_impl(void) {
     if (!gx_aurora::g_initialized)
         return;
+    // A present that holds the game thread 100 ms or more says which part took
+    // the time ([present-slow]): waiting for the worker's batch, Aurora's end
+    // of frame, the window's events, or the next frame's begin (a frame slot
+    // or the swapchain's next texture).
+    const unsigned long long slow_start = gx_aurora::timing_now_us();
+    unsigned long long slow_lock = 0, slow_end = 0, slow_events = 0, slow_begin = 0;
     // Everything below up to the next begin_frame runs with no frame packet for
     // the translation worker to record into. The lock is what makes that window
     // invisible to the worker: it waits here for a batch in flight, and a batch
     // that starts afterwards sees g_aurora_recording_open false and parses
     // without offering draws to a renderer that has no frame.
     std::unique_lock<std::mutex> aurora_recording(gx_aurora::g_aurora_recording_mutex);
+    slow_lock = gx_aurora::timing_now_us() - slow_start;
     gx_aurora::g_aurora_recording_open = false;
     gx_aurora::g_aurora_recording_in_transition = true;
 #if GXRUNTIME_HAS_AURORA_RECOMP
@@ -1401,7 +1416,8 @@ static void aurora_backend_present_impl(void) {
         gx_aurora::g_timing_draws += aurora_get_stats()->drawCallCount;
         const unsigned long long end_frame_start = gx_aurora::timing_now_us();
         aurora_end_frame();
-        gx_aurora::g_timing_end_frame_us += gx_aurora::timing_now_us() - end_frame_start;
+        slow_end = gx_aurora::timing_now_us() - end_frame_start;
+        gx_aurora::g_timing_end_frame_us += slow_end;
         gx_aurora::g_frame_open = false;
     }
     ++gx_aurora::g_present_count;
@@ -1604,7 +1620,9 @@ static void aurora_backend_present_impl(void) {
     }
     const unsigned long long present_fifo = gx_aurora::g_fifo_bytes;
     gx_aurora::g_fifo_bytes = 0;
+    const unsigned long long events_start = gx_aurora::timing_now_us();
     gx_aurora::poll_events();
+    slow_events = gx_aurora::timing_now_us() - events_start;
     // The host may hold the guest at this frame boundary: a menu or layout
     // editor is open, or the app is leaving the foreground. Events keep being
     // pumped so the host UI stays live, the last frame stays on screen, and
@@ -1630,7 +1648,9 @@ static void aurora_backend_present_impl(void) {
                      (SDL_GetTicks() - start) / 1000.0);
     }
     if (!gx_aurora::g_should_quit) {
+        const unsigned long long begin_start = gx_aurora::timing_now_us();
         gx_aurora::g_frame_open = aurora_begin_frame();
+        slow_begin = gx_aurora::timing_now_us() - begin_start;
         // The frame the worker records into exists from here until the next
         // present's end_frame, and this is what opens it to the worker.
         gx_aurora::g_aurora_recording_open = gx_aurora::g_frame_open;
@@ -1662,6 +1682,12 @@ static void aurora_backend_present_impl(void) {
     if (gx_aurora::g_graphics_log && present_fifo > 50000ull)
         std::fprintf(stderr, "[gfx] LARGE present=%llu fifo_this_interval=%llu\n",
                      gx_aurora::g_present_count, present_fifo);
+    if (const unsigned long long total = gx_aurora::timing_now_us() - slow_start; total >= 100000ull)
+        std::fprintf(stderr,
+                     "[present-slow] present=%llu ms=%.0f lock=%.0f end_frame=%.0f events=%.0f begin_frame=%.0f "
+                     "frame_open=%d\n",
+                     gx_aurora::g_present_count, total / 1000.0, slow_lock / 1000.0, slow_end / 1000.0,
+                     slow_events / 1000.0, slow_begin / 1000.0, gx_aurora::g_frame_open ? 1 : 0);
     // The transition is over: a packet exists again (or the window is not
     // presentable), and the worker may record.
     gx_aurora::g_aurora_recording_in_transition = false;

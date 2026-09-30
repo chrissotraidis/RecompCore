@@ -6,6 +6,7 @@
 #include "../gx/gx.hpp" // UseReversedZ + set_logical_viewport (substrate glue)
 #include "frame_interp.hpp"
 #include "pipeline_cache.hpp"
+#include "thread_cpu.hpp"
 #include "texture.hpp"
 #include "tex_copy_conv.hpp" // EFB-copy format conversion (63/S16)
 #include "texture_replacement.hpp" // Dolphin-format HD texture packs
@@ -1098,6 +1099,7 @@ struct InterpHelper {
 std::atomic<InterpHelper*> g_interpHelper{nullptr};
 
 void interp_helper_main(InterpHelper* h) {
+  thread_cpu::register_current(thread_cpu::Role::InterpHelper);
   for (;;) {
     const uint64_t tail = h->consumed.load(std::memory_order_relaxed);
     if (tail == h->produced.load(std::memory_order_seq_cst)) {

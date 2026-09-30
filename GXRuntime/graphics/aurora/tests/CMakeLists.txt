@@ -77,6 +77,7 @@ if (AURORA_ENABLE_GX)
   add_executable(render_worker_tests
     render_worker_test.cpp
     ../lib/gfx/render_worker.cpp
+    ../lib/gfx/thread_cpu.cpp
   )
   target_include_directories(render_worker_tests PRIVATE
     ../include

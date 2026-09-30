@@ -5,6 +5,7 @@ add_library(aurora_gx STATIC
         lib/gfx/efb_readback.cpp
         lib/gfx/pipeline_cache.cpp
         lib/gfx/render_worker.cpp
+        lib/gfx/thread_cpu.cpp
         lib/gfx/dds_io.cpp
         lib/gfx/tex_copy_conv.cpp
         lib/gfx/tex_palette_conv.cpp

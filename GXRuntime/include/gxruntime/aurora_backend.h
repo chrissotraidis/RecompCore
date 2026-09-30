@@ -69,6 +69,11 @@ typedef struct DolAuroraFrameTiming {
     unsigned long long interp_draws;
     unsigned long long interp_rejected; /* draws judged implausible (not blended) */
     unsigned long long interp_unmatched; /* draws with no counterpart the frame before */
+    /* CPU time of the graphics threads, microseconds: the FIFO translation
+       worker, Smooth Motion's helper and Aurora's render worker. */
+    unsigned long long gx_worker_cpu_us;
+    unsigned long long interp_helper_cpu_us;
+    unsigned long long render_worker_cpu_us;
 } DolAuroraFrameTiming;
 void dol_aurora_frame_timing(DolAuroraFrameTiming* out);
 

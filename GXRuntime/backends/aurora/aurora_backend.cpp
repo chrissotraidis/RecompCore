@@ -9,6 +9,7 @@
 #include <gfx/gxcore_draw.hpp>
 #endif
 #include <SDL3/SDL_init.h>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -157,14 +158,32 @@ void log_callback(AuroraLogLevel level, const char* module, const char* message,
 }
 
 void poll_events() {
+    // An event pump that holds the game thread 100 ms or more says whether
+    // SDL's pump (window messages, device detection) or the host's handlers
+    // took the time, and the last event type ([events-slow]).
+    using clock = std::chrono::steady_clock;
+    const clock::time_point start = clock::now();
     const AuroraEvent* event = aurora_update();
+    const clock::time_point pumped = clock::now();
+    clock::duration observers{};
+    unsigned count = 0;
+    unsigned last_type = 0;
     while (event != nullptr && event->type != AURORA_NONE) {
         if (event->type == AURORA_EXIT)
             g_should_quit = true;
-        if (event->type == AURORA_SDL_EVENT && g_host_event_observer != nullptr)
+        if (event->type == AURORA_SDL_EVENT && g_host_event_observer != nullptr) {
+            const clock::time_point before = clock::now();
             g_host_event_observer(&event->sdl, g_host_event_user);
+            observers += clock::now() - before;
+            last_type = event->sdl.type;
+        }
+        ++count;
         ++event;
     }
+    const auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
+    if (clock::now() - start >= std::chrono::milliseconds(100))
+        std::fprintf(stderr, "[events-slow] pump=%.0f ms host=%.0f ms events=%u last=0x%X\n", ms(pumped - start),
+                     ms(observers), count, last_type);
 }
 
 void run_host_overlay() {
