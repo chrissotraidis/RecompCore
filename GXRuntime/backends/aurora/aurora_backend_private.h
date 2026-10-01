@@ -171,6 +171,7 @@ int audio_ms_env(const char* name, int fallback, int min_value, int max_value);
 unsigned long long ull_env(const char* name, unsigned long long fallback);
 long long_env(const char* name, long fallback);
 void log_callback(AuroraLogLevel level, const char* module, const char* message, unsigned int);
+bool retry_audio_open(bool force);
 void poll_events();
 void write_aurora_command(u16 command);
 void flush_pending_resource_metadata();

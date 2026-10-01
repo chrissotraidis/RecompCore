@@ -5,6 +5,7 @@
 #include <vector>
 #include <SDL3/SDL_audio.h>
 #include <SDL3/SDL_timer.h>
+#include <SDL3/SDL_init.h>
 #include <cstdio>
 
 namespace {
@@ -25,6 +26,31 @@ bool stretch_enabled() {
     return enabled;
 }
 }  // namespace
+
+namespace gx_aurora {
+bool retry_audio_open(bool force) {
+    if (g_audio_stream != nullptr) return true;
+    static Uint64 next_attempt;
+    Uint64 now = SDL_GetTicks();
+    if (!force && now < next_attempt) return false;
+    next_attempt = now + 2000;
+    if (!SDL_WasInit(SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        std::fprintf(stderr, "[audio] output unavailable; retrying in 2s: %s\n", SDL_GetError());
+        return false;
+    }
+    SDL_AudioSpec spec{};
+    spec.format = SDL_AUDIO_S16; spec.channels = 2; spec.freq = static_cast<int>(g_audio_sample_rate);
+    g_audio_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+    g_audio_playing = false;
+    if (!g_audio_stream) {
+        std::fprintf(stderr, "[audio] output unavailable; retrying in 2s: %s\n", SDL_GetError());
+        return false;
+    }
+    g_stretcher = AudioStretcher(); g_stretch_out.clear(); g_stretch = 1.0;
+    std::fprintf(stderr, "[audio] output available; prebuffering\n");
+    return true;
+}
+} // namespace gx_aurora
 
 extern "C" {
 
@@ -50,8 +76,8 @@ void aurora_backend_audio_set_sample_rate(u32 sample_rate) {
 }
 
 void aurora_backend_audio_push(const s16* samples, u32 frames) {
-    if (gx_aurora::g_audio_stream == nullptr || samples == nullptr || frames == 0)
-        return;
+    if (samples == nullptr || frames == 0) return;
+    if (!gx_aurora::retry_audio_open(false)) return;
     const int bytes_per_second =
         static_cast<int>(gx_aurora::g_audio_sample_rate) * 2 * static_cast<int>(sizeof(s16));
     const int prebuffer_bytes = bytes_per_second * gx_aurora::g_audio_prebuffer_ms / 1000;

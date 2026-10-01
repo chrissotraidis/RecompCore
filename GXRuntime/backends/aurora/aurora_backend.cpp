@@ -9,6 +9,7 @@
 #include <gfx/gxcore_draw.hpp>
 #endif
 #include <SDL3/SDL_init.h>
+#include <imgui.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -171,6 +172,8 @@ void poll_events() {
     while (event != nullptr && event->type != AURORA_NONE) {
         if (event->type == AURORA_EXIT)
             g_should_quit = true;
+        if (event->type == AURORA_SDL_EVENT && event->sdl.type == SDL_EVENT_AUDIO_DEVICE_ADDED)
+            retry_audio_open(true);
         if (event->type == AURORA_SDL_EVENT && g_host_event_observer != nullptr) {
             const clock::time_point before = clock::now();
             g_host_event_observer(&event->sdl, g_host_event_user);
@@ -180,6 +183,7 @@ void poll_events() {
         ++count;
         ++event;
     }
+    retry_audio_open(false);
     const auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
     if (clock::now() - start >= std::chrono::milliseconds(100))
         std::fprintf(stderr, "[events-slow] pump=%.0f ms host=%.0f ms events=%u last=0x%X\n", ms(pumped - start),
@@ -189,6 +193,12 @@ void poll_events() {
 void run_host_overlay() {
     if (g_host_overlay != nullptr)
         g_host_overlay(g_host_overlay_user);
+    if (g_audio_stream == nullptr) {
+        ImGui::SetNextWindowBgAlpha(0.8f);
+        ImGui::Begin("Audio unavailable", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs);
+        ImGui::TextUnformatted("Audio output unavailable. BlueWake is retrying.");
+        ImGui::End();
+    }
 }
 
 bool host_wants_hold() {
@@ -507,21 +517,7 @@ bool dol_aurora_initialize(int argc, char** argv,
     gx_aurora::g_audio_low_log_push = 0;
     gx_aurora::g_audio_sample_rate = 32000;
 
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-        SDL_AudioSpec spec{};
-        spec.format = SDL_AUDIO_S16;
-        spec.channels = 2;
-        spec.freq = static_cast<int>(gx_aurora::g_audio_sample_rate);
-        gx_aurora::g_audio_stream = SDL_OpenAudioDeviceStream(
-            SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
-        if (gx_aurora::g_audio_stream == nullptr)
-            std::fprintf(stderr, "[audio] SDL output unavailable: %s\n", SDL_GetError());
-        else if (gx_aurora::g_audio_queue_log)
-            std::fprintf(stderr, "[audio-queue] prebuffer_ms=%d max_queue_ms=%d\n",
-                         gx_aurora::g_audio_prebuffer_ms, gx_aurora::g_audio_max_queue_ms);
-    } else {
-        std::fprintf(stderr, "[audio] SDL audio initialization failed: %s\n", SDL_GetError());
-    }
+    gx_aurora::retry_audio_open(true);
 
     gx_aurora::poll_events();
     gx_aurora::g_frame_open = !gx_aurora::g_should_quit && aurora_begin_frame();
