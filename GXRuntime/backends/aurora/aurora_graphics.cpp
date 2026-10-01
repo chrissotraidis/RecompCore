@@ -644,7 +644,8 @@ void wait_for_present(std::unique_lock<std::mutex>& recording) {
 }
 
 void g_fifo_worker_start() {
-    if (g_fifo_worker_started || trace_should_record())
+    // Armed traces own translation before and during their frame window.
+    if (g_fifo_worker_started || g_trace_armed)
         return;
     // DOL_GX_FIFO_WORKER=0 translates on the guest thread (A/B and diagnosis).
     static const bool disabled = [] {
