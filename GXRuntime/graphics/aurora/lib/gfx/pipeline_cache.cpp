@@ -1183,7 +1183,12 @@ void initialize_pipeline_cache() {
 void shutdown_pipeline_cache() {
   g_pipelineCacheGeneration.fetch_add(1, std::memory_order_acq_rel);
   if (g_hasPipelineThread) {
-    g_pipelineThreadEnd = true;
+    {
+      // Publish under the predicate wait's mutex, so notification cannot land
+      // between the worker's false check and its transition to sleep.
+      std::lock_guard lock{g_pipelineMutex};
+      g_pipelineThreadEnd = true;
+    }
     g_pipelineQueueCv.notify_all();
     g_pipelineReadyCv.notify_all();
     g_pipelineThread.join();
