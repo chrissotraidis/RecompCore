@@ -317,7 +317,8 @@ static bool read_whole_file(const char* path, u8** data, size_t* size) {
         return false;
     }
     long end = ftell(input);
-    if (end < 0 || fseek(input, 0, SEEK_SET) != 0) {
+    if (end < 0 || end > (128 * 16 * 8192 + 127 * 68 + 40) ||
+        fseek(input, 0, SEEK_SET) != 0) {
         fclose(input);
         return false;
     }
@@ -326,9 +327,9 @@ static bool read_whole_file(const char* path, u8** data, size_t* size) {
         fclose(input);
         return false;
     }
-    bool success =
-        fread(bytes, 1, (size_t)end, input) == (size_t)end &&
-        fclose(input) == 0;
+    bool success = fread(bytes, 1, (size_t)end, input) == (size_t)end;
+    if (fclose(input) != 0)
+        success = false;
     if (!success) {
         free(bytes);
         return false;
@@ -424,12 +425,14 @@ static bool load_container(DolMemoryCard* card) {
     return valid;
 }
 
-static bool path_exists(const char* path) {
-    FILE* file = fopen(path, "rb");
-    if (file == NULL)
+bool dol_card_validate(const char* path) {
+    if (path == NULL || path[0] == '\0')
         return false;
-    fclose(file);
-    return true;
+    DolMemoryCard card = {0};
+    card.path = (char*)path;
+    bool valid = load_container(&card);
+    clear_files(&card);
+    return valid;
 }
 
 static u32 card_time(void) {
@@ -470,13 +473,21 @@ DolMemoryCard* dol_card_open(const DolMemoryCardConfig* config) {
         dol_card_close(card);
         return NULL;
     }
-    if (card->path != NULL && path_exists(card->path)) {
+    errno = 0;
+    FILE* existing = card->path != NULL ? fopen(card->path, "rb") : NULL;
+    if (existing != NULL) {
+        fclose(existing);
         if (!load_container(card)) {
             fprintf(stderr, "[card] invalid card container: %s\n", card->path);
             dol_card_close(card);
             return NULL;
         }
     } else {
+        if (card->path != NULL && errno != ENOENT) {
+            fprintf(stderr, "[card] cannot read %s; refusing to replace it\n", card->path);
+            dol_card_close(card);
+            return NULL;
+        }
         if (card->serial == 0)
             card->serial = generated_serial(card->path);
         if (!write_container(card)) {

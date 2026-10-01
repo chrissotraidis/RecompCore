@@ -76,6 +76,8 @@ typedef struct DolMemoryCardStat {
 // malformed containers are rejected rather than overwritten.
 DolMemoryCard* dol_card_open(const DolMemoryCardConfig* config);
 void dol_card_close(DolMemoryCard* card);
+// Read-only validation: never creates, replaces or locks a card.
+bool dol_card_validate(const char* path);
 
 DolCardResult dol_card_probe(DolMemoryCard* card, u16* size_mbits,
                              u32* sector_size);
