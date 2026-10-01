@@ -2414,8 +2414,13 @@ void note_render_overload() noexcept { frame_interp::note_overload("a drawable c
 static std::atomic<unsigned long long> g_shownFrames{0};
 
 void after_present() noexcept {
-  g_shownFrames.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t present = g_shownFrames.fetch_add(1, std::memory_order_relaxed) + 1;
   const auto now = PresentClock::now();
+  if (g_presentLog) {
+    std::fprintf(stderr, "[display-timing] present=%llu us=%llu\n",
+        static_cast<unsigned long long>(present),
+        static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count()));
+  }
   const int64_t nowNs = timestamp_ns(now);
   const int64_t previousPresentNs = g_lastPresentNs.exchange(nowNs, std::memory_order_acq_rel);
   if (previousPresentNs != 0) {
