@@ -25,6 +25,7 @@
 #include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_timer.h>
 #include <magic_enum.hpp>
+#include <string_view>
 
 #include "system_info.hpp"
 #include "tracy/Tracy.hpp"
@@ -33,6 +34,14 @@ namespace aurora {
 AuroraConfig g_config;
 uint32_t g_sdlCustomEventsStart;
 char g_gameName[4];
+
+AuroraFpsOverlayPosition fps_overlay_position(std::string_view name) noexcept {
+  return name == "top-left"       ? FPS_OVERLAY_TOP_LEFT
+         : name == "top-right"    ? FPS_OVERLAY_TOP_RIGHT
+         : name == "bottom-left"  ? FPS_OVERLAY_BOTTOM_LEFT
+         : name == "bottom-right" ? FPS_OVERLAY_BOTTOM_RIGHT
+                                  : FPS_OVERLAY_TOP_CENTER;
+}
 
 namespace {
 Module Log("aurora");
@@ -175,6 +184,10 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   gfx::initialize();
 
   imgui::create_context();
+  // DOL_AURORA_FPS_POSITION sets where the FPS counter starts.
+  if (const char* env = std::getenv("DOL_AURORA_FPS_POSITION"); env != nullptr) {
+    aurora_set_fps_overlay_position(fps_overlay_position(env));
+  }
 #endif
   const auto size = window::get_window_size();
   Log.info("Using framebuffer size {}x{} scale {}", size.fb_width, size.fb_height, size.scale);
@@ -258,6 +271,8 @@ static std::atomic_bool g_showFps{[] {
   const char* env = std::getenv("DOL_AURORA_SHOW_FPS");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }()};
+// Where (aurora_set_fps_overlay_position).
+static std::atomic_int g_fpsPosition{FPS_OVERLAY_TOP_CENTER};
 
 static void draw_fps_overlay() {
   if (!g_showFps.load(std::memory_order_relaxed)) {
@@ -282,8 +297,17 @@ static void draw_fps_overlay() {
     last = totals;
     last_at = now;
   }
-  // Top center: the corners hold the game's HUD (hearts, buttons, map, rupees).
-  ImGui::SetNextWindowPos(ImVec2{ImGui::GetIO().DisplaySize.x * 0.5f, 12.f}, ImGuiCond_Always, ImVec2{0.5f, 0.f});
+  // Top center unless a corner is chosen: the corners hold the game's HUD
+  // (hearts, buttons, map, rupees). Anchored to the window as it is this frame.
+  const int position = g_fpsPosition.load(std::memory_order_relaxed);
+  const bool center = position == FPS_OVERLAY_TOP_CENTER;
+  const bool right = position == FPS_OVERLAY_TOP_RIGHT || position == FPS_OVERLAY_BOTTOM_RIGHT;
+  const bool bottom = position == FPS_OVERLAY_BOTTOM_LEFT || position == FPS_OVERLAY_BOTTOM_RIGHT;
+  constexpr float margin = 12.f;
+  const ImVec2 display = ImGui::GetIO().DisplaySize;
+  const float x = center ? display.x * 0.5f : right ? display.x - margin : margin;
+  ImGui::SetNextWindowPos(ImVec2{x, bottom ? display.y - margin : margin}, ImGuiCond_Always,
+                          ImVec2{center ? 0.5f : right ? 1.f : 0.f, bottom ? 1.f : 0.f});
   ImGui::SetNextWindowBgAlpha(0.6f);
   constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                                      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings |
@@ -518,6 +542,13 @@ void aurora_set_fps_overlay(bool enabled) {
   aurora::g_showFps.store(enabled, std::memory_order_relaxed);
 #else
   (void)enabled;
+#endif
+}
+void aurora_set_fps_overlay_position(AuroraFpsOverlayPosition position) {
+#ifdef AURORA_ENABLE_GX
+  aurora::g_fpsPosition.store(position, std::memory_order_relaxed);
+#else
+  (void)position;
 #endif
 }
 void aurora_end_frame() { aurora::end_frame(); }
