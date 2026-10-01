@@ -97,6 +97,9 @@ bool dol_aurora_gx_load_state(const void* data, size_t size);
    load replaces guest memory the worker must not still be reading it. */
 void dol_aurora_gx_drain(void);
 
+// Request recovery on the audio-owning host thread after an OS interruption.
+void dol_aurora_audio_resume(void);
+
 #ifdef __cplusplus
 }
 #endif

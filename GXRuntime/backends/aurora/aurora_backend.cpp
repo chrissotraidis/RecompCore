@@ -184,6 +184,7 @@ void poll_events() {
         ++count;
         ++event;
     }
+    recover_audio_output();
     retry_audio_open(false);
     const auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
     if (clock::now() - start >= std::chrono::milliseconds(100))

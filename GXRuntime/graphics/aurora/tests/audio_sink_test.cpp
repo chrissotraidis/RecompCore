@@ -50,6 +50,18 @@ int main() {
     assert(input.gcount() == sizeof actual && std::memcmp(actual, samples, sizeof actual) == 0);
     assert(input.peek() == std::ifstream::traits_type::eof());
     input.close(); std::filesystem::remove(capture);
+    gx_aurora::g_audio_playing = true;
+    assert(SDL_PauseAudioStreamDevice(stream));
+    dol_aurora_audio_resume();
+    gx_aurora::recover_audio_output();
+    assert(!gx_aurora::g_audio_playing);
+    assert(SDL_ClearAudioStream(stream));
+    gx_aurora::g_audio_prebuffer_ms = 1;
+    dol_aurora_audio_resume();
+    aurora_backend_audio_push(samples, 256);
+    assert(gx_aurora::g_audio_playing && !SDL_AudioDevicePaused(SDL_GetAudioStreamDevice(stream)));
+    gx_aurora::close_audio_capture();
+    std::filesystem::remove(capture);
     SDL_DestroyAudioStream(stream); gx_aurora::g_audio_stream = nullptr;
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
 }

@@ -53,6 +53,7 @@ bool stretch_enabled() {
 }  // namespace
 
 namespace gx_aurora {
+static std::atomic_bool resume_requested{false};
 void close_audio_capture() {
     if (g_sink_capture && std::fclose(g_sink_capture) != 0)
         std::fprintf(stderr, "[audio-sink] capture close failed\n");
@@ -60,6 +61,22 @@ void close_audio_capture() {
     g_sink_capture_checked = false;
     g_sink_capture_bytes = 0;
     g_sink_capture_rate = 0;
+}
+void recover_audio_output() {
+    static Uint64 next_check;
+    bool requested = resume_requested.exchange(false, std::memory_order_relaxed);
+    Uint64 now = SDL_GetTicks();
+    if (!requested && now < next_check) return;
+    next_check = now + 250;
+    if (g_audio_stream) {
+        SDL_AudioDeviceID device = SDL_GetAudioStreamDevice(g_audio_stream);
+        SDL_AudioSpec format;
+        if (!device || !SDL_GetAudioDeviceFormat(device, &format, nullptr)) {
+            SDL_DestroyAudioStream(g_audio_stream); g_audio_stream = nullptr;
+            g_audio_playing = false;
+        } else if (SDL_AudioDevicePaused(device)) g_audio_playing = false;
+    }
+    if (requested) retry_audio_open(true);
 }
 bool retry_audio_open(bool force) {
     if (g_audio_stream != nullptr) return true;
@@ -86,6 +103,10 @@ bool retry_audio_open(bool force) {
 } // namespace gx_aurora
 
 extern "C" {
+void dol_aurora_audio_resume(void) {
+    gx_aurora::resume_requested.store(true, std::memory_order_relaxed);
+}
+
 
 void aurora_backend_audio_set_sample_rate(u32 sample_rate) {
     if (sample_rate != 48000)
@@ -110,6 +131,7 @@ void aurora_backend_audio_set_sample_rate(u32 sample_rate) {
 
 void aurora_backend_audio_push(const s16* samples, u32 frames) {
     if (samples == nullptr || frames == 0) return;
+    gx_aurora::recover_audio_output();
     gx_aurora::g_audio_push_count++;
     if (!gx_aurora::retry_audio_open(false)) {
         gx_aurora::g_audio_dropped_count++;
@@ -136,6 +158,14 @@ void aurora_backend_audio_push(const s16* samples, u32 frames) {
     }
 
     int queued = SDL_GetAudioStreamQueued(gx_aurora::g_audio_stream);
+    if (queued < 0) {
+        gx_aurora::g_audio_dropped_count++;
+        gx_aurora::g_audio_dropped_frames += frames;
+        SDL_DestroyAudioStream(gx_aurora::g_audio_stream);
+        gx_aurora::g_audio_stream = nullptr;
+        gx_aurora::g_audio_playing = false;
+        return;
+    }
     // Fast-forward (dol_aurora_set_fast_forward): the sound made faster than
     // real time is kept only up to the stretcher's target, so the queue neither
     // holds it late after the fast-forward nor runs dry during it.

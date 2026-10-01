@@ -174,6 +174,7 @@ long long_env(const char* name, long fallback);
 void log_callback(AuroraLogLevel level, const char* module, const char* message, unsigned int);
 bool retry_audio_open(bool force);
 void close_audio_capture();
+void recover_audio_output();
 void poll_events();
 void write_aurora_command(u16 command);
 void flush_pending_resource_metadata();
