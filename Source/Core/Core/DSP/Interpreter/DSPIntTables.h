@@ -6,12 +6,22 @@
 #include <array>
 
 #include "Core/DSP/DSPCommon.h"
+#include "Core/DSP/Interpreter/DSPInterpreter.h"
 
 namespace DSP::Interpreter
 {
-class Interpreter;
-
+// Interpreter must be complete here, not forward-declared. The Microsoft ABI
+// picks a member-function pointer's size from what it knows of the class where
+// the pointer type is first used: 24 bytes for an incomplete class, 8 for a
+// complete one with single inheritance. With only a forward declaration,
+// DSPIntTables.cpp built s_decoded_ops with 56-byte entries while
+// DSPInterpreter.cpp indexed it in 24-byte ones, so the first DSP instruction
+// on Windows called address 0 (Exact/LLE audio).
 using InterpreterFunction = void (Interpreter::*)(UDSPInstruction);
+#ifdef _MSC_VER
+static_assert(sizeof(InterpreterFunction) == sizeof(void*),
+              "DSP Interpreter must be a complete single-inheritance class here");
+#endif
 
 struct DecodedInterpreterOp
 {
