@@ -704,6 +704,15 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     ++counters.vertex_stride_mismatch;
     return skip("walk stride != frontend stride");
   }
+  // Admit the complete payload before reading any multi-byte attribute or
+  // allocating decoded vertices. An entry-start check cannot detect a final
+  // f32 or u16 index that extends past the captured bytes.
+  if (static_cast<std::uint64_t>(draw.vertex_count) * walk.vertex_size >
+      draw.vertex_payload.size()) {
+    ++counters.vertex_decode_failures;
+    ++counters.vertex_payload_overrun;
+    return skip("payload overrun");
+  }
   // Cache only register-derived pipeline state. Geometry, mutable guest
   // arrays, uniforms, texture bytes and cross-draw NBT remain live each draw.
   // Thread-local storage keeps separate FIFO consumers independent. The key is

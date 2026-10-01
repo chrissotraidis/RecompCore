@@ -507,6 +507,52 @@ void test_state_to_plan_and_wgsl() {
   }
 }
 
+void test_truncated_vertex_payload() {
+  // Direct f32 and indexed-u16 attributes must reject an incomplete final
+  // element before decoding it. Exact-size allocations expose overreads to
+  // ASan instead of leaving spare vector capacity after resize().
+  for (std::uint32_t vcd_type : {1u, 3u}) {
+    gxc::GxCoreState state;
+    state.reset();
+    state.apply({.kind = ar::RenderStateKind::CpVcd, .index = 0,
+                 .value = vcd_type << 9});
+    state.apply({.kind = ar::RenderStateKind::CpVcd, .index = 1, .value = 0});
+    for (std::uint32_t word = 0; word < 3u; ++word)
+      state.apply({.kind = ar::RenderStateKind::CpVat, .index = 0,
+                   .value = word == 0u ? 1u | (4u << 1) : 0u,
+                   .aux0 = word});
+    ar::ConsumedDraw draw{};
+    draw.primitive = 0xB8; // points: one complete vertex is drawable
+    draw.vertex_count = 1u;
+    draw.vertex_size = vcd_type == 1u ? 12u : 2u;
+    draw.transform_flags = ar::kDrawTransformProjectionValid;
+    for (std::uint32_t count : {1u, 2u}) {
+      draw.vertex_count = count;
+      for (std::size_t size = 1u; size < count * draw.vertex_size; ++size) {
+        draw.vertex_payload = std::vector<std::uint8_t>(size, 0u);
+        gxc::GapCounters gaps{};
+        const auto plan = state.build_draw_plan(draw, gaps);
+        CHECK(!plan.ok);
+        CHECK(gaps.vertex_decode_failures == 1u);
+        CHECK(gaps.vertex_payload_overrun == 1u);
+        CHECK(gaps.vertex_array_unresolved == 0u);
+        CHECK(gaps.draws_skipped == 1u);
+        CHECK(plan.vertices.empty());
+      }
+    }
+    draw.vertex_count = 1u;
+    // A valid direct vertex still decodes, including a trailing byte. The
+    // guard checks a minimum span and does not reject extra captured data.
+    if (vcd_type == 1u) {
+      draw.vertex_payload = std::vector<std::uint8_t>(13u, 0u);
+      gxc::GapCounters gaps{};
+      const auto plan = state.build_draw_plan(draw, gaps);
+      CHECK(plan.ok);
+      CHECK(gaps.vertex_decode_failures == 0u);
+    }
+  }
+}
+
 void test_untextured_defaults() {
   gxc::ShaderKey key{};
   key.num_tex_gens = 0;
@@ -1921,6 +1967,7 @@ void test_efb_copy_sink() {
 
 int main() {
   test_state_to_plan_and_wgsl();
+  test_truncated_vertex_payload();
   test_untextured_defaults();
   test_texgen_color();
   test_texgen_normal_source();
