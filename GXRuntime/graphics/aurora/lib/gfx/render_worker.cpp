@@ -303,4 +303,45 @@ void set_idle_hook(WorkCallback hook) { g_idleHook = std::move(hook); }
 
 bool is_idle() noexcept { return g_pendingItems.load(std::memory_order_acquire) == 0; }
 
+struct Pause::State {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool parked = false;
+  bool released = false;
+};
+
+Pause::Pause(WorkCallback before) {
+  if (is_worker_thread() || !g_running.load(std::memory_order_acquire)) {
+    return;
+  }
+  ZoneScoped;
+  m_state = std::make_shared<State>();
+  enqueue({
+      .type = ItemType::Sync,
+      .work =
+          [state = m_state, before = std::move(before)] {
+            if (before) {
+              before();
+            }
+            std::unique_lock lock{state->mutex};
+            state->parked = true;
+            state->cv.notify_all();
+            state->cv.wait(lock, [&] { return state->released; });
+          },
+  });
+  std::unique_lock lock{m_state->mutex};
+  m_state->cv.wait(lock, [&] { return m_state->parked; });
+}
+
+Pause::~Pause() {
+  if (!m_state) {
+    return;
+  }
+  {
+    std::lock_guard lock{m_state->mutex};
+    m_state->released = true;
+  }
+  m_state->cv.notify_all();
+}
+
 } // namespace aurora::gfx::render_worker

@@ -249,6 +249,9 @@ uint32_t current_frame() noexcept;
 void render_pass(const wgpu::RenderPassEncoder& pass, uint32_t idx);
 void after_submit() noexcept;
 void gpu_synchronize();
+// On the render worker: every deferred present still waiting, now, in order
+// (before the swapchain they were made for is reconfigured).
+void flush_deferred_presents();
 void after_present() noexcept;
 // Rendering fell behind: fewer in-between frames for a while (frame_interp::note_overload).
 void note_render_overload() noexcept;

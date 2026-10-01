@@ -2407,6 +2407,8 @@ void after_submit() noexcept {
 
 void gpu_synchronize() { render_worker::synchronize(); }
 
+void flush_deferred_presents() { run_deferred_present(); }
+
 void note_render_overload() noexcept { frame_interp::note_overload("a drawable came late"); }
 
 static std::atomic<unsigned long long> g_shownFrames{0};

@@ -1084,7 +1084,7 @@ void shutdown() {
 }
 
 void release_surface() noexcept {
-  gfx::gpu_synchronize();
+  const gfx::render_worker::Pause pause{gfx::flush_deferred_presents};
   {
     window::SurfaceLock surfaceLock;
     release_surface_locked();
@@ -1121,7 +1121,7 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
 }
 
 bool refresh_surface(bool recreate) {
-  gfx::gpu_synchronize();
+  const gfx::render_worker::Pause pause{gfx::flush_deferred_presents};
   if (!g_instance || !g_device) {
     return false;
   }
@@ -1152,8 +1152,15 @@ bool refresh_surface(bool recreate) {
   return true;
 }
 
+// The surface, the frame buffers and the copy bind group change here, on the
+// main thread, with the render worker paused: Smooth Motion's deferred
+// presents run on the worker between queue items (its idle hook) and use all
+// of them, so after a plain synchronize() one could start mid-resize and
+// present a texture of the old swapchain, a crash inside Dawn's Direct3D 12
+// backend when going fullscreen on a slower GPU (an Intel UHD 620 laptop,
+// 2026-09-30). The presents still waiting go out first, on the old swapchain.
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force) {
-  gfx::gpu_synchronize();
+  const gfx::render_worker::Pause pause{gfx::flush_deferred_presents};
   resize_swapchain_internal(width, height, nativeWidth, nativeHeight, force);
 }
 } // namespace aurora::webgpu

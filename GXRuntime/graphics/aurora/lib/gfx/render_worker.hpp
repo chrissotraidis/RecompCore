@@ -96,4 +96,22 @@ bool is_worker_thread() noexcept;
 void set_idle_hook(WorkCallback hook);
 bool is_idle() noexcept;
 
+// Holds the worker still while it lives: the worker finishes everything queued
+// before it, runs `before` (on the worker), then waits, running neither queue
+// items nor the idle hook, until the Pause is destroyed. synchronize() only
+// drains the queue; the idle hook (Smooth Motion's deferred presents) can run
+// right after it. Nothing on the pausing thread may wait for the worker while
+// paused. On the worker itself, or before it starts, a Pause does nothing.
+class Pause {
+public:
+  explicit Pause(WorkCallback before = {});
+  ~Pause();
+  Pause(const Pause&) = delete;
+  Pause& operator=(const Pause&) = delete;
+
+private:
+  struct State;
+  std::shared_ptr<State> m_state;
+};
+
 } // namespace aurora::gfx::render_worker
