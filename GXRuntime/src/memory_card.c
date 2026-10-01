@@ -202,13 +202,10 @@ static bool write_container(const DolMemoryCard* card) {
         output = NULL;
     }
 
-    if (success && rename(temporary_path, card->path) != 0) {
-        // ISO C does not require rename to replace an existing file. POSIX
-        // does; hosts that do not get a remove-and-retry fallback.
-        if (remove(card->path) != 0 ||
-            rename(temporary_path, card->path) != 0)
-            success = false;
-    }
+    // POSIX rename and the Windows replacement shim preserve the old card
+    // on failure. Never delete the destination to retry a failed replacement.
+    if (success && rename(temporary_path, card->path) != 0)
+        success = false;
     if (!success)
         remove(temporary_path);
 
