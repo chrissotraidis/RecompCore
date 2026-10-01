@@ -62,10 +62,10 @@ std::array<PendingTlutMetadata, 20> g_pending_tluts{};
 gxruntime::aurora_recomp::RetailGxFrontend g_shadow_frontend;
 gxruntime::aurora_recomp::ConsumingAuroraRenderSink g_shadow_packet_sink;
 bool g_shadow_frontend_enabled = false;
-bool g_shadow_frontend_failed = false;
+std::atomic<bool> g_shadow_frontend_failed{false};
 gxruntime::gxcore::GxCoreSink g_core_sink;
-unsigned long long g_core_submitted = 0;
-unsigned long long g_core_rejected = 0;
+std::atomic<unsigned long long> g_core_submitted{0};
+std::atomic<unsigned long long> g_core_rejected{0};
 std::atomic<bool> g_display_copy_pending{false};
 
 unsigned long long g_shadow_last_draw_total = 0;
@@ -456,8 +456,8 @@ bool dol_aurora_initialize(int argc, char** argv,
             gx_aurora::core_texture_dirty_epoch);
         gx_aurora::g_core_sink.set_plan_observer(gx_aurora::core_plan_observer, nullptr);
         gx_aurora::g_core_sink.set_copy_observer(gx_aurora::core_copy_observer, nullptr);
-        gx_aurora::g_core_submitted = 0;
-        gx_aurora::g_core_rejected = 0;
+        gx_aurora::g_core_submitted.store(0, std::memory_order_relaxed);
+        gx_aurora::g_core_rejected.store(0, std::memory_order_relaxed);
         aurora::gfx::gxcore::reset_texture_cache();
         std::fprintf(stderr,
                      "[gx-core] renderer = gxcore (default): draws route "
@@ -467,7 +467,7 @@ bool dol_aurora_initialize(int argc, char** argv,
     // The FIFO translation runs on a worker now, so the reset has to wait for
     // it to be idle before the front end's state is cleared.
     gx_aurora::shadow_frontend_flush_pending();
-    gx_aurora::g_shadow_frontend_failed = false;
+    gx_aurora::g_shadow_frontend_failed.store(false, std::memory_order_relaxed);
     gx_aurora::g_shadow_frontend.reset(nullptr);
     gx_aurora::g_shadow_frontend.set_packet_drain_enabled(gx_aurora::g_shadow_frontend_enabled);
     // The frame ends at the display copy: stop each parse there so the draws
@@ -605,8 +605,8 @@ void dol_aurora_shutdown(void) {
                      "logic_op_ignored=%llu dst_alpha_active=%llu "
                      "early_depth_active=%llu ztexture_active=%llu "
                      "ztexture_ignored=%llu\n",
-                     gx_aurora::g_core_submitted, gx_aurora::g_core_rejected,
-                     gx_aurora::g_shadow_frontend_failed ? 1 : 0,
+                     gx_aurora::g_core_submitted.load(std::memory_order_relaxed), gx_aurora::g_core_rejected.load(std::memory_order_relaxed),
+                     gx_aurora::g_shadow_frontend_failed.load(std::memory_order_relaxed) ? 1 : 0,
                      gaps.draws_planned, gaps.draws_skipped,
                      gaps.draws_noop, gaps.cull_all_draws, gaps.missing_vcd,
                      gaps.vertex_decode_failures,

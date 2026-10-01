@@ -86,10 +86,10 @@ extern std::array<PendingTlutMetadata, 20> g_pending_tluts;
 extern gxruntime::aurora_recomp::RetailGxFrontend g_shadow_frontend;
 extern gxruntime::aurora_recomp::ConsumingAuroraRenderSink g_shadow_packet_sink;
 extern bool g_shadow_frontend_enabled;
-extern bool g_shadow_frontend_failed;
+extern std::atomic<bool> g_shadow_frontend_failed;
 extern gxruntime::gxcore::GxCoreSink g_core_sink;
-extern unsigned long long g_core_submitted;
-extern unsigned long long g_core_rejected;
+extern std::atomic<unsigned long long> g_core_submitted;
+extern std::atomic<unsigned long long> g_core_rejected;
 // Set by the copy observer (the FIFO worker's thread in worker mode) when a
 // display copy ends a frame; the main thread presents and clears it.
 extern std::atomic<bool> g_display_copy_pending;
