@@ -55,6 +55,12 @@ int main() {
     dol_aurora_audio_resume();
     gx_aurora::recover_audio_output();
     assert(!gx_aurora::g_audio_playing);
+    gx_aurora::g_audio_prebuffer_ms = 1;
+    assert(SDL_GetAudioStreamQueued(stream) > static_cast<int>(gx_aurora::g_audio_sample_rate) * 4 * gx_aurora::g_audio_max_queue_ms / 1000);
+    dol_aurora_audio_resume();
+    aurora_backend_audio_push(samples, 256);
+    assert(gx_aurora::g_audio_playing && !SDL_AudioDevicePaused(SDL_GetAudioStreamDevice(stream)));
+    assert(SDL_PauseAudioStreamDevice(stream));
     assert(SDL_ClearAudioStream(stream));
     gx_aurora::g_audio_prebuffer_ms = 1;
     dol_aurora_audio_resume();

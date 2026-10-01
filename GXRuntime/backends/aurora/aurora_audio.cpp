@@ -77,6 +77,19 @@ void recover_audio_output() {
         } else if (SDL_AudioDevicePaused(device)) g_audio_playing = false;
     }
     if (requested) retry_audio_open(true);
+    // A paused device can already hold a full prebuffer. Resume it before
+    // the push path drops overflow/discard samples and returns without
+    // reaching its ordinary start-playback check.
+    if (g_audio_stream && !g_audio_playing) {
+        const int queued = SDL_GetAudioStreamQueued(g_audio_stream);
+        const int prebuffer = static_cast<int>(g_audio_sample_rate) * 2 * sizeof(s16) * g_audio_prebuffer_ms / 1000;
+        if (queued >= prebuffer) {
+            if (SDL_ResumeAudioStreamDevice(g_audio_stream))
+                g_audio_playing = true;
+            else
+                std::fprintf(stderr, "[audio] failed to resume queued playback: %s\n", SDL_GetError());
+        }
+    }
 }
 bool retry_audio_open(bool force) {
     if (g_audio_stream != nullptr) return true;
