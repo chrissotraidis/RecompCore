@@ -25,7 +25,7 @@ BoundedQueue g_queue{QueueCapacity};
 std::thread g_thread;
 std::atomic_bool g_running = false;
 std::atomic_size_t g_pendingItems = 0;
-std::thread::id g_workerThreadId;
+thread_local bool g_isWorkerThread = false;
 WorkCallback g_idleHook;
 
 void complete_sync(const std::shared_ptr<SyncState>& sync) {
@@ -45,7 +45,7 @@ void worker_main() {
   tracy::SetThreadName("Aurora render worker");
 #endif
   thread_cpu::register_current(thread_cpu::Role::RenderWorker);
-  g_workerThreadId = std::this_thread::get_id();
+  g_isWorkerThread = true;
 #if !defined(_WIN32)
   g_renderPthread.store(pthread_self(), std::memory_order_release);
 #endif
@@ -90,7 +90,7 @@ void worker_main() {
     }
   }
 
-  g_workerThreadId = {};
+  g_isWorkerThread = false;
 }
 
 void enqueue(QueueItem item) {
@@ -297,7 +297,7 @@ void synchronize() {
   sync->cv.wait(lock, [&] { return sync->complete; });
 }
 
-bool is_worker_thread() noexcept { return g_workerThreadId == std::this_thread::get_id(); }
+bool is_worker_thread() noexcept { return g_isWorkerThread; }
 
 void set_idle_hook(WorkCallback hook) { g_idleHook = std::move(hook); }
 
