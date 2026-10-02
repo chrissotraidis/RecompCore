@@ -146,7 +146,7 @@ if(BUILD_TESTING)
         target_link_libraries(gxruntime_guest_memory_${_variant}_test PRIVATE GXRuntime::runtime)
         if(_variant STREQUAL "global")
             target_compile_definitions(gxruntime_guest_memory_${_variant}_test PRIVATE
-                BW_GUEST_MEM1=bw_test_mem1 BW_GUEST_MEM1_SIZE=4096)
+                BW_GUEST_MEM1=bw_test_mem1 BW_GUEST_MEM1_SIZE=0x02000000u)
         endif()
         add_test(NAME gxruntime_guest_memory_${_variant}_test COMMAND gxruntime_guest_memory_${_variant}_test)
     endforeach()

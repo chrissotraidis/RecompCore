@@ -166,7 +166,7 @@ static void ppc_guest_alias_recompute_bounds(void) {
         const u64 alias_end = (u64)alias->linked_start + alias->size;
         if (alias_end > g_guest_alias_max_end)
             g_guest_alias_max_end = alias_end;
-        if (alias->linked_start < GC_RAM_BASE + GC_MAIN_RAM_SIZE &&
+        if (alias->linked_start < GC_MEM1_ADDRESS_END &&
             alias_end > GC_RAM_BASE)
             ppc_guest_alias_set_overlap_mem1(true);
     }
@@ -202,7 +202,7 @@ static bool ppc_guest_alias_add_storage(u32 linked_start, u32 size,
     const u64 alias_end = (u64)alias->linked_start + alias->size;
     if (alias_end > g_guest_alias_max_end)
         g_guest_alias_max_end = alias_end;
-    if (alias->linked_start < GC_RAM_BASE + GC_MAIN_RAM_SIZE &&
+    if (alias->linked_start < GC_MEM1_ADDRESS_END &&
         alias_end > GC_RAM_BASE)
         ppc_guest_alias_set_overlap_mem1(true);
     if (getenv("BLUEWAKE_TRACE_GUEST_ALIASES") != NULL &&

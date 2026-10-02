@@ -36,6 +36,8 @@ extern "C" {
 
 #define GC_MAIN_RAM_SIZE    (24 * 1024 * 1024)
 #define GC_RAM_BASE         0x80000000u
+/* Cached MEM1 address region, including host extensions beyond retail 24 MiB. */
+#define GC_MEM1_ADDRESS_END 0x90000000u
 #define GC_RAM_UNCACHED     0xC0000000u
 
 #define PPC_EXC_PROGRAM        0x00000001u
