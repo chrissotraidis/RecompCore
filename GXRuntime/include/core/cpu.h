@@ -188,14 +188,33 @@ typedef void (*PPCMemWriteJournal)(u32 offset, u32 size, void* user);
 extern PPCMemWriteJournal g_mem_write_journal;
 extern void* g_mem_write_journal_user;
 
+// BW_GUEST_MEM1 (a module build's define): MEM1 is also that global array of
+// BW_GUEST_MEM1_SIZE bytes, the very memory cpu->ram points at (the host
+// adopts it: bluewake_composite_guest_mem1). Reached through a global the
+// compiler can tell apart from the guest CPU's state (another global), a
+// guest load or store cannot touch the guest registers, so translated code
+// keeps them in host registers across guest memory accesses. Through
+// cpu->ram, a pointer read at run time, any guest store might have written
+// them and any guest load read them: each access put them back in memory.
+#if defined(BW_GUEST_MEM1)
+extern u8 BW_GUEST_MEM1[];
+#endif
+
 static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size, u32* out_offset) {
     if (!g_ppc_guest_aliases_overlap_mem1 &&
         (addr & 0x40000000u) == 0u) {
         u32 offset = addr - GC_RAM_BASE;
-        if (offset <= cpu->ram_size - size) {
+#if defined(BW_GUEST_MEM1)
+        if (size <= BW_GUEST_MEM1_SIZE && offset <= BW_GUEST_MEM1_SIZE - size) {
+            if (out_offset) *out_offset = offset;
+            return BW_GUEST_MEM1 + offset;
+        }
+#else
+        if (size <= cpu->ram_size && offset <= cpu->ram_size - size) {
             if (out_offset) *out_offset = offset;
             return cpu->ram + offset;
         }
+#endif
     }
 
     u8* alias = NULL;
@@ -217,7 +236,7 @@ static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size
     // Check MEM2 (EXRAM) first as it is much more common in Wii titles
     if (cpu->exram) {
         u32 offset = masked_addr - 0x90000000u;
-        if (offset <= cpu->exram_size - size) {
+        if (size <= cpu->exram_size && offset <= cpu->exram_size - size) {
             if (out_offset) *out_offset = (u32)-1;
             return cpu->exram + offset;
         }
@@ -225,7 +244,7 @@ static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size
     
     // Check MEM1
     u32 offset = masked_addr - 0x80000000u;
-    if (offset <= cpu->ram_size - size) {
+    if (size <= cpu->ram_size && offset <= cpu->ram_size - size) {
         if (out_offset) *out_offset = offset;
         return cpu->ram + offset;
     }
