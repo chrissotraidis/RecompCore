@@ -50,8 +50,8 @@ struct DrawTransformSnapshot {
 
 // XF post-transform ("dual texture") matrix memory, 0x500..0x5FF: 64 rows of
 // four floats. Kept beside DolGxRecompState rather than in it, so the saved
-// front-end state keeps its size; after a load the rows read as identity
-// until the game loads them again.
+// legacy register-state layout keeps its size. New saves append this state;
+// legacy saves restore identity until the game loads the rows again.
 struct PostTexMatrices {
   float rows[64][4]{};
   std::uint64_t written = 0;  // rows the game has loaded

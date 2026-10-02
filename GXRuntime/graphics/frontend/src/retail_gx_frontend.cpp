@@ -422,6 +422,10 @@ void RetailGxFrontend::reset(const DolGuestAddressResolver* resolver) {
 namespace {
 
 constexpr std::uint32_t kFrontendStateMagic = 0x47585346u; // "GXSF"
+constexpr std::uint32_t kPostTexStateMagic = 0x50545831u; // "PTX1"
+constexpr std::size_t kPostTexStateSize = 2u * sizeof(std::uint32_t) +
+    sizeof(std::uint64_t) + sizeof(PostTexMatrices::rows);
+
 
 void resolve_saved_range(const DolGuestAddressResolver& resolver,
                          DolGuestResolvedRange& range, bool& valid) {
@@ -442,12 +446,12 @@ void resolve_saved_range(const DolGuestAddressResolver& resolver,
 std::vector<std::uint8_t> RetailGxFrontend::save_state() const {
   // Header, the register model with its host-only parts (resolver, the C
   // parser's FIFO copy, the per-flush event trace) cleared, the stale-palette
-  // mask and the unparsed tail.
+  // mask and the unparsed tail, followed by a versioned post-texture extension.
   const std::uint32_t header[3] = {
       kFrontendStateMagic, static_cast<std::uint32_t>(sizeof(DolGxRecompState)),
       static_cast<std::uint32_t>(fifo_buffer_.size())};
   std::vector<std::uint8_t> out(sizeof header + sizeof(DolGxRecompState) + 1u +
-                                fifo_buffer_.size());
+                                fifo_buffer_.size() + kPostTexStateSize);
   std::uint8_t* at = out.data();
   std::memcpy(at, header, sizeof header);
   at += sizeof header;
@@ -463,6 +467,13 @@ std::vector<std::uint8_t> RetailGxFrontend::save_state() const {
   *at++ = tlut_stale_mask_;
   if (!fifo_buffer_.empty())
     std::memcpy(at, fifo_buffer_.data(), fifo_buffer_.size());
+  at += fifo_buffer_.size();
+  const std::uint32_t post_header[2] = {kPostTexStateMagic, post_tex_.off ? 1u : 0u};
+  std::memcpy(at, post_header, sizeof post_header);
+  at += sizeof post_header;
+  std::memcpy(at, &post_tex_.written, sizeof post_tex_.written);
+  at += sizeof post_tex_.written;
+  std::memcpy(at, post_tex_.rows, sizeof post_tex_.rows);
   return out;
 }
 
@@ -471,9 +482,33 @@ bool RetailGxFrontend::load_state(const std::uint8_t* data, std::size_t size) {
   if (data == nullptr || size < sizeof header + sizeof(DolGxRecompState) + 1u)
     return false;
   std::memcpy(header, data, sizeof header);
+  const std::size_t legacy_size = sizeof header + sizeof(DolGxRecompState) + 1u + header[2];
   if (header[0] != kFrontendStateMagic || header[1] != sizeof(DolGxRecompState) ||
-      size != sizeof header + sizeof(DolGxRecompState) + 1u + header[2])
+      (size != legacy_size && size != legacy_size + kPostTexStateSize))
     return false;
+  PostTexMatrices restored_post{};
+  if (size != legacy_size) {
+    const std::uint8_t* post_at = data + legacy_size;
+    std::uint32_t post_header[2];
+    std::memcpy(post_header, post_at, sizeof post_header);
+    if (post_header[0] != kPostTexStateMagic || post_header[1] > 1u)
+      return false;
+    restored_post.off = post_header[1] != 0u;
+    post_at += sizeof post_header;
+    std::memcpy(&restored_post.written, post_at, sizeof restored_post.written);
+    post_at += sizeof restored_post.written;
+    std::memcpy(restored_post.rows, post_at, sizeof restored_post.rows);
+    // Rebuild the derived identity cache rather than trusting serialized bits.
+    for (unsigned row = 0; row < 64u; ++row) {
+      if ((restored_post.written & (1ull << row)) == 0u) continue;
+      const float* r = restored_post.rows[row];
+      for (unsigned k = 0; k < 3u; ++k)
+        if (!(r[0] == (k == 0u ? 1.f : 0.f) &&
+              r[1] == (k == 1u ? 1.f : 0.f) &&
+              r[2] == (k == 2u ? 1.f : 0.f) && r[3] == 0.f))
+          restored_post.identity[k] &= ~(1ull << row);
+    }
+  }
   const DolGuestAddressResolver resolver = state_.resolver;
   // The packet sequence keeps counting: a sink that has seen packets from this
   // front end requires it to rise.
@@ -495,6 +530,7 @@ bool RetailGxFrontend::load_state(const std::uint8_t* data, std::size_t size) {
   resolve_saved_range(resolver, state_.copy.range, state_.copy.range_valid);
   tlut_stale_mask_ = *at++;
   fifo_buffer_.assign(at, at + header[2]);
+  post_tex_ = restored_post;
   return true;
 }
 

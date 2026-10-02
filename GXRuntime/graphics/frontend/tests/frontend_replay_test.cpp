@@ -6,6 +6,7 @@
 #include "gxruntime/aurora_recomp/retail_gx_frontend_c.h"
 
 #include <cassert>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -697,6 +698,126 @@ void test_xf_projection_capture() {
   assert(both.projection_type == 1u);
 }
 
+// Exercise the actual FIFO -> snapshot -> consuming sink path, including
+// draw-time isolation and save/restore before the guest reloads its matrices.
+void test_post_tex_fifo_and_save_state() {
+  using gxruntime::aurora_recomp::ConsumingAuroraRenderSink;
+  RetailGxFrontend frontend;
+  ConsumingAuroraRenderSink sink;
+  frontend.set_packet_drain_enabled(true);
+  assert(frontend.set_vertex_layout(0u, 12u));
+  auto draw = [](std::vector<std::uint8_t>& fifo) {
+    push_u8(fifo, 0x90u);
+    push_u16(fifo, 3u);
+    for (unsigned i = 0; i < 9; ++i) push_u32(fifo, 0u);
+  };
+  auto flush = [&](const std::vector<std::uint8_t>& fifo) {
+    assert(frontend.write_fifo(fifo));
+    const bool ok = frontend.flush(&sink);
+    if (!ok) std::fprintf(stderr, "post-texture frontend: %s; sink: %s\n", frontend.last_error(), sink.failure_reason());
+    assert(ok);
+    assert(sink.failure_reason() == nullptr);
+  };
+  std::vector<std::uint8_t> fifo;
+  push_cp(fifo, DOL_GX_CP_REG_VCD_LO, 1u << 9u);
+  push_cp(fifo, DOL_GX_CP_REG_VAT_GRP0, 1u | (4u << 1u));
+  push_xf(fifo, 0x1012u, 1u);
+  push_xf(fifo, 0x103Fu, 1u);
+  push_xf(fifo, 0x1040u, 0u);
+  push_xf(fifo, 0x1050u, 0u);
+  push_xf_block(fifo, 0x500u,
+      {f32_bits(2.f), 0u, 0u, f32_bits(4.f),
+       0u, f32_bits(3.f), 0u, f32_bits(5.f),
+       0u, 0u, f32_bits(1.f), f32_bits(6.f)});
+  draw(fifo);
+  push_xf(fifo, 0x503u, f32_bits(9.f));
+  draw(fifo);
+  flush(fifo);
+  assert(sink.draws().size() == 2u);
+  assert(sink.draws()[0].post_tex_mask == 1u);
+  assert(sink.draws()[0].post_tex_normalize == 0u);
+  assert(sink.draws()[0].post_tex_rows[0][3] == 4.f);
+  assert(sink.draws()[1].post_tex_rows[0][3] == 9.f);
+  const auto saved = frontend.save_state();
+  // Malformed extensions fail before mutating the live frontend.
+  const std::size_t extension_size = 2u * sizeof(std::uint32_t) +
+      sizeof(std::uint64_t) + 64u * 4u * sizeof(float);
+  for (unsigned damage = 0; damage < 4; ++damage) {
+    auto bad = saved;
+    if (damage == 0) bad.pop_back();
+    if (damage == 1) bad.push_back(0);
+    if (damage == 2) bad[saved.size() - extension_size] ^= 1u;
+    if (damage == 3) {
+      const std::uint32_t invalid_switch = 2u;
+      std::memcpy(bad.data() + saved.size() - extension_size + sizeof(std::uint32_t),
+                  &invalid_switch, sizeof invalid_switch);
+    }
+    assert(!frontend.load_state(bad.data(), bad.size()));
+    assert(frontend.save_state() == saved);
+  }
+  fifo.clear();
+  push_xf(fifo, 0x503u, f32_bits(15.f));
+  flush(fifo);
+  assert(frontend.load_state(saved.data(), saved.size()));
+  fifo.clear(); draw(fifo); flush(fifo);
+  assert(sink.draws().back().post_tex_mask == 1u);
+  assert(sink.draws().back().post_tex_rows[0][3] == 9.f);
+
+  fifo.clear(); push_xf(fifo, 0x1050u, 1u << 8u); draw(fifo); flush(fifo);
+  assert(sink.draws().back().post_tex_normalize == 1u);
+  fifo.clear(); push_xf(fifo, 0x1012u, 0u); draw(fifo); flush(fifo);
+  assert(sink.draws().back().post_tex_mask == 0u);
+  const auto disabled = frontend.save_state();
+  fifo.clear(); push_xf(fifo, 0x1012u, 1u); flush(fifo);
+  assert(frontend.load_state(disabled.data(), disabled.size()));
+  fifo.clear(); draw(fifo); flush(fifo);
+  assert(sink.draws().back().post_tex_mask == 0u);
+
+  // Legacy payloads still load, with unknown post memory reset to identity.
+  std::uint32_t header[3];
+  std::memcpy(header, saved.data(), sizeof header);
+  const std::size_t legacy_size = sizeof header + sizeof(DolGxRecompState) + 1u + header[2];
+  assert(frontend.load_state(saved.data(), legacy_size));
+  fifo.clear(); draw(fifo); flush(fifo);
+  assert(sink.draws().back().post_tex_mask == 0u);
+}
+
+void test_indexed_post_tex_fifo() {
+  using gxruntime::aurora_recomp::ConsumingAuroraRenderSink;
+  CPUState cpu;
+  assert(cpu_init(&cpu));
+  DolGuestMemory memory;
+  assert(dol_guest_memory_init(&memory, nullptr));
+  DolGuestAddressResolver resolver;
+  dol_guest_address_resolver_init(&resolver, &memory, &cpu);
+  std::vector<std::uint8_t> rows;
+  for (float value : {2.f, 0.f, 0.f, 4.f, 0.f, 3.f, 0.f, 5.f,
+                      0.f, 0.f, 1.f, 6.f}) push_u32(rows, f32_bits(value));
+  std::memcpy(cpu.ram + 0x1000u + 48u, rows.data(), rows.size());
+  RetailGxFrontend frontend(resolver);
+  ConsumingAuroraRenderSink sink;
+  sink.set_guest_resolver(&resolver);
+  std::vector<std::uint8_t> fifo;
+  push_cp(fifo, DOL_GX_CP_REG_VCD_LO, 1u << 9u);
+  push_cp(fifo, DOL_GX_CP_REG_VAT_GRP0, 1u | (4u << 1u));
+  push_cp(fifo, DOL_GX_CP_REG_ARRAYBASE + 12u, 0x1000u);
+  push_cp(fifo, DOL_GX_CP_REG_ARRAYSTRIDE + 12u, 48u);
+  push_xf(fifo, 0x103Fu, 1u);
+  push_xf(fifo, 0x1040u, 0u);
+  push_xf(fifo, 0x1050u, 0u);
+  push_indexed_xf(fifo, 0x20u, 1u, 0x500u, 12u);
+  push_u8(fifo, 0x90u); push_u16(fifo, 3u);
+  for (unsigned i = 0; i < 9; ++i) push_u32(fifo, 0u);
+  assert(frontend.replay_fifo(fifo, &sink));
+  assert(sink.draws().size() == 1u);
+  const auto& draw = sink.draws().front();
+  assert(draw.post_tex_mask == 1u && draw.post_tex_normalize == 0u);
+  for (unsigned i = 0; i < 12; ++i)
+    assert(f32_bits(draw.post_tex_rows[0][i]) == read_fixture_be32(rows.data() + i * 4u));
+  dol_guest_memory_shutdown(&memory);
+  cpu_free(&cpu);
+}
+
 } // namespace
 
 int main() {
@@ -726,6 +847,8 @@ int main() {
   test_large_batch_drains_instead_of_dropping();
   test_flush_stops_after_display_copy();
   test_xf_projection_capture();
+  test_post_tex_fifo_and_save_state();
+  test_indexed_post_tex_fifo();
 
   CPUState cpu;
   assert(cpu_init(&cpu));
