@@ -2557,7 +2557,7 @@ static void test_savestate_roundtrip(void) {
     PPCHostCall saved_host_call = cpu.host_call;
     u8* saved_ram = cpu.ram;
 
-    const char* path = "/tmp/gxruntime_savestate_test.dols";
+    const char* path = "gxruntime_savestate_test.dols";
     DolSaveRegion regions[1] = {{"MEM1", cpu.ram, cpu.ram_size}};
     assert(dol_savestate_write(path, &cpu, regions, 1));
 
