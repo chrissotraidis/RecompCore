@@ -205,12 +205,12 @@ static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size
         (addr & 0x40000000u) == 0u) {
         u32 offset = addr - GC_RAM_BASE;
 #if defined(BW_GUEST_MEM1)
-        if (offset <= BW_GUEST_MEM1_SIZE - size) {
+        if (size <= BW_GUEST_MEM1_SIZE && offset <= BW_GUEST_MEM1_SIZE - size) {
             if (out_offset) *out_offset = offset;
             return BW_GUEST_MEM1 + offset;
         }
 #else
-        if (offset <= cpu->ram_size - size) {
+        if (size <= cpu->ram_size && offset <= cpu->ram_size - size) {
             if (out_offset) *out_offset = offset;
             return cpu->ram + offset;
         }
@@ -236,7 +236,7 @@ static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size
     // Check MEM2 (EXRAM) first as it is much more common in Wii titles
     if (cpu->exram) {
         u32 offset = masked_addr - 0x90000000u;
-        if (offset <= cpu->exram_size - size) {
+        if (size <= cpu->exram_size && offset <= cpu->exram_size - size) {
             if (out_offset) *out_offset = (u32)-1;
             return cpu->exram + offset;
         }
@@ -244,7 +244,7 @@ static GXRUNTIME_ALWAYS_INLINE u8* get_ram_ptr(CPUState* cpu, u32 addr, u32 size
     
     // Check MEM1
     u32 offset = masked_addr - 0x80000000u;
-    if (offset <= cpu->ram_size - size) {
+    if (size <= cpu->ram_size && offset <= cpu->ram_size - size) {
         if (out_offset) *out_offset = offset;
         return cpu->ram + offset;
     }
