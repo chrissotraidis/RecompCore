@@ -2,6 +2,7 @@
 #include <dolphin/gx.h>
 
 #include <utility>
+#include <vector>
 
 #include "common.hpp"
 
@@ -62,6 +63,9 @@ TextureHandle new_dynamic_texture_2d(uint32_t width, uint32_t height, uint32_t m
 TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
 TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, const char* label) noexcept;
 void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
+// Caller has submitted the texture's writes. Copy on the render worker and
+// wait for GPU mapping; returns empty on unsupported format or map failure.
+std::vector<uint8_t> read_texture_rgba8(const TextureHandle& texture);
 }; // namespace aurora::gfx
 
 struct GXTexObj_ {

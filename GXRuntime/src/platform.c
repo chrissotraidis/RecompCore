@@ -65,6 +65,11 @@ void dol_platform_gx_flush(void) {
         g_ops.gx_flush();
 }
 
+bool dol_platform_gx_read_draw_sync(u16* token) {
+    return token != NULL && g_ops.gx_read_draw_sync != NULL &&
+           g_ops.gx_read_draw_sync(token);
+}
+
 void dol_platform_call_display_list(const void* data, u32 size) {
     if (g_ops.call_display_list != NULL && data != NULL && size != 0)
         g_ops.call_display_list(data, size);

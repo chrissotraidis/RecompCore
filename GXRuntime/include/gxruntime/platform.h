@@ -37,6 +37,7 @@ typedef struct DolPlatformOps {
     // matter to it). NULL where they do: the host then sends writes one by one.
     void (*gx_write_bytes)(const u8* bytes, u32 size);
     void (*gx_flush)(void);
+    bool (*gx_read_draw_sync)(u16* token);
     void (*call_display_list)(const void* data, u32 size);
     void (*set_array)(u32 attr, const void* data, u32 size, u8 stride);
     void (*set_array_guest)(u32 attr, u32 guest_address, const void* data,
@@ -87,6 +88,9 @@ void dol_platform_gx_write_bytes(const u8* bytes, u32 size);
 // guest is about to observe GPU progress - the draw-done commit - so the
 // translation is never behind a wait it is supposed to satisfy.
 void dol_platform_gx_flush(void);
+// Drain submitted commands and read the last decoded interrupt token.
+// False means no token was decoded or the backend cannot provide it.
+bool dol_platform_gx_read_draw_sync(u16* token);
 void dol_platform_call_display_list(const void* data, u32 size);
 void dol_platform_set_array(u32 attr, const void* data, u32 size, u8 stride);
 void dol_platform_set_array_guest(u32 attr, u32 guest_address,

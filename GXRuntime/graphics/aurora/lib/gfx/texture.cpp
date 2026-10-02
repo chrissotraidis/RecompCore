@@ -5,6 +5,12 @@
 #include "aurora/aurora.h"
 #include "texture.hpp"
 #include "texture_convert.hpp"
+#include "render_worker.hpp"
+#include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <mutex>
+#include <vector>
 #include "../gx/gx_fmt.hpp"
 
 #include <algorithm>
@@ -157,7 +163,7 @@ TextureHandle new_render_texture(uint32_t width, uint32_t height, u32 gxFormat, 
   };
   const wgpu::TextureDescriptor textureDescriptor{
       .label = label,
-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::RenderAttachment,
+      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::RenderAttachment,
       .dimension = wgpu::TextureDimension::e2D,
       .size = size,
       .format = wgpuFormat,
@@ -190,7 +196,7 @@ TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, co
   };
   const wgpu::TextureDescriptor textureDescriptor{
       .label = label,
-      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::RenderAttachment,
+      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::RenderAttachment,
       .dimension = wgpu::TextureDimension::e2D,
       .size = size,
       .format = wgpuFormat,
@@ -210,6 +216,78 @@ TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, co
   wgpu::TextureView sampleTextureView = attachmentTextureView;
   return std::make_shared<TextureRef>(std::move(texture), std::move(sampleTextureView),
                                       std::move(attachmentTextureView), size, wgpuFormat, 1, gxFormat);
+}
+
+std::vector<uint8_t> read_texture_rgba8(const TextureHandle& texture) {
+  if (!texture || render_worker::is_worker_thread())
+    return {};
+  const auto format = texture->format;
+  const bool bgra = format == wgpu::TextureFormat::BGRA8Unorm ||
+                    format == wgpu::TextureFormat::BGRA8UnormSrgb;
+  if (!bgra && format != wgpu::TextureFormat::RGBA8Unorm &&
+      format != wgpu::TextureFormat::RGBA8UnormSrgb)
+    return {};
+  struct Readback {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    std::vector<uint8_t> rgba;
+  };
+  auto result = std::make_shared<Readback>();
+  // Keep all resources in the queued work/callback if the caller times out.
+  render_worker::enqueue_work([texture, result, bgra] {
+    const auto width = texture->size.width, height = texture->size.height;
+    const uint32_t stride = (width * 4u + 255u) & ~255u;
+    const uint64_t size = uint64_t(stride) * height;
+    const wgpu::BufferDescriptor desc{
+        .label = "GX copy RAM readback", .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
+        .size = size};
+    auto buffer = g_device.CreateBuffer(&desc);
+    auto encoder = g_device.CreateCommandEncoder();
+    if (!buffer || !encoder) {
+      std::lock_guard lock(result->mutex);
+      result->done = true;
+      result->cv.notify_all();
+      return;
+    }
+    const wgpu::TexelCopyTextureInfo src{.texture = texture->texture};
+    const wgpu::TexelCopyBufferInfo dst{
+        .layout = {.bytesPerRow = stride, .rowsPerImage = height}, .buffer = buffer};
+    encoder.CopyTextureToBuffer(&src, &dst, &texture->size);
+    const auto commands = encoder.Finish();
+    g_queue.Submit(1, &commands);
+    buffer.MapAsync(wgpu::MapMode::Read, 0, size, wgpu::CallbackMode::AllowSpontaneous,
+        [result, buffer, size, stride, width, height, bgra](wgpu::MapAsyncStatus status, wgpu::StringView) {
+          std::lock_guard lock(result->mutex);
+          if (status == wgpu::MapAsyncStatus::Success) {
+            const auto* data = static_cast<const uint8_t*>(buffer.GetConstMappedRange(0, size));
+            if (data != nullptr) {
+              result->rgba.resize(size_t(width) * height * 4u);
+              for (uint32_t y = 0; y < height; ++y) {
+                auto* row = result->rgba.data() + size_t(y) * width * 4u;
+                std::memcpy(row, data + size_t(y) * stride, size_t(width) * 4u);
+                if (bgra)
+                  for (uint32_t x = 0; x < width; ++x)
+                    std::swap(row[x * 4u], row[x * 4u + 2u]);
+              }
+            }
+            buffer.Unmap();
+          }
+          result->done = true;
+          result->cv.notify_all();
+        });
+  });
+  std::unique_lock lock(result->mutex);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!result->done && std::chrono::steady_clock::now() < deadline) {
+    result->cv.wait_for(lock, std::chrono::milliseconds(10));
+    if (!result->done) {
+      lock.unlock();
+      render_worker::enqueue_work([] { webgpu::g_instance.ProcessEvents(); });
+      lock.lock();
+    }
+  }
+  return result->done ? std::move(result->rgba) : std::vector<uint8_t>{};
 }
 
 void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept {

@@ -202,6 +202,7 @@ void aurora_backend_mark_gx_begin(void);
 void aurora_backend_gx_write(u64 value, u8 size);
 void aurora_backend_gx_write_bytes(const u8* bytes, u32 size);
 void aurora_backend_gx_flush(void);
+bool aurora_backend_gx_read_draw_sync(u16* token);
 void aurora_backend_call_display_list(const void* data, u32 size);
 void aurora_backend_set_array(u32 attr, const void* data, u32 size, u8 stride);
 void aurora_backend_set_array_guest(u32 attr, u32 guest_address, const void* data, u32 size, u8 stride);

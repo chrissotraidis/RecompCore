@@ -11,6 +11,7 @@
 #define DOL_PI_INTERRUPT_MASK  (DOL_PI_BASE + 0x04u)
 
 #define DOL_PE_INTERRUPT_STATUS 0xCC00100Au
+#define DOL_PE_TOKEN 0xCC00100Eu
 
 #define DOL_PI_CAUSE_PI        0x00000001u
 #define DOL_PI_CAUSE_RSW       0x00000002u
@@ -35,12 +36,19 @@
 #define DOL_VI_DI0_STATUS_BIT 0x80u
 #define DOL_VI_DI0_MASK_BIT 0x10u
 
+#define DOL_PE_TOKEN_ENABLE_BIT 0x0001u
+#define DOL_PE_FINISH_ENABLE_BIT 0x0002u
+#define DOL_PE_TOKEN_ACK_BIT 0x0004u
 #define DOL_PE_FINISH_ACK_BIT 0x0008u
 
 typedef struct DolInterrupts {
     u8 vi_regs[DOL_VI_REGISTER_BYTES];
     u32 pi_cause;
     u32 pi_mask;
+    u16 pe_token;
+    u16 pe_control;
+    bool pe_token_pending;
+    bool pe_finish_pending;
 } DolInterrupts;
 
 void dol_interrupts_init(DolInterrupts* interrupts);
@@ -57,5 +65,6 @@ void dol_interrupts_set_source(DolInterrupts* interrupts, u32 cause_mask,
                                bool pending);
 void dol_interrupts_assert_vi_retrace(DolInterrupts* interrupts);
 void dol_interrupts_commit_pe_finish(DolInterrupts* interrupts);
+void dol_interrupts_commit_pe_token(DolInterrupts* interrupts, u16 token);
 
 #endif
