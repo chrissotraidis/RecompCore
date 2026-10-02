@@ -99,6 +99,9 @@ void reset_pass_state();
 // address samples the copied EFB instead of stale guest memory. Called by the
 // GxCoreSink copy observer at the copy's stream position (pending draw flushed).
 void copy_efb_to_texture(const gxruntime::gxcore::EfbCopyCommand& cmd);
+// Submit a preserving frame segment, read the exact captured texture, and
+// encode guest tiles. Recording thread only, with the FIFO worker drained.
+std::vector<uint8_t> read_efb_copy(const gxruntime::gxcore::EfbCopyCommand& cmd);
 
 // Submission layer: turn one headless DrawPlan into buffer pushes, texture
 // upload (guest-identity cache keyed incl. TLUT identity; gxcore decodes every

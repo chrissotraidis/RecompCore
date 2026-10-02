@@ -13,6 +13,7 @@
 
 #include <gxruntime/gxcore/gxcore.hpp> // EfbCopyCommand
 #include <gxruntime/gxcore/texture_decode.hpp>
+#include <gxruntime/gxcore/texture_encode.hpp>
 
 #include <absl/container/flat_hash_map.h>
 
@@ -863,6 +864,21 @@ unsigned long long texture_upload_count() { return g_textureCacheStats.uploads; 
 // incl. depth targets) and optionally clears the EFB to the game's copy-clear
 // color/Z afterwards. The bound draw's geometry is already in the pass (the
 // sink flushed the pending draw before firing this).
+std::vector<uint8_t> read_efb_copy(const gxc::EfbCopyCommand& cmd) {
+  const auto it = g_efbCopyTextures.find(cmd.dest_address);
+  if (it == g_efbCopyTextures.end() || !it->second.handle ||
+      (cmd.format != 1u && cmd.format != 4u))
+    return {};
+  const auto texture = it->second.handle;
+  // Submission keeps the current EFB and does not present an extra frame.
+  // The following worker readback is ordered after the copy's render pass.
+  if (!gfx::segment_frame())
+    return {};
+  const auto rgba = gfx::read_texture_rgba8(texture);
+  return gxc::encode_efb_copy(cmd.format, cmd.destination_width,
+      cmd.destination_height, rgba, texture->size.width, texture->size.height);
+}
+
 void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
   // Mirror the copy-clear color/Z (BP 0x4F-0x51 at this copy) into the gx
   // state GXSetCopyClear would have written: begin_frame's pass-0 EFB clear

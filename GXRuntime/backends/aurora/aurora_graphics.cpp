@@ -37,6 +37,7 @@
 namespace aurora::gfx::gxcore {
 bool submit_draw_plan(const gxruntime::gxcore::DrawPlan& plan);
 void copy_efb_to_texture(const gxruntime::gxcore::EfbCopyCommand& cmd);
+std::vector<uint8_t> read_efb_copy(const gxruntime::gxcore::EfbCopyCommand& cmd);
 void reset_texture_cache();
 void note_frame_presented();
 void set_texture_dirty_epoch_observer(
@@ -131,8 +132,18 @@ void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
         g_core_rejected.fetch_add(1, std::memory_order_relaxed);
 }
 
+// Written by the FIFO worker and consumed only after its drain. Wind Waker's
+// capture copy is immediately followed by GXSetDrawSync; display copies do
+// not replace this texture-copy descriptor.
+static gxruntime::gxcore::EfbCopyCommand g_draw_sync_copy;
+static bool g_draw_sync_copy_valid;
+
 void core_copy_observer(const gxruntime::gxcore::EfbCopyCommand& cmd, void*) {
     aurora::gfx::gxcore::copy_efb_to_texture(cmd);
+    if (cmd.format != 0xFu) {
+        g_draw_sync_copy = cmd;
+        g_draw_sync_copy_valid = true;
+    }
     if (cmd.format == 0xFu && !g_worker_mode.load(std::memory_order_relaxed))
         g_display_copy_pending = true;
 }
@@ -1726,6 +1737,54 @@ void aurora_backend_call_display_list(const void* data, u32 size) {
 // draw-done commit, where the guest is about to observe GPU progress, so the
 // translation is never behind a wait it is supposed to satisfy. Without Aurora
 // there is no front end to drain.
+bool aurora_backend_gx_read_draw_sync(u16* token) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    if (token == nullptr || !gx_aurora::g_initialized ||
+        !gx_aurora::g_shadow_frontend_enabled)
+        return false;
+    // The frontend worker owns its registers until this drain completes.
+    // Capture copies preceding the token must be submitted before the guest
+    // receives its callback. Repeated identical tokens are still events.
+    gx_aurora::shadow_frontend_flush_pending();
+    if (gx_aurora::g_shadow_frontend_failed.load(std::memory_order_relaxed))
+        return false;
+    const auto& state = gx_aurora::g_shadow_frontend.state();
+    if (!state.bp_valid[0x48u])
+        return false;
+    if (gx_aurora::g_gx_core_enabled && gx_aurora::g_draw_sync_copy_valid) {
+        const auto copy = gx_aurora::g_draw_sync_copy;
+        // These are the regular and Deluxe Picto Box CPU capture formats.
+        // GPU-only copies keep their existing texture path.
+        if (copy.format == 1u || copy.format == 4u) {
+            DolGuestResolvedRange range{};
+            if (!gx_aurora::frontend_guest_address_resolver_bridge(nullptr,
+                    copy.dest_address, copy.byte_size, DOL_GUEST_ADDRESS_PHYSICAL,
+                    DOL_GUEST_RESOURCE_COPY_DESTINATION, &range))
+                return false;
+            std::lock_guard<std::mutex> recording(gx_aurora::g_aurora_recording_mutex);
+            if (!gx_aurora::g_aurora_recording_open)
+                return false;
+            const auto bytes = aurora::gfx::gxcore::read_efb_copy(copy);
+            if (bytes.empty() || bytes.size() > copy.byte_size) {
+                std::fprintf(stderr, "[draw-sync] capture readback failed address=0x%08X format=%u\n",
+                             copy.dest_address, copy.format);
+                return false;
+            }
+            std::memcpy(range.data, bytes.data(), bytes.size());
+            dol_guest_memory_dirty_mark(copy.dest_address, static_cast<u32>(bytes.size()));
+            std::fprintf(stderr, "[draw-sync] capture written address=0x%08X format=%u size=%zu\n",
+                         copy.dest_address, copy.format, bytes.size());
+        }
+        gx_aurora::g_draw_sync_copy_valid = false;
+    }
+    *token = static_cast<u16>(state.bp_regs[0x48u]);
+    return true;
+#else
+    (void)token;
+    return false;
+#endif
+}
+
 void aurora_backend_gx_flush(void) {
 #if GXRUNTIME_HAS_AURORA_RECOMP
     if (!gx_aurora::g_initialized)
@@ -1961,6 +2020,9 @@ void aurora_backend_set_copy_destination_guest(u32 guest_address,
 
 void aurora_backend_set_guest_address_resolver(
     DolPlatformGuestAddressResolverFn resolve, void* user) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    gx_aurora::g_draw_sync_copy_valid = false;
+#endif
     gx_aurora::g_guest_address_resolver = resolve;
     gx_aurora::g_guest_address_resolver_user = user;
 #if GXRUNTIME_HAS_AURORA_RECOMP
@@ -2048,6 +2110,7 @@ bool dol_aurora_gx_load_state(const void* data, size_t size) {
         return false;
     // Whatever this run had buffered belongs to the frame being replaced.
     gx_aurora::shadow_frontend_flush_pending();
+    gx_aurora::g_draw_sync_copy_valid = false;
     const auto* bytes = static_cast<const std::uint8_t*>(data) + sizeof header;
     if (!gx_aurora::g_shadow_frontend.load_state(bytes, header[1]))
         return false;

@@ -28,6 +28,15 @@ static void sync_vi(DolInterrupts* interrupts) {
                                          (di0 & DOL_VI_DI0_MASK_BIT) != 0u);
 }
 
+static void sync_pe(DolInterrupts* interrupts) {
+    dol_interrupts_set_source(interrupts, DOL_PI_CAUSE_PE_TOKEN,
+        interrupts->pe_token_pending &&
+        (interrupts->pe_control & DOL_PE_TOKEN_ENABLE_BIT) != 0u);
+    dol_interrupts_set_source(interrupts, DOL_PI_CAUSE_PE_FINISH,
+        interrupts->pe_finish_pending &&
+        (interrupts->pe_control & DOL_PE_FINISH_ENABLE_BIT) != 0u);
+}
+
 void dol_interrupts_init(DolInterrupts* interrupts) {
     if (interrupts == NULL)
         return;
@@ -41,7 +50,7 @@ void dol_interrupts_init(DolInterrupts* interrupts) {
 bool dol_interrupts_mmio_contains(u32 ea) {
     return range_contains(DOL_VI_BASE, DOL_VI_REGISTER_BYTES, ea) ||
            range_contains(DOL_PI_BASE, 0x40u, ea) ||
-           ea == DOL_PE_INTERRUPT_STATUS;
+           ea == DOL_PE_INTERRUPT_STATUS || ea == DOL_PE_TOKEN;
 }
 
 u64 dol_interrupts_mmio_read(DolInterrupts* interrupts, u32 ea, u8 size) {
@@ -54,9 +63,9 @@ u64 dol_interrupts_mmio_read(DolInterrupts* interrupts, u32 ea, u8 size) {
     if (ea == DOL_PI_INTERRUPT_MASK)
         return interrupts->pi_mask;
     if (ea == DOL_PE_INTERRUPT_STATUS)
-        return (interrupts->pi_cause & DOL_PI_CAUSE_PE_FINISH)
-                   ? DOL_PE_FINISH_ACK_BIT
-                   : 0u;
+        return interrupts->pe_control; // acknowledgment bits are write-only
+    if (ea == DOL_PE_TOKEN)
+        return interrupts->pe_token;
 
     if (range_contains(DOL_VI_BASE, DOL_VI_REGISTER_BYTES, ea)) {
         const u32 off = ea - DOL_VI_BASE;
@@ -83,9 +92,13 @@ void dol_interrupts_mmio_write(DolInterrupts* interrupts, u32 ea, u8 size,
         return;
     }
     if (ea == DOL_PE_INTERRUPT_STATUS) {
+        if ((value & DOL_PE_TOKEN_ACK_BIT) != 0u)
+            interrupts->pe_token_pending = false;
         if ((value & DOL_PE_FINISH_ACK_BIT) != 0u)
-            dol_interrupts_set_source(interrupts, DOL_PI_CAUSE_PE_FINISH,
-                                      false);
+            interrupts->pe_finish_pending = false;
+        interrupts->pe_control = (u16)value &
+            (DOL_PE_TOKEN_ENABLE_BIT | DOL_PE_FINISH_ENABLE_BIT);
+        sync_pe(interrupts);
         return;
     }
 
@@ -129,5 +142,16 @@ void dol_interrupts_assert_vi_retrace(DolInterrupts* interrupts) {
 }
 
 void dol_interrupts_commit_pe_finish(DolInterrupts* interrupts) {
-    dol_interrupts_set_source(interrupts, DOL_PI_CAUSE_PE_FINISH, true);
+    if (interrupts == NULL)
+        return;
+    interrupts->pe_finish_pending = true;
+    sync_pe(interrupts);
+}
+
+void dol_interrupts_commit_pe_token(DolInterrupts* interrupts, u16 token) {
+    if (interrupts == NULL)
+        return;
+    interrupts->pe_token = token;
+    interrupts->pe_token_pending = true;
+    sync_pe(interrupts);
 }

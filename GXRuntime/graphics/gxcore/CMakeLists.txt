@@ -2,6 +2,7 @@ add_library(gxruntime_gxcore STATIC
     src/gxcore.cpp
     src/gxcore_shader.cpp
     src/texture_decode.cpp
+    src/texture_encode.cpp
 )
 add_library(GXRuntime::gxcore ALIAS gxruntime_gxcore)
 
@@ -16,6 +17,10 @@ target_link_libraries(gxruntime_gxcore
 )
 
 if(BUILD_TESTING)
+    add_executable(gxcore_texture_encode_tests tests/gxcore_texture_encode_test.cpp)
+    target_link_libraries(gxcore_texture_encode_tests PRIVATE GXRuntime::gxcore)
+    add_test(NAME gxcore_texture_encode_tests COMMAND gxcore_texture_encode_tests)
+
     add_executable(gxcore_tests
         tests/gxcore_wgsl_test.cpp
     )

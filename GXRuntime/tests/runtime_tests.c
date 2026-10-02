@@ -1679,13 +1679,15 @@ static void test_interrupts(void) {
                               0x1000u);
     assert((dol_interrupts_pi_cause(&interrupts) & DOL_PI_CAUSE_VI) == 0);
 
+    dol_interrupts_mmio_write(&interrupts, DOL_PE_INTERRUPT_STATUS, 2,
+                              DOL_PE_FINISH_ENABLE_BIT);
     dol_interrupts_commit_pe_finish(&interrupts);
     assert((dol_interrupts_pi_cause(&interrupts) &
             DOL_PI_CAUSE_PE_FINISH) != 0);
     assert(dol_interrupts_mmio_read(&interrupts, DOL_PE_INTERRUPT_STATUS, 2) ==
-           DOL_PE_FINISH_ACK_BIT);
+           DOL_PE_FINISH_ENABLE_BIT);
     dol_interrupts_mmio_write(&interrupts, DOL_PE_INTERRUPT_STATUS, 2,
-                              DOL_PE_FINISH_ACK_BIT);
+                              DOL_PE_FINISH_ENABLE_BIT | DOL_PE_FINISH_ACK_BIT);
     assert((dol_interrupts_pi_cause(&interrupts) &
             DOL_PI_CAUSE_PE_FINISH) == 0);
 
@@ -1696,6 +1698,49 @@ static void test_interrupts(void) {
                               DOL_PI_CAUSE_DSP);
     assert((dol_interrupts_pi_cause(&interrupts) & DOL_PI_CAUSE_DSP) == 0);
     assert(!dol_interrupts_external_pending(&interrupts));
+}
+
+static void test_pe_tokens(void) {
+    DolInterrupts irq;
+    dol_interrupts_init(&irq);
+    assert(dol_interrupts_mmio_contains(DOL_PE_TOKEN));
+    assert(dol_interrupts_mmio_read(&irq, DOL_PE_INTERRUPT_STATUS, 2) == 0u);
+    // An interrupt token can be zero. Pending state is distinct from value,
+    // and a disabled PE interrupt must become visible when its mask is enabled.
+    dol_interrupts_commit_pe_token(&irq, 0u);
+    dol_interrupts_commit_pe_finish(&irq);
+    assert(!dol_interrupts_external_pending(&irq));
+    const u16 enabled = DOL_PE_TOKEN_ENABLE_BIT | DOL_PE_FINISH_ENABLE_BIT;
+    dol_interrupts_mmio_write(&irq, DOL_PE_INTERRUPT_STATUS, 2, enabled);
+    assert(!dol_interrupts_external_pending(&irq)); // PI still masks both
+    dol_interrupts_mmio_write(&irq, DOL_PI_INTERRUPT_MASK, 4,
+        DOL_PI_CAUSE_PE_TOKEN | DOL_PI_CAUSE_PE_FINISH);
+    assert(dol_interrupts_external_pending(&irq));
+    assert(dol_interrupts_mmio_read(&irq, DOL_PE_TOKEN, 2) == 0u);
+    assert(dol_interrupts_mmio_read(&irq, DOL_PE_INTERRUPT_STATUS, 2) == enabled);
+    dol_interrupts_mmio_write(&irq, DOL_PE_INTERRUPT_STATUS, 2,
+        enabled | DOL_PE_TOKEN_ACK_BIT);
+    assert((irq.pi_cause & DOL_PI_CAUSE_PE_TOKEN) == 0u);
+    assert((irq.pi_cause & DOL_PI_CAUSE_PE_FINISH) != 0u);
+    // A second identical token still raises a fresh event.
+    dol_interrupts_commit_pe_token(&irq, 0u);
+    assert((irq.pi_cause & DOL_PI_CAUSE_PE_TOKEN) != 0u);
+    dol_interrupts_mmio_write(&irq, DOL_PE_INTERRUPT_STATUS, 2,
+        enabled | DOL_PE_FINISH_ACK_BIT);
+    assert((irq.pi_cause & DOL_PI_CAUSE_PE_TOKEN) != 0u);
+    assert((irq.pi_cause & DOL_PI_CAUSE_PE_FINISH) == 0u);
+    dol_interrupts_commit_pe_token(&irq, 0xabcd);
+    assert(dol_interrupts_mmio_read(&irq, DOL_PE_TOKEN, 2) == 0xabcd);
+    dol_interrupts_mmio_write(&irq, DOL_PE_TOKEN, 2, 0); // read-only
+    assert(dol_interrupts_mmio_read(&irq, DOL_PE_TOKEN, 2) == 0xabcd);
+    dol_interrupts_mmio_write(&irq, DOL_PE_INTERRUPT_STATUS, 2, 0);
+    assert(!dol_interrupts_external_pending(&irq));
+    dol_interrupts_mmio_write(&irq, DOL_PE_INTERRUPT_STATUS, 2, enabled);
+    assert(dol_interrupts_external_pending(&irq));
+    dol_interrupts_mmio_write(&irq, DOL_PE_INTERRUPT_STATUS, 2,
+        enabled | DOL_PE_TOKEN_ACK_BIT | DOL_PE_FINISH_ACK_BIT);
+    assert(!dol_interrupts_external_pending(&irq));
+    assert(dol_interrupts_mmio_read(&irq, DOL_PE_INTERRUPT_STATUS, 2) == enabled);
 }
 
 static void test_si_device(void) {
@@ -2512,7 +2557,7 @@ static void test_savestate_roundtrip(void) {
     PPCHostCall saved_host_call = cpu.host_call;
     u8* saved_ram = cpu.ram;
 
-    const char* path = "/tmp/gxruntime_savestate_test.dols";
+    const char* path = "gxruntime_savestate_test.dols";
     DolSaveRegion regions[1] = {{"MEM1", cpu.ram, cpu.ram_size}};
     assert(dol_savestate_write(path, &cpu, regions, 1));
 
@@ -2660,6 +2705,7 @@ int main(void) {
     test_event_clock();
     test_vi_clock();
     test_interrupts();
+    test_pe_tokens();
     test_si_device();
     test_exi_device();
     test_di_device();
