@@ -248,6 +248,91 @@ std::uint32_t payload_pn_matrix_mask(const DolGxRecompState& state,
   return mask;
 }
 
+constexpr std::uint32_t kXfDualTex = 0x1012u;
+constexpr std::uint32_t kXfPostMatrixBase = 0x500u;
+constexpr std::uint32_t kXfPostMatrixEnd = 0x600u;
+constexpr std::uint32_t kPtIdentityRow = 61u; // GX_PTIDENTITY - GX_PTTEXMTX0
+
+// An XF load's words that land on the dual-texture switch (0x1012) or the
+// post-transform matrix memory (0x500..0x5FF). Wind Waker's lava is the one
+// user of a post matrix that is not the identity: its pattern and its colour
+// ramp are both projected through one (d_magma.cpp).
+void capture_post_tex(PostTexMatrices& post, std::uint32_t base,
+                      std::uint32_t count, const std::uint8_t* data_be) {
+  const std::span<const std::uint8_t> data(data_be, count * 4u);
+  const std::uint32_t last = base + count - 1u;
+  if (base <= kXfDualTex && last >= kXfDualTex)
+    post.off = (read_be32(data, (kXfDualTex - base) * 4u) & 1u) == 0u;
+  if (last < kXfPostMatrixBase || base >= kXfPostMatrixEnd)
+    return;
+  const std::uint32_t first = base > kXfPostMatrixBase ? base : kXfPostMatrixBase;
+  const std::uint32_t end = last < kXfPostMatrixEnd - 1u ? last : kXfPostMatrixEnd - 1u;
+  for (std::uint32_t address = first; address <= end; ++address) {
+    const std::uint32_t bits = read_be32(data, (address - base) * 4u);
+    const std::uint32_t row = (address - kXfPostMatrixBase) / 4u;
+    std::memcpy(&post.rows[row][(address - kXfPostMatrixBase) % 4u], &bits,
+                sizeof bits);
+    post.written |= 1ull << row;
+  }
+  for (std::uint32_t row = (first - kXfPostMatrixBase) / 4u;
+       row <= (end - kXfPostMatrixBase) / 4u; ++row) {
+    const float* r = post.rows[row];
+    for (std::uint32_t k = 0; k < 3u; ++k) {
+      const bool is_identity = r[0] == (k == 0u ? 1.f : 0.f) &&
+                               r[1] == (k == 1u ? 1.f : 0.f) &&
+                               r[2] == (k == 2u ? 1.f : 0.f) && r[3] == 0.f;
+      if (is_identity)
+        post.identity[k] |= 1ull << row;
+      else
+        post.identity[k] &= ~(1ull << row);
+    }
+  }
+}
+
+// The post transform of each regular texgen at draw time: nothing for the
+// usual identity (GXSetTexCoordGen's GX_PTIDENTITY), else its three rows.
+void snapshot_post_tex(DrawTransformSnapshot& out,
+                       const DolGxRecompState& state,
+                       const PostTexMatrices& post) {
+  out.post_tex_mask = 0u;
+  out.post_tex_normalize = 0u;
+  if (post.off)
+    return;
+  constexpr std::uint32_t kNumTexGens = 0x103Fu - DOL_GX_XF_REG_WINDOW_BASE;
+  std::uint32_t num = 8u;
+  if ((state.xf_reg_mask & (1ull << kNumTexGens)) != 0u &&
+      (state.xf_regs[kNumTexGens] & 0xFu) < num)
+    num = state.xf_regs[kNumTexGens] & 0xFu;
+  for (std::uint32_t i = 0; i < num; ++i) {
+    const std::uint32_t info = 0x1040u - DOL_GX_XF_REG_WINDOW_BASE + i;
+    if ((state.xf_reg_mask & (1ull << info)) != 0u &&
+        ((state.xf_regs[info] >> 4u) & 7u) != 0u)
+      continue; // only regular (matrix) texgens are post-transformed
+    const std::uint32_t reg = 0x1050u - DOL_GX_XF_REG_WINDOW_BASE + i;
+    const std::uint32_t post_info =
+        (state.xf_reg_mask & (1ull << reg)) != 0u ? state.xf_regs[reg] : kPtIdentityRow;
+    const std::uint32_t rows[3] = {post_info & 0x3Fu, (post_info + 1u) & 0x3Fu,
+                                   (post_info + 2u) & 0x3Fu};
+    const bool normalize = ((post_info >> 8u) & 1u) != 0u;
+    if (!normalize && ((post.identity[0] >> rows[0]) & 1u) != 0u &&
+        ((post.identity[1] >> rows[1]) & 1u) != 0u &&
+        ((post.identity[2] >> rows[2]) & 1u) != 0u)
+      continue;
+    out.post_tex_mask |= static_cast<std::uint8_t>(1u << i);
+    if (normalize)
+      out.post_tex_normalize |= static_cast<std::uint8_t>(1u << i);
+    for (std::uint32_t k = 0; k < 3u; ++k) {
+      float* dst = &out.post_tex_rows[i][4u * k];
+      if ((post.written & (1ull << rows[k])) != 0u) {
+        std::memcpy(dst, post.rows[rows[k]], 4u * sizeof(float));
+      } else {
+        dst[0] = dst[1] = dst[2] = dst[3] = 0.f;
+        dst[k] = 1.f;
+      }
+    }
+  }
+}
+
 // Fills a queue slot in place. Every field is written (the arrays by a copy or,
 // for an invalid position matrix, a zero of that slot), so a reused slot reads
 // exactly as a value-initialized one would, without zeroing 2.3 KB first and
@@ -255,6 +340,7 @@ std::uint32_t payload_pn_matrix_mask(const DolGxRecompState& state,
 // memmoves on the GX worker, about 18,000 draws a frame in heavy scenes).
 void snapshot_transform_into(DrawTransformSnapshot& out,
                              const DolGxRecompState& state,
+                             const PostTexMatrices& post,
                              const DolGxRecompVertexLayout& layout,
                              std::span<const std::uint8_t> vertex_data,
                              std::uint16_t vertex_count) {
@@ -301,6 +387,7 @@ void snapshot_transform_into(DrawTransformSnapshot& out,
               sizeof(out.tex_matrix_word_mask));
   std::memcpy(out.xf_regs, state.xf_regs, sizeof(out.xf_regs));
   out.xf_reg_mask = state.xf_reg_mask;
+  snapshot_post_tex(out, state, post);
 }
 
 } // namespace
@@ -313,6 +400,7 @@ RetailGxFrontend::RetailGxFrontend(const DolGuestAddressResolver& resolver) {
 
 void RetailGxFrontend::reset(const DolGuestAddressResolver* resolver) {
   dol_gx_recomp_init(&state_, resolver);
+  post_tex_ = PostTexMatrices{};
   fifo_buffer_.clear();
   draw_payload_queue_.clear();
   draw_transform_queue_.clear();
@@ -334,6 +422,10 @@ void RetailGxFrontend::reset(const DolGuestAddressResolver* resolver) {
 namespace {
 
 constexpr std::uint32_t kFrontendStateMagic = 0x47585346u; // "GXSF"
+constexpr std::uint32_t kPostTexStateMagic = 0x50545831u; // "PTX1"
+constexpr std::size_t kPostTexStateSize = 2u * sizeof(std::uint32_t) +
+    sizeof(std::uint64_t) + sizeof(PostTexMatrices::rows);
+
 
 void resolve_saved_range(const DolGuestAddressResolver& resolver,
                          DolGuestResolvedRange& range, bool& valid) {
@@ -354,12 +446,12 @@ void resolve_saved_range(const DolGuestAddressResolver& resolver,
 std::vector<std::uint8_t> RetailGxFrontend::save_state() const {
   // Header, the register model with its host-only parts (resolver, the C
   // parser's FIFO copy, the per-flush event trace) cleared, the stale-palette
-  // mask and the unparsed tail.
+  // mask and the unparsed tail, followed by a versioned post-texture extension.
   const std::uint32_t header[3] = {
       kFrontendStateMagic, static_cast<std::uint32_t>(sizeof(DolGxRecompState)),
       static_cast<std::uint32_t>(fifo_buffer_.size())};
   std::vector<std::uint8_t> out(sizeof header + sizeof(DolGxRecompState) + 1u +
-                                fifo_buffer_.size());
+                                fifo_buffer_.size() + kPostTexStateSize);
   std::uint8_t* at = out.data();
   std::memcpy(at, header, sizeof header);
   at += sizeof header;
@@ -375,6 +467,13 @@ std::vector<std::uint8_t> RetailGxFrontend::save_state() const {
   *at++ = tlut_stale_mask_;
   if (!fifo_buffer_.empty())
     std::memcpy(at, fifo_buffer_.data(), fifo_buffer_.size());
+  at += fifo_buffer_.size();
+  const std::uint32_t post_header[2] = {kPostTexStateMagic, post_tex_.off ? 1u : 0u};
+  std::memcpy(at, post_header, sizeof post_header);
+  at += sizeof post_header;
+  std::memcpy(at, &post_tex_.written, sizeof post_tex_.written);
+  at += sizeof post_tex_.written;
+  std::memcpy(at, post_tex_.rows, sizeof post_tex_.rows);
   return out;
 }
 
@@ -383,9 +482,33 @@ bool RetailGxFrontend::load_state(const std::uint8_t* data, std::size_t size) {
   if (data == nullptr || size < sizeof header + sizeof(DolGxRecompState) + 1u)
     return false;
   std::memcpy(header, data, sizeof header);
+  const std::size_t legacy_size = sizeof header + sizeof(DolGxRecompState) + 1u + header[2];
   if (header[0] != kFrontendStateMagic || header[1] != sizeof(DolGxRecompState) ||
-      size != sizeof header + sizeof(DolGxRecompState) + 1u + header[2])
+      (size != legacy_size && size != legacy_size + kPostTexStateSize))
     return false;
+  PostTexMatrices restored_post{};
+  if (size != legacy_size) {
+    const std::uint8_t* post_at = data + legacy_size;
+    std::uint32_t post_header[2];
+    std::memcpy(post_header, post_at, sizeof post_header);
+    if (post_header[0] != kPostTexStateMagic || post_header[1] > 1u)
+      return false;
+    restored_post.off = post_header[1] != 0u;
+    post_at += sizeof post_header;
+    std::memcpy(&restored_post.written, post_at, sizeof restored_post.written);
+    post_at += sizeof restored_post.written;
+    std::memcpy(restored_post.rows, post_at, sizeof restored_post.rows);
+    // Rebuild the derived identity cache rather than trusting serialized bits.
+    for (unsigned row = 0; row < 64u; ++row) {
+      if ((restored_post.written & (1ull << row)) == 0u) continue;
+      const float* r = restored_post.rows[row];
+      for (unsigned k = 0; k < 3u; ++k)
+        if (!(r[0] == (k == 0u ? 1.f : 0.f) &&
+              r[1] == (k == 1u ? 1.f : 0.f) &&
+              r[2] == (k == 2u ? 1.f : 0.f) && r[3] == 0.f))
+          restored_post.identity[k] &= ~(1ull << row);
+    }
+  }
   const DolGuestAddressResolver resolver = state_.resolver;
   // The packet sequence keeps counting: a sink that has seen packets from this
   // front end requires it to rise.
@@ -407,6 +530,7 @@ bool RetailGxFrontend::load_state(const std::uint8_t* data, std::size_t size) {
   resolve_saved_range(resolver, state_.copy.range, state_.copy.range_valid);
   tlut_stale_mask_ = *at++;
   fifo_buffer_.assign(at, at + header[2]);
+  post_tex_ = restored_post;
   return true;
 }
 
@@ -659,6 +783,7 @@ bool RetailGxFrontend::parse_stream(std::span<const std::uint8_t> bytes,
       // viewport/projection registers if this load covers them (transform-diff).
       dol_gx_recomp_capture_xf_transform(&state_, base, count,
                                          bytes.data() + pos + 5u);
+      capture_post_tex(post_tex_, base, count, bytes.data() + pos + 5u);
       pos += command_size;
       continue;
     }
@@ -689,6 +814,9 @@ bool RetailGxFrontend::parse_stream(std::span<const std::uint8_t> bytes,
           &state_, base, count,
           static_cast<const std::uint8_t*>(array.range.data) +
               index * state_.arrays[attr].stride);
+      capture_post_tex(post_tex_, base, count,
+                       static_cast<const std::uint8_t*>(array.range.data) +
+                           index * state_.arrays[attr].stride);
       if (!dol_gx_recomp_note_xf_load(&state_, base, count))
         return false;
       // `dol_gx_recomp_note_xf_load` records the generic XF event; retain the
@@ -1055,7 +1183,7 @@ bool RetailGxFrontend::handle_draw(std::uint8_t command,
     draw_payload_queue_[draw_queue_count_].assign(vertex_data.begin(),
                                                   vertex_data.end());
     snapshot_transform_into(draw_transform_queue_[draw_queue_count_], state_,
-                            *layout, vertex_data, vertex_count);
+                            post_tex_, *layout, vertex_data, vertex_count);
     ++draw_queue_count_;
   }
 
@@ -1177,6 +1305,12 @@ bool RetailGxFrontend::emit_new_packets(AuroraRenderSink& sink,
       std::memcpy(packet.draw.xf_regs, transform.xf_regs,
                   sizeof(packet.draw.xf_regs));
       packet.draw.xf_reg_mask = transform.xf_reg_mask;
+      packet.draw.post_tex_mask = transform.post_tex_mask;
+      packet.draw.post_tex_normalize = transform.post_tex_normalize;
+      for (std::uint32_t i = 0; i < 8u; ++i)
+        if ((transform.post_tex_mask & (1u << i)) != 0u)
+          std::memcpy(packet.draw.post_tex_rows[i], transform.post_tex_rows[i],
+                      sizeof(packet.draw.post_tex_rows[i]));
     }
     if (!sink.submit_packet(packet))
       return false;
