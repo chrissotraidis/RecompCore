@@ -23,6 +23,7 @@
 #include "window.hpp"
 
 #include <SDL3/SDL_filesystem.h>
+#include <SDL3/SDL_timer.h>
 #include <magic_enum.hpp>
 
 #include "system_info.hpp"
@@ -264,6 +265,23 @@ static void draw_fps_overlay() {
   }
   const float shown = gfx::calculate_fps();
   const float game = gfx::calculate_game_fps();
+  // With Smooth Motion's in-between frames paused (the game ran slow a moment
+  // ago), each game frame is presented twice: the count says 60 while the
+  // picture moves at 30. Over the last second, fewer than 90% of game frames
+  // interpolated says so.
+  static AuroraFrameInterpTotals last{};
+  static Uint64 last_at = 0;
+  static bool paused = false;
+  const Uint64 now = SDL_GetTicks();
+  if (now - last_at >= 1000) {
+    AuroraFrameInterpTotals totals{};
+    aurora_get_frame_interp_totals(&totals);
+    const unsigned long long frames = totals.frames - last.frames;
+    const unsigned long long interpolated = totals.interpolated - last.interpolated;
+    paused = aurora_get_frame_interpolation() && frames > 0 && interpolated * 10 < frames * 9;
+    last = totals;
+    last_at = now;
+  }
   // Top center: the corners hold the game's HUD (hearts, buttons, map, rupees).
   ImGui::SetNextWindowPos(ImVec2{ImGui::GetIO().DisplaySize.x * 0.5f, 12.f}, ImGuiCond_Always, ImVec2{0.5f, 0.f});
   ImGui::SetNextWindowBgAlpha(0.6f);
@@ -272,7 +290,9 @@ static void draw_fps_overlay() {
                                      ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
   if (ImGui::Begin("##aurora-fps", nullptr, flags)) {
     ImGui::SetWindowFontScale(1.5f);
-    if (game > 0.f && shown > game + 5.f) {
+    if (paused && game > 0.f) {
+      ImGui::Text("%.0f FPS (Smooth Motion paused)", game);
+    } else if (game > 0.f && shown > game + 5.f) {
       ImGui::Text("%.0f FPS (game %.0f)", shown, game);
     } else {
       ImGui::Text("%.0f FPS", shown);
