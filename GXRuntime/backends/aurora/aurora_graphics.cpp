@@ -789,6 +789,7 @@ static void g_fifo_drain_impl();
 std::atomic<unsigned long long> g_timing_drain_us{0};
 std::atomic<unsigned long long> g_timing_present_us{0};
 std::atomic<unsigned long long> g_timing_end_frame_us{0};
+std::atomic<unsigned long long> g_timing_held_us{0};
 std::atomic<unsigned long long> g_timing_draws{0};
 std::atomic<unsigned long long> g_timing_present_in_drain_us{0};
 bool g_timing_in_drain = false;  // main thread only
@@ -1363,6 +1364,8 @@ void aurora_backend_present(void) {
         gx_aurora::g_timing_present_in_drain_us += spent;
 }
 
+unsigned long long dol_aurora_held_us(void) { return gx_aurora::g_timing_held_us; }
+
 void dol_aurora_frame_timing(DolAuroraFrameTiming* out) {
     out->presents = gx_aurora::g_present_count;
     out->drain_us = gx_aurora::g_timing_drain_us - gx_aurora::g_timing_present_in_drain_us;
@@ -1379,6 +1382,7 @@ void dol_aurora_frame_timing(DolAuroraFrameTiming* out) {
     out->interp_draws = interp.draws;
     out->interp_rejected = interp.rejected;
     out->interp_unmatched = interp.unmatched;
+    out->held_us = gx_aurora::g_timing_held_us;
     {
         using aurora::gfx::thread_cpu::Role;
         out->gx_worker_cpu_us = aurora::gfx::thread_cpu::cpu_us(Role::GxWorker);
@@ -1690,6 +1694,7 @@ static void aurora_backend_present_impl(void) {
         }
         std::fprintf(stderr, "[gfx] guest released after %.1f s\n",
                      (SDL_GetTicks() - start) / 1000.0);
+        gx_aurora::g_timing_held_us += (SDL_GetTicks() - start) * 1000ull;
     }
     if (!gx_aurora::g_should_quit) {
         const unsigned long long begin_start = gx_aurora::timing_now_us();

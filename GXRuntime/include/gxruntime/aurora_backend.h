@@ -75,8 +75,13 @@ typedef struct DolAuroraFrameTiming {
     unsigned long long gx_worker_cpu_us;
     unsigned long long interp_helper_cpu_us;
     unsigned long long render_worker_cpu_us;
+    /* Microseconds the host held the guest at a present (a menu open, the app in
+       the background), so per-second diagnostics can leave that time out. */
+    unsigned long long held_us;
 } DolAuroraFrameTiming;
 void dol_aurora_frame_timing(DolAuroraFrameTiming* out);
+/* The same held time on its own, cheap enough to read every retrace. */
+unsigned long long dol_aurora_held_us(void);
 
 /* Presents a frame the FIFO worker has finished and requested, if any. The
    request is otherwise taken only at the next GX write; the host calls this
