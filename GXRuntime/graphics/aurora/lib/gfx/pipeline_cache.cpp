@@ -13,8 +13,11 @@
 #include "../webgpu/gpu.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
@@ -22,6 +25,8 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <type_traits>
+#include <vector>
 
 #include <SDL3/SDL_iostream.h>
 #include <absl/container/flat_hash_map.h>
@@ -45,6 +50,9 @@ struct PendingPipeline {
   PipelineRef hash;
   uint32_t firstFrameUsed = UINT32_MAX;
   NewPipelineCallback create;
+  // Which of the ubershader's two shaders (gxcore depthOnly 2; 1 with dual-
+  // source blending) the pipeline uses, or -1 for any other pipeline.
+  int8_t uberShader = -1;
 };
 
 struct PipelineCacheWrite {
@@ -69,8 +77,48 @@ constexpr size_t BuildPipelinesPerFrame = 5;
 #else
 constexpr size_t BuildPipelinesPerFrame = 1;
 #endif
-static std::thread g_pipelineThread;
+// Pipelines compile on several threads when Dawn takes its device lock (with
+// it, Dawn's pipeline creation is safe from many threads, as its own
+// asynchronous creation does; without it only one thread may). A draw whose
+// pipeline is still compiling is skipped, and entering a new place asks for
+// dozens at once: one thread made them one after another, so the last ones
+// were missing for longer. Dolphin compiles shaders on several threads too.
+// AURORA_PIPELINE_THREADS sets how many (1-16); the default is a quarter of
+// the logical CPUs, 1 to 4.
+static std::vector<std::thread> g_pipelineThreads;
 static std::atomic_bool g_pipelineThreadEnd = false;
+// Draws skipped because their pipeline was not compiled yet, and the
+// pipelines asked for while drawing (not loaded from the cache): new shaders,
+// and shaders already compiled in another blend, depth or cull state. Said
+// once a second while it happens (report_skipped_draws).
+static std::atomic<uint64_t> g_skippedDraws{0};
+static std::atomic<uint64_t> g_uberDraws{0};
+static std::atomic<uint64_t> g_leftOutDraws{0};
+static std::atomic<uint32_t> g_newShaders{0};
+static std::atomic<uint32_t> g_newStates{0};
+// When the cache started loading, how many it queued, and whether the time
+// they took to compile was said.
+static std::chrono::steady_clock::time_point g_cacheLoadStart;
+static size_t g_cacheLoadCount = 0;
+static bool g_cacheLoadReported = true;
+#ifdef AURORA_ENABLE_GXCORE
+// The shaders the gxcore pipelines were made with, to tell a new shader from
+// a known one in a new blend, depth or cull state (report_skipped_draws).
+static std::mutex g_gxcoreShaderMutex;
+static absl::flat_hash_set<HashType> g_gxcoreShaders;
+
+static void note_gxcore_shader(const gxcore::PipelineConfig& config, bool drawing) {
+  const HashType shader = xxh3_hash(config.key.shader);
+  bool known = false;
+  {
+    std::lock_guard lock{g_gxcoreShaderMutex};
+    known = !g_gxcoreShaders.insert(shader).second;
+  }
+  if (drawing) {
+    (known ? g_newStates : g_newShaders).fetch_add(1, std::memory_order_relaxed);
+  }
+}
+#endif
 static std::condition_variable g_pipelineQueueCv;
 static std::condition_variable g_pipelineReadyCv;
 static absl::flat_hash_map<PipelineRef, CachedPipeline> g_pipelines;
@@ -400,6 +448,86 @@ static PendingPipeline* touch_pending_pipeline(PipelineRef hash, PipelinePriorit
   return nullptr;
 }
 
+// The ubershader's two shaders take most of a second each to compile the
+// first time (DXC, with nothing in Dawn's blob cache yet), and every state's
+// pipeline compiles the same shader; from the blob cache a pipeline takes a few
+// ms. So one pipeline with a shader is made before its others (they wait,
+// queued), and when to make it depends on whether an earlier run did: the
+// pipeline cache keeps the ubershader pipelines draws asked for. If it has one
+// with the shader, the shader's first pipeline is made before anything else
+// (the ubershader then draws whatever shader in its state is still compiling);
+// if not, only once the cache's pipelines are all queued and nothing else is,
+// one shader at a time, so the compile takes no thread from the draws'
+// pipelines while a scene loads.
+// 0: no pipeline with the shader yet, 1: one compiling, 2: one made.
+static std::array<uint8_t, 2> g_uberShaderState{};
+static std::array<bool, 2> g_uberShaderKnown{};
+static bool g_cacheQueued = false;
+
+enum class TakePass {
+  KnownUbershader, // the first pipeline with a shader an earlier run compiled
+  Ready,           // any other pipeline, the draws' queue first
+  NewUbershader,   // the first pipeline with a shader not compiled before
+};
+
+static bool take_in_pass(const PendingPipeline& pending, TakePass pass) {
+  if (pending.uberShader < 0)
+    return pass == TakePass::Ready;
+  switch (g_uberShaderState[pending.uberShader]) {
+  case 2:
+    return pass == TakePass::Ready;
+  case 1:
+    return false;
+  default:
+    if (g_uberShaderKnown[pending.uberShader])
+      return pass == TakePass::KnownUbershader;
+    return pass == TakePass::NewUbershader && g_cacheQueued && g_uberShaderState[0] != 1 &&
+           g_uberShaderState[1] != 1;
+  }
+}
+
+static bool next_pipeline_ready() {
+  const auto takeable = [](const PendingPipeline& pending) {
+    return take_in_pass(pending, TakePass::KnownUbershader) || take_in_pass(pending, TakePass::Ready) ||
+           take_in_pass(pending, TakePass::NewUbershader);
+  };
+  return std::any_of(g_pipelineQueue.begin(), g_pipelineQueue.end(), takeable) ||
+         std::any_of(g_backgroundPipelineQueue.begin(), g_backgroundPipelineQueue.end(), takeable);
+}
+
+// The queued pipeline a compile thread makes next (the caller holds
+// g_pipelineMutex and has checked next_pipeline_ready).
+static PendingPipeline take_next_pipeline() {
+  for (const TakePass pass : {TakePass::KnownUbershader, TakePass::Ready, TakePass::NewUbershader}) {
+    for (auto* queue : {&g_pipelineQueue, &g_backgroundPipelineQueue}) {
+      const auto it = std::find_if(queue->begin(), queue->end(),
+                                   [=](const PendingPipeline& pending) { return take_in_pass(pending, pass); });
+      if (it == queue->end())
+        continue;
+      PendingPipeline pending = std::move(*it);
+      queue->erase(it);
+      if (pending.uberShader >= 0 && g_uberShaderState[pending.uberShader] == 0) {
+        g_uberShaderState[pending.uberShader] = 1;
+      }
+      return pending;
+    }
+  }
+  std::abort(); // next_pipeline_ready said there was one
+}
+
+template <typename PipelineConfig>
+static int8_t ubershader_of(const PipelineConfig&) {
+  return -1;
+}
+
+#ifdef AURORA_ENABLE_GXCORE
+static int8_t ubershader_of(const gxcore::PipelineConfig& config) {
+  if (config.depthOnly != 2u)
+    return -1;
+  return config.key.shader.use_dst_alpha != 0 ? 1 : 0;
+}
+#endif
+
 static std::optional<PendingPipeline> take_pending_pipeline(PipelineRef hash) {
   auto priorityIt = find_pending_pipeline(g_pipelineQueue, hash);
   if (priorityIt != g_pipelineQueue.end()) {
@@ -434,7 +562,8 @@ static PipelineRef g_lastPipelineRef = std::numeric_limits<PipelineRef>::max();
 template <typename PipelineConfig>
 static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& config, NewPipelineCallback&& cb,
                                       PipelinePriority priority = PipelinePriority::Normal,
-                                      std::optional<uint32_t> firstFrameUsedOverride = std::nullopt) {
+                                      std::optional<uint32_t> firstFrameUsedOverride = std::nullopt,
+                                      bool* queuedNew = nullptr) {
   ZoneScoped;
 
   // GXRuntime recomp patch (0006): draws are silently skipped while their
@@ -519,6 +648,7 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
           .hash = hash,
           .firstFrameUsed = firstFrameUsed,
           .create = std::move(cb),
+          .uberShader = ubershader_of(config),
       };
       switch (priority) {
       case PipelinePriority::Background:
@@ -537,6 +667,9 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
       }
       ++queuedPipelines;
       notifyWorker = true;
+      if (queuedNew != nullptr) {
+        *queuedNew = true;
+      }
     }
   }
 
@@ -569,6 +702,29 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
 
   return hash;
 }
+
+#ifdef AURORA_ENABLE_GXCORE
+// The ubershader's pipelines (gxcore depthOnly 2: one per fixed-function
+// state, drawing any shader key), queued in the background at start for every
+// state the cache's pipelines use, so a shader not seen before in one of them
+// is drawn from its first frame. Dolphin queues its uber pipelines for the
+// states already seen the same way (ShaderCache::QueueUberSiblingStates). The
+// specialized pipeline follows; the ubershader stands in until it is ready.
+static absl::flat_hash_set<HashType> g_uberStates;
+
+static void queue_ubershader_state(const gxcore::PipelineConfig& config) {
+  if (ubershader_mode() == 0 || config.depthOnly != 0u)
+    return;
+  gxcore::PipelineConfig uber = config;
+  uber.key.shader = {};
+  uber.key.shader.use_dst_alpha = config.key.shader.use_dst_alpha;
+  uber.depthOnly = 2u;
+  if (!g_uberStates.insert(xxh3_hash(uber)).second)
+    return;
+  find_pipeline_impl(ShaderType::GXCore, uber, [=] { return gxcore::create_pipeline(uber); },
+                     PipelinePriority::Background, 0u);
+}
+#endif
 
 static void pipeline_cache_abort() {
   g_pipelineCacheBroken = true;
@@ -993,28 +1149,25 @@ static void pipeline_worker() {
   tracy::SetThreadName("Pipeline compilation thread");
 #endif
 
-  bool hasMore = false;
   while (g_hasPipelineThread || g_pipelinesPerFrame < BuildPipelinesPerFrame) {
     PendingPipeline pending;
     {
       std::unique_lock lock{g_pipelineMutex};
       if (g_hasPipelineThread) {
-        if (!hasMore) {
-          g_pipelineQueueCv.wait(lock, [] {
-            return !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty() || g_pipelineThreadEnd;
-          });
-        }
-      } else if (g_pipelineQueue.empty() && g_backgroundPipelineQueue.empty()) {
+        // Another compile thread may have taken what was queued, so wait on
+        // the queues themselves.
+        g_pipelineQueueCv.wait(lock, [] { return next_pipeline_ready() || g_pipelineThreadEnd; });
+      } else if (!next_pipeline_ready()) {
         return;
       }
       if (g_pipelineThreadEnd) {
         break;
       }
-      auto& source = !g_pipelineQueue.empty() ? g_pipelineQueue : g_backgroundPipelineQueue;
-      pending = std::move(source.front());
-      source.pop_front();
+      pending = take_next_pipeline();
     }
     auto result = pending.create();
+    bool cacheLoaded = false;
+    bool uberShaderMade = false;
     {
       std::lock_guard lock{g_pipelineMutex};
       g_pipelines.try_emplace(pending.hash, CachedPipeline{
@@ -1022,12 +1175,29 @@ static void pipeline_worker() {
                                                 .firstFrameUsed = pending.firstFrameUsed,
                                             });
       g_pendingPipelines.erase(pending.hash);
-      hasMore = !g_pipelineQueue.empty() || !g_backgroundPipelineQueue.empty();
+      if (!g_cacheLoadReported && g_pendingPipelines.empty()) {
+        g_cacheLoadReported = true;
+        cacheLoaded = true;
+      }
+      if (pending.uberShader >= 0 && g_uberShaderState[pending.uberShader] != 2) {
+        g_uberShaderState[pending.uberShader] = 2;
+        uberShaderMade = true;
+      }
+    }
+    if (uberShaderMade) {
+      // The pipelines left queued behind it can be made now.
+      g_pipelineQueueCv.notify_all();
     }
     if (!g_hasPipelineThread) {
       ++g_pipelinesPerFrame;
     }
     notify_pipeline_ready(true);
+    if (cacheLoaded) {
+      const double ms =
+          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_cacheLoadStart).count();
+      std::fprintf(stderr, "[pipelines] the %zu cached pipelines were compiled %.0f ms after start (%zu threads)\n",
+                   g_cacheLoadCount, ms, g_pipelineThreads.size());
+    }
   }
 }
 
@@ -1065,7 +1235,23 @@ static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersio
       continue;
     }
 
+#ifdef AURORA_ENABLE_GXCORE
+    if constexpr (std::is_same_v<PipelineConfig, gxcore::PipelineConfig>) {
+      // An ubershader pipeline a draw asked for in an earlier run: its shader
+      // is in Dawn's blob cache.
+      if (const int8_t uber = ubershader_of(config); uber >= 0) {
+        std::scoped_lock guard{g_pipelineMutex};
+        g_uberShaderKnown[uber] = true;
+      }
+    }
+#endif
     find_pipeline_impl(type, config, [=] { return create(config); }, PipelinePriority::Background, firstFrameUsed);
+#ifdef AURORA_ENABLE_GXCORE
+    if constexpr (std::is_same_v<PipelineConfig, gxcore::PipelineConfig>) {
+      note_gxcore_shader(config, false);
+      queue_ubershader_state(config);
+    }
+#endif
     ++acceptedRows;
   }
 
@@ -1148,7 +1334,13 @@ PipelineRef find_pipeline(ShaderType type, const rmlui::PipelineConfig& config, 
 #ifdef AURORA_ENABLE_GXCORE
 template <>
 PipelineRef find_pipeline(ShaderType type, const gxcore::PipelineConfig& config, NewPipelineCallback&& cb) {
-  return find_pipeline_impl(type, config, std::move(cb));
+  bool queuedNew = false;
+  const PipelineRef ref = find_pipeline_impl(type, config, std::move(cb), PipelinePriority::Normal, std::nullopt,
+                                             &queuedNew);
+  if (queuedNew) {
+    note_gxcore_shader(config, true);
+  }
+  return ref;
 }
 #endif
 
@@ -1167,10 +1359,35 @@ void initialize_pipeline_cache() {
     g_hasPipelineThread = false;
   } else {
     g_hasPipelineThread = true;
-    g_pipelineThread = std::thread(pipeline_worker);
+    size_t threads = 1;
+    if (webgpu::g_deviceLock) {
+      threads = std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 1, 4);
+      if (const char* env = std::getenv("AURORA_PIPELINE_THREADS")) {
+        const long n = std::strtol(env, nullptr, 10);
+        if (n >= 1) {
+          threads = static_cast<size_t>(std::min(n, 16L));
+        }
+      }
+    }
+    for (size_t i = 0; i < threads; ++i) {
+      g_pipelineThreads.emplace_back(pipeline_worker);
+    }
+    Log.info("Pipeline compile threads: {}", threads);
   }
 
+  g_cacheLoadStart = std::chrono::steady_clock::now();
+  g_cacheLoadReported = true;
   const size_t loadedCount = load_pipeline_cache();
+  if (loadedCount > 0 && g_hasPipelineThread) {
+    std::lock_guard lock{g_pipelineMutex};
+    g_cacheLoadCount = loadedCount;
+    g_cacheLoadReported = g_pendingPipelines.empty();
+  }
+  {
+    std::lock_guard lock{g_pipelineMutex};
+    g_cacheQueued = true;
+  }
+  g_pipelineQueueCv.notify_all();
   if (!g_pipelineCacheBroken && loadedCount > 0) {
     g_gpuCachePrunePending = true;
   }
@@ -1191,7 +1408,10 @@ void shutdown_pipeline_cache() {
     }
     g_pipelineQueueCv.notify_all();
     g_pipelineReadyCv.notify_all();
-    g_pipelineThread.join();
+    for (auto& thread : g_pipelineThreads) {
+      thread.join();
+    }
+    g_pipelineThreads.clear();
   }
   g_hasPipelineThread = false;
 
@@ -1204,15 +1424,57 @@ void shutdown_pipeline_cache() {
   g_pipelineQueue.clear();
   g_backgroundPipelineQueue.clear();
   g_pendingPipelines.clear();
+  g_uberShaderState = {};
+  g_uberShaderKnown = {};
+  g_cacheQueued = false;
+#ifdef AURORA_ENABLE_GXCORE
+  g_uberStates.clear();
+#endif
 
   queuedPipelines = 0;
   createdPipelines = 0;
+}
+
+// Once a second while draws are being skipped: how many, and what was
+// compiled for them.
+static void report_skipped_draws() {
+  static auto last = std::chrono::steady_clock::now();
+  static uint64_t lastSkipped = 0;
+  static uint64_t lastUber = 0;
+  static uint64_t lastLeftOut = 0;
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::seconds(1)) {
+    return;
+  }
+  last = now;
+  const uint64_t skipped = g_skippedDraws.load(std::memory_order_relaxed);
+  const uint64_t leftOut = g_leftOutDraws.load(std::memory_order_relaxed);
+  if (skipped == lastSkipped && leftOut == lastLeftOut) {
+    return;
+  }
+  const uint64_t uber = g_uberDraws.load(std::memory_order_relaxed);
+  const uint32_t newShaders = g_newShaders.exchange(0, std::memory_order_relaxed);
+  const uint32_t newStates = g_newStates.exchange(0, std::memory_order_relaxed);
+  size_t queued = 0;
+  {
+    std::lock_guard lock{g_pipelineMutex};
+    queued = g_pendingPipelines.size();
+  }
+  std::fprintf(stderr,
+               "[pipelines] %llu draws left out while their pipelines compiled, %llu drawn with the ubershader "
+               "(%u new shaders, %u known shaders in a new state; %zu still compiling)\n",
+               static_cast<unsigned long long>(leftOut - lastLeftOut), static_cast<unsigned long long>(uber - lastUber),
+               newShaders, newStates, queued);
+  lastSkipped = skipped;
+  lastUber = uber;
+  lastLeftOut = leftOut;
 }
 
 void begin_pipeline_frame() {
   if (!g_hasPipelineThread) {
     g_pipelinesPerFrame = 0;
   }
+  report_skipped_draws();
 }
 
 void end_pipeline_frame() {
@@ -1221,10 +1483,31 @@ void end_pipeline_frame() {
   }
 }
 
+void note_ubershader_draw() { g_uberDraws.fetch_add(1, std::memory_order_relaxed); }
+
+int ubershader_mode() {
+  static const int mode = [] {
+    const char* env = std::getenv("DOL_AURORA_UBERSHADER");
+    if (env != nullptr && env[0] != '\0')
+      return std::atoi(env);
+    return webgpu::g_backendType == wgpu::BackendType::D3D12 ? 1 : 0;
+  }();
+  return mode;
+}
+void note_draw_left_out(uint32_t draws) { g_leftOutDraws.fetch_add(draws, std::memory_order_relaxed); }
+
+bool pipeline_ready(PipelineRef ref) {
+  if (__atomic_load_n(&g_stats.queuedPipelines, __ATOMIC_RELAXED) == 0u)
+    return true;
+  std::lock_guard guard{g_pipelineMutex};
+  return g_pipelines.contains(ref);
+}
+
 bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline) {
   std::lock_guard guard{g_pipelineMutex};
   const auto it = g_pipelines.find(ref);
   if (it == g_pipelines.end()) {
+    g_skippedDraws.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
   pipeline = it->second.pipeline;

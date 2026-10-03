@@ -850,6 +850,88 @@ int main() {
     CHECK(front != nullptr && near(front[2], -30.f) && near(front[3 * 3 + 2], 30.f));
   }
 
+  // A cloth's strips (a scope over draws that index their positions): the
+  // game moves the vertices itself, under a matrix that stays put, so each
+  // vertex is blended halfway, as a particle's are.
+  {
+    fi::end_game_frame();
+    fi::end_game_frame();
+    static const uint8_t payload[24] = {7};
+    const auto strip = [](uint32_t part, float sway) {
+      gxc::DrawPlan plan;
+      plan.match_payload = payload;
+      plan.match_payload_size = sizeof(payload);
+      plan.match_primitive = 0x98;
+      plan.match_direct_position = false; // indexed positions
+      plan.vertex_count = 4;
+      plan.draw_scope = 0x5151;
+      plan.draw_scope_part = part;
+      plan.vertices.assign(4 * gxc::kVertexFloats, 0.f);
+      for (int i = 0; i < 4; ++i) {
+        float* v = plan.vertices.data() + i * gxc::kVertexFloats;
+        v[0] = (i & 1) * 20.f + sway * (i >> 1); // the free edge sways
+        v[1] = (i >> 1) * 30.f;
+      }
+      return plan;
+    };
+    const auto pole = draw_at(0, 0, -300);
+    blend_plan(strip(1, 0.f), pole);
+    blend_plan(strip(2, 0.f), pole);
+    fi::end_game_frame();
+    CHECK(blend_plan(strip(1, 8.f), pole) == nullptr); // the matrix did not move
+    const float* swayed = fi::blended_positions();
+    CHECK(swayed != nullptr && near(swayed[2 * 3], 4.f) && near(swayed[3 * 3], 24.f) && near(swayed[0], 0.f));
+    // The second strip did not move: drawn as it is.
+    blend_plan(strip(2, 0.f), pole);
+    CHECK(fi::blended_positions() == nullptr);
+  }
+
+  // Colours: a TEV draw's colour and konst registers and its fog colour, and
+  // the material and light colours, halfway between the two frames' (a fade,
+  // a particle's colour over its life). The rest of the pixel constants and
+  // the alpha-test references stay this frame's.
+  {
+    fi::end_game_frame();
+    fi::end_game_frame();
+    gxc::PixelShaderConstants before{};
+    before.kcolors[0][0] = 0;
+    before.kcolors[0][3] = 255;
+    before.colors[1][0] = -100;
+    before.fogcolor[2] = 10;
+    before.alpha_ref[0] = 4;
+    gxc::PixelShaderConstants after = before;
+    after.kcolors[0][0] = 200;
+    after.kcolors[0][3] = 0;
+    after.colors[1][0] = 101;
+    after.fogcolor[2] = 30;
+    after.alpha_ref[0] = 90;
+    auto lit = draw_at(0, 0, -500);
+    lit.materials[2][3] = 255;
+    lit.lights[0].color[1] = 40;
+    fi::DrawInput input;
+    input.key = 4242;
+    fi::blend_draw(input, lit, false, &before);
+    CHECK(fi::blended_pixel(0) == nullptr); // no previous frame for it
+    fi::end_game_frame();
+    auto faded = lit;
+    faded.materials[2][3] = 0;
+    faded.lights[0].color[1] = 80;
+    const auto* block = fi::blend_draw(input, faded, false, &after);
+    const auto* pixel = fi::blended_pixel(0);
+    CHECK(pixel != nullptr);
+    if (pixel != nullptr) {
+      CHECK(pixel->kcolors[0][0] == 100 && pixel->kcolors[0][3] == 128);
+      CHECK(pixel->colors[1][0] == 1); // round(-100 + 201 / 2)
+      CHECK(pixel->fogcolor[2] == 20);
+      CHECK(pixel->alpha_ref[0] == 90);
+    }
+    CHECK(block != nullptr && block->materials[2][3] == 128 && block->lights[0].color[1] == 60);
+    // The same colours the next frame: nothing to blend.
+    fi::end_game_frame();
+    fi::blend_draw(input, faded, false, &after);
+    CHECK(fi::blended_pixel(0) == nullptr);
+  }
+
   // 120/240 Hz: every in-between step advances evenly toward the next real
   // frame, including moving draws, particle vertices and camera screw motion.
   for (const int count : {3, 7}) {

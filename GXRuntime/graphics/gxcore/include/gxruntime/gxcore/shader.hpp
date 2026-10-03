@@ -453,16 +453,34 @@ struct PlanTexture {
   std::uint32_t tlut_available = 0;
 };
 
+// What a draw's vertex constants are made from besides the transform state's
+// own words (DrawPlan::constants_inputs): two draws with the same inputs have
+// the same constants. Every byte is a field, so it compares as a block (bit
+// for bit: equal inputs make equal constants).
+struct ConstantsInputs {
+  std::uint64_t xf_version = 0; // ar::ConsumedDraw::xf_version; 0 never matches
+  float cached[9]{};            // the incoming cached normal, tangent, binormal
+  std::uint8_t has_cached = 0;
+  std::uint8_t lit_valid = 0;
+  std::uint8_t chan_lit = 0;    // a colour channel takes the lit path
+  std::uint8_t num_tex_gens = 0;
+  std::uint8_t texgen_stq = 0;  // bit per texgen with three rows (projection)
+  std::uint8_t pad[7]{};
+};
+// No padding the compiler adds (the floats keep the type from proving it).
+static_assert(sizeof(ConstantsInputs) == 8 + 9 * 4 + 5 + 7);
+
 // packed uniforms, the pipeline key, and the bound texture's guest identity +
 // host bytes (converted by the substrate's GX codecs at upload).
-struct DrawPlan {
+// DrawPlanFields is everything set afresh for each draw; DrawPlan adds the
+// vertex constants, which a plan reused for the next draw keeps when they are
+// made from the same inputs (most draws repeat the draw before's), and the
+// vertex and index arrays.
+struct DrawPlanFields {
   bool ok = false;
   const char* skip_reason = nullptr; // set when ok==false
   PipelineKey pipeline{};
-  VertexShaderConstants constants{};
   PixelShaderConstants pixel_constants{}; // S14 TEV color/konst/alpha uniforms
-  std::vector<float> vertices; // kVertexFloats per vertex
-  std::vector<std::uint16_t> indices;
   std::uint32_t vertex_count = 0;
   // The draw's raw FIFO vertex payload (per-vertex indices and direct
   // attributes) and its command, for matching one model's draw across frames.
@@ -482,8 +500,8 @@ struct DrawPlan {
   std::uint32_t draw_tag = 0;
   std::uint32_t draw_tag_age = 0;
   // Or, for one of the draws an emitter's callback makes (kDrawScopeRegister:
-  // a wake's fans and strips), that emitter and the draw's place among them
-  // (from 1). 0: none.
+  // a wake's fans and strips) or a cloth's strips, that emitter or cloth and
+  // the draw's place among them (from 1). 0: none.
   std::uint32_t draw_scope = 0;
   std::uint32_t draw_scope_part = 0;
   // Viewport, raw XF values (wd/2, -ht/2, zmax*2^24, xorig+342, yorig+342,
@@ -521,9 +539,23 @@ struct DrawPlan {
   std::uint32_t texmap_mask = 0;
   PlanSampler samplers[8]{};
   PlanTexture textures[8]{};
-  // Diagnostics: each texgen's XF matrix row, and MatrixIndexA as captured.
-  std::uint8_t texgen_row[kMaxTexGens]{};
+  // Diagnostics: MatrixIndexA as captured.
   std::uint32_t matrix_index_a = 0;
+};
+
+struct DrawPlan : DrawPlanFields {
+  VertexShaderConstants constants{};
+  // Made with the constants: each texgen's XF matrix row (diagnostics) and
+  // how many texgens found no matrix (GapCounters::unresolved_tex_matrix).
+  std::uint8_t texgen_row[kMaxTexGens]{};
+  std::uint32_t constants_unresolved = 0;
+  // What they were made from, and a number for them, new each time they are
+  // made (0: not made), so a consumer knows two draws' are the same without
+  // comparing them.
+  ConstantsInputs constants_inputs{};
+  std::uint64_t constants_id = 0;
+  std::vector<float> vertices; // kVertexFloats per vertex
+  std::vector<std::uint16_t> indices;
 };
 
 // --- EFB copy-to-texture (S16) ------------------------------------------------
@@ -575,5 +607,18 @@ struct EfbCopyCommand {
 // group(1)=dynamic uniform, group(2)=texture+sampler.
 std::string generate_wgsl(const ShaderKey& key);
 bool channel_lit_path(const ShaderKey& k, unsigned j);
+
+// The ubershader (gxcore_uber.cpp): one module for any key, which it reads
+// from the pixel uniform (UberPixelConstants), for a draw whose own pipeline
+// is still compiling. dual_source: the destination-alpha form.
+inline constexpr std::uint32_t kUberKeyWords =
+    static_cast<std::uint32_t>((sizeof(ShaderKey) + 15u) / 16u);
+struct UberPixelConstants {
+  PixelShaderConstants psc{};
+  std::uint32_t key[kUberKeyWords * 4u]{}; // the ShaderKey's bytes
+  std::uint32_t extra[4]{};                // [0]: more than one texmap sampled
+};
+static_assert(sizeof(PixelShaderConstants) % 16u == 0u);
+std::string generate_uber_wgsl(bool dual_source);
 
 } // namespace gxruntime::gxcore

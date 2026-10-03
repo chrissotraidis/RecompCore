@@ -18,6 +18,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -368,11 +369,14 @@ bool needs_early_depth_emulation(const gxc::PipelineKey& key) {
 
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   const gxc::PipelineKey& key = config.key;
-  const bool depthOnly = config.depthOnly != 0u;
+  // depthOnly 2: the ubershader for this fixed-function state (the key's
+  // shader is empty but for destination alpha), drawing any shader key.
+  const bool uber = config.depthOnly == 2u;
+  const bool depthOnly = config.depthOnly == 1u;
   CHECK(key.shader.use_dst_alpha == 0 ||
             webgpu::g_dualSourceBlendingSupported,
         "GX destination alpha requires WebGPU dual-source blending");
-  std::string wgsl = gxc::generate_wgsl(key.shader);
+  std::string wgsl = uber ? gxc::generate_uber_wgsl(key.shader.use_dst_alpha != 0) : gxc::generate_wgsl(key.shader);
   if (depthOnly) {
     wgsl += "\n@fragment\nfn fs_depth_only() -> @location(0) vec4f {\n"
             "    return vec4f(0.0);\n}\n";
@@ -394,15 +398,15 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   // Multi-texmap: the texture group's layout matches the set of texmaps the WGSL
   // declares (derived identically from the shader key), so pipeline and bind
   // group agree. Untextured draws never use the texture group (layoutCount below).
-  const uint32_t tex_mask = textured ? gxc::used_texmap_mask(key.shader) : 1u;
+  const uint32_t tex_mask = uber ? 0xFFu : textured ? gxc::used_texmap_mask(key.shader) : 1u;
   std::array<wgpu::BindGroupLayout, 4> bindGroupLayouts{
       g_staticBindGroupLayout,
       g_uniformBindGroupLayout,
-      tev ? g_uniformBindGroupLayout : texture_bind_group_layout(tex_mask),
+      tev || uber ? g_uniformBindGroupLayout : texture_bind_group_layout(tex_mask),
       texture_bind_group_layout(tex_mask),
   };
   const size_t layoutCount =
-      depthOnly ? 2 : tev ? (textured ? 4 : 3) : (textured ? 3 : 2);
+      uber ? 4 : depthOnly ? 2 : tev ? (textured ? 4 : 3) : (textured ? 3 : 2);
   const wgpu::PipelineLayoutDescriptor layoutDescriptor{
       .label = "GXCore Pipeline Layout",
       .bindGroupLayoutCount = layoutCount,
@@ -475,44 +479,44 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   // vertex FORMAT carries that attribute. A lit/emboss draw whose format omits
   // it reads the cached fallback from the uniform instead (I_CACHED_NORMAL), so
   // the shader does not declare the input and the layout must not provide it.
-  if ((key.shader.lit_valid != 0 || has_emboss || has_normal_source) &&
-      key.shader.has_vertex_normal != 0) {
+  if (uber || ((key.shader.lit_valid != 0 || has_emboss || has_normal_source) &&
+                key.shader.has_vertex_normal != 0)) {
     attributes.push_back(wgpu::VertexAttribute{
         .format = wgpu::VertexFormat::Float32x3,
         .offset = gxc::kVertexNormalOffset,
         .shaderLocation = 8,
     });
   }
-  if (key.shader.has_tex_mtx_idx != 0) {
+  if (uber || key.shader.has_tex_mtx_idx != 0) {
     attributes.push_back(wgpu::VertexAttribute{
         .format = wgpu::VertexFormat::Uint32,
         .offset = gxc::kVertexTexMtxIdxOffset,
         .shaderLocation = 9,
     });
   }
-  if (has_emboss && key.shader.has_vertex_binormal != 0) {
+  if (uber || (has_emboss && key.shader.has_vertex_binormal != 0)) {
     attributes.push_back(wgpu::VertexAttribute{
         .format = wgpu::VertexFormat::Float32x3,
         .offset = gxc::kVertexBinormalOffset,
         .shaderLocation = 10,
     });
   }
-  if (has_emboss && key.shader.has_vertex_tangent != 0) {
+  if (uber || (has_emboss && key.shader.has_vertex_tangent != 0)) {
     attributes.push_back(wgpu::VertexAttribute{
         .format = wgpu::VertexFormat::Float32x3,
         .offset = gxc::kVertexTangentOffset,
         .shaderLocation = 11,
     });
   }
-  if ((key.shader.uv_mask & (1u << 4u)) != 0u) {
+  if (uber || (key.shader.uv_mask & (1u << 4u)) != 0u) {
     attributes.push_back(wgpu::VertexAttribute{
         .format = wgpu::VertexFormat::Float32x2,
         .offset = gxc::kVertexUvOffset + 32u,
         .shaderLocation = 12,
     });
   }
-  if (key.shader.has_tex_mtx_idx != 0 &&
-      (key.shader.tex_mtx_idx_mask & 0xF0u) != 0u) {
+  if (uber || (key.shader.has_tex_mtx_idx != 0 &&
+                (key.shader.tex_mtx_idx_mask & 0xF0u) != 0u)) {
     attributes.push_back(wgpu::VertexAttribute{
         .format = wgpu::VertexFormat::Uint32,
         .offset = gxc::kVertexTexMtxIdxHiOffset,
@@ -526,7 +530,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
       .attributes = attributes.data(),
   };
 
-  const bool emulateEarlyDepth = needs_early_depth_emulation(key);
+  // The ubershader draws without early-depth emulation (a frame or two).
+  const bool emulateEarlyDepth = !uber && needs_early_depth_emulation(key);
   const bool depthCompare = key.depth_test != 0;
   const wgpu::DepthStencilState depthStencil{
       .format = g_graphicsConfig.depthFormat,
@@ -646,7 +651,17 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
           },
       .fragment = &fragmentState,
   };
-  return g_device.CreateRenderPipeline(&descriptor);
+  if (!uber)
+    return g_device.CreateRenderPipeline(&descriptor);
+  // An ubershader pipeline takes most of a second when its shader is not in
+  // Dawn's blob cache yet (pipeline_cache.cpp makes one first): say so.
+  const auto start = std::chrono::steady_clock::now();
+  auto made = g_device.CreateRenderPipeline(&descriptor);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+  if (ms >= 100.0)
+    std::fprintf(stderr, "[pipelines] the ubershader compiled in %.0f ms (%s)\n", ms,
+                 key.shader.use_dst_alpha != 0 ? "dual-source blending" : "plain");
+  return made;
 }
 
 // What render() last bound in the pass being encoded, so a draw sets only
@@ -682,6 +697,7 @@ namespace {
 struct DrawPart {
   Range uniform;
   Range verts;
+  Range pixel;
   uint32_t firstIndex;
   uint32_t indexCount;
   uint32_t firstVertex;
@@ -700,23 +716,37 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   };
   // Ensure both asynchronous pipelines are ready before the prepass writes any
   // depth. Binding the color pipeline first is harmless; it is rebound below.
-  if (!bind(data.pipeline)) {
-    return;
+  // A draw whose own are not ready yet is drawn with the ubershader, if it was
+  // recorded with its data (submit_draw_plan), without the depth prepass.
+  static const bool uberForced = ubershader_mode() == 2;
+  bool uberDraw = false;
+  if (uberForced && data.uberPipeline != 0) {
+    if (!bind(data.uberPipeline)) {
+      note_draw_left_out(data.batchSize);
+      return;
+    }
+    uberDraw = true;
+  } else if (!bind(data.pipeline) || (data.depthPipeline != 0 && !bind(data.depthPipeline))) {
+    if (data.uberPipeline == 0 || !bind(data.uberPipeline)) {
+      note_draw_left_out(data.batchSize);
+      return;
+    }
+    uberDraw = true;
+    note_ubershader_draw();
   }
-  if (data.depthPipeline != 0 && !bind(data.depthPipeline))
-    return;
   // The in-between frame being encoded: its step's block and vertices (a
   // traced frame's own, matched while recording, are one step's).
   const bool interpolated = frame_interp::encoding_interpolated();
   const int step = interpolated ? interp_replay_step() : 0;
-  const auto job_ranges = [&](uint32_t job, Range& uniform, Range& verts) {
-    uniform = verts = {};
+  const auto job_ranges = [&](uint32_t job, Range& uniform, Range& verts, Range& pixel) {
+    uniform = verts = pixel = {};
     if (!interpolated)
       return;
     if (data.interpJob != UINT32_MAX) {
       const InterpRanges& ranges = interp_job_ranges(job);
       uniform = ranges.uniform[step];
       verts = ranges.verts[step];
+      pixel = ranges.pixel[step];
     } else if (step == 0) {
       uniform = data.interpUniformRange;
       verts = data.interpVertRange;
@@ -728,14 +758,15 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   static std::vector<DrawPart> parts;
   parts.clear();
   DrawPart whole{.firstIndex = firstIndex, .indexCount = data.indexCount, .firstVertex = 0};
-  job_ranges(data.interpJob, whole.uniform, whole.verts);
+  job_ranges(data.interpJob, whole.uniform, whole.verts, whole.pixel);
   bool asOne = true;
   if (interpolated && data.batchSize > 1 && data.interpJob != UINT32_MAX) {
     for (uint32_t i = 1; i < data.batchSize && asOne; ++i) {
-      Range uniform, verts;
-      job_ranges(data.interpJob + i, uniform, verts);
+      Range uniform, verts, pixel;
+      job_ranges(data.interpJob + i, uniform, verts, pixel);
       const uint32_t first = batch_draw(data.batch + i).firstVertex;
       asOne = uniform.offset == whole.uniform.offset && uniform.size == whole.uniform.size &&
+              pixel.offset == whole.pixel.offset && pixel.size == whole.pixel.size &&
               (whole.verts.size == 0 ? verts.size == 0
                                      : verts.size != 0 && verts.offset == whole.verts.offset +
                                                                               first * gxc::kVertexStrideBytes);
@@ -746,7 +777,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
         const BatchDraw& part = batch_draw(data.batch + i);
         DrawPart& draw = parts.emplace_back(
             DrawPart{.firstIndex = index, .indexCount = part.indexCount, .firstVertex = part.firstVertex});
-        job_ranges(data.interpJob + i, draw.uniform, draw.verts);
+        job_ranges(data.interpJob + i, draw.uniform, draw.verts, draw.pixel);
         index += part.indexCount;
       }
     }
@@ -796,27 +827,50 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16);
     g_pass.indexBound = true;
   }
-  const auto draw = [&] {
+  // group 2 on the TEV path: the PS uniform (a dynamic-uniform bind group at
+  // its own offset), or in an in-between frame its blended colours'.
+  const auto setGroup2 = [&](const DrawPart& part) {
+    const bool blended = part.pixel.size != 0;
+    const auto& psGroup = blended ? g_interpUniformBindGroup : g_uniformBindGroup;
+    const uint32_t psOffset = blended ? part.pixel.offset : data.pixelUniformRange.offset;
+    if (psGroup.Get() != g_pass.group2 || psOffset != g_pass.offset2) {
+      pass.SetBindGroup(2, psGroup, 1, &psOffset);
+      g_pass.group2 = psGroup.Get();
+      g_pass.offset2 = psOffset;
+    }
+  };
+  const auto draw = [&](bool pixel) {
     for (const DrawPart& part : parts) {
       setGroup1(part);
+      if (pixel)
+        setGroup2(part);
       const int32_t baseVertex = setVertices(part);
       pass.DrawIndexed(part.indexCount, 1, part.firstIndex, baseVertex);
     }
   };
-  if (data.depthPipeline != 0) {
-    draw();
-    if (!bind(data.pipeline))
-      return;
-  }
-  if (data.tev) {
-    // group 2 = PS uniform (same dynamic-uniform bind group, its own offset);
-    // group 3 = texture.
-    const uint32_t psOffset = data.pixelUniformRange.offset;
+  if (uberDraw) {
+    // group 2: the pixel constants and the shader key; group 3: all eight texmaps.
+    const uint32_t psOffset = data.uberPixelRange.offset;
     if (g_uniformBindGroup.Get() != g_pass.group2 || psOffset != g_pass.offset2) {
       pass.SetBindGroup(2, g_uniformBindGroup, 1, &psOffset);
       g_pass.group2 = g_uniformBindGroup.Get();
       g_pass.offset2 = psOffset;
     }
+    const auto& group = find_bind_group(data.uberTextureBindGroup);
+    if (group.Get() != g_pass.group3) {
+      pass.SetBindGroup(3, group);
+      g_pass.group3 = group.Get();
+    }
+    draw(false);
+    return;
+  }
+  if (data.depthPipeline != 0) {
+    draw(false);
+    if (!bind(data.pipeline))
+      return;
+  }
+  if (data.tev) {
+    // group 3 = texture (group 2, the PS uniform, is set for each part).
     if (data.textureBindGroup != 0) {
       const auto& group = find_bind_group(data.textureBindGroup);
       if (group.Get() != g_pass.group3) {
@@ -832,7 +886,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
       g_pass.offset2 = UINT32_MAX;
     }
   }
-  draw();
+  draw(data.tev);
 }
 
 void note_frame_presented() {
@@ -997,8 +1051,41 @@ struct UniformCache {
 #endif
 };
 static UniformCache g_vertexUniformCache;
+// The constants_id of the plan whose constants g_vertexUniformCache holds the bytes of (0: none).
+static uint64_t g_pushedConstantsId = 0;
 static UniformCache g_interpUniformCache;
 static UniformCache g_pixelUniformCache;
+static UniformCache g_uberPixelUniformCache;
+
+// The ubershader's texture for a texmap slot no TEV stage samples: one white
+// texel, made once per device (the ubershader's bind group has all eight).
+static const wgpu::TextureView& empty_texmap_view() {
+  static std::mutex mutex;
+  std::lock_guard lock{mutex};
+  static wgpu::Device owner;
+  static wgpu::Texture texture;
+  static wgpu::TextureView view;
+  if (owner.Get() != g_device.Get()) {
+    owner = g_device;
+    const wgpu::TextureDescriptor descriptor{
+        .label = "GXCore ubershader empty texmap",
+        .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+        .dimension = wgpu::TextureDimension::e2D,
+        .size = {1, 1, 1},
+        .format = wgpu::TextureFormat::RGBA8Unorm,
+        .mipLevelCount = 1,
+        .sampleCount = 1,
+    };
+    texture = g_device.CreateTexture(&descriptor);
+    view = texture.CreateView();
+    static constexpr uint8_t kWhite[4] = {255, 255, 255, 255};
+    const wgpu::TexelCopyTextureInfo dst{.texture = texture};
+    const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = 4, .rowsPerImage = 1};
+    const wgpu::Extent3D size{1, 1, 1};
+    webgpu::g_queue.WriteTexture(&dst, kWhite, sizeof kWhite, &layout, &size);
+  }
+  return view;
+}
 
 // The block the cache last took: `staged` where it was staged, or the copy.
 static const uint8_t* cached_bytes(const UniformCache& cache, const uint8_t* staged) {
@@ -1073,6 +1160,11 @@ struct InterpJob {
   // helper, which keeps the last it was given (InterpHelper::constants).
   bool constantsCopied;
   gxc::VertexShaderConstants constants;
+  // A TEV draw's pixel constants, the same way: copied only where they differ
+  // from those the job before them carried (pixelCopied).
+  bool tev;
+  bool pixelCopied;
+  gxc::PixelShaderConstants pixel;
 };
 
 // A particle's in-between vertices: its own, with the blended positions, in
@@ -1099,15 +1191,19 @@ struct InterpHelper {
   std::mutex mutex;
   std::condition_variable work;
   std::condition_variable idle;
-  // Recording thread: the frame packet being queued and its job count.
+  // Recording thread: the frame packet being queued and its job count, and
+  // whether a job of it has carried pixel constants.
   uint64_t packet = 0;
   uint32_t jobs = 0;
+  bool pixelCarried = false;
   // Helper thread: the last block it staged per step, and a particle's vertices.
   UniformCache cache[frame_interp::kMaxSteps];
+  UniformCache pixelCache[frame_interp::kMaxSteps];
   std::vector<float> vertices;
   // Helper thread: the constants of the last job that carried them, which the
-  // jobs after it that repeat them use.
+  // jobs after it that repeat them use; and the pixel constants likewise.
   gxc::VertexShaderConstants constants;
+  gxc::PixelShaderConstants pixel;
 };
 
 // Made with the thread and never destroyed: the detached thread may still be
@@ -1149,7 +1245,10 @@ void interp_helper_main(InterpHelper* h) {
     const int steps = frame_interp::frame_steps();
     if (job.constantsCopied)
       std::memcpy(&h->constants, &job.constants, sizeof(h->constants));
-    if (frame_interp::blend_draw(job.input, h->constants, job.repeatsLastDraw) != nullptr) {
+    if (job.pixelCopied)
+      std::memcpy(&h->pixel, &job.pixel, sizeof(h->pixel));
+    if (frame_interp::blend_draw(job.input, h->constants, job.repeatsLastDraw, job.tev ? &h->pixel : nullptr) !=
+        nullptr) {
       const bool repeated = frame_interp::last_blend_repeated();
       for (int step = 0; step < steps; ++step)
         ranges.uniform[step] =
@@ -1160,13 +1259,16 @@ void interp_helper_main(InterpHelper* h) {
     for (int step = 0; step < steps; ++step) {
       if (const float* positions = frame_interp::blended_positions(step))
         ranges.verts[step] = push_blended_vertices(job.slot, job.vertices, positions, h->vertices);
+      if (const gxc::PixelShaderConstants* pixel = frame_interp::blended_pixel(step))
+        ranges.pixel[step] = push_interp_uniform_dedup(h->pixelCache[step], job.frameId, job.slot,
+                                                       reinterpret_cast<const uint8_t*>(pixel), sizeof(*pixel), false);
     }
     resolve_interp_job(job.slot, ranges);
     h->consumed.store(tail + 1, std::memory_order_release);
   }
 }
 
-uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw) {
+uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool tev, bool pixelRepeats) {
   InterpHelper* h = g_interpHelper.load(std::memory_order_acquire);
   if (h == nullptr) {
     h = new InterpHelper;
@@ -1177,6 +1279,7 @@ uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw) {
   if (h->packet != frameId) {
     h->packet = frameId;
     h->jobs = 0;
+    h->pixelCarried = false;
   }
   const uint64_t head = h->produced.load(std::memory_order_relaxed);
   while (head - h->consumed.load(std::memory_order_acquire) >= InterpHelper::Capacity)
@@ -1197,6 +1300,14 @@ uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw) {
   job.constantsCopied = !repeatsLastDraw || h->jobs == 0u;
   if (job.constantsCopied)
     std::memcpy(&job.constants, &plan.constants, sizeof(plan.constants));
+  // pixelRepeats: the pixel constants are those last pushed in this frame
+  // packet, which the last TEV job before this one carried (or repeated).
+  job.tev = tev;
+  job.pixelCopied = tev && (!pixelRepeats || !h->pixelCarried);
+  if (job.pixelCopied) {
+    std::memcpy(&job.pixel, &plan.pixel_constants, sizeof(plan.pixel_constants));
+    h->pixelCarried = true;
+  }
   h->produced.store(head + 1, std::memory_order_release);
   // Asleep, it consumes nothing, so a sleeping helper has WakeBatch or more
   // waiting before it is woken. Only then is `sleeping` read, after a full
@@ -1700,8 +1811,15 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // in-between frame's pool and its block): most draws repeat the constants of
   // the draw before them, 96 percent of the Forsaken Fortress's 17,500 a frame,
   // and each comparison of equal blocks reads all 2.8 KB of both.
-  const bool repeatsLast = repeats_cached(g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
-                                          sizeof(plan.constants));
+  // A plan whose constants were kept from the draw before (constants_id, set
+  // by GxCoreState::build_draw_plan_into) is known to repeat the block last
+  // pushed in this frame packet without comparing them; constants made anew
+  // are compared (they may still be the same bytes).
+  const uint64_t frameId = current_frame_id();
+  const bool repeatsLast =
+      (plan.constants_id != 0 && frameId != 0 && plan.constants_id == g_pushedConstantsId &&
+       g_vertexUniformCache.frameId == frameId && g_vertexUniformCache.range.size == sizeof(plan.constants)) ||
+      repeats_cached(g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants), sizeof(plan.constants));
   // In-between frames: matched on the helper thread (queued below), or here
   // while a traced frame reports each draw's outcome. Here it is matched
   // before a staging segment can split the frame; a split frame is not
@@ -1730,7 +1848,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     std::fprintf(stderr,
                  "[frame-interp-trace] frame=%llu %s key=%016llx prim=0x%02X fmt=%u verts=%u payload=%u idx=%d "
                  "t=(%.1f,%.1f,%.1f) s=%.3f proj00=%.3f proj32=%.1f tex=%08X bt=(%.1f,%.1f,%.1f) bt0=(%.1f,%.1f,%.1f) "
-                 "direct=%d tag=%06X age=%u positions=%d\n",
+                 "direct=%d tag=%06X age=%u scope=%06X:%u positions=%d\n",
                  static_cast<unsigned long long>(frame_interp::game_frame_number()), frame_interp::last_outcome(),
                  static_cast<unsigned long long>(frame_interp::draw_key(plan)),
                  plan.match_primitive, plan.match_vtx_fmt, plan.vertex_count, plan.match_payload_size,
@@ -1743,14 +1861,14 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                  interpConstants ? interpConstants->transformmatrices[0][3] - plan.constants.transformmatrices[0][3] : 0.f,
                  interpConstants ? interpConstants->transformmatrices[1][3] - plan.constants.transformmatrices[1][3] : 0.f,
                  interpConstants ? interpConstants->transformmatrices[2][3] - plan.constants.transformmatrices[2][3] : 0.f,
-                 plan.match_direct_position ? 1 : 0, plan.draw_tag, plan.draw_tag_age,
+                 plan.match_direct_position ? 1 : 0, plan.draw_tag, plan.draw_tag_age, plan.draw_scope, plan.draw_scope_part,
                  tracedPositions != nullptr ? 1 : 0);
   }
-  if (!staging_has_capacity(vertBytes + gxc::kVertexStrideBytes, indexBytes, sizeof(plan.constants),
-                            pixelUniformBytes)) {
+  // (Room too for a pixel block of the ubershader's, should the draw need one.)
+  const size_t pixelRoom = pixelUniformBytes + sizeof(gxc::UberPixelConstants);
+  if (!staging_has_capacity(vertBytes + gxc::kVertexStrideBytes, indexBytes, sizeof(plan.constants), pixelRoom)) {
     if (!segment_frame() ||
-        !staging_has_capacity(vertBytes + gxc::kVertexStrideBytes, indexBytes, sizeof(plan.constants),
-                              pixelUniformBytes)) {
+        !staging_has_capacity(vertBytes + gxc::kVertexStrideBytes, indexBytes, sizeof(plan.constants), pixelRoom)) {
       Log.error("GXCore draw exceeds an empty Aurora staging segment");
       return false;
     }
@@ -1759,12 +1877,16 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const auto uniformRange = push_uniform_dedup(
       g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
       sizeof(plan.constants), repeatsLast ? 1 : 0);
+  g_pushedConstantsId = plan.constants_id;
   Range pixelUniformRange{};
+  bool pixelRepeats = false;
   if (tev) {
+    const uint64_t hits = g_pixelUniformCache.hits;
     pixelUniformRange = push_uniform_dedup(
         g_pixelUniformCache,
         reinterpret_cast<const uint8_t*>(&plan.pixel_constants),
         sizeof(plan.pixel_constants));
+    pixelRepeats = g_pixelUniformCache.hits != hits;
   }
   const PipelineConfig colorConfig{
       .version = GXCorePipelineConfigVersion,
@@ -1779,6 +1901,89 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     depthPipeline = pipeline_ref(depthConfig);
   }
   const bool ownVertices = plan.draw_tag != 0 || plan.draw_scope_part != 0;
+
+  // The ubershader (gxcore_uber.cpp): a draw whose own pipeline is still
+  // compiling is drawn with it, with the same result, rather than left out of
+  // the frame (Dolphin's ubershaders). Its pipelines are one per fixed-function
+  // state, few, and kept in the pipeline cache like any other. The draw gets
+  // a pixel block with its shader key and a bind group with all eight texmaps,
+  // used only if its own pipeline is still not ready when it is encoded.
+  // On by default on D3D12 (ubershader_mode()); DOL_AURORA_UBERSHADER=0 turns
+  // it off, =2 draws every draw with it (testing: a frame drawn both ways can
+  // be compared).
+  static const int uberMode = ubershader_mode();
+  PipelineRef uberPipeline = 0;
+  Range uberPixelRange{};
+  BindGroupRef uberTextureBindGroup = 0;
+  if (uberMode != 0 && (uberMode == 2 || !pipeline_ready(pipeline) ||
+                        (depthPipeline != 0 && !pipeline_ready(depthPipeline)))) {
+    // All eight texmap slots: on the single-texmap path the draw's texture in
+    // every one (as its own shader samples slot 0 whatever the stage's texmap
+    // says), else each used texmap where it is bound; the rest empty.
+    const wgpu::TextureView& empty = empty_texmap_view();
+    const auto emptySampler = sampler_ref(sampler_descriptor(gxc::PlanSampler{}));
+    std::array<WGPUTextureView, 8> views{};
+    std::array<wgpu::Sampler, 8> samplers{};
+    views.fill(empty.Get());
+    samplers.fill(emptySampler);
+    std::array<TextureHandle, 8> held{};
+    bool complete = true;
+    if (plan.pipeline.shader.textured != 0) {
+      if (plan.texmap_mask == 0u) {
+        if (plan.has_texture)
+          held[0] = resolve_texture_handle(plan.tex_address, plan.tex_size, plan.tex_format, plan.tex_width,
+                                           plan.tex_height, plan.tex_data, plan.tex_available, plan.has_tlut,
+                                           plan.tlut_address, plan.tlut_format, plan.tlut_entries, plan.tlut_data,
+                                           plan.tlut_available);
+        complete = static_cast<bool>(held[0]);
+        if (complete) {
+          views.fill(held[0]->sampleTextureView.Get());
+          samplers.fill(sampler_ref(sampler_descriptor(plan.samplers[plan.tex_slot & 7u])));
+        }
+      } else {
+        for (uint32_t t = 0; t < 8u && complete; ++t) {
+          if ((plan.texmap_mask & (1u << t)) == 0u)
+            continue;
+          const gxc::PlanTexture& pt = plan.textures[t];
+          if (pt.valid)
+            held[t] = resolve_texture_handle(pt.address, pt.size, pt.format, pt.width, pt.height, pt.data,
+                                             pt.available, pt.has_tlut, pt.tlut_address, pt.tlut_format,
+                                             pt.tlut_entries, pt.tlut_data, pt.tlut_available);
+          complete = static_cast<bool>(held[t]);
+          if (complete) {
+            views[t] = held[t]->sampleTextureView.Get();
+            samplers[t] = sampler_ref(sampler_descriptor(plan.samplers[t]));
+          }
+        }
+      }
+    }
+    if (complete) {
+      std::array<WGPUBindGroupEntry, 16> entries{};
+      for (uint32_t t = 0; t < 8u; ++t) {
+        entries[2u * t] = WGPUBindGroupEntry{.binding = 2u * t, .textureView = views[t]};
+        entries[2u * t + 1u] = WGPUBindGroupEntry{.binding = 2u * t + 1u, .sampler = samplers[t].Get()};
+      }
+      const WGPUBindGroupDescriptor descriptor{
+          .label = {"GXCore Ubershader Texture Bind Group", WGPU_STRLEN},
+          .layout = texture_bind_group_layout(0xFFu).Get(),
+          .entryCount = entries.size(),
+          .entries = entries.data(),
+      };
+      uberTextureBindGroup = bind_group_ref(descriptor);
+      PipelineConfig uberConfig = colorConfig;
+      uberConfig.key.shader = gxc::ShaderKey{};
+      uberConfig.key.shader.use_dst_alpha = plan.pipeline.shader.use_dst_alpha;
+      uberConfig.depthOnly = 2u;
+      uberPipeline = pipeline_ref(uberConfig);
+      static gxc::UberPixelConstants block; // one recording thread at a time
+      std::memcpy(&block.psc, &plan.pixel_constants, sizeof block.psc);
+      std::memset(block.key, 0, sizeof block.key);
+      std::memcpy(block.key, &plan.pipeline.shader, sizeof plan.pipeline.shader);
+      block.extra[0] = gxc::texmap_popcount(gxc::used_texmap_mask(plan.pipeline.shader)) > 1u ? 1u : 0u;
+      uberPixelRange = push_uniform_dedup(g_uberPixelUniformCache, reinterpret_cast<const uint8_t*>(&block),
+                                          sizeof block);
+    }
+  }
 
   // Batching: a draw of the state of the pass's last command (pipeline,
   // constants, pixel constants, textures), with nothing between them, whose
@@ -1796,7 +2001,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   uint32_t firstVertex = 0;
   if (batching && !matchHere) {
     DrawData* last = last_recorded_draw();
-    if (last != nullptr && last->pipeline == pipeline && last->depthPipeline == depthPipeline &&
+    if (last != nullptr && uberPipeline == 0 && last->uberPipeline == 0 && last->pipeline == pipeline &&
+        last->depthPipeline == depthPipeline &&
         last->uniformRange.offset == uniformRange.offset && last->tev == tev &&
         (!tev || last->pixelUniformRange.offset == pixelUniformRange.offset) &&
         last->textureBindGroup == textureBindGroup && last->ownVertices == ownVertices &&
@@ -1835,7 +2041,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         g_interpUniformCache, current_frame_id(), recording_frame_slot(), reinterpret_cast<const uint8_t*>(interpConstants),
         sizeof(*interpConstants), frame_interp::last_blend_repeated());
   else if (interpolating && !matchHere)
-    interpJob = queue_interp_job(plan, repeatsLast);
+    interpJob = queue_interp_job(plan, repeatsLast, tev, pixelRepeats);
 
   const auto indexCount = static_cast<uint32_t>(plan.indices.size());
   if (batch != nullptr) {
@@ -1863,6 +2069,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .textureBindGroup = textureBindGroup,
       .tev = tev,
       .ownVertices = ownVertices,
+      .uberPipeline = uberPipeline,
+      .uberPixelRange = uberPixelRange,
+      .uberTextureBindGroup = uberTextureBindGroup,
   });
   return true;
 }

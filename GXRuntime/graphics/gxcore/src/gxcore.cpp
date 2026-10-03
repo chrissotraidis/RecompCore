@@ -458,22 +458,36 @@ std::uint32_t read_be(const std::uint8_t* p, std::uint32_t size) {
   return v;
 }
 
-float decode_component(const std::uint8_t* p, std::uint32_t format,
-                       std::uint32_t frac) {
+std::uint16_t load_be16(const std::uint8_t* p) {
+  std::uint16_t v;
+  std::memcpy(&v, p, sizeof v);
+  return __builtin_bswap16(v);
+}
+
+std::uint32_t load_be32(const std::uint8_t* p) {
+  std::uint32_t v;
+  std::memcpy(&v, p, sizeof v);
+  return __builtin_bswap32(v);
+}
+
+// One component of an attribute: fixed-point formats times the entry's
+// 1 / 2^frac, which is exactly dividing by 2^frac as this did (both are the
+// one rounding of the same real number, and an 8- or 16-bit value over 2^31
+// at most is far from the subnormals).
+inline float decode_scaled(const std::uint8_t* p, std::uint32_t format,
+                           float scale) {
   switch (format) {
   case 0u: // u8
-    return static_cast<float>(p[0]) / static_cast<float>(1u << frac);
+    return static_cast<float>(p[0]) * scale;
   case 1u: // s8
-    return static_cast<float>(static_cast<std::int8_t>(p[0])) /
-           static_cast<float>(1u << frac);
+    return static_cast<float>(static_cast<std::int8_t>(p[0])) * scale;
   case 2u: // u16
-    return static_cast<float>(read_be(p, 2)) / static_cast<float>(1u << frac);
-  case 3u: { // s16
-    const auto raw = static_cast<std::int16_t>(read_be(p, 2));
-    return static_cast<float>(raw) / static_cast<float>(1u << frac);
-  }
+    return static_cast<float>(load_be16(p)) * scale;
+  case 3u: // s16
+    return static_cast<float>(static_cast<std::int16_t>(load_be16(p))) *
+           scale;
   case 4u: { // f32 big-endian
-    const std::uint32_t v = read_be(p, 4);
+    const std::uint32_t v = load_be32(p);
     float f;
     std::memcpy(&f, &v, sizeof f);
     return f;
@@ -536,10 +550,17 @@ void decode_color(const std::uint8_t* p, std::uint32_t format, float out[4]) {
     a = p[3];
     break;
   }
-  out[0] = static_cast<float>(r) / 255.f;
-  out[1] = static_cast<float>(g) / 255.f;
-  out[2] = static_cast<float>(b) / 255.f;
-  out[3] = static_cast<float>(a) / 255.f;
+  // The 256 quotients x / 255 once, rather than four divisions a colour.
+  static const auto unorm8 = [] {
+    std::array<float, 256> table{};
+    for (std::uint32_t i = 0; i < 256u; ++i)
+      table[i] = static_cast<float>(i) / 255.f;
+    return table;
+  }();
+  out[0] = unorm8[r];
+  out[1] = unorm8[g];
+  out[2] = unorm8[b];
+  out[3] = unorm8[a];
 }
 
 const ar::ConsumedArrayInput* find_array(const ar::ConsumedDraw& draw,
@@ -606,17 +627,13 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
                                        CachedVertexAttrs* cached,
                                        DrawPlan& plan) const {
   {
-    std::vector<float> vertices = std::move(plan.vertices);
-    std::vector<std::uint16_t> indices = std::move(plan.indices);
-    // Re-constructed in place: assigning a DrawPlan{} built the zeroed
-    // temporary and then copied all of it (the shader constants are several
-    // KB) over the plan, at every draw.
-    std::destroy_at(&plan);
-    std::construct_at(&plan);
-    vertices.clear();
-    indices.clear();
-    plan.vertices = std::move(vertices);
-    plan.indices = std::move(indices);
+    // Every field to its default, from one copy made once; the vertex and
+    // index arrays keep their capacity, and the vertex constants stay as they
+    // are until the draw's inputs are known (see "Uniforms" below).
+    static const DrawPlanFields kDefaults{};
+    static_cast<DrawPlanFields&>(plan) = kDefaults;
+    plan.vertices.clear();
+    plan.indices.clear();
   }
   plan.match_payload = draw.vertex_payload.data();
   plan.match_payload_size = static_cast<std::uint32_t>(draw.vertex_payload.size());
@@ -1289,6 +1306,18 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
       static_cast<std::size_t>(draw.vertex_count) * kVertexFloats, 0.f);
   const std::uint8_t* payload = draw.vertex_payload.data();
   const std::size_t payload_size = draw.vertex_payload.size();
+  // Each indexed entry's array, found once for the draw (it was looked up
+  // for every element of every vertex), and each entry's component scale.
+  // Whether it is usable is still decided where the first vertex reaches
+  // it, as before.
+  const ar::ConsumedArrayInput* entry_arrays[24] = {};
+  float entry_scales[24];
+  for (std::uint32_t e = 0; e < walk.entry_count; ++e) {
+    const WalkEntry& entry = walk.entries[e];
+    if (entry.vcd_type > 1u)
+      entry_arrays[e] = find_array(draw, entry.attr);
+    entry_scales[e] = 1.f / static_cast<float>(1u << entry.frac);
+  }
   for (std::uint32_t v = 0; v < draw.vertex_count; ++v) {
     float* out_vertex = plan.vertices.data() +
                         static_cast<std::size_t>(v) * kVertexFloats;
@@ -1337,9 +1366,9 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
         advance = entry.element_size;
       } else {
         const std::uint32_t idx_size = entry.vcd_type == 2u ? 1u : 2u;
-        const std::uint32_t index = read_be(p, idx_size);
+        const std::uint32_t index = idx_size == 1u ? p[0] : load_be16(p);
         advance = idx_size;
-        const ar::ConsumedArrayInput* array = find_array(draw, entry.attr);
+        const ar::ConsumedArrayInput* array = entry_arrays[e];
         if (array == nullptr || !array->resolved ||
             array->host_data == nullptr) {
           ++counters.vertex_decode_failures;
@@ -1363,9 +1392,9 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
       case WalkEntry::kPos: {
         std::uint32_t scalar = 0;
         component_scalar_size(entry.format, &scalar);
+        const float scale = entry_scales[e];
         for (std::uint32_t c = 0; c < entry.count && c < 3u; ++c)
-          out_vertex[c] =
-              decode_component(element + c * scalar, entry.format, entry.frac);
+          out_vertex[c] = decode_scaled(element + c * scalar, entry.format, scale);
         if (entry.count == 2u)
           out_vertex[2] = 0.f;
         break;
@@ -1383,10 +1412,10 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
           std::uint32_t scalar = 0;
           component_scalar_size(entry.format, &scalar);
           float* dst = out_vertex + 12u + 2u * entry.out_slot;
-          dst[0] = decode_component(element, entry.format, entry.frac);
+          const float scale = entry_scales[e];
+          dst[0] = decode_scaled(element, entry.format, scale);
           dst[1] = entry.count == 2u
-                       ? decode_component(element + scalar, entry.format,
-                                          entry.frac)
+                       ? decode_scaled(element + scalar, entry.format, scale)
                        : 0.f;
         }
         break;
@@ -1397,10 +1426,11 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
         // arrives as three count==3 entries routed by normal_part.
         std::uint32_t scalar = 0;
         component_scalar_size(entry.format, &scalar);
+        const float scale = entry_scales[e];
         auto decode3 = [&](const std::uint8_t* src, std::uint32_t dst_off) {
           float* dst = out_vertex + dst_off / 4u;
           for (std::uint32_t c = 0; c < 3u; ++c)
-            dst[c] = decode_component(src + c * scalar, entry.format, entry.frac);
+            dst[c] = decode_scaled(src + c * scalar, entry.format, scale);
         };
         if (entry.count >= 9u) {
           decode3(element, kVertexNormalOffset);
@@ -1430,172 +1460,237 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
                 &texmtxidx_packed_hi, sizeof texmtxidx_packed_hi);
   }
 
-  // Uniforms.
-  VertexShaderConstants& c = plan.constants;
-  // Rows 0-29 are position_matrices laid end to end (3 rows of 4 per matrix)
-  // and rows 30-62 are tex_matrices the same way, so the 63 per-row copies
-  // load_matrix_row made (their validity result was discarded) are two block
-  // copies. This ran for every draw, about 18,000 a frame in heavy scenes.
-  static_assert(sizeof(draw.position_matrices) == 30u * 4u * sizeof(float));
-  static_assert(sizeof(draw.tex_matrices) == 33u * 4u * sizeof(float));
-  std::memcpy(&c.transformmatrices[0][0], draw.position_matrices,
-              sizeof(draw.position_matrices));
-  std::memcpy(&c.transformmatrices[30][0], draw.tex_matrices,
-              sizeof(draw.tex_matrices));
-  const std::uint32_t pn_row = draw.current_pn_matrix * 3u;
-  for (std::uint32_t k = 0; k < 3u; ++k)
-    (void)load_matrix_row(draw, pn_row + k, c.posnormalmatrix[k]);
-  // Normal matrix (XF 0x400): matrix M = current_pn_matrix, 3 rows of
-  // 3 (Dolphin VertexShaderManager normalMatrices[3*(PosNormalMtxIdx&31)] == our
-  // per-matrix [M] slot). Fall back to the position rows when it was never
-  // captured (keeps the A1 behavior for uncaptured draws).
-  {
-    const std::uint32_t m = draw.current_pn_matrix;
-    const bool nm_valid =
-        m < DOL_GX_RECOMP_NORMAL_MATRIX_COUNT &&
-        draw.normal_matrix_word_mask[m] ==
-            ((1u << DOL_GX_RECOMP_NORMAL_MATRIX_WORDS) - 1u);
+  // Uniforms. Most draws are made with the transform state of the draw
+  // before them (96 percent in the Forsaken Fortress, 17,500 draws a frame):
+  // when the inputs below are the ones the plan's constants were made from,
+  // they are kept, and the constants_id tells the submission layer that the
+  // block is the same without comparing its 2.8 KB.
+  // DOL_GXCORE_CONSTANTS_VERIFY=1 makes them again anyway and compares, and
+  // DOL_GXCORE_CONSTANTS_KEEP=0 always makes them (debug).
+  ConstantsInputs inputs{};
+  inputs.xf_version = draw.xf_version;
+  if (cached != nullptr) {
+    inputs.has_cached = 1u;
     for (std::uint32_t k = 0; k < 3u; ++k) {
-      if (nm_valid) {
-        c.posnormalmatrix[3u + k][0] = draw.normal_matrices[m][3u * k + 0u];
-        c.posnormalmatrix[3u + k][1] = draw.normal_matrices[m][3u * k + 1u];
-        c.posnormalmatrix[3u + k][2] = draw.normal_matrices[m][3u * k + 2u];
-        c.posnormalmatrix[3u + k][3] = 0.f;
-      } else {
-        (void)load_matrix_row(draw, pn_row + k, c.posnormalmatrix[3u + k]);
-      }
+      inputs.cached[k] = cached->normal[k];
+      inputs.cached[3u + k] = cached->tangent[k];
+      inputs.cached[6u + k] = cached->binormal[k];
     }
   }
-  // Dolphin uploads the complete packed normal-matrix row bank for vertex
-  // formats carrying PNMTXIDX. XF stores 96 floats as 32 rows of three; the
-  // C/WGSL uniform pads each row to vec4 alignment.
-  for (std::uint32_t row = 0; row < 32u; ++row) {
-    const std::uint32_t matrix = row / 3u;
-    const std::uint32_t matrix_row = row % 3u;
-    if (matrix >= DOL_GX_RECOMP_NORMAL_MATRIX_COUNT)
-      continue;
-    const std::uint16_t row_mask =
-        static_cast<std::uint16_t>(0x7u << (3u * matrix_row));
-    if ((draw.normal_matrix_word_mask[matrix] & row_mask) != row_mask)
-      continue;
-    for (std::uint32_t col = 0; col < 3u; ++col)
-      c.normalmatrices[row][col] =
-          draw.normal_matrices[matrix][3u * matrix_row + col];
-  }
-
-  // Lighting uniforms (S15): 8 XF lights + 4 material/ambient registers. Light
-  // words (gx_recomp.h): [3]=RGBA8 color, [4..6]=cosatt, [7..9]=distatt,
-  // [10..12]=pos, [13..15]=dir (f32 bit patterns). Lights are read only when a
-  // light is enabled (lit_valid); the material registers are read by any channel
-  // taking the full path (register material/ambient or lighting). Both are left
-  // zero otherwise — the WGSL for such a draw never references them.
-  auto unpack_rgba8 = [](std::uint32_t col, std::int32_t out[4]) {
-    out[0] = static_cast<std::int32_t>((col >> 24) & 0xFFu);
-    out[1] = static_cast<std::int32_t>((col >> 16) & 0xFFu);
-    out[2] = static_cast<std::int32_t>((col >> 8) & 0xFFu);
-    out[3] = static_cast<std::int32_t>(col & 0xFFu);
-  };
-  if (key.lit_valid) {
-    auto f32_of = [](std::uint32_t raw) {
-      float f;
-      std::memcpy(&f, &raw, sizeof f);
-      return f;
-    };
-    for (std::uint32_t i = 0; i < 8u; ++i) {
-      const std::uint32_t* w = draw.light_words[i];
-      unpack_rgba8(w[3], c.lights[i].color);
+  inputs.lit_valid = key.lit_valid;
+  inputs.chan_lit = channel_lit_path(key, 0u) || channel_lit_path(key, 1u) ? 1u : 0u;
+  inputs.num_tex_gens = key.num_tex_gens;
+  for (std::uint32_t i = 0; i < key.num_tex_gens && i < kMaxTexGens; ++i)
+    if (key.tex_gens[i].projection != 0u)
+      inputs.texgen_stq |= static_cast<std::uint8_t>(1u << i);
+  static const bool keep_constants = [] {
+    const char* env = std::getenv("DOL_GXCORE_CONSTANTS_KEEP");
+    return env == nullptr || env[0] != '0';
+  }();
+  const bool reuse = keep_constants && inputs.xf_version != 0u && plan.constants_id != 0u &&
+                     std::memcmp(&inputs, &plan.constants_inputs, sizeof inputs) == 0;
+  static const bool verify_constants = [] {
+    const char* env = std::getenv("DOL_GXCORE_CONSTANTS_VERIFY");
+    return env != nullptr && env[0] == '1';
+  }();
+  static VertexShaderConstants verify_scratch;
+  if (!reuse || verify_constants) {
+    VertexShaderConstants& c = reuse ? verify_scratch : plan.constants;
+    std::uint8_t texgen_row[kMaxTexGens];
+    std::memset(texgen_row, 0, sizeof texgen_row);
+    std::uint32_t unresolved = 0;
+    c = VertexShaderConstants{};
+    // Rows 0-29 are position_matrices laid end to end (3 rows of 4 per matrix)
+    // and rows 30-62 are tex_matrices the same way, so the 63 per-row copies
+    // load_matrix_row made (their validity result was discarded) are two block
+    // copies. This ran for every draw, about 18,000 a frame in heavy scenes.
+    static_assert(sizeof(draw.position_matrices) == 30u * 4u * sizeof(float));
+    static_assert(sizeof(draw.tex_matrices) == 33u * 4u * sizeof(float));
+    std::memcpy(&c.transformmatrices[0][0], draw.position_matrices,
+                sizeof(draw.position_matrices));
+    std::memcpy(&c.transformmatrices[30][0], draw.tex_matrices,
+                sizeof(draw.tex_matrices));
+    const std::uint32_t pn_row = draw.current_pn_matrix * 3u;
+    for (std::uint32_t k = 0; k < 3u; ++k)
+      (void)load_matrix_row(draw, pn_row + k, c.posnormalmatrix[k]);
+    // Normal matrix (XF 0x400): matrix M = current_pn_matrix, 3 rows of
+    // 3 (Dolphin VertexShaderManager normalMatrices[3*(PosNormalMtxIdx&31)] == our
+    // per-matrix [M] slot). Fall back to the position rows when it was never
+    // captured (keeps the A1 behavior for uncaptured draws).
+    {
+      const std::uint32_t m = draw.current_pn_matrix;
+      const bool nm_valid =
+          m < DOL_GX_RECOMP_NORMAL_MATRIX_COUNT &&
+          draw.normal_matrix_word_mask[m] ==
+              ((1u << DOL_GX_RECOMP_NORMAL_MATRIX_WORDS) - 1u);
       for (std::uint32_t k = 0; k < 3u; ++k) {
-        c.lights[i].cosatt[k] = f32_of(w[4 + k]);
-        c.lights[i].distatt[k] = f32_of(w[7 + k]);
-        c.lights[i].pos[k] = f32_of(w[10 + k]);
-        c.lights[i].dir[k] = f32_of(w[13 + k]);
+        if (nm_valid) {
+          c.posnormalmatrix[3u + k][0] = draw.normal_matrices[m][3u * k + 0u];
+          c.posnormalmatrix[3u + k][1] = draw.normal_matrices[m][3u * k + 1u];
+          c.posnormalmatrix[3u + k][2] = draw.normal_matrices[m][3u * k + 2u];
+          c.posnormalmatrix[3u + k][3] = 0.f;
+        } else {
+          (void)load_matrix_row(draw, pn_row + k, c.posnormalmatrix[3u + k]);
+        }
       }
     }
-  }
-  if (channel_lit_path(key, 0u) || channel_lit_path(key, 1u)) {
-    // I_MATERIALS: [0]=amb0(0x100A), [1]=amb1(0x100B), [2]=mat0(0x100C),
-    // [3]=mat1(0x100D) — chan_regs slots 1..4.
-    const std::uint32_t mat_slot[4] = {1u, 2u, 3u, 4u};
-    for (std::uint32_t m = 0; m < 4u; ++m) {
-      const std::uint32_t col = (draw.chan_reg_mask & (1u << mat_slot[m]))
-                                    ? draw.chan_regs[mat_slot[m]]
-                                    : 0u;
-      unpack_rgba8(col, c.materials[m]);
+    // Dolphin uploads the complete packed normal-matrix row bank for vertex
+    // formats carrying PNMTXIDX. XF stores 96 floats as 32 rows of three; the
+    // C/WGSL uniform pads each row to vec4 alignment.
+    for (std::uint32_t row = 0; row < 32u; ++row) {
+      const std::uint32_t matrix = row / 3u;
+      const std::uint32_t matrix_row = row % 3u;
+      if (matrix >= DOL_GX_RECOMP_NORMAL_MATRIX_COUNT)
+        continue;
+      const std::uint16_t row_mask =
+          static_cast<std::uint16_t>(0x7u << (3u * matrix_row));
+      if ((draw.normal_matrix_word_mask[matrix] & row_mask) != row_mask)
+        continue;
+      for (std::uint32_t col = 0; col < 3u; ++col)
+        c.normalmatrices[row][col] =
+            draw.normal_matrices[matrix][3u * matrix_row + col];
     }
-  }
-  // Projection (GC 6-param form; Dolphin VertexShaderManager layout).
-  const float* pr = draw.projection;
-  if (draw.projection_type == 1u) { // orthographic
-    c.projection[0][0] = pr[0];
-    c.projection[0][3] = pr[1];
-    c.projection[1][1] = pr[2];
-    c.projection[1][3] = pr[3];
-    c.projection[2][2] = pr[4];
-    c.projection[2][3] = pr[5];
-    c.projection[3][3] = 1.f;
-  } else { // perspective
-    c.projection[0][0] = pr[0];
-    c.projection[0][2] = pr[1];
-    c.projection[1][1] = pr[2];
-    c.projection[1][2] = pr[3];
-    c.projection[2][2] = pr[4];
-    c.projection[2][3] = pr[5];
-    c.projection[3][2] = -1.f;
-  }
-  // Per-texgen matrix rows via XF MatrixIndexA/B (CPMemory.h TMatrixIndexA/B).
-  const bool mat_idx_a_valid = (draw.xf_reg_mask & 0x1ull) != 0ull;
-  const bool mat_idx_b_valid = (draw.xf_reg_mask & 0x2ull) != 0ull;
-  const std::uint32_t mat_idx_a = draw.xf_regs[0];
-  const std::uint32_t mat_idx_b = draw.xf_regs[1];
-  for (std::uint32_t i = 0; i < key.num_tex_gens; ++i) {
-    std::uint32_t row = 60u; // GX_IDENTITY row when never configured
-    bool row_known = false;
-    if (i < 4u && mat_idx_a_valid) {
-      row = bits(mat_idx_a, 6, 6 + 6 * i);
-      row_known = true;
-    } else if (i >= 4u && mat_idx_b_valid) {
-      // CPMemory.h TMatrixIndexB begins Tex4MtxIdx at bit 0; unlike A it has
-      // no leading PosNormalMtxIdx field.
-      row = bits(mat_idx_b, 6, 6 * (i - 4u));
-      row_known = true;
-    }
-    float rows[3][4];
-    bool resolved = row_known;
-    for (std::uint32_t k = 0; k < 3u; ++k)
-      resolved = load_matrix_row(draw, row + k, rows[k]) && resolved;
-    if (!resolved) {
-      // Never-written matrix memory: pass raw ST through (identity) and
-      // count it loudly instead of collapsing every UV to zero.
-      identity_rows(rows);
-      ++counters.unresolved_tex_matrix;
-    }
-    // Dual-texture post transform (XF 0x1012, on since GXInit): the texture
-    // matrix's result goes through a second matrix from post-transform memory
-    // (Dolphin VertexShaderGen WriteTexCoordTransforms). Without normalization
-    // the two are one 3x4 matrix, folded here so the shader is unchanged:
-    // coord.w is 1, so each post row's w joins the fourth column, and a
-    // two-row (ST) texgen's third coordinate is the constant 1. The lava's
-    // pattern and colour ramp are projected this way (d_magma.cpp).
-    if ((draw.post_tex_mask & (1u << i)) != 0u &&
-        (draw.post_tex_normalize & (1u << i)) == 0u) {
-      const float* p = draw.post_tex_rows[i];
-      const bool stq = key.tex_gens[i].projection != 0u;
-      float folded[3][4];
-      for (std::uint32_t r = 0; r < 3u; ++r) {
-        const float* pr = p + 4u * r;
-        for (std::uint32_t col = 0; col < 4u; ++col)
-          folded[r][col] = pr[0] * rows[0][col] + pr[1] * rows[1][col] +
-                           (stq ? pr[2] * rows[2][col] : 0.f);
-        folded[r][3] += pr[3] + (stq ? 0.f : pr[2]);
+
+    // Lighting uniforms (S15): 8 XF lights + 4 material/ambient registers. Light
+    // words (gx_recomp.h): [3]=RGBA8 color, [4..6]=cosatt, [7..9]=distatt,
+    // [10..12]=pos, [13..15]=dir (f32 bit patterns). Lights are read only when a
+    // light is enabled (lit_valid); the material registers are read by any channel
+    // taking the full path (register material/ambient or lighting). Both are left
+    // zero otherwise — the WGSL for such a draw never references them.
+    auto unpack_rgba8 = [](std::uint32_t col, std::int32_t out[4]) {
+      out[0] = static_cast<std::int32_t>((col >> 24) & 0xFFu);
+      out[1] = static_cast<std::int32_t>((col >> 16) & 0xFFu);
+      out[2] = static_cast<std::int32_t>((col >> 8) & 0xFFu);
+      out[3] = static_cast<std::int32_t>(col & 0xFFu);
+    };
+    if (key.lit_valid) {
+      auto f32_of = [](std::uint32_t raw) {
+        float f;
+        std::memcpy(&f, &raw, sizeof f);
+        return f;
+      };
+      for (std::uint32_t i = 0; i < 8u; ++i) {
+        const std::uint32_t* w = draw.light_words[i];
+        unpack_rgba8(w[3], c.lights[i].color);
+        for (std::uint32_t k = 0; k < 3u; ++k) {
+          c.lights[i].cosatt[k] = f32_of(w[4 + k]);
+          c.lights[i].distatt[k] = f32_of(w[7 + k]);
+          c.lights[i].pos[k] = f32_of(w[10 + k]);
+          c.lights[i].dir[k] = f32_of(w[13 + k]);
+        }
       }
-      std::memcpy(rows, folded, sizeof rows);
     }
-    for (std::uint32_t k = 0; k < 3u; ++k)
-      std::memcpy(c.texmatrices[3u * i + k], rows[k], sizeof rows[k]);
-    if (i < kMaxTexGens)
-      plan.texgen_row[i] = static_cast<std::uint8_t>(resolved ? row : 0xFFu);
+    if (channel_lit_path(key, 0u) || channel_lit_path(key, 1u)) {
+      // I_MATERIALS: [0]=amb0(0x100A), [1]=amb1(0x100B), [2]=mat0(0x100C),
+      // [3]=mat1(0x100D) — chan_regs slots 1..4.
+      const std::uint32_t mat_slot[4] = {1u, 2u, 3u, 4u};
+      for (std::uint32_t m = 0; m < 4u; ++m) {
+        const std::uint32_t col = (draw.chan_reg_mask & (1u << mat_slot[m]))
+                                      ? draw.chan_regs[mat_slot[m]]
+                                      : 0u;
+        unpack_rgba8(col, c.materials[m]);
+      }
+    }
+    // Projection (GC 6-param form; Dolphin VertexShaderManager layout).
+    const float* pr = draw.projection;
+    if (draw.projection_type == 1u) { // orthographic
+      c.projection[0][0] = pr[0];
+      c.projection[0][3] = pr[1];
+      c.projection[1][1] = pr[2];
+      c.projection[1][3] = pr[3];
+      c.projection[2][2] = pr[4];
+      c.projection[2][3] = pr[5];
+      c.projection[3][3] = 1.f;
+    } else { // perspective
+      c.projection[0][0] = pr[0];
+      c.projection[0][2] = pr[1];
+      c.projection[1][1] = pr[2];
+      c.projection[1][2] = pr[3];
+      c.projection[2][2] = pr[4];
+      c.projection[2][3] = pr[5];
+      c.projection[3][2] = -1.f;
+    }
+    // Per-texgen matrix rows via XF MatrixIndexA/B (CPMemory.h TMatrixIndexA/B).
+    const bool mat_idx_a_valid = (draw.xf_reg_mask & 0x1ull) != 0ull;
+    const bool mat_idx_b_valid = (draw.xf_reg_mask & 0x2ull) != 0ull;
+    const std::uint32_t mat_idx_a = draw.xf_regs[0];
+    const std::uint32_t mat_idx_b = draw.xf_regs[1];
+    for (std::uint32_t i = 0; i < key.num_tex_gens; ++i) {
+      std::uint32_t row = 60u; // GX_IDENTITY row when never configured
+      bool row_known = false;
+      if (i < 4u && mat_idx_a_valid) {
+        row = bits(mat_idx_a, 6, 6 + 6 * i);
+        row_known = true;
+      } else if (i >= 4u && mat_idx_b_valid) {
+        // CPMemory.h TMatrixIndexB begins Tex4MtxIdx at bit 0; unlike A it has
+        // no leading PosNormalMtxIdx field.
+        row = bits(mat_idx_b, 6, 6 * (i - 4u));
+        row_known = true;
+      }
+      float rows[3][4];
+      bool resolved = row_known;
+      for (std::uint32_t k = 0; k < 3u; ++k)
+        resolved = load_matrix_row(draw, row + k, rows[k]) && resolved;
+      if (!resolved) {
+        // Never-written matrix memory: pass raw ST through (identity) and
+        // count it loudly instead of collapsing every UV to zero.
+        identity_rows(rows);
+        ++unresolved;
+      }
+      // Dual-texture post transform (XF 0x1012, on since GXInit): the texture
+      // matrix's result goes through a second matrix from post-transform memory
+      // (Dolphin VertexShaderGen WriteTexCoordTransforms). Without normalization
+      // the two are one 3x4 matrix, folded here so the shader is unchanged:
+      // coord.w is 1, so each post row's w joins the fourth column, and a
+      // two-row (ST) texgen's third coordinate is the constant 1. The lava's
+      // pattern and colour ramp are projected this way (d_magma.cpp).
+      if ((draw.post_tex_mask & (1u << i)) != 0u &&
+          (draw.post_tex_normalize & (1u << i)) == 0u) {
+        const float* p = draw.post_tex_rows[i];
+        const bool stq = key.tex_gens[i].projection != 0u;
+        float folded[3][4];
+        for (std::uint32_t r = 0; r < 3u; ++r) {
+          const float* pr = p + 4u * r;
+          for (std::uint32_t col = 0; col < 4u; ++col)
+            folded[r][col] = pr[0] * rows[0][col] + pr[1] * rows[1][col] +
+                             (stq ? pr[2] * rows[2][col] : 0.f);
+          folded[r][3] += pr[3] + (stq ? 0.f : pr[2]);
+        }
+        std::memcpy(rows, folded, sizeof rows);
+      }
+      for (std::uint32_t k = 0; k < 3u; ++k)
+        std::memcpy(c.texmatrices[3u * i + k], rows[k], sizeof rows[k]);
+      if (i < kMaxTexGens)
+        texgen_row[i] = static_cast<std::uint8_t>(resolved ? row : 0xFFu);
+    }
+    // Cached N/B/T fallback (Dolphin ConstantManager cached_normal): the
+    // incoming cross-draw cache, for a draw whose format omits the attribute
+    // (see the end of the plan, where this draw advances the cache).
+    if (cached != nullptr) {
+      for (std::uint32_t k = 0; k < 3u; ++k) {
+        c.cached_normal[k] = cached->normal[k];
+        c.cached_tangent[k] = cached->tangent[k];
+        c.cached_binormal[k] = cached->binormal[k];
+      }
+    }
+    if (!reuse) {
+      std::memcpy(plan.texgen_row, texgen_row, sizeof texgen_row);
+      plan.constants_unresolved = unresolved;
+      plan.constants_inputs = inputs;
+      static std::atomic<std::uint64_t> next_constants_id{0};
+      plan.constants_id = next_constants_id.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    } else {
+      static std::uint64_t mismatches = 0;
+      if ((std::memcmp(&c, &plan.constants, sizeof c) != 0 ||
+           std::memcmp(texgen_row, plan.texgen_row, sizeof texgen_row) != 0 ||
+           unresolved != plan.constants_unresolved) &&
+          ++mismatches <= 8u)
+        std::fprintf(stderr, "[gx-constants] kept constants differ from remade ones (#%llu, xf version %llu)\n",
+                     static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(inputs.xf_version));
+    }
   }
-  plan.matrix_index_a = mat_idx_a_valid ? mat_idx_a : 0xFFFFFFFFu;
+  counters.unresolved_tex_matrix += plan.constants_unresolved;
+  plan.matrix_index_a = (draw.xf_reg_mask & 0x1ull) != 0ull ? draw.xf_regs[0] : 0xFFFFFFFFu;
 
   // Viewport + texture.
   if ((draw.transform_flags & ar::kDrawTransformViewportValid) != 0u) {
@@ -1827,18 +1922,14 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   }
 
   // Cached N/B/T fallback (Dolphin VertexLoaderManager normal_cache /
-  // ConstantManager cached_normal). Expose the incoming cross-draw cache in the
-  // uniform so a draw whose format omits an attribute reads the last-decoded
-  // vertex's value instead of a zero input (normalize(0) = NaN). Then, if THIS
-  // draw carried the attribute, advance the cache to its LAST vertex's raw
-  // object-space value (Dolphin writes the cache on the loader's m_remaining==0
-  // vertex). N/B/T are appended in the fixed vertex layout at these float slots.
+  // ConstantManager cached_normal). The uniform has the incoming cross-draw
+  // cache (above, with the constants) so a draw whose format omits an
+  // attribute reads the last-decoded vertex's value instead of a zero input
+  // (normalize(0) = NaN). Then, if THIS draw carried the attribute, advance the
+  // cache to its LAST vertex's raw object-space value (Dolphin writes the cache
+  // on the loader's m_remaining==0 vertex). N/B/T are appended in the fixed
+  // vertex layout at these float slots.
   if (cached != nullptr) {
-    for (std::uint32_t k = 0; k < 3u; ++k) {
-      c.cached_normal[k] = cached->normal[k];
-      c.cached_tangent[k] = cached->tangent[k];
-      c.cached_binormal[k] = cached->binormal[k];
-    }
     if (plan.vertex_count > 0u) {
       const float* last =
           plan.vertices.data() +
@@ -1877,17 +1968,21 @@ void GxCoreSink::on_consumed_draw(const ar::ConsumedDraw& draw,
   self->pending_state_.build_draw_plan_into(draw, self->counters_,
                                             &self->cached_attrs_, plan);
   // A draw scope: the next draws with positions of their own, up to its
-  // count, are its emitter's; any other draw ends it.
+  // count, are its emitter's; any other draw ends it. A count with bit 23
+  // set is a cloth's strips, which index their positions.
   const GxCoreState& state = self->pending_state_;
   if (state.bp_valid(GxCoreState::kDrawScopeRegister)) {
+    const std::uint32_t count =
+        state.bp_valid(GxCoreState::kDrawScopeCountRegister)
+            ? state.bp(GxCoreState::kDrawScopeCountRegister)
+            : 0u;
     self->scope_ = state.bp(GxCoreState::kDrawScopeRegister);
-    self->scope_left_ = state.bp_valid(GxCoreState::kDrawScopeCountRegister)
-                            ? state.bp(GxCoreState::kDrawScopeCountRegister)
-                            : 0u;
+    self->scope_left_ = count & 0x7FFFFFu;
+    self->scope_indexed_ = (count & 0x800000u) != 0u;
     self->scope_part_ = 1;
   }
   if (self->scope_left_ != 0u) {
-    if (plan.ok && plan.match_direct_position) {
+    if (plan.ok && (plan.match_direct_position || self->scope_indexed_)) {
       plan.draw_scope = self->scope_;
       plan.draw_scope_part = self->scope_part_++;
       --self->scope_left_;
