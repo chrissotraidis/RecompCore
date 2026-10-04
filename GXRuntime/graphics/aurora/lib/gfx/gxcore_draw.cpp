@@ -137,8 +137,22 @@ wgpu::AddressMode to_address_mode(std::uint8_t wrap) {
   }
 }
 
-wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler) {
-  const bool mipmaps = sampler.mipmap_filter != 0u;
+// The levels a draw's texture has of its own: an HD replacement's mip chain
+// (decoded GameCube textures are uploaded with one level).
+uint32_t replacement_mips(const TextureHandle& texture) noexcept {
+  return texture && texture->isReplacement ? texture->mipCount : 1u;
+}
+
+// `textureMips`: replacement_mips() of the texture the sampler goes with.
+wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler, uint32_t textureMips = 1u) {
+  // Most of Wind Waker's textures have no mips (TX_SETMODE0 filter 4), so their
+  // sampler stays on level 0. An HD replacement is several times their size and
+  // brings its own mips: drawn from level 0 alone it aliases at a distance, and
+  // shimmers and flickers as the camera turns. Like Dolphin (a custom texture's
+  // max LOD is 255), a replacement's levels are all used, blended linearly when
+  // the game asked for no mip filter.
+  const bool ownMips = textureMips > 1u;
+  const bool mipmaps = sampler.mipmap_filter != 0u || ownMips;
   std::uint16_t maxAnisotropy = 1;
   if (mipmaps && (sampler.max_aniso == 1u || sampler.max_aniso == 2u)) {
     maxAnisotropy = sampler.max_aniso == 1u
@@ -160,7 +174,7 @@ wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler) {
                                              : wgpu::FilterMode::Nearest;
   auto minFilter = sampler.min_filter != 0u ? wgpu::FilterMode::Linear
                                              : wgpu::FilterMode::Nearest;
-  auto mipFilter = sampler.mipmap_filter == 2u
+  auto mipFilter = sampler.mipmap_filter == 2u || (ownMips && sampler.mipmap_filter == 0u)
                        ? wgpu::MipmapFilterMode::Linear
                        : wgpu::MipmapFilterMode::Nearest;
   if (maxAnisotropy > 1u) {
@@ -176,8 +190,10 @@ wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler) {
       .magFilter = magFilter,
       .minFilter = minFilter,
       .mipmapFilter = mipFilter,
-      .lodMinClamp = mipmaps ? static_cast<float>(sampler.min_lod) / 16.f : 0.f,
-      .lodMaxClamp = mipmaps ? static_cast<float>(sampler.max_lod) / 16.f : 0.f,
+      .lodMinClamp = sampler.mipmap_filter != 0u ? static_cast<float>(sampler.min_lod) / 16.f : 0.f,
+      .lodMaxClamp = ownMips    ? static_cast<float>(textureMips - 1u)
+                     : mipmaps ? static_cast<float>(sampler.max_lod) / 16.f
+                               : 0.f,
       .maxAnisotropy = maxAnisotropy,
   };
 }
@@ -1167,15 +1183,25 @@ struct InterpJob {
   gxc::PixelShaderConstants pixel;
 };
 
-// A particle's in-between vertices: its own, with the blended positions, in
-// the in-between vertex area of `slot`.
+// A draw's in-between vertices: replace its blended positions and direct UVs
+// while preserving all other attributes in the current vertex stream.
 Range push_blended_vertices(size_t slot, const std::vector<float>& vertices, const float* positions,
-                            std::vector<float>& scratch) {
+                            const float* texcoords, uint8_t texcoordMask, std::vector<float>& scratch) {
   scratch.assign(vertices.begin(), vertices.end());
   const size_t count = scratch.size() / gxc::kVertexFloats;
-  for (size_t i = 0; i < count; ++i)
-    std::memcpy(scratch.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float), positions + i * 3u,
-                sizeof(float) * 3u);
+  size_t uvAt = 0;
+  for (size_t i = 0; i < count; ++i) {
+    float* vertex = scratch.data() + i * gxc::kVertexFloats;
+    if (positions != nullptr)
+      std::memcpy(vertex + gxc::kVertexPosOffset / sizeof(float), positions + i * 3u, sizeof(float) * 3u);
+    if (texcoords != nullptr)
+      for (unsigned uv = 0; uv < gxc::kMaxTexGens; ++uv)
+        if ((texcoordMask >> uv) & 1u) {
+          std::memcpy(vertex + gxc::kVertexUvOffset / sizeof(float) + uv * 2u,
+                      texcoords + uvAt, sizeof(float) * 2u);
+          uvAt += 2;
+        }
+  }
   return push_interp_vertices(slot, reinterpret_cast<const uint8_t*>(scratch.data()), scratch.size() * sizeof(float));
 }
 
@@ -1257,8 +1283,11 @@ void interp_helper_main(InterpHelper* h) {
                                       sizeof(gxc::VertexShaderConstants), repeated);
     }
     for (int step = 0; step < steps; ++step) {
-      if (const float* positions = frame_interp::blended_positions(step))
-        ranges.verts[step] = push_blended_vertices(job.slot, job.vertices, positions, h->vertices);
+      const float* positions = frame_interp::blended_positions(step);
+      const float* texcoords = frame_interp::blended_texcoords(step);
+      if (positions != nullptr || texcoords != nullptr)
+        ranges.verts[step] = push_blended_vertices(job.slot, job.vertices, positions, texcoords,
+                                                 frame_interp::blended_texcoord_mask(), h->vertices);
       if (const gxc::PixelShaderConstants* pixel = frame_interp::blended_pixel(step))
         ranges.pixel[step] = push_interp_uniform_dedup(h->pixelCache[step], job.frameId, job.slot,
                                                        reinterpret_cast<const uint8_t*>(pixel), sizeof(*pixel), false);
@@ -1268,7 +1297,81 @@ void interp_helper_main(InterpHelper* h) {
   }
 }
 
-uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool tev, bool pixelRepeats) {
+// Whether the game wrote this indexed draw's position array in this game
+// frame or the one before. Per array (its guest address), a hash of the bytes
+// its draws read, taken once a game frame, and the frame it last changed in;
+// an array seen for the first time counts as written. The frame before counts
+// too, so a mesh whose next positions are written before its draw is
+// recorded is still taken as moving. (The guest's cache flushes, which give
+// the texture cache its dirty epochs, miss small meshes the game writes
+// without one: a flag on the Forsaken Fortress.)
+// DOL_AURORA_INTERP_ALL_VERTICES=1 takes every such mesh as written.
+bool positions_written(const gxc::DrawPlan& plan) {
+  static const bool s_all = [] {
+    const char* env = std::getenv("DOL_AURORA_INTERP_ALL_VERTICES");
+    return env != nullptr && env[0] == '1';
+  }();
+  if (s_all || plan.match_direct_position || plan.match_position_span == 0 || plan.match_position_data == nullptr)
+    return true;
+  struct ArrayState {
+    uint64_t hash = 0;
+    uint64_t changed = 0; // the game frame its bytes last changed in
+    uint64_t hashed = 0;  // the game frame they were last hashed in
+    uint32_t span = 0;
+  };
+  static absl::flat_hash_map<uint32_t, ArrayState> s_arrays;
+  const uint64_t frame = frame_interp::game_frame_number();
+  // A model's draws mostly index one array in turn: the last answer, while
+  // its frame holds.
+  static uint32_t s_lastBase = 0, s_lastSpan = 0;
+  static uint64_t s_lastFrame = UINT64_MAX;
+  static bool s_lastWritten = true;
+  if (plan.match_position_base == s_lastBase && plan.match_position_span <= s_lastSpan && frame == s_lastFrame)
+    return s_lastWritten;
+  auto [it, fresh] = s_arrays.try_emplace(plan.match_position_base);
+  ArrayState& state = it->second;
+  if (fresh || state.hashed != frame || plan.match_position_span > state.span) {
+    // The widest span the array's draws have read (draws of one array reach
+    // different lengths, in no fixed order), as far as this draw can read.
+    const uint32_t span = std::min(std::max(plan.match_position_span, state.span),
+                                   std::max(plan.match_position_readable, plan.match_position_span));
+    const uint64_t hash = XXH3_64bits(plan.match_position_data, span);
+    if (fresh || hash != state.hash || span != state.span)
+      state.changed = frame;
+    state.hash = hash;
+    state.span = span;
+    state.hashed = frame;
+  }
+  const bool written = state.changed + 1u >= frame;
+  s_lastBase = plan.match_position_base;
+  s_lastSpan = state.span;
+  s_lastFrame = frame;
+  s_lastWritten = written;
+  if (s_arrays.size() > 65536u)
+    s_arrays.clear(); // bounded; a cleared array counts as written once
+  // DOL_AURORA_INTERP_VERTEX_LOG=1: how many arrays, and of them written, a
+  // second (each array once per game frame).
+  static const bool s_log = [] {
+    const char* env = std::getenv("DOL_AURORA_INTERP_VERTEX_LOG");
+    return env != nullptr && env[0] == '1';
+  }();
+  if (s_log) {
+    static uint64_t s_logFrame = 0, s_seen = 0, s_written = 0;
+    ++s_seen;
+    s_written += written ? 1u : 0u;
+    if (frame >= s_logFrame + 30u) {
+      std::fprintf(stderr, "[interp-vertices] frame=%llu arrays=%llu written=%llu tracked=%zu\n",
+                   static_cast<unsigned long long>(frame), static_cast<unsigned long long>(s_seen),
+                   static_cast<unsigned long long>(s_written), s_arrays.size());
+      s_logFrame = frame;
+      s_seen = s_written = 0;
+    }
+  }
+  return written;
+}
+
+uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool tev, bool pixelRepeats,
+                          bool positionsWritten) {
   InterpHelper* h = g_interpHelper.load(std::memory_order_acquire);
   if (h == nullptr) {
     h = new InterpHelper;
@@ -1285,7 +1388,7 @@ uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool 
   while (head - h->consumed.load(std::memory_order_acquire) >= InterpHelper::Capacity)
     std::this_thread::yield();
   InterpJob& job = h->ring[head % InterpHelper::Capacity];
-  frame_interp::capture_draw(plan, job.input);
+  frame_interp::capture_draw(plan, job.input, positionsWritten);
   if (job.input.positions.empty())
     job.vertices.clear();
   else
@@ -1395,12 +1498,12 @@ static void dump_draw(const gxc::DrawPlan& plan) {
     const auto& t = sh.tev_stages[i];
     std::fprintf(stderr,
                  "[draw-dump]   s%u tc%u map%u en%u ras%u  C=%u,%u,%u,%u op%u b%u s%u cl%u ->%u  "
-                 "A=%u,%u,%u,%u op%u b%u s%u cl%u ->%u  k=%u/%u  ind: st%u fmt%u bias%u mtx%u id%u wrap%u,%u add%u\n",
+                 "A=%u,%u,%u,%u op%u b%u s%u cl%u ->%u  k=%u/%u  ind: st%u fmt%u bias%u mtx%u id%u wrap%u,%u add%u lod%u\n",
                  i, t.tevorders_texcoord, t.tevorders_texmap, t.tevorders_enable, t.tevorders_colorchan, t.cc_a,
                  t.cc_b, t.cc_c, t.cc_d, t.cc_op, t.cc_bias, t.cc_scale, t.cc_clamp, t.cc_dest, t.ac_a, t.ac_b, t.ac_c,
                  t.ac_d, t.ac_op, t.ac_bias, t.ac_scale, t.ac_clamp, t.ac_dest, t.ksel_kc, t.ksel_ka, t.ind_stage,
                  t.ind_format, t.ind_bias, t.ind_matrix_index, t.ind_matrix_id, t.ind_wrap_s, t.ind_wrap_t,
-                 t.ind_add_prev);
+                 t.ind_add_prev, t.ind_use_original_lod);
   }
   for (uint32_t i = 0; i < sh.num_ind_stages && i < 4u; ++i)
     std::fprintf(stderr, "[draw-dump]   ind%u map%u tc%u scale=%u,%u\n", i, sh.ind_stages[i].texmap,
@@ -1741,7 +1844,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
               std::memcmp(&s_last.sampler, &samplerState, sizeof samplerState) == 0) {
             textureBindGroup = s_last.ref;
           } else {
-            const auto sampler = sampler_ref(sampler_descriptor(samplerState));
+            const auto sampler = sampler_ref(sampler_descriptor(samplerState, replacement_mips(bound)));
             const std::array entries{
                 WGPUBindGroupEntry{.binding = 0, .textureView = view},
                 WGPUBindGroupEntry{.binding = 1, .sampler = sampler.Get()},
@@ -1784,7 +1887,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
           break;
         }
         held[heldCount] = bound;
-        heldSamplers[heldCount] = sampler_ref(sampler_descriptor(plan.samplers[t]));
+        heldSamplers[heldCount] = sampler_ref(sampler_descriptor(plan.samplers[t], replacement_mips(bound)));
         entries[entryCount++] = WGPUBindGroupEntry{
             .binding = 2u * t, .textureView = bound->sampleTextureView.Get()};
         entries[entryCount++] = WGPUBindGroupEntry{
@@ -1829,26 +1932,30 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // (as after a cut).
   const bool interpolating = frame_interp::enabled() && !frame_interp::frame_skipped();
   const bool matchHere = interpolating && frame_interp::tracing();
+  const bool positionsWritten = interpolating && frame_interp::may_blend_vertices(plan) && positions_written(plan);
   if (matchHere)
     wait_interp_jobs();
   static frame_interp::DrawInput tracedInput;
   if (matchHere)
-    frame_interp::capture_draw(plan, tracedInput);
+    frame_interp::capture_draw(plan, tracedInput, positionsWritten);
   const gxc::VertexShaderConstants* interpConstants =
       matchHere ? frame_interp::blend_draw(tracedInput, plan.constants, repeatsLast) : nullptr;
   // The helper is idle while a frame is traced, so its areas are ours.
   static std::vector<float> tracedVertices;
   const float* tracedPositions = matchHere ? frame_interp::blended_positions() : nullptr;
+  const float* tracedTexcoords = matchHere ? frame_interp::blended_texcoords() : nullptr;
   const Range interpVertRange =
-      tracedPositions != nullptr
-          ? push_blended_vertices(recording_frame_slot(), plan.vertices, tracedPositions, tracedVertices)
+      tracedPositions != nullptr || tracedTexcoords != nullptr
+          ? push_blended_vertices(recording_frame_slot(), plan.vertices, tracedPositions, tracedTexcoords,
+                                  frame_interp::blended_texcoord_mask(), tracedVertices)
           : Range{};
   if (frame_interp::tracing()) {
     const auto& m = plan.constants.posnormalmatrix;
     std::fprintf(stderr,
                  "[frame-interp-trace] frame=%llu %s key=%016llx prim=0x%02X fmt=%u verts=%u payload=%u idx=%d "
                  "t=(%.1f,%.1f,%.1f) s=%.3f proj00=%.3f proj32=%.1f tex=%08X bt=(%.1f,%.1f,%.1f) bt0=(%.1f,%.1f,%.1f) "
-                 "direct=%d tag=%06X age=%u scope=%06X:%u positions=%d\n",
+                 "direct=%d tag=%06X age=%u scope=%06X:%u positions=%d uv_mask=%u uv0=(%.7f,%.7f) buv0=(%.7f,%.7f) "
+                 "bp0=(%.3f,%.3f,%.3f)\n",
                  static_cast<unsigned long long>(frame_interp::game_frame_number()), frame_interp::last_outcome(),
                  static_cast<unsigned long long>(frame_interp::draw_key(plan)),
                  plan.match_primitive, plan.match_vtx_fmt, plan.vertex_count, plan.match_payload_size,
@@ -1862,7 +1969,14 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                  interpConstants ? interpConstants->transformmatrices[1][3] - plan.constants.transformmatrices[1][3] : 0.f,
                  interpConstants ? interpConstants->transformmatrices[2][3] - plan.constants.transformmatrices[2][3] : 0.f,
                  plan.match_direct_position ? 1 : 0, plan.draw_tag, plan.draw_tag_age, plan.draw_scope, plan.draw_scope_part,
-                 tracedPositions != nullptr ? 1 : 0);
+                 tracedPositions != nullptr ? 1 : 0, frame_interp::blended_texcoord_mask(),
+                 plan.vertices.empty() ? 0.f : plan.vertices[gxc::kVertexUvOffset / sizeof(float)],
+                 plan.vertices.empty() ? 0.f : plan.vertices[gxc::kVertexUvOffset / sizeof(float) + 1],
+                 tracedTexcoords != nullptr ? tracedTexcoords[0] : 0.f,
+                 tracedTexcoords != nullptr ? tracedTexcoords[1] : 0.f,
+                 tracedPositions != nullptr ? tracedPositions[0] : 0.f,
+                 tracedPositions != nullptr ? tracedPositions[1] : 0.f,
+                 tracedPositions != nullptr ? tracedPositions[2] : 0.f);
   }
   // (Room too for a pixel block of the ubershader's, should the draw need one.)
   const size_t pixelRoom = pixelUniformBytes + sizeof(gxc::UberPixelConstants);
@@ -1900,7 +2014,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     depthConfig.depthOnly = 1u;
     depthPipeline = pipeline_ref(depthConfig);
   }
-  const bool ownVertices = plan.draw_tag != 0 || plan.draw_scope_part != 0;
+  const bool ownVertices = plan.draw_tag != 0 || plan.draw_scope_part != 0 ||
+                           (interpolating && frame_interp::blends_vertices(plan, positionsWritten));
 
   // The ubershader (gxcore_uber.cpp): a draw whose own pipeline is still
   // compiling is drawn with it, with the same result, rather than left out of
@@ -1938,7 +2053,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         complete = static_cast<bool>(held[0]);
         if (complete) {
           views.fill(held[0]->sampleTextureView.Get());
-          samplers.fill(sampler_ref(sampler_descriptor(plan.samplers[plan.tex_slot & 7u])));
+          samplers.fill(sampler_ref(sampler_descriptor(plan.samplers[plan.tex_slot & 7u], replacement_mips(held[0]))));
         }
       } else {
         for (uint32_t t = 0; t < 8u && complete; ++t) {
@@ -1952,7 +2067,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
           complete = static_cast<bool>(held[t]);
           if (complete) {
             views[t] = held[t]->sampleTextureView.Get();
-            samplers[t] = sampler_ref(sampler_descriptor(plan.samplers[t]));
+            samplers[t] = sampler_ref(sampler_descriptor(plan.samplers[t], replacement_mips(held[t])));
           }
         }
       }
@@ -1999,7 +2114,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const size_t vertexOffset = next_vertex_offset(gxc::kVertexStrideBytes);
   DrawData* batch = nullptr;
   uint32_t firstVertex = 0;
-  if (batching && !matchHere) {
+  // Independently blended vertices cannot share a batch's rebased index
+  // range. Keep their original draw order, including each depth/color pair.
+  if (batching && !matchHere && !ownVertices) {
     DrawData* last = last_recorded_draw();
     if (last != nullptr && uberPipeline == 0 && last->uberPipeline == 0 && last->pipeline == pipeline &&
         last->depthPipeline == depthPipeline &&
@@ -2041,7 +2158,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         g_interpUniformCache, current_frame_id(), recording_frame_slot(), reinterpret_cast<const uint8_t*>(interpConstants),
         sizeof(*interpConstants), frame_interp::last_blend_repeated());
   else if (interpolating && !matchHere)
-    interpJob = queue_interp_job(plan, repeatsLast, tev, pixelRepeats);
+    interpJob = queue_interp_job(plan, repeatsLast, tev, pixelRepeats, positionsWritten);
 
   const auto indexCount = static_cast<uint32_t>(plan.indices.size());
   if (batch != nullptr) {

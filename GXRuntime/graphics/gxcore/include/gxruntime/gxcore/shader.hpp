@@ -493,6 +493,19 @@ struct DrawPlanFields {
   // payload differs every frame, so such a draw is matched by its shape.
   bool match_direct_position = false;
   std::uint32_t match_vertex_stride = 0; // payload bytes per vertex
+  // Indexed CPU meshes keep their topology while direct UVs can change as
+  // the mesh follows the player. FIFO span of the position index; the array
+  // address may change when the game allocates a fresh frame buffer.
+  std::uint32_t match_position_offset = 0;
+  std::uint32_t match_position_size = 0;
+  // The position array's guest address, its bytes as the draw reads them and
+  // how many its indices reach (none when positions are direct): whether the
+  // game wrote it this frame. The bytes are valid while the plan is submitted.
+  std::uint32_t match_position_base = 0;
+  std::uint32_t match_position_span = 0;
+  std::uint32_t match_position_readable = 0; // bytes at match_position_data
+  const std::uint8_t* match_position_data = nullptr;
+  std::uint8_t match_direct_texcoord_mask = 0; // VCD direct UV attributes
   // The host's tag for the object this draw is, written just before it to
   // BP registers the retail GX never uses (kDrawTagRegister and
   // kDrawTagAgeRegister): the game's particle drawn here and its age in game
