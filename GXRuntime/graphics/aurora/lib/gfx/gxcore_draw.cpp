@@ -495,8 +495,12 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   // vertex FORMAT carries that attribute. A lit/emboss draw whose format omits
   // it reads the cached fallback from the uniform instead (I_CACHED_NORMAL), so
   // the shader does not declare the input and the layout must not provide it.
-  if (uber || ((key.shader.lit_valid != 0 || has_emboss || has_normal_source) &&
-                key.shader.has_vertex_normal != 0)) {
+  // A vertex with TEX5..7 and no normal carries them in these three slots
+  // (gxc::kMaxRawTexCoords), so the shader declares all three.
+  const bool tex_hi = key.shader.raw_tex_hi_in_nbt != 0u;
+  if (uber || tex_hi ||
+      ((key.shader.lit_valid != 0 || has_emboss || has_normal_source) &&
+       key.shader.has_vertex_normal != 0)) {
     attributes.push_back(wgpu::VertexAttribute{
         .format = wgpu::VertexFormat::Float32x3,
         .offset = gxc::kVertexNormalOffset,
@@ -510,14 +514,14 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
         .shaderLocation = 9,
     });
   }
-  if (uber || (has_emboss && key.shader.has_vertex_binormal != 0)) {
+  if (uber || tex_hi || (has_emboss && key.shader.has_vertex_binormal != 0)) {
     attributes.push_back(wgpu::VertexAttribute{
         .format = wgpu::VertexFormat::Float32x3,
         .offset = gxc::kVertexBinormalOffset,
         .shaderLocation = 10,
     });
   }
-  if (uber || (has_emboss && key.shader.has_vertex_tangent != 0)) {
+  if (uber || tex_hi || (has_emboss && key.shader.has_vertex_tangent != 0)) {
     attributes.push_back(wgpu::VertexAttribute{
         .format = wgpu::VertexFormat::Float32x3,
         .offset = gxc::kVertexTangentOffset,
@@ -1195,7 +1199,7 @@ Range push_blended_vertices(size_t slot, const std::vector<float>& vertices, con
     if (positions != nullptr)
       std::memcpy(vertex + gxc::kVertexPosOffset / sizeof(float), positions + i * 3u, sizeof(float) * 3u);
     if (texcoords != nullptr)
-      for (unsigned uv = 0; uv < gxc::kMaxTexGens; ++uv)
+      for (unsigned uv = 0; uv < gxc::kMaxRawTexCoords; ++uv)
         if ((texcoordMask >> uv) & 1u) {
           std::memcpy(vertex + gxc::kVertexUvOffset / sizeof(float) + uv * 2u,
                       texcoords + uvAt, sizeof(float) * 2u);

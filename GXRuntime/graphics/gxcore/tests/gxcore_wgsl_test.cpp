@@ -736,6 +736,45 @@ void test_five_texgens() {
         std::string::npos);
 }
 
+// Wind Waker's dungeon map draws quads with all eight raw coordinates, eight
+// texgens (TEX0..7 in order) and twelve TEV stages. Without a normal, TEX5..7
+// travel in the normal, binormal and tangent slots (kMaxRawTexCoords).
+void test_eight_texgens_dungeon_map() {
+  CHECK(gxc::kMaxTexGens == 8u && gxc::kMaxTevStages == 16u);
+  gxc::ShaderKey key{};
+  key.num_tex_gens = 8;
+  key.uv_mask = 0xFFu;
+  key.raw_tex_hi_in_nbt = 1;
+  key.textured = 1;
+  key.tev_valid = 1;
+  key.num_tev_stages = 12;
+  for (std::uint32_t i = 0; i < 8u; ++i) {
+    key.tex_gens[i].enabled = 1;
+    key.tex_gens[i].texgentype =
+        static_cast<std::uint8_t>(gxc::TexGenType::Regular);
+    key.tex_gens[i].sourcerow =
+        static_cast<std::uint8_t>(gxc::TexSourceRow::Tex0) + i;
+  }
+  for (std::uint32_t n = 0; n < 12u; ++n) {
+    key.tev_stages[n].tevorders_enable = 1;
+    key.tev_stages[n].tevorders_texmap = static_cast<std::uint8_t>(n & 7u);
+    key.tev_stages[n].tevorders_texcoord = static_cast<std::uint8_t>(n & 7u);
+  }
+  const std::string w = gxc::generate_wgsl(key);
+  CHECK(w.find("@location(8) rawnormal: vec3f") != std::string::npos);
+  CHECK(w.find("@location(10) rawbinormal: vec3f") != std::string::npos);
+  CHECK(w.find("@location(11) rawtangent: vec3f") != std::string::npos);
+  CHECK(w.find("coord = vec4f(in.rawnormal.x, in.rawnormal.y, 1.0, 1.0)") != std::string::npos);
+  CHECK(w.find("coord = vec4f(in.rawbinormal.x, in.rawbinormal.y, 1.0, 1.0)") != std::string::npos);
+  CHECK(w.find("coord = vec4f(in.rawtangent.x, in.rawtangent.y, 1.0, 1.0)") != std::string::npos);
+  CHECK(w.find("uv7: vec3f") != std::string::npos);
+  // Without the flag, TEX5..7 stay at the default coordinate (unsupported).
+  key.raw_tex_hi_in_nbt = 0;
+  key.uv_mask = 0x1Fu;
+  const std::string plain = gxc::generate_wgsl(key);
+  CHECK(plain.find("in.rawtangent.x") == std::string::npos);
+}
+
 void test_fifth_texgen_plan_decode() {
   gxc::GxCoreState state;
   state.reset();
@@ -2048,6 +2087,7 @@ int main() {
   test_texgen_color();
   test_texgen_normal_source();
   test_five_texgens();
+  test_eight_texgens_dungeon_map();
   test_fifth_texgen_plan_decode();
   test_post_tex_matrix_fold();
   test_texgen_emboss();

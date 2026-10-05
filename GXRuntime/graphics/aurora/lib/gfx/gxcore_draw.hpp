@@ -83,7 +83,9 @@ DrawData* last_recorded_draw() noexcept;
 // v9: GXSetZCompLoc early depth adds a depth-only pipeline variant. v10:
 // RGB and alpha blending carry donor-exact independent factors. v11: BP SU
 // texture-coordinate scales enlarge pixel constants and alter TEV WGSL.
-constexpr uint32_t GXCorePipelineConfigVersion = 12;
+// v13: the hardware's eight texgens and sixteen TEV stages, and TEX5..7 in the
+// normal/binormal/tangent slots of a vertex with no normal (BlueWake #74).
+constexpr uint32_t GXCorePipelineConfigVersion = 13;
 
 struct PipelineConfig {
   uint32_t version = GXCorePipelineConfigVersion;

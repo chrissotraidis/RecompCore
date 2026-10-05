@@ -274,6 +274,12 @@ struct WalkLayout {
   std::uint8_t tex_mtx_idx_mask = 0; // per-vertex TEXMTXIDX per texgen (0..4)
 };
 
+// TEX5..7 go to the normal, binormal and tangent slots (shader.hpp,
+// kMaxRawTexCoords) when the vertex has them and no normal.
+static bool raw_tex_hi_in_nbt(const WalkLayout& walk) {
+  return (walk.uv_mask & 0xE0u) != 0u && !walk.has_normal && !walk.has_nbt;
+}
+
 // Derive the payload walk from raw VCD/VAT (CPMemory.h bit positions).
 bool derive_walk(std::uint32_t vcd_lo, std::uint32_t vcd_hi,
                  const std::uint32_t vat[3], WalkLayout& out) {
@@ -677,7 +683,7 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   }
 
   plan.match_direct_position = bits(vcd_lo_, 2, 9) == 1u; // VCD position: direct
-  for (std::uint32_t uv = 0; uv < kMaxTexGens; ++uv)
+  for (std::uint32_t uv = 0; uv < kMaxRawTexCoords; ++uv)
     if (bits(vcd_hi_, 2, uv * 2) == 1u)
       plan.match_direct_texcoord_mask |= 1u << uv;
   if (!plan.match_direct_position) {
@@ -875,8 +881,9 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     key.tex_mtx_idx_mask = walk.tex_mtx_idx_mask;
     key.has_color0 = walk.has_color[0] ? 1u : 0u;
     key.has_color1 = walk.has_color[1] ? 1u : 0u;
-    key.uv_mask =
-        static_cast<std::uint8_t>(walk.uv_mask & ((1u << kMaxTexGens) - 1u));
+    key.raw_tex_hi_in_nbt = raw_tex_hi_in_nbt(walk) ? 1u : 0u;
+    key.uv_mask = static_cast<std::uint8_t>(
+        walk.uv_mask & (key.raw_tex_hi_in_nbt != 0u ? 0xFFu : (1u << kMaxRawTexCoords) - 1u));
     // Vertex-format N/B/T presence (GC packs all three in one NBT attribute, so
     // binormal/tangent presence follows has_nbt). A lit/emboss draw that omits
     // one substitutes the cached fallback from the uniform instead of a
@@ -991,7 +998,7 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
         if (source == TexSourceRow::Geom ||
             (tg.sourcerow >= static_cast<std::uint8_t>(TexSourceRow::Tex0) &&
              tg.sourcerow <
-                 static_cast<std::uint8_t>(TexSourceRow::Tex0) + kMaxTexGens)) {
+                 static_cast<std::uint8_t>(TexSourceRow::Tex0) + kMaxRawTexCoords)) {
           unsupported_source = false;
         } else if (source == TexSourceRow::Normal) {
           ++counters.texgen_source_normal;
@@ -1006,6 +1013,8 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
         } else if (tg.sourcerow <
                    static_cast<std::uint8_t>(TexSourceRow::Tex0) + 8u) {
           ++counters.texgen_source_tex47;
+          if (key.raw_tex_hi_in_nbt != 0u)
+            unsupported_source = false;
         } else {
           ++counters.texgen_source_unknown;
         }
@@ -1333,6 +1342,7 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
       entry_arrays[e] = find_array(draw, entry.attr);
     entry_scales[e] = 1.f / static_cast<float>(1u << entry.frac);
   }
+  const bool tex_hi_in_nbt = raw_tex_hi_in_nbt(walk);
   for (std::uint32_t v = 0; v < draw.vertex_count; ++v) {
     float* out_vertex = plan.vertices.data() +
                         static_cast<std::size_t>(v) * kVertexFloats;
@@ -1423,10 +1433,17 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
         break;
       }
       case WalkEntry::kTex: {
-        if (entry.out_slot < kMaxTexGens) {
+        float* dst = nullptr;
+        if (entry.out_slot < kMaxRawTexCoords) {
+          dst = out_vertex + 12u + 2u * entry.out_slot;
+        } else if (tex_hi_in_nbt && entry.out_slot < 8u) {
+          static constexpr std::uint32_t kHiSlot[3] = {
+              kVertexNormalOffset, kVertexBinormalOffset, kVertexTangentOffset};
+          dst = out_vertex + kHiSlot[entry.out_slot - kMaxRawTexCoords] / 4u;
+        }
+        if (dst != nullptr) {
           std::uint32_t scalar = 0;
           component_scalar_size(entry.format, &scalar);
-          float* dst = out_vertex + 12u + 2u * entry.out_slot;
           const float scale = entry_scales[e];
           dst[0] = decode_scaled(element, entry.format, scale);
           dst[1] = entry.count == 2u
