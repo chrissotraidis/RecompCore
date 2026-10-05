@@ -39,6 +39,11 @@ typedef struct DolPlatformOps {
     void (*gx_flush)(void);
     bool (*gx_read_draw_sync)(u16* token);
     void (*call_display_list)(const void* data, u32 size);
+    // The same with the list's guest address, for a backend that needs to
+    // know where a list lives (a list in a linked module's data names that
+    // module's textures). NULL: call_display_list is used.
+    void (*call_display_list_guest)(u32 guest_address, const void* data,
+                                    u32 size);
     void (*set_array)(u32 attr, const void* data, u32 size, u8 stride);
     void (*set_array_guest)(u32 attr, u32 guest_address, const void* data,
                             u32 size, u8 stride);
@@ -92,6 +97,8 @@ void dol_platform_gx_flush(void);
 // False means no token was decoded or the backend cannot provide it.
 bool dol_platform_gx_read_draw_sync(u16* token);
 void dol_platform_call_display_list(const void* data, u32 size);
+void dol_platform_call_display_list_guest(u32 guest_address, const void* data,
+                                          u32 size);
 void dol_platform_set_array(u32 attr, const void* data, u32 size, u8 stride);
 void dol_platform_set_array_guest(u32 attr, u32 guest_address,
                                   const void* data, u32 size, u8 stride);

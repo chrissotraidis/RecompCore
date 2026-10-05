@@ -777,7 +777,8 @@ static void finish_GXCallDisplayList(CPUState* cpu) {
                 available);
     } else {
         emit_gx_resource_metadata(cpu);
-        dol_platform_call_display_list(data, g_display_list_call.size);
+        dol_platform_call_display_list_guest(g_display_list_call.address, data,
+                                             g_display_list_call.size);
     }
     cpu->lr = g_display_list_call.caller;
     cpu->pc = g_display_list_call.caller;

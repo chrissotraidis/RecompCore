@@ -500,6 +500,8 @@ void RetailGxFrontend::reset(const DolGuestAddressResolver* resolver) {
   last_error_b_ = 0u;
   last_error_c_ = 0u;
   last_error_d_ = 0u;
+  in_module_list_ = false;
+  module_image_mask_ = 0u;
 }
 
 namespace {
@@ -705,7 +707,8 @@ bool RetailGxFrontend::flush(AuroraRenderSink* sink) {
 }
 
 bool RetailGxFrontend::write_display_list(std::span<const std::uint8_t> bytes,
-                                          AuroraRenderSink* sink) {
+                                          AuroraRenderSink* sink,
+                                          std::uint32_t guest_address) {
   last_error_ = nullptr;
   std::uint32_t first_event = 0;
   if (packet_drain_enabled_) {
@@ -723,7 +726,10 @@ bool RetailGxFrontend::write_display_list(std::span<const std::uint8_t> bytes,
       return false;
     std::size_t dl_consumed = 0;
     parse_sink_ = packet_drain_enabled_ ? sink : nullptr;
+    const bool outer_module_list = in_module_list_;
+    in_module_list_ = (guest_address & 0x40000000u) != 0u;
     const bool parsed = parse_stream(bytes, false, false, 1u, &dl_consumed);
+    in_module_list_ = outer_module_list;
     parse_sink_ = nullptr;
     if (!parsed || dl_consumed != bytes.size()) {
       return false;
@@ -938,11 +944,14 @@ bool RetailGxFrontend::parse_stream(std::span<const std::uint8_t> bytes,
         return false;
 
       std::size_t dl_consumed = 0;
-      if (!parse_stream(
-              std::span<const std::uint8_t>{
-                  static_cast<const std::uint8_t*>(range.data), range.size},
-              false, false, depth + 1u, &dl_consumed) ||
-          dl_consumed != range.size) {
+      const bool outer_module_list = in_module_list_;
+      in_module_list_ = outer_module_list || (address & 0x40000000u) != 0u;
+      const bool list_parsed = parse_stream(
+          std::span<const std::uint8_t>{
+              static_cast<const std::uint8_t*>(range.data), range.size},
+          false, false, depth + 1u, &dl_consumed);
+      in_module_list_ = outer_module_list;
+      if (!list_parsed || dl_consumed != range.size) {
         // A display list that does not parse as GX commands (first met in
         // Wind Waker's Hyrule stage, 2026-09-26) used to fail the whole FIFO,
         // and a failed front end presents nothing more: a black screen with
@@ -1082,6 +1091,12 @@ bool RetailGxFrontend::handle_bp(std::uint32_t raw) {
   value = state_.bp_regs[reg];
 
   std::uint8_t slot = 0;
+  if (map_image3_reg(reg, &slot) && slot < 8u) {
+    const std::uint8_t bit = static_cast<std::uint8_t>(1u << slot);
+    module_image_mask_ = in_module_list_
+                             ? static_cast<std::uint8_t>(module_image_mask_ | bit)
+                             : static_cast<std::uint8_t>(module_image_mask_ & ~bit);
+  }
   if (map_image0_reg(reg, &slot) || map_image3_reg(reg, &slot))
     return maybe_resolve_texture(slot);
   if (map_tlut_reg(reg, &slot)) {
@@ -1182,9 +1197,11 @@ bool RetailGxFrontend::maybe_resolve_texture(std::uint8_t slot) {
   DolGxRecompTexture texture;
   if (slot < 8u)
     tlut_stale_mask_ &= static_cast<std::uint8_t>(~(1u << slot));
-  return dol_gx_recomp_resolve_texture_image(
+  const std::uint32_t address_bits =
+      slot < 8u && ((module_image_mask_ >> slot) & 1u) != 0u ? 0xC0000000u : 0u;
+  return dol_gx_recomp_resolve_texture_image_at(
       &state_, slot, state_.bp_regs[image0_reg], state_.bp_regs[image3_reg],
-      &texture);
+      address_bits, &texture);
 }
 
 bool RetailGxFrontend::handle_copy_trigger(std::uint32_t value) {

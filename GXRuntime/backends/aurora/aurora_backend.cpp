@@ -221,6 +221,7 @@ void install_platform_ops() {
         .gx_flush = aurora_backend_gx_flush,
         .gx_read_draw_sync = aurora_backend_gx_read_draw_sync,
         .call_display_list = aurora_backend_call_display_list,
+        .call_display_list_guest = aurora_backend_call_display_list_guest,
         .set_array = aurora_backend_set_array,
         .set_array_guest = aurora_backend_set_array_guest,
         .load_texture = aurora_backend_load_texture,

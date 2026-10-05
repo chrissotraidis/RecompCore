@@ -108,8 +108,10 @@ public:
   // (the bytes are already host-visible). Entry point for trace replay
   // (CALL_DL records) and the backend's DL mirror; keep it
   // byte-path-identical to the opcode branch.
+  // guest_address is where the list lives, when known (0 when not).
   bool write_display_list(std::span<const std::uint8_t> bytes,
-                          AuroraRenderSink* sink = nullptr);
+                          AuroraRenderSink* sink = nullptr,
+                          std::uint32_t guest_address = 0u);
   std::size_t pending_fifo_size() const { return fifo_buffer_.size(); }
 
   bool replay_fifo(std::span<const std::uint8_t> bytes,
@@ -194,6 +196,14 @@ private:
   // Texture slots (bit per slot) whose palette TMEM was reloaded after the
   // texture event was emitted; re-resolved at the next draw.
   std::uint8_t tlut_stale_mask_ = 0;
+  // A display list in a linked module's data (an address with 0x40000000
+  // set: 0xC0xxxxxx, or 0x40xxxxxx after OSCachedToPhysical) names the
+  // module's own textures, but SETIMAGE3's 24 bits drop the address's top
+  // bits and leave an unrelated MEM1 address. While such a list is parsed,
+  // its texture slots (bit per slot) resolve at 0xC0000000 | that address,
+  // which the host's module aliases hold (Molgera's sand floor, d_a_bwdg).
+  bool in_module_list_ = false;
+  std::uint8_t module_image_mask_ = 0;
   std::uint64_t next_packet_sequence_ = 0;
   // emit_new_packets' reused packet (see there).
   RenderPacket scratch_packet_{};

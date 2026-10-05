@@ -307,6 +307,13 @@ bool dol_gx_recomp_texture_size(u16 width, u16 height, u32 format,
 bool dol_gx_recomp_resolve_texture_image(DolGxRecompState* gx, u8 slot,
                                          u32 image0, u32 image3,
                                          DolGxRecompTexture* out);
+// The same with address_bits ORed into the image address and the result read
+// as a virtual address: 0xC0000000 for a texture a linked module's display
+// list names (see RetailGxFrontend::in_module_list_). 0 is the call above.
+bool dol_gx_recomp_resolve_texture_image_at(DolGxRecompState* gx, u8 slot,
+                                            u32 image0, u32 image3,
+                                            u32 address_bits,
+                                            DolGxRecompTexture* out);
 bool dol_gx_recomp_resolve_tlut(DolGxRecompState* gx, u8 slot,
                                 u32 load_tlut0, u32 format, u16 entries,
                                 DolGxRecompTlut* out);

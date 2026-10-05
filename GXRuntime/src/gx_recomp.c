@@ -710,6 +710,14 @@ bool dol_gx_recomp_texture_size(u16 width, u16 height, u32 format,
 bool dol_gx_recomp_resolve_texture_image(DolGxRecompState* gx, u8 slot,
                                          u32 image0, u32 image3,
                                          DolGxRecompTexture* out) {
+    return dol_gx_recomp_resolve_texture_image_at(gx, slot, image0, image3, 0u,
+                                                  out);
+}
+
+bool dol_gx_recomp_resolve_texture_image_at(DolGxRecompState* gx, u8 slot,
+                                            u32 image0, u32 image3,
+                                            u32 address_bits,
+                                            DolGxRecompTexture* out) {
     if (gx == NULL || out == NULL || slot >= DOL_GX_RECOMP_TEXTURE_SLOTS)
         return false;
     const u16 width = (u16)((image0 & 0x3FFu) + 1u);
@@ -718,10 +726,14 @@ bool dol_gx_recomp_resolve_texture_image(DolGxRecompState* gx, u8 slot,
     u32 byte_size = 0;
     if (!dol_gx_recomp_texture_size(width, height, format, &byte_size))
         return false;
-    const u32 physical_base = texture_physical_base(image3);
+    const u32 physical_base = texture_physical_base(image3) | address_bits;
     DolGuestResolvedRange range;
-    if (!resolve_physical(gx, physical_base, byte_size,
-                          DOL_GUEST_RESOURCE_TEXTURE, &range))
+    if (address_bits != 0u
+            ? !dol_guest_address_resolver_resolve(
+                  &gx->resolver, physical_base, byte_size,
+                  DOL_GUEST_ADDRESS_VIRTUAL, DOL_GUEST_RESOURCE_TEXTURE, &range)
+            : !resolve_physical(gx, physical_base, byte_size,
+                                DOL_GUEST_RESOURCE_TEXTURE, &range))
         return false;
     DolGxRecompTexture texture = {
         .valid = true,
