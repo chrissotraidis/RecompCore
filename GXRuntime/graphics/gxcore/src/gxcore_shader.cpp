@@ -895,13 +895,14 @@ std::string generate_wgsl(const ShaderKey& key) {
             "    @location(5) rawtex1: vec2f,\n"
             "    @location(6) rawtex2: vec2f,\n"
             "    @location(7) rawtex3: vec2f,\n");
-  if ((lit || emit_nbt || has_normal_source) && has_normal)
+  const bool tex_hi = key.raw_tex_hi_in_nbt != 0u; // TEX5..7 in the N/B/T slots
+  if (((lit || emit_nbt || has_normal_source) && has_normal) || tex_hi)
     emit(out, "    @location(8) rawnormal: vec3f,\n");
   if (key.has_tex_mtx_idx != 0)
     emit(out, "    @location(9) texmtxidx: u32,\n");
-  if (emit_nbt && has_binormal)
+  if ((emit_nbt && has_binormal) || tex_hi)
     emit(out, "    @location(10) rawbinormal: vec3f,\n");
-  if (emit_nbt && has_tangent)
+  if ((emit_nbt && has_tangent) || tex_hi)
     emit(out, "    @location(11) rawtangent: vec3f,\n");
   if ((key.uv_mask & (1u << 4u)) != 0u)
     emit(out, "    @location(12) rawtex4: vec2f,\n");
@@ -1017,7 +1018,7 @@ std::string generate_wgsl(const ShaderKey& key) {
         emit(out, "        coord = vec4f(in.rawnormal, 1.0);\n");
     } else if (tg.sourcerow >= static_cast<std::uint8_t>(TexSourceRow::Tex0) &&
                tg.sourcerow <
-                   static_cast<std::uint8_t>(TexSourceRow::Tex0) + kMaxTexGens) {
+                   static_cast<std::uint8_t>(TexSourceRow::Tex0) + kMaxRawTexCoords) {
       const std::uint32_t texnum =
           tg.sourcerow - static_cast<std::uint8_t>(TexSourceRow::Tex0);
       if ((key.uv_mask & (1u << texnum)) != 0u) {
@@ -1026,6 +1027,16 @@ std::string generate_wgsl(const ShaderKey& key) {
               "1.0);\n",
               texnum, texnum);
       }
+    } else if (key.raw_tex_hi_in_nbt != 0u &&
+               tg.sourcerow >= static_cast<std::uint8_t>(TexSourceRow::Tex0) + kMaxRawTexCoords &&
+               tg.sourcerow < static_cast<std::uint8_t>(TexSourceRow::Tex0) + 8u) {
+      // TEX5..7 travel in the normal, binormal and tangent slots (shader.hpp).
+      const std::uint32_t texnum =
+          tg.sourcerow - static_cast<std::uint8_t>(TexSourceRow::Tex0);
+      static const char* const kHiInput[3] = {"rawnormal", "rawbinormal", "rawtangent"};
+      if ((key.uv_mask & (1u << texnum)) != 0u)
+        emitf(out, "        coord = vec4f(in.%s.x, in.%s.y, 1.0, 1.0);\n",
+              kHiInput[texnum - kMaxRawTexCoords], kHiInput[texnum - kMaxRawTexCoords]);
     }
     // Other source rows (normal/colors/binormals, tex4-7) are outside the
     // slice; the plan builder classifies each residual and coord stays default.

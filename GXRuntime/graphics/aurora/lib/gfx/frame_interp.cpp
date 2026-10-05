@@ -1347,7 +1347,7 @@ static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
         return 0;
       for (size_t v = 0; v < decoded; ++v) {
         const float* vertex = plan.vertices.data() + v * gxc::kVertexFloats;
-        for (unsigned uv = 0; uv < plan.pipeline.shader.num_tex_gens && uv < gxc::kMaxTexGens; ++uv)
+        for (unsigned uv = 0; uv < plan.pipeline.shader.num_tex_gens && uv < gxc::kMaxRawTexCoords; ++uv)
           for (unsigned st = 0; st < 2; ++st)
             h = mix64(h ^ std::bit_cast<uint32_t>(vertex[gxc::kVertexUvOffset / sizeof(float) + uv * 2 + st]));
         for (unsigned rgb = 0; rgb < 3; ++rgb)
@@ -1476,12 +1476,12 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritt
       std::memcpy(out.positions.data() + i * 3u,
                   plan.vertices.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float),
                   sizeof(float) * 3);
-    out.texcoordMask = plan.match_direct_texcoord_mask & ((1u << gxc::kMaxTexGens) - 1u);
+    out.texcoordMask = plan.match_direct_texcoord_mask & ((1u << gxc::kMaxRawTexCoords) - 1u);
     const size_t uvStride = 2u * std::popcount(out.texcoordMask);
     out.texcoords.resize(decoded * uvStride);
     for (size_t v = 0; v < decoded; ++v) {
       size_t at = v * uvStride;
-      for (unsigned uv = 0; uv < gxc::kMaxTexGens; ++uv)
+      for (unsigned uv = 0; uv < gxc::kMaxRawTexCoords; ++uv)
         if ((out.texcoordMask >> uv) & 1u) {
           std::memcpy(out.texcoords.data() + at,
                       plan.vertices.data() + v * gxc::kVertexFloats + gxc::kVertexUvOffset / sizeof(float) + uv * 2u,

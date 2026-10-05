@@ -101,13 +101,20 @@ enum class FogProjection : std::uint8_t { Perspective = 0, Orthographic = 1 };
 
 // --- Shader / pipeline keys -------------------------------------------------
 
-// Wind Waker's first-play scene requests five texgens. The hardware supports
-// eight; keep the admitted slice at the measured route maximum until a later
-// scene proves another count.
-inline constexpr std::uint32_t kMaxTexGens = 5;
+// The hardware's texgens (XF numTexGens) and TEV stages. Wind Waker's dungeon
+// map uses eight texgens and twelve stages; the earlier caps (5 and 8, the
+// first-play maximum) cut it to the room markers (BlueWake #74).
+inline constexpr std::uint32_t kMaxTexGens = 8;
+inline constexpr std::uint32_t kMaxTevStages = 16;
 
-// Slice cap: the S9 gameplay histogram shows numtevstages <= 6.
-inline constexpr std::uint32_t kMaxTevStages = 8;
+// Raw texture coordinates a vertex carries into the fixed decoded layout
+// (GX_VA_TEX0..4). Texgens read them by source row; a texgen can also come
+// from the position, the normal or another texgen, so there are more texgens
+// than raw coordinates. The layout is limited by WebGPU's 16 vertex inputs.
+// A vertex with TEX5..7 and no normal (the dungeon map's quads carry all
+// eight) puts those three in the normal, binormal and tangent slots it doesn't
+// use: ShaderKey::raw_tex_hi_in_nbt.
+inline constexpr std::uint32_t kMaxRawTexCoords = 5;
 
 // Hardware exposes four indirect lookups, referenced by each TEV stage.
 inline constexpr std::uint32_t kMaxIndirectStages = 4;
@@ -202,7 +209,7 @@ struct ShaderKey {
   std::uint8_t has_tex_mtx_idx = 0; // per-vertex TEXMTXIDX attr present (item 5)
   std::uint8_t has_color0 = 0;
   std::uint8_t has_color1 = 0;
-  std::uint8_t uv_mask = 0;  // raw uv inputs present (bit per tex0..4)
+  std::uint8_t uv_mask = 0;  // raw uv inputs present (bit per tex0..4, kMaxRawTexCoords)
   std::uint8_t textured = 0; // fragment samples texmap0 via texcoord0
   // TEV combiner (S14). tev_valid==0 keeps the S12/S13 passthrough fragment
   // (used when combiner regs were never seen, e.g. synthetic slices).
@@ -254,9 +261,10 @@ struct ShaderKey {
   // not perturb ordinary shader identity. Values match GXZTexOp/ZTexFormat.
   std::uint8_t ztex_op = 0;
   std::uint8_t ztex_type = 0;
-  // Re-pad the scalar block to a multiple of 4, keeping ShaderKey a
-  // unique-object-representation (memcmp identity) type.
-  std::uint8_t pad2[1]{};
+  // TEX5..7 are in the normal, binormal and tangent slots (.xy): the vertex has
+  // them and no normal (kMaxRawTexCoords). Also keeps the scalar block a
+  // multiple of 4, so ShaderKey stays a unique-object-representation type.
+  std::uint8_t raw_tex_hi_in_nbt = 0;
   LightChanKey litchan[4]{}; // color0, color1, alpha0, alpha1
   TexGenKey tex_gens[kMaxTexGens]{};
   IndirectStageKey ind_stages[kMaxIndirectStages]{};
@@ -373,14 +381,14 @@ static_assert(sizeof(PixelShaderConstants) ==
 // indices packed one byte per texgen (@location 9), and the NBT binormal/tangent
 // emboss needs in view space (@location 10/11).
 inline constexpr std::uint32_t kVertexFloats =
-    3 + 1 + 4 + 4 + 2 * kMaxTexGens + 3 + 2 + 3 + 3;
+    3 + 1 + 4 + 4 + 2 * kMaxRawTexCoords + 3 + 2 + 3 + 3;
 inline constexpr std::uint32_t kVertexStrideBytes = kVertexFloats * 4;
 inline constexpr std::uint32_t kVertexPosOffset = 0;
 inline constexpr std::uint32_t kVertexPosMtxOffset = 12;
 inline constexpr std::uint32_t kVertexColor0Offset = 16;
 inline constexpr std::uint32_t kVertexColor1Offset = 32;
 inline constexpr std::uint32_t kVertexUvOffset = 48; // + 8*i
-inline constexpr std::uint32_t kVertexNormalOffset = 48 + 8 * kMaxTexGens;
+inline constexpr std::uint32_t kVertexNormalOffset = 48 + 8 * kMaxRawTexCoords;
 inline constexpr std::uint32_t kVertexTexMtxIdxOffset = kVertexNormalOffset + 12;
 inline constexpr std::uint32_t kVertexTexMtxIdxHiOffset =
     kVertexTexMtxIdxOffset + 4;

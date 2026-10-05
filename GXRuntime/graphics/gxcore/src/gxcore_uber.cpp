@@ -48,6 +48,7 @@ void emit_key_layout(std::string& out) {
   K(has_vertex_normal);
   K(has_vertex_binormal);
   K(has_vertex_tangent);
+  K(raw_tex_hi_in_nbt);
   K(dst_alpha);
   K(litchan);
   K(tex_gens);
@@ -118,6 +119,7 @@ void emit_key_layout(std::string& out) {
   S(ind_add_prev);
 #undef S
   define(out, "MAX_TEXGENS", kMaxTexGens);
+  define(out, "MAX_RAWTEX", kMaxRawTexCoords);
   define(out, "MAX_TEV", kMaxTevStages);
   define(out, "KEY_WORDS", kUberKeyWords);
 }
@@ -240,6 +242,9 @@ struct VertexOut {
     @location(4) uv2: vec3f,
     @location(5) uv3: vec3f,
     @location(6) uv4: vec3f,
+    @location(7) uv5: vec3f,
+    @location(8) uv6: vec3f,
+    @location(9) uv7: vec3f,
 };
 
 fn rawtex(in: VertexIn, n: u32) -> vec2f {
@@ -405,7 +410,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
     if (nchans == 0u) { o.color0 = vec4f(0.0); }
     if (nchans <= 1u) { o.color1 = vec4f(0.0); }
 
-    var uvs: array<vec3f, 5>;
+    var uvs: array<vec3f, MAX_TEXGENS>;
     let uv_mask = kb(K_uv_mask);
     let has_tmi = kb(K_has_tex_mtx_idx) != 0u;
     let tmi_mask = kb(K_tex_mtx_idx_mask);
@@ -417,10 +422,18 @@ fn vs_main(in: VertexIn) -> VertexOut {
             coord = vec4f(in.rawpos, 1.0);
         } else if (row == 1u) {
             if (has_normal) { coord = vec4f(in.rawnormal, 1.0); }
-        } else if (row >= 5u && row < 5u + MAX_TEXGENS) {
+        } else if (row >= 5u && row < 5u + MAX_RAWTEX) {
             let texnum = row - 5u;
             if (((uv_mask >> texnum) & 1u) != 0u) {
                 let r = rawtex(in, texnum);
+                coord = vec4f(r.x, r.y, 1.0, 1.0);
+            }
+        } else if (row >= 5u + MAX_RAWTEX && row < 13u && kb(K_raw_tex_hi_in_nbt) != 0u) {
+            // TEX5..7 travel in the normal, binormal and tangent slots.
+            let texnum = row - 5u;
+            if (((uv_mask >> texnum) & 1u) != 0u) {
+                var r = in.rawtangent.xy;
+                if (texnum == 5u) { r = in.rawnormal.xy; } else if (texnum == 6u) { r = in.rawbinormal.xy; }
                 coord = vec4f(r.x, r.y, 1.0, 1.0);
             }
         }
@@ -467,7 +480,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
                            dot(vsc.posnormalmatrix[5].xyz, binormal_in));
             }
             let ld = normalize(vsc.lights[kb(tg + TG_embosslightshift)].pos.xyz - viewpos.xyz);
-            uvs[i] = uvs[min(kb(tg + TG_embosssourceshift), 4u)] + vec3f(dot(ld, tn), dot(ld, bn), 0.0);
+            uvs[i] = uvs[min(kb(tg + TG_embosssourceshift), MAX_TEXGENS - 1u)] + vec3f(dot(ld, tn), dot(ld, bn), 0.0);
         }
     }
     o.uv0 = uvs[0];
@@ -475,6 +488,9 @@ fn vs_main(in: VertexIn) -> VertexOut {
     o.uv2 = uvs[2];
     o.uv3 = uvs[3];
     o.uv4 = uvs[4];
+    o.uv5 = uvs[5];
+    o.uv6 = uvs[6];
+    o.uv7 = uvs[7];
     return o;
 }
 
@@ -484,7 +500,10 @@ fn uv_of(in: VertexOut, n: u32) -> vec3f {
         case 1u: { return in.uv1; }
         case 2u: { return in.uv2; }
         case 3u: { return in.uv3; }
-        default: { return in.uv4; }
+        case 4u: { return in.uv4; }
+        case 5u: { return in.uv5; }
+        case 6u: { return in.uv6; }
+        default: { return in.uv7; }
     }
 }
 
@@ -651,7 +670,7 @@ fn tev(in: VertexOut) -> vec4i {
     var tevcoord = vec2i(0, 0);
     let col0i = vec4i(round(in.color0 * 255.0));
     let col1i = vec4i(round(in.color1 * 255.0));
-    var fixpoint: array<vec2i, 5>;
+    var fixpoint: array<vec2i, MAX_TEXGENS>;
     for (var i = 0u; i < ntg; i++) {
         let uv = uv_of(in, i);
         if (kb(K_tex_gens + i * TG_SIZE + TG_projection) != 0u) {
