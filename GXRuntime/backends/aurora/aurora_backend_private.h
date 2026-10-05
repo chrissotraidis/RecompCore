@@ -151,7 +151,7 @@ void trace_on_present();
 void shadow_frontend_fail_metadata(const char* reason, u32 attr, u32 guest_address, u32 value);
 void shadow_frontend_set_array(u32 attr, u32 guest_address, u8 stride);
 bool frontend_guest_address_resolver_bridge(void*, u32 address, u32 size, DolGuestAddressSpace space, DolGuestResourceKind resource, DolGuestResolvedRange* out);
-void shadow_frontend_call_display_list(const void* data, u32 size);
+void shadow_frontend_call_display_list(const void* data, u32 size, u32 guest_address);
 void shadow_frontend_write(u64 value, u8 size);
 // Waits for the FIFO translation worker to catch up with everything appended so
 // far. The auras's reset paths call it so the front end is not reset while a
@@ -204,6 +204,7 @@ void aurora_backend_gx_write_bytes(const u8* bytes, u32 size);
 void aurora_backend_gx_flush(void);
 bool aurora_backend_gx_read_draw_sync(u16* token);
 void aurora_backend_call_display_list(const void* data, u32 size);
+void aurora_backend_call_display_list_guest(u32 guest_address, const void* data, u32 size);
 void aurora_backend_set_array(u32 attr, const void* data, u32 size, u8 stride);
 void aurora_backend_set_array_guest(u32 attr, u32 guest_address, const void* data, u32 size, u8 stride);
 void aurora_backend_load_texture(u8 slot, const void* data, u32 width, u32 height, u32 format, u32 tlut, bool mipmap, u32 object_id, u32 data_version);

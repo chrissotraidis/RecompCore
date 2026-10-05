@@ -893,7 +893,7 @@ bool frontend_guest_address_resolver_bridge(
     return true;
 }
 
-void shadow_frontend_call_display_list(const void* data, u32 size) {
+void shadow_frontend_call_display_list(const void* data, u32 size, u32 guest_address) {
     if (!g_shadow_frontend_enabled || g_shadow_frontend_failed.load(std::memory_order_relaxed))
         return;
     // Same ordering rule as the array mirror: the HLE path parses the list
@@ -902,7 +902,7 @@ void shadow_frontend_call_display_list(const void* data, u32 size) {
     const std::span<const std::uint8_t> bytes(
         static_cast<const std::uint8_t*>(data), size);
     if (g_gx_core_enabled) {
-        if (!g_shadow_frontend.write_display_list(bytes, &g_core_sink)) {
+        if (!g_shadow_frontend.write_display_list(bytes, &g_core_sink, guest_address)) {
             g_shadow_frontend_failed.store(true, std::memory_order_relaxed);
             std::fprintf(stderr,
                          "[gx-core] frontend rejected HLE display list "
@@ -916,7 +916,7 @@ void shadow_frontend_call_display_list(const void* data, u32 size) {
         }
         return;
     }
-    if (!g_shadow_frontend.write_display_list(bytes, &g_shadow_packet_sink)) {
+    if (!g_shadow_frontend.write_display_list(bytes, &g_shadow_packet_sink, guest_address)) {
         g_shadow_frontend_failed.store(true, std::memory_order_relaxed);
         std::fprintf(stderr,
                      "[aurora-recomp] shadow RetailGxFrontend rejected HLE "
@@ -1753,10 +1753,14 @@ void aurora_backend_mark_gx_begin(void) {
 }
 
 void aurora_backend_call_display_list(const void* data, u32 size) {
+    aurora_backend_call_display_list_guest(0u, data, size);
+}
+
+void aurora_backend_call_display_list_guest(u32 guest_address, const void* data, u32 size) {
     if (!gx_aurora::g_initialized || data == nullptr || size == 0)
         return;
 #if GXRUNTIME_HAS_AURORA_RECOMP
-    gx_aurora::shadow_frontend_call_display_list(data, size);
+    gx_aurora::shadow_frontend_call_display_list(data, size, guest_address);
     if (gx_aurora::trace_should_record())
         gx_aurora::g_trace_writer.call_display_list(0u, data, size);
     if (gx_aurora::g_gx_core_enabled) {

@@ -613,6 +613,53 @@ void test_tlut_written_after_image_selects_palette() {
   assert(bound_format == 2u);
 }
 
+// A display list kept in a linked module's data names the module's own
+// texture, but SETIMAGE3 holds only 24 bits of the address: 0xC06A0DA0 >> 5
+// leaves 0x006A0DA0, unrelated MEM1. Such a list's texture resolves at
+// 0xC0000000 | that address (Molgera's sand floor, Wind Waker's d_a_bwdg);
+// the same list from anywhere else keeps the physical address.
+struct ModuleTextureMemory {
+  std::uint8_t module_texture[128] = {};
+  std::uint8_t mem1_texture[128] = {};
+};
+
+bool resolve_module_texture(void* user, std::uint32_t address,
+                            std::uint32_t size, DolGuestAddressSpace space,
+                            DolGuestResourceKind, DolGuestResolvedRange* out) {
+  auto* memory = static_cast<ModuleTextureMemory*>(user);
+  std::uint8_t* data = nullptr;
+  if (address == 0xC06A0DA0u)
+    data = memory->module_texture;
+  else if (address == 0x006A0DA0u && space == DOL_GUEST_ADDRESS_PHYSICAL)
+    data = memory->mem1_texture;
+  if (data == nullptr || size > 128u)
+    return false;
+  out->data = data;
+  out->available = 128u;
+  return true;
+}
+
+void test_module_display_list_texture() {
+  ModuleTextureMemory memory;
+  DolGuestAddressResolver resolver;
+  dol_guest_address_resolver_init_callback(&resolver, resolve_module_texture,
+                                           &memory);
+  std::vector<std::uint8_t> list;
+  push_bp(list, DOL_GX_BP_REG_TX_SETIMAGE0, tex_image0(16u, 16u, 0u)); // I4
+  push_bp(list, DOL_GX_BP_REG_TX_SETIMAGE3, 0xC06A0DA0u >> 5u);
+
+  RetailGxFrontend frontend(resolver);
+  RecordingAuroraRenderSink sink;
+  assert(frontend.write_display_list(list, &sink, 0xC06B2000u));
+  assert(frontend.state().textures[0].valid);
+  assert(frontend.state().textures[0].range.data == memory.module_texture);
+
+  assert(frontend.write_display_list(list, &sink, 0x806B2000u));
+  assert(frontend.state().textures[0].range.data == memory.mem1_texture);
+  assert(frontend.write_display_list(list, &sink));
+  assert(frontend.state().textures[0].range.data == memory.mem1_texture);
+}
+
 // The XF projection register (XF 0x1020) is decoded from a direct XF_LOAD that
 // covers it, so the recomp's projection transform is inspectable for the
 // Dolphin-vs-recomp transform diff. A wrong/degenerate projection puts geometry
@@ -844,6 +891,7 @@ int main() {
   test_fragmented_zero_vertex_draw_is_noop();
   test_unresolved_tlut_load_is_noop();
   test_tlut_written_after_image_selects_palette();
+  test_module_display_list_texture();
   test_large_batch_drains_instead_of_dropping();
   test_flush_stops_after_display_copy();
   test_xf_projection_capture();

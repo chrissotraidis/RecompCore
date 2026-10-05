@@ -75,6 +75,16 @@ void dol_platform_call_display_list(const void* data, u32 size) {
         g_ops.call_display_list(data, size);
 }
 
+void dol_platform_call_display_list_guest(u32 guest_address, const void* data,
+                                          u32 size) {
+    if (data == NULL || size == 0)
+        return;
+    if (g_ops.call_display_list_guest != NULL)
+        g_ops.call_display_list_guest(guest_address, data, size);
+    else
+        dol_platform_call_display_list(data, size);
+}
+
 void dol_platform_set_array(u32 attr, const void* data, u32 size, u8 stride) {
     if (g_ops.set_array != NULL)
         g_ops.set_array(attr, data, size, stride);
