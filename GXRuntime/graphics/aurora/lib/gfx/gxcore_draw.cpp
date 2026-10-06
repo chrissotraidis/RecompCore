@@ -934,7 +934,13 @@ void reset_texture_cache() {
   g_textureCacheStats = {};
 }
 
+void stop_interp_helper();
+
 void shutdown() {
+  // Stop the detached interpolation helper before it outlives the process:
+  // it waits on `work` forever, so without a stop flag glibc's exit() teardown
+  // hangs on the still-live detached thread. (Defined with InterpHelper.)
+  stop_interp_helper();
   // Release every wgpu object we still hold before webgpu::shutdown() destroys
   // the device, the Vulkan instance and the XCB connection. The flat_hash_map
   // and the device/texture/view statics hold the last references; destroying
@@ -1245,6 +1251,7 @@ struct InterpHelper {
   std::atomic<uint64_t> produced{0};
   std::atomic<uint64_t> consumed{0};
   std::atomic<bool> sleeping{false};
+  std::atomic<bool> stop{false};
   std::mutex mutex;
   std::condition_variable work;
   std::condition_variable idle;
@@ -1288,11 +1295,14 @@ void interp_helper_main(InterpHelper* h) {
       }
       if (arrived)
         continue;
+      if (h->stop.load(std::memory_order_acquire))
+        return;
       std::unique_lock lock{h->mutex};
       h->sleeping.store(true, std::memory_order_seq_cst);
       h->idle.notify_all();
       h->work.wait(lock, [h] {
-        return h->produced.load(std::memory_order_seq_cst) != h->consumed.load(std::memory_order_relaxed);
+        return h->stop.load(std::memory_order_acquire) ||
+               h->produced.load(std::memory_order_seq_cst) != h->consumed.load(std::memory_order_relaxed);
       });
       h->sleeping.store(false, std::memory_order_relaxed);
       continue;
@@ -1465,6 +1475,14 @@ uint32_t next_interp_job() {
   return h == nullptr || h->packet != current_frame_id() ? 0u : h->jobs;
 }
 } // namespace
+
+void stop_interp_helper() {
+  if (InterpHelper* h = g_interpHelper.load(std::memory_order_acquire)) {
+    h->stop.store(true, std::memory_order_release);
+    h->work.notify_all();
+    g_interpHelper.store(nullptr, std::memory_order_release);
+  }
+}
 
 void wait_interp_jobs() {
   InterpHelper* h = g_interpHelper.load(std::memory_order_acquire);
