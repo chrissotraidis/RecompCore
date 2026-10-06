@@ -1314,6 +1314,13 @@ void shutdown() {
   tex_palette_conv::shutdown();
   texture_replacement::shutdown();
   gx::shutdown();
+#ifdef AURORA_ENABLE_GXCORE
+  // After the last gxcore draws/waits above and while the device is still
+  // alive: drop the gxcore module's device, bind-group-layout cache and
+  // empty-texmap texture/view before webgpu::shutdown() destroys the device and
+  // its Vulkan instance/XCB connection (see gxcore_draw.cpp shutdown()).
+  gxcore::shutdown();
+#endif
 #ifdef AURORA_ENABLE_RMLUI
   rmlui::shutdown_pipeline();
 #endif
