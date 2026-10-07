@@ -596,6 +596,16 @@ static void EnsureMappingLoaded(aurora::input::GameController* controller) {
   }
 }
 
+// A controller axis in GameCube units with Aurora's cutoff off. The game's own
+// PADClamp is then the only dead zone, as on the console (15, full at 87 on the
+// main stick and 74 on the C-stick), and the stick's full travel reaches 100,
+// about where a GameCube stick's gate stops it. Divided by 256, as before, full
+// tilt was 127 and the game's clamp saturated by two thirds of the travel.
+static Sint16 gamecube_axis(int value) {
+  const int scaled = (value * 100 + (value >= 0 ? 16383 : -16383)) / 32767;
+  return static_cast<Sint16>(std::clamp(scaled, -100, 100));
+}
+
 static Sint16 _get_axis_value(const aurora::input::GameController* controller, //  NOLINT(*-reserved-identifier)
                               PADAxis axis) {
   const auto iter =
@@ -888,8 +898,8 @@ u32 PADRead(PADStatus* status) {
           yl = 0;
         }
       } else {
-        xl /= 256;
-        yl = static_cast<Sint16>(-(yl + 1u) / 256u);
+        xl = gamecube_axis(xl);
+        yl = gamecube_axis(-static_cast<int>(yl));
       }
 
       // Combine with the keyboard's stick rather than replace it: with any
@@ -921,8 +931,8 @@ u32 PADRead(PADStatus* status) {
           yr = 0;
         }
       } else {
-        xr /= 256;
-        yr = static_cast<Sint16>(-(yr + 1u) / 256u);
+        xr = gamecube_axis(xr);
+        yr = gamecube_axis(-static_cast<int>(yr));
       }
 
       status[i].substickX = static_cast<int8_t>(dominant_axis_value(status[i].substickX, xr, -127, 127));
