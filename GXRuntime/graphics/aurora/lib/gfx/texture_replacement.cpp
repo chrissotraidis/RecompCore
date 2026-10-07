@@ -853,13 +853,16 @@ absl::flat_hash_set<aurora::texture::ReplacementKey, ReplacementKeyHash> s_decod
 absl::flat_hash_map<aurora::texture::ReplacementKey, std::optional<aurora::gfx::ConvertedTexture>, ReplacementKeyHash>
     s_decoded;
 bool s_decoderStarted = false;
+bool s_decoderStop = false;
 
 void decoder_main() noexcept {
   for (;;) {
     DecodeJob job;
     {
       std::unique_lock lk(s_decodeMutex);
-      s_decodeCv.wait(lk, [] { return !s_decodeQueue.empty(); });
+      s_decodeCv.wait(lk, [] { return s_decoderStop || !s_decodeQueue.empty(); });
+      if (s_decoderStop && s_decodeQueue.empty())
+        return;
       job = std::move(s_decodeQueue.front());
       s_decodeQueue.pop_front();
     }
@@ -1193,6 +1196,11 @@ namespace aurora::gfx::texture_replacement {
 void initialize() noexcept {}
 
 void shutdown() noexcept {
+  {
+    std::lock_guard lk(s_decodeMutex);
+    s_decoderStop = true;
+  }
+  s_decodeCv.notify_all();
   texture::clear_replacements();
   s_pendingTluts.clear();
   for (auto& tlut : s_loadedTluts) {

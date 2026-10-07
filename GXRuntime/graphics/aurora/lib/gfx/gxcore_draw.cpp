@@ -40,6 +40,20 @@ static Module Log("aurora::gfx::gxcore");
 
 namespace {
 
+// Device-retaining caches, hoisted out of their functions so shutdown() can
+// release them BEFORE webgpu::shutdown()/window::shutdown() destroy the Vulkan
+// instance and XCB connection. As function-local statics they were destroyed at
+// exit(), when the last wgpu::Device ref's destructor walked a freed XCB
+// connection to destroy fences -> "double free or corruption (!prev)".
+std::mutex g_texBindLayoutMutex;
+absl::flat_hash_map<uint32_t, wgpu::BindGroupLayout> g_texBindLayoutCache;
+wgpu::Device g_texBindLayoutOwner;
+
+std::mutex g_emptyTexmapMutex;
+wgpu::Device g_emptyTexmapOwner;
+wgpu::Texture g_emptyTexmapTexture;
+wgpu::TextureView g_emptyTexmapView;
+
 wgpu::CompareFunction to_compare(gxc::CompareMode func) {
   // GC compare flipped for the substrate's reversed-Z (gx/gx.cpp:526 shape).
   switch (func) {
@@ -204,18 +218,15 @@ wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler, uint
 wgpu::BindGroupLayout texture_bind_group_layout(uint32_t used_mask = 1u) {
   // Both the pipeline compiler and FIFO submission use this cache. A lookup
   // concurrent with flat_hash_map growth can read an invalid layout handle.
-  static std::mutex mutex;
-  std::lock_guard lock{mutex};
-  static absl::flat_hash_map<uint32_t, wgpu::BindGroupLayout> cache;
+  std::lock_guard lock{g_texBindLayoutMutex};
   // Retaining the owner also prevents pointer reuse from matching a dead
   // device after renderer reinitialization.
-  static wgpu::Device owner;
-  if (owner.Get() != g_device.Get()) {
-    cache.clear();
-    owner = g_device;
+  if (g_texBindLayoutOwner.Get() != g_device.Get()) {
+    g_texBindLayoutCache.clear();
+    g_texBindLayoutOwner = g_device;
   }
-  auto it = cache.find(used_mask);
-  if (it != cache.end())
+  auto it = g_texBindLayoutCache.find(used_mask);
+  if (it != g_texBindLayoutCache.end())
     return it->second;
   std::vector<wgpu::BindGroupLayoutEntry> entries;
   for (uint32_t t = 0; t < 8u; ++t) {
@@ -245,7 +256,7 @@ wgpu::BindGroupLayout texture_bind_group_layout(uint32_t used_mask = 1u) {
       .entries = entries.data(),
   };
   auto layout = g_device.CreateBindGroupLayout(&descriptor);
-  cache.emplace(used_mask, layout);
+  g_texBindLayoutCache.emplace(used_mask, layout);
   return layout;
 }
 
@@ -923,6 +934,32 @@ void reset_texture_cache() {
   g_textureCacheStats = {};
 }
 
+void stop_interp_helper();
+
+void shutdown() {
+  // Stop the detached interpolation helper before it outlives the process:
+  // it waits on `work` forever, so without a stop flag glibc's exit() teardown
+  // hangs on the still-live detached thread. (Defined with InterpHelper.)
+  stop_interp_helper();
+  // Release every wgpu object we still hold before webgpu::shutdown() destroys
+  // the device, the Vulkan instance and the XCB connection. The flat_hash_map
+  // and the device/texture/view statics hold the last references; destroying
+  // them at exit() (after the connection was freed) aborted in
+  // xcb_send_request -> realloc with "double free or corruption (!prev)".
+  {
+    std::lock_guard lock{g_texBindLayoutMutex};
+    g_texBindLayoutCache.clear();
+    g_texBindLayoutOwner = {};
+  }
+  {
+    std::lock_guard lock{g_emptyTexmapMutex};
+    g_emptyTexmapView = {};
+    g_emptyTexmapTexture = {};
+    g_emptyTexmapOwner = {};
+  }
+  reset_texture_cache();
+}
+
 void set_texture_dirty_epoch_observer(TextureDirtyEpochObserver observer) {
   g_textureDirtyEpochObserver = observer;
 }
@@ -1080,13 +1117,9 @@ static UniformCache g_uberPixelUniformCache;
 // The ubershader's texture for a texmap slot no TEV stage samples: one white
 // texel, made once per device (the ubershader's bind group has all eight).
 static const wgpu::TextureView& empty_texmap_view() {
-  static std::mutex mutex;
-  std::lock_guard lock{mutex};
-  static wgpu::Device owner;
-  static wgpu::Texture texture;
-  static wgpu::TextureView view;
-  if (owner.Get() != g_device.Get()) {
-    owner = g_device;
+  std::lock_guard lock{g_emptyTexmapMutex};
+  if (g_emptyTexmapOwner.Get() != g_device.Get()) {
+    g_emptyTexmapOwner = g_device;
     const wgpu::TextureDescriptor descriptor{
         .label = "GXCore ubershader empty texmap",
         .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
@@ -1096,15 +1129,15 @@ static const wgpu::TextureView& empty_texmap_view() {
         .mipLevelCount = 1,
         .sampleCount = 1,
     };
-    texture = g_device.CreateTexture(&descriptor);
-    view = texture.CreateView();
+    g_emptyTexmapTexture = g_device.CreateTexture(&descriptor);
+    g_emptyTexmapView = g_emptyTexmapTexture.CreateView();
     static constexpr uint8_t kWhite[4] = {255, 255, 255, 255};
-    const wgpu::TexelCopyTextureInfo dst{.texture = texture};
+    const wgpu::TexelCopyTextureInfo dst{.texture = g_emptyTexmapTexture};
     const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = 4, .rowsPerImage = 1};
     const wgpu::Extent3D size{1, 1, 1};
     webgpu::g_queue.WriteTexture(&dst, kWhite, sizeof kWhite, &layout, &size);
   }
-  return view;
+  return g_emptyTexmapView;
 }
 
 // The block the cache last took: `staged` where it was staged, or the copy.
@@ -1218,6 +1251,7 @@ struct InterpHelper {
   std::atomic<uint64_t> produced{0};
   std::atomic<uint64_t> consumed{0};
   std::atomic<bool> sleeping{false};
+  std::atomic<bool> stop{false};
   std::mutex mutex;
   std::condition_variable work;
   std::condition_variable idle;
@@ -1261,11 +1295,14 @@ void interp_helper_main(InterpHelper* h) {
       }
       if (arrived)
         continue;
+      if (h->stop.load(std::memory_order_acquire))
+        return;
       std::unique_lock lock{h->mutex};
       h->sleeping.store(true, std::memory_order_seq_cst);
       h->idle.notify_all();
       h->work.wait(lock, [h] {
-        return h->produced.load(std::memory_order_seq_cst) != h->consumed.load(std::memory_order_relaxed);
+        return h->stop.load(std::memory_order_acquire) ||
+               h->produced.load(std::memory_order_seq_cst) != h->consumed.load(std::memory_order_relaxed);
       });
       h->sleeping.store(false, std::memory_order_relaxed);
       continue;
@@ -1438,6 +1475,14 @@ uint32_t next_interp_job() {
   return h == nullptr || h->packet != current_frame_id() ? 0u : h->jobs;
 }
 } // namespace
+
+void stop_interp_helper() {
+  if (InterpHelper* h = g_interpHelper.load(std::memory_order_acquire)) {
+    h->stop.store(true, std::memory_order_release);
+    h->work.notify_all();
+    g_interpHelper.store(nullptr, std::memory_order_release);
+  }
+}
 
 void wait_interp_jobs() {
   InterpHelper* h = g_interpHelper.load(std::memory_order_acquire);

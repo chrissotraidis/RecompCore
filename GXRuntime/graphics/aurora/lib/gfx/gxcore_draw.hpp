@@ -122,6 +122,13 @@ bool submit_draw_plan(const gxruntime::gxcore::DrawPlan& plan);
 void wait_interp_jobs();
 // Drop the texture cache + reset its stats (start of a replay run).
 void reset_texture_cache();
+// Release every wgpu object this module holds, before the device and its
+// backing Vulkan instance/XCB connection are torn down. Called from
+// gfx::shutdown() (ahead of webgpu::shutdown()). Without this the device,
+// bind-group-layout cache and empty-texmap texture/view statics are destroyed
+// at exit(), after the connection is gone, aborting with
+// "double free or corruption (!prev)" in the last device ref's destructor.
+void shutdown();
 // Once per presented frame: small textures are re-hashed at most once a frame.
 void note_frame_presented();
 
