@@ -283,6 +283,12 @@ bool dol_aurora_initialize(int argc, char** argv,
     // once never write one SQLite file together.
     if (const char* cache_dir = std::getenv("DOL_AURORA_CACHE_DIR"); cache_dir != nullptr && cache_dir[0] != '\0')
         config.cachePath = strdup(cache_dir);
+    // DOL_AURORA_USER_DIR: where Aurora keeps its own settings, imgui.ini
+    // (default: SDL's preference folder for the app name). A host with a
+    // portable data folder points it there, so nothing is written to the
+    // per-user folder (BlueWake #64).
+    if (const char* user_dir = std::getenv("DOL_AURORA_USER_DIR"); user_dir != nullptr && user_dir[0] != '\0')
+        config.userPath = strdup(user_dir);
     config.vsync = backend_config->vsync;
     config.windowWidth = backend_config->window_width != 0
                              ? backend_config->window_width
