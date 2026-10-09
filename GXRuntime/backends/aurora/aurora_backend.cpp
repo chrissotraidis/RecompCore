@@ -290,6 +290,8 @@ bool dol_aurora_initialize(int argc, char** argv,
     if (const char* user_dir = std::getenv("DOL_AURORA_USER_DIR"); user_dir != nullptr && user_dir[0] != '\0')
         config.userPath = strdup(user_dir);
     config.vsync = backend_config->vsync;
+    config.windowPosX = backend_config->window_pos_x;
+    config.windowPosY = backend_config->window_pos_y;
     config.windowWidth = backend_config->window_width != 0
                              ? backend_config->window_width
                              : defaults.window_width;

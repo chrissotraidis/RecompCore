@@ -20,6 +20,12 @@ typedef struct AuroraBackendConfig {
     bool info_logging;
     bool graphics_logging;
     bool force_untextured;
+    // Where the window is created, so it opens in place instead of moving
+    // after it is shown. Passed to Aurora's windowPosX/windowPosY: 0,0 (the
+    // default) is the screen's corner as before, a negative value lets the
+    // system choose, and SDL_WINDOWPOS_CENTERED centres it.
+    int window_pos_x;
+    int window_pos_y;
 } AuroraBackendConfig;
 
 bool dol_aurora_initialize(int argc, char** argv,
