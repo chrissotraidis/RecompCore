@@ -111,6 +111,12 @@ void dol_aurora_gx_drain(void);
 // Request recovery on the audio-owning host thread after an OS interruption.
 void dol_aurora_audio_resume(void);
 
+/* The graphics API Aurora actually chose ("Vulkan", "D3D12", "Metal", "OpenGL",
+   "OpenGL ES", ...), or NULL before it started. What was asked for is usually
+   "auto", so this is how a host tells a slow fallback (OpenGL ES where Vulkan
+   is missing) from the normal path. */
+const char* dol_aurora_backend_name(void);
+
 #ifdef __cplusplus
 }
 #endif

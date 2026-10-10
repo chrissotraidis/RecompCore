@@ -22,6 +22,7 @@
 namespace gx_aurora {
 
 bool g_initialized = false;
+int g_backend = -1; // the AuroraBackend aurora_initialize chose, -1 before it ran
 bool g_frame_open = false;
 bool g_should_quit = false;
 DolAuroraOverlayFn g_host_overlay = nullptr;
@@ -329,6 +330,7 @@ bool dol_aurora_initialize(int argc, char** argv,
     gx_aurora::g_initialized = info.window != nullptr;
     if (!gx_aurora::g_initialized)
         return false;
+    gx_aurora::g_backend = static_cast<int>(info.backend);
 
     // Keep the guest's configured frame aspect instead of stretching it to the
     // window. iPad and iPhone windows are rarely 4:3; the macOS window is
@@ -568,6 +570,21 @@ void dol_aurora_set_hold_redraw(bool redraw) { gx_aurora::g_hold_redraw = redraw
 void dol_aurora_set_hold(DolAuroraHoldFn should_hold, void* user) {
     gx_aurora::g_host_hold = should_hold;
     gx_aurora::g_host_hold_user = user;
+}
+
+const char* dol_aurora_backend_name(void) {
+    switch (gx_aurora::g_backend) {
+    case BACKEND_D3D11: return "D3D11";
+    case BACKEND_D3D12: return "D3D12";
+    case BACKEND_METAL: return "Metal";
+    case BACKEND_VULKAN: return "Vulkan";
+    case BACKEND_OPENGL: return "OpenGL";
+    case BACKEND_OPENGLES: return "OpenGL ES";
+    case BACKEND_WEBGPU: return "WebGPU";
+    case BACKEND_NULL: return "none";
+    case BACKEND_AUTO: return "auto";
+    default: return nullptr;
+    }
 }
 
 void dol_aurora_shutdown(void) {
