@@ -473,3 +473,17 @@ private:
 };
 
 extern std::unique_ptr<TextureCacheBase> g_texture_cache;
+
+// Measurement only (SunPad perf loop). Totals since boot.
+namespace EFBCopyStats
+{
+u64 RamCopies();      // EFB copies written to guest RAM
+u64 ImmediateCopies(); // of which flushed immediately (no VRAM copy or no deferral)
+u64 ReadbackNs();     // wall time spent in ReadTexels (GPU wait + memcpy)
+// Attribute later readback time to the sync point that flushed it.
+enum class FlushReason : int { Other, DrawDone, Token, TokenInterrupt, FrameEnd, Count };
+void SetFlushReason(FlushReason reason);
+u64 ReadbackNsFor(FlushReason reason);
+// With MODERNGEKKO_EFB_CENSUS set, returns and clears a summary of distinct copies.
+std::string TakeCensus();
+}  // namespace EFBCopyStats

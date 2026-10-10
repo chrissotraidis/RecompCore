@@ -183,7 +183,9 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
     case 0x02:
     {
       INCSTAT(g_stats.this_frame.num_draw_done);
+      EFBCopyStats::SetFlushReason(EFBCopyStats::FlushReason::DrawDone);
       g_texture_cache->FlushEFBCopies();
+      EFBCopyStats::SetFlushReason(EFBCopyStats::FlushReason::Other);
       g_texture_cache->FlushStaleBinds();
       g_framebuffer_manager->InvalidatePeekCache(false);
       g_framebuffer_manager->RefreshPeekCache();
@@ -202,7 +204,9 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
   case BPMEM_PE_TOKEN_ID:  // Pixel Engine Token ID
   {
     INCSTAT(g_stats.this_frame.num_token);
+    EFBCopyStats::SetFlushReason(EFBCopyStats::FlushReason::Token);
     g_texture_cache->FlushEFBCopies();
+    EFBCopyStats::SetFlushReason(EFBCopyStats::FlushReason::Other);
     g_texture_cache->FlushStaleBinds();
     g_framebuffer_manager->InvalidatePeekCache(false);
     g_framebuffer_manager->RefreshPeekCache();
@@ -218,7 +222,9 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
   case BPMEM_PE_TOKEN_INT_ID:  // Pixel Engine Interrupt Token ID
   {
     INCSTAT(g_stats.this_frame.num_token_int);
+    EFBCopyStats::SetFlushReason(EFBCopyStats::FlushReason::TokenInterrupt);
     g_texture_cache->FlushEFBCopies();
+    EFBCopyStats::SetFlushReason(EFBCopyStats::FlushReason::Other);
     g_texture_cache->FlushStaleBinds();
     g_framebuffer_manager->InvalidatePeekCache(false);
     g_framebuffer_manager->RefreshPeekCache();
