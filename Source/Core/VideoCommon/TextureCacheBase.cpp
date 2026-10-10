@@ -4,10 +4,14 @@
 #include "VideoCommon/TextureCacheBase.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -66,6 +70,68 @@ static const int TEXTURE_POOL_KILL_THRESHOLD = 3;
 static int xfb_count = 0;
 
 std::unique_ptr<TextureCacheBase> g_texture_cache;
+
+namespace EFBCopyStats
+{
+namespace
+{
+std::atomic<u64> s_ram_copies{0};
+std::atomic<u64> s_immediate{0};
+std::atomic<u64> s_readback_ns{0};
+std::array<std::atomic<u64>, static_cast<int>(FlushReason::Count)> s_reason_ns{};
+FlushReason s_reason = FlushReason::Other;
+const bool s_census = std::getenv("MODERNGEKKO_EFB_CENSUS") != nullptr;
+std::mutex s_census_mutex;
+std::map<std::tuple<u32, u32, u32, int, bool, bool>, u32> s_census_counts;
+}  // namespace
+
+static void RecordCopy(u32 addr, u32 width, u32 height, int format, bool vram, bool depth,
+                       bool immediate)
+{
+  s_ram_copies.fetch_add(1, std::memory_order_relaxed);
+  if (immediate)
+    s_immediate.fetch_add(1, std::memory_order_relaxed);
+  if (!s_census)
+    return;
+  std::lock_guard lock(s_census_mutex);
+  ++s_census_counts[{addr, width, height, format, vram, depth}];
+}
+
+static void AddReadback(s64 ns)
+{
+  s_readback_ns.fetch_add(static_cast<u64>(ns), std::memory_order_relaxed);
+  s_reason_ns[static_cast<int>(s_reason)].fetch_add(static_cast<u64>(ns),
+                                                    std::memory_order_relaxed);
+}
+
+void SetFlushReason(FlushReason reason)
+{
+  s_reason = reason;
+}
+
+u64 ReadbackNsFor(FlushReason reason)
+{
+  return s_reason_ns[static_cast<int>(reason)].load(std::memory_order_relaxed);
+}
+
+u64 RamCopies() { return s_ram_copies.load(std::memory_order_relaxed); }
+u64 ImmediateCopies() { return s_immediate.load(std::memory_order_relaxed); }
+u64 ReadbackNs() { return s_readback_ns.load(std::memory_order_relaxed); }
+
+std::string TakeCensus()
+{
+  std::string out;
+  std::lock_guard lock(s_census_mutex);
+  for (const auto& [key, count] : s_census_counts)
+  {
+    const auto& [addr, w, h, format, vram, depth] = key;
+    out += fmt::format("[efb] addr={:08x} {}x{} fmt={} vram={} depth={} n={}\n", addr, w, h,
+                       format, vram, depth, count);
+  }
+  s_census_counts.clear();
+  return out;
+}
+}  // namespace EFBCopyStats
 
 TCacheEntry::TCacheEntry(std::unique_ptr<AbstractTexture> tex,
                          std::unique_ptr<AbstractFramebuffer> fb)
@@ -776,7 +842,9 @@ void TextureCacheBase::OnFrameEnd()
   // Flush any outstanding EFB copies to RAM, in case the game is running at an uncapped frame
   // rate and not waiting for vblank. Otherwise, we'd end up with a huge list of pending
   // copies.
+  EFBCopyStats::SetFlushReason(EFBCopyStats::FlushReason::FrameEnd);
   FlushEFBCopies();
+  EFBCopyStats::SetFlushReason(EFBCopyStats::FlushReason::Other);
 
   Cleanup(g_presenter->FrameCount());
 }
@@ -2387,6 +2455,8 @@ void TextureCacheBase::CopyRenderTargetToTexture(
 
   if (copy_to_ram)
   {
+    EFBCopyStats::RecordCopy(dstAddr, width, height, static_cast<int>(dstFormat), copy_to_vram,
+                             is_depth_copy, !copy_to_vram || !g_ActiveConfig.bDeferEFBCopies);
     const std::array<u32, 3> coefficients = GetRAMCopyFilterCoefficients(filter_coefficients);
     PixelFormat srcFormat = bpmem.zcontrol.pixel_format;
     EFBCopyParams format(srcFormat, dstFormat, is_depth_copy, isIntensity,
@@ -2536,7 +2606,11 @@ void TextureCacheBase::WriteEFBCopyToRAM(u8* dst_ptr, u32 width, u32 height, u32
                                          std::unique_ptr<AbstractStagingTexture> staging_texture)
 {
   MathUtil::Rectangle<int> copy_rect(0, 0, static_cast<int>(width), static_cast<int>(height));
+  const auto readback_start = std::chrono::steady_clock::now();
   staging_texture->ReadTexels(copy_rect, dst_ptr, stride);
+  EFBCopyStats::AddReadback(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - readback_start)
+                                .count());
   ReleaseEFBCopyStagingTexture(std::move(staging_texture));
 }
 
