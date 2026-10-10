@@ -1,5 +1,6 @@
 #include "frame_interp.hpp"
 
+#include <thread>
 #include <algorithm>
 #include <bit>
 #include <array>
@@ -2196,8 +2197,23 @@ static void pace_steps() {
   const int wanted = g_steps.load(std::memory_order_relaxed);
   const bool pacing = setting == 1 || (setting < 0 && wanted < 3);
   // The game running slow counts at any number of in-between frames (slow
-  // motion is worse than fewer of them) unless pacing is off altogether.
-  const bool slow = slow_game(p) && setting != 0;
+  // motion is worse than fewer of them) unless pacing is off altogether, or
+  // the CPU has threads to spare. The slow-game rule was measured on four
+  // E-cores, where the in-between frames' work took the game thread's core;
+  // with 8 threads or more it doesn't, and dropping them for a slow game only
+  // made it look worse for seconds after (#137: an 8-core Ryzen at 120 Hz
+  // went 3 -> 1 -> 0 and waited up to 12 s, while half of those slow seconds
+  // were at full game speed). GPU and render overloads still drop them.
+  // DOL_AURORA_FRAME_INTERP_PACING=1 keeps the slow-game rule everywhere.
+  static const bool spare_threads = [] {
+    const unsigned threads = std::thread::hardware_concurrency();
+    const bool spare = threads >= 8 && setting != 1;
+    std::fprintf(stderr, "[interp-pace] %u threads: %s\n", threads,
+                 spare ? "a slow game keeps its in-between frames"
+                       : "a slow game drops in-between frames");
+    return spare;
+  }();
+  const bool slow = slow_game(p) && setting != 0 && !spare_threads;
   const bool overloaded = (g_overloaded.exchange(false, std::memory_order_relaxed) && pacing) || slow;
   p.recent = (p.recent << 1) | (overloaded ? 1u : 0u);
   const bool sustained = std::popcount(p.recent & 0xFFu) >= 3;
