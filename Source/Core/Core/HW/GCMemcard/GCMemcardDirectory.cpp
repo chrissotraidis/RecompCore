@@ -39,6 +39,41 @@
 
 static const char* MC_HDR = "MC_SYSTEM_AREA";
 
+namespace
+{
+// True when the file holds a whole GCI: a directory entry and exactly the blocks it claims.
+// 2043 is the largest number of free blocks on a memory card.
+bool IsCompleteGCI(const std::string& path)
+{
+  File::IOFile file(path, "rb");
+  Memcard::DEntry header;
+  if (!file || !file.ReadBytes(&header, Memcard::DENTRY_SIZE))
+    return false;
+  const u16 blocks = header.m_block_count;
+  return blocks != 0 && blocks <= 2043 &&
+         file.GetSize() == Memcard::DENTRY_SIZE + u64{blocks} * Memcard::BLOCK_SIZE;
+}
+
+// Restores a short or damaged save from the backup WriteGCIFile keeps, moving the damaged file
+// to <file>.damaged. Without a complete backup the file is left as it is.
+void RestoreGCIFromBackup(const std::string& path)
+{
+  const std::string backup = path + ".bak";
+  if (IsCompleteGCI(path) || !IsCompleteGCI(backup))
+    return;
+  const std::string damaged = path + ".damaged";
+  File::Delete(damaged, File::IfAbsentBehavior::NoConsoleWarning);
+  if (!File::Rename(path, damaged))
+    return;
+  if (!File::CopyRegularFile(backup, path))
+  {
+    File::Rename(damaged, path);
+    return;
+  }
+  WARN_LOG_FMT(EXPANSIONINTERFACE, "GCI restored from backup: {}", path);
+}
+}  // namespace
+
 namespace Memcard
 {
 GCIWriteResult WriteGCIFile(const std::string& path, const DEntry& header,
@@ -62,6 +97,9 @@ GCIWriteResult WriteGCIFile(const std::string& path, const DEntry& header,
     if (!gci.Flush() || !gci.IsGood())
       return GCIWriteResult::WriteFailed;
   }
+  // Keep the save being replaced as one backup generation for load-time repair.
+  if (IsCompleteGCI(path))
+    File::CopyRegularFile(path, path + ".bak");
   if (!File::RenameSync(temporary, path))
     return GCIWriteResult::WriteFailed;
   return GCIWriteResult::Success;
@@ -226,6 +264,7 @@ GCMemcardDirectory::GCMemcardDirectory(std::string directory, ExpansionInterface
   std::vector<Memcard::GCIFile> gci_other_games;
   for (const std::string& filename : filenames)
   {
+    RestoreGCIFromBackup(filename);
     Memcard::GCIFile gci;
     gci.m_filename = filename;
     gci.m_dirty = false;
@@ -247,11 +286,17 @@ GCMemcardDirectory::GCMemcardDirectory(std::string directory, ExpansionInterface
   size_t failed_loads_current_game = 0;
   for (Memcard::GCIFile& gci : gci_current_game)
   {
+    // A leftover .tmp is an interrupted write; drop it once its save has loaded.
+    const std::string temporary = gci.m_filename + ".tmp";
     if (!LoadGCI(std::move(gci)))
     {
       // keep track of how many files failed to load for the current game so we can display a
       // message to the user informing them why some of their saves may not be loaded
       ++failed_loads_current_game;
+    }
+    else if (File::Exists(temporary))
+    {
+      File::Delete(temporary);
     }
   }
 

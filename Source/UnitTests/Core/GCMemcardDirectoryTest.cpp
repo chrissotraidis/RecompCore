@@ -10,6 +10,7 @@
 
 #include "Common/CommonTypes.h"
 #include "Common/FileUtil.h"
+#include "Common/IOFile.h"
 #include "Common/Swap.h"
 #include "Core/HW/EXI/EXI.h"
 #include "Core/HW/EXI/EXI_Device.h"
@@ -77,6 +78,19 @@ protected:
 
   std::string Path() const { return m_directory + FILE_NAME; }
 
+  void Write(u8 fill)
+  {
+    ASSERT_EQ(Memcard::WriteGCIFile(Path(), MakeEntry(), MakeBlocks(fill)),
+              Memcard::GCIWriteResult::Success);
+  }
+
+  // Cuts the save short, as an interrupted in-place write from an older build would.
+  void Truncate()
+  {
+    File::IOFile file(Path(), "r+b");
+    ASSERT_TRUE(file.Resize(Memcard::DENTRY_SIZE + Memcard::BLOCK_SIZE));
+  }
+
   std::string m_directory;
 };
 }  // namespace
@@ -101,4 +115,44 @@ TEST_F(GCMemcardDirectoryTest, StopDuringWriteKeepsOldOrNewSave)
     EXPECT_TRUE(fill == OLD_FILL || fill == NEW_FILL)
         << "write stopped after " << stop << " blocks left fill " << static_cast<int>(fill);
   }
+}
+
+TEST_F(GCMemcardDirectoryTest, ShortSaveRestoredFromBackup)
+{
+  Write(OLD_FILL);
+  Write(NEW_FILL);
+  ASSERT_TRUE(File::Exists(Path() + ".bak"));
+  Truncate();
+  EXPECT_EQ(LoadedFill(m_directory), OLD_FILL);
+  EXPECT_TRUE(File::Exists(Path() + ".damaged"));
+  EXPECT_TRUE(File::Exists(Path() + ".bak"));
+}
+
+TEST_F(GCMemcardDirectoryTest, ShortSaveWithoutBackupIsLeftAlone)
+{
+  Write(OLD_FILL);
+  EXPECT_FALSE(File::Exists(Path() + ".bak"));
+  Truncate();
+  EXPECT_EQ(LoadedFill(m_directory), NO_SAVE);
+  EXPECT_TRUE(File::Exists(Path()));
+  EXPECT_FALSE(File::Exists(Path() + ".damaged"));
+}
+
+TEST_F(GCMemcardDirectoryTest, DamagedSaveIsNotKeptAsBackup)
+{
+  Write(OLD_FILL);
+  Truncate();
+  Write(NEW_FILL);
+  EXPECT_FALSE(File::Exists(Path() + ".bak"));
+  EXPECT_EQ(LoadedFill(m_directory), NEW_FILL);
+}
+
+TEST_F(GCMemcardDirectoryTest, InterruptedWriteLeftoverIsRemovedAfterLoad)
+{
+  Write(OLD_FILL);
+  EXPECT_EQ(Memcard::WriteGCIFile(Path(), MakeEntry(), MakeBlocks(NEW_FILL), 1),
+            Memcard::GCIWriteResult::WriteFailed);
+  ASSERT_TRUE(File::Exists(Path() + ".tmp"));
+  EXPECT_EQ(LoadedFill(m_directory), OLD_FILL);
+  EXPECT_FALSE(File::Exists(Path() + ".tmp"));
 }
