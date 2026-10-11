@@ -45,17 +45,26 @@ GCIWriteResult WriteGCIFile(const std::string& path, const DEntry& header,
                             const std::vector<GCMBlock>& blocks,
                             std::optional<size_t> stop_after_blocks)
 {
-  File::IOFile gci(path, "wb");
-  if (!gci)
-    return GCIWriteResult::OpenFailed;
-  gci.WriteBytes(&header, DENTRY_SIZE);
-  for (size_t i = 0; i < blocks.size(); ++i)
+  // Write a complete copy beside the save, then rename it over the save, so a stop at any point
+  // leaves the previous file or the new one, never a short file the loader would skip.
+  const std::string temporary = path + ".tmp";
   {
-    if (stop_after_blocks && i == *stop_after_blocks)
+    File::IOFile gci(temporary, "wb");
+    if (!gci)
+      return GCIWriteResult::OpenFailed;
+    gci.WriteBytes(&header, DENTRY_SIZE);
+    for (size_t i = 0; i < blocks.size(); ++i)
+    {
+      if (stop_after_blocks && i == *stop_after_blocks)
+        return GCIWriteResult::WriteFailed;
+      gci.WriteBytes(blocks[i].m_block.data(), BLOCK_SIZE);
+    }
+    if (!gci.Flush() || !gci.IsGood())
       return GCIWriteResult::WriteFailed;
-    gci.WriteBytes(blocks[i].m_block.data(), BLOCK_SIZE);
   }
-  return gci.IsGood() ? GCIWriteResult::Success : GCIWriteResult::WriteFailed;
+  if (!File::RenameSync(temporary, path))
+    return GCIWriteResult::WriteFailed;
+  return GCIWriteResult::Success;
 }
 }  // namespace Memcard
 
