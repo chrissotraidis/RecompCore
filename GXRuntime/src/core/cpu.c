@@ -61,6 +61,7 @@ bool g_ppc_guest_aliases_overlap_mem1;
 // same answer. The index is kept sorted by the mutators (never rebuilt lazily
 // by a reader), and any overlap sends the resolver back to the scan.
 static u32 g_guest_alias_sorted[PPC_GUEST_ALIAS_MAX];
+static _Atomic u32 g_guest_alias_last = PPC_GUEST_ALIAS_MAX;
 static bool g_guest_alias_overlapping;
 
 static bool ppc_guest_alias_pair_overlaps(const PPCGuestAlias* a,
@@ -285,6 +286,23 @@ GXRUNTIME_EXPORT bool ppc_guest_alias_resolve(u32 address, u32 size,
         return false;
     }
     if (!g_guest_alias_overlapping) {
+        // The alias the last lookup found, first: no two aliases overlap here,
+        // so if it holds the access it is the one the search would find, and
+        // a run of accesses to one module's data skips the search. Any thread
+        // may store it; a stale index is only a miss.
+        const u32 last = atomic_load_explicit(&g_guest_alias_last, memory_order_relaxed);
+        if (last < g_guest_alias_count) {
+            const PPCGuestAlias* alias = &g_guest_aliases[last];
+            if (address >= alias->linked_start && size <= alias->size &&
+                address - alias->linked_start <= alias->size - size) {
+                if (cost)
+                    g_alias_cost_hits++;
+                *pointer = alias->storage + (address - alias->linked_start);
+                if (journal_offset != NULL)
+                    *journal_offset = address - GC_RAM_BASE;
+                return true;
+            }
+        }
         u32 lo = 0u, hi = g_guest_alias_count;
         while (lo < hi) { // last alias whose start is at or below the address
             const u32 mid = lo + (hi - lo) / 2u;
@@ -297,10 +315,12 @@ GXRUNTIME_EXPORT bool ppc_guest_alias_resolve(u32 address, u32 size,
         }
         if (lo == 0u)
             return false;
-        const PPCGuestAlias* alias = &g_guest_aliases[g_guest_alias_sorted[lo - 1u]];
+        const u32 found = g_guest_alias_sorted[lo - 1u];
+        const PPCGuestAlias* alias = &g_guest_aliases[found];
         if (size > alias->size ||
             address - alias->linked_start > alias->size - size)
             return false;
+        atomic_store_explicit(&g_guest_alias_last, found, memory_order_relaxed);
         if (cost)
             g_alias_cost_hits++;
         *pointer = alias->storage + (address - alias->linked_start);
