@@ -39,6 +39,26 @@
 
 static const char* MC_HDR = "MC_SYSTEM_AREA";
 
+namespace Memcard
+{
+GCIWriteResult WriteGCIFile(const std::string& path, const DEntry& header,
+                            const std::vector<GCMBlock>& blocks,
+                            std::optional<size_t> stop_after_blocks)
+{
+  File::IOFile gci(path, "wb");
+  if (!gci)
+    return GCIWriteResult::OpenFailed;
+  gci.WriteBytes(&header, DENTRY_SIZE);
+  for (size_t i = 0; i < blocks.size(); ++i)
+  {
+    if (stop_after_blocks && i == *stop_after_blocks)
+      return GCIWriteResult::WriteFailed;
+    gci.WriteBytes(blocks[i].m_block.data(), BLOCK_SIZE);
+  }
+  return gci.IsGood() ? GCIWriteResult::Success : GCIWriteResult::WriteFailed;
+}
+}  // namespace Memcard
+
 static std::string GenerateDefaultGCIFilename(const Memcard::DEntry& entry,
                                               bool card_encoding_is_shift_jis)
 {
@@ -656,23 +676,17 @@ void GCMemcardDirectory::FlushToFile()
           }
           save.m_filename = default_save_name;
         }
-        File::IOFile gci(save.m_filename, "wb");
-        if (gci)
+        const Memcard::GCIWriteResult result =
+            Memcard::WriteGCIFile(save.m_filename, save.m_gci_header, save.m_save_data);
+        if (result == Memcard::GCIWriteResult::Success)
         {
-          gci.WriteBytes(&save.m_gci_header, Memcard::DENTRY_SIZE);
-          for (const Memcard::GCMBlock& block : save.m_save_data)
-            gci.WriteBytes(block.m_block.data(), Memcard::BLOCK_SIZE);
-
-          if (gci.IsGood())
-          {
-            Core::DisplayMessage("Wrote save contents to GCI Folder", 4000);
-          }
-          else
-          {
-            Core::DisplayMessage(
-                fmt::format("Failed to write save contents to {}", save.m_filename), 10000);
-            ERROR_LOG_FMT(EXPANSIONINTERFACE, "Failed to save data to {}", save.m_filename);
-          }
+          Core::DisplayMessage("Wrote save contents to GCI Folder", 4000);
+        }
+        else if (result == Memcard::GCIWriteResult::WriteFailed)
+        {
+          Core::DisplayMessage(
+              fmt::format("Failed to write save contents to {}", save.m_filename), 10000);
+          ERROR_LOG_FMT(EXPANSIONINTERFACE, "Failed to save data to {}", save.m_filename);
         }
         else
         {

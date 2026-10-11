@@ -4,6 +4,7 @@
 #pragma once
 
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -18,6 +19,22 @@
 // #define _WRITE_MC_HEADER 1
 void MigrateFromMemcardFile(const std::string& directory_name, ExpansionInterface::Slot card_slot,
                             DiscIO::Region region);
+
+namespace Memcard
+{
+enum class GCIWriteResult
+{
+  Success,
+  OpenFailed,
+  WriteFailed,
+};
+
+// Writes one save file to a GCI folder. stop_after_blocks is for fault-injection tests: writing
+// stops after that many data blocks, as if the process had been killed.
+GCIWriteResult WriteGCIFile(const std::string& path, const DEntry& header,
+                            const std::vector<GCMBlock>& blocks,
+                            std::optional<size_t> stop_after_blocks = std::nullopt);
+}  // namespace Memcard
 
 class GCMemcardDirectory : public MemoryCardBase
 {
