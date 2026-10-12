@@ -17,7 +17,13 @@
 // _END (distances in near-plane units, default 8000 and 30000) up to
 // DOL_AURORA_FAR_BLUR_AMOUNT (default 0.8); where the game drew without depth
 // (the sky, the horizon, the islands' far models), _BACKGROUND (default 0.35). Off unless
-// DOL_AURORA_FAR_BLUR=1 or aurora_set_far_blur(true); _DEBUG=1 shows it in red.
+// DOL_AURORA_FAR_BLUR=1 or aurora_set_far_blur(true); _DEBUG=1 shows the
+// distance as brightness.
+//
+// Ambient occlusion (HD's darkened creases and contact shadows): first, from
+// depth alone, at a quarter of the size, blurred and multiplied into the
+// scene. DOL_AURORA_AO_RADIUS (near-plane units, default 30) and _STRENGTH
+// (default 0.6). Off unless DOL_AURORA_AO=1 or aurora_set_ambient_occlusion(true).
 namespace aurora::gfx::post_fx {
 void initialize();
 void shutdown();
@@ -25,8 +31,11 @@ bool bloom_enabled() noexcept;
 void set_bloom(bool enabled) noexcept;
 bool far_blur_enabled() noexcept;
 void set_far_blur(bool enabled) noexcept;
+bool ambient_occlusion_enabled() noexcept;
+void set_ambient_occlusion(bool enabled) noexcept;
 bool any_enabled() noexcept;
-// Every effect that is on, in order (far blur, then bloom); depthView: the EFB's depth.
+// Every effect that is on, in order (ambient occlusion, far blur, bloom);
+// depthView: the EFB's depth.
 void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
             const wgpu::Extent3D& size, wgpu::TextureFormat format, const wgpu::TextureView& dst,
             const wgpu::TextureView& resolve, uint32_t msaaSamples);
