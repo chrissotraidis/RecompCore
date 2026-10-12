@@ -179,6 +179,9 @@ void aurora_set_ambient_occlusion(bool enabled);
    passed to aurora_set_world_view. Takes effect at the next frame. */
 void aurora_set_sun_shadows(bool enabled);
 void aurora_set_sun_direction(float x, float y, float z);
+/* Edge light: a warm rim on the sunlit outline of what is near the camera,
+   from the same sun and camera. Takes effect at the next frame. */
+void aurora_set_edge_light(bool enabled);
 /* Cloud shadows on the sea and the land, from the camera last passed to
    aurora_set_world_view. Takes effect at the next frame. */
 void aurora_set_cloud_shadows(bool enabled);
