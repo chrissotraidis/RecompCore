@@ -470,6 +470,7 @@ bool dol_aurora_initialize(int argc, char** argv,
         dol_guest_memory_dirty_reset();
         aurora::gfx::gxcore::set_texture_dirty_epoch_observer(
             gx_aurora::core_texture_dirty_epoch);
+        aurora::gfx::gxcore::set_efb_copy_epoch_observer(gx_aurora::core_efb_copy_epoch);
         gx_aurora::g_core_sink.set_plan_observer(gx_aurora::core_plan_observer, nullptr);
         gx_aurora::g_core_sink.set_copy_observer(gx_aurora::core_copy_observer, nullptr);
         gx_aurora::g_core_submitted.store(0, std::memory_order_relaxed);

@@ -332,6 +332,13 @@ uint64_t small_texture_hash(const uint8_t* bytes, uint32_t size,
 }
 TextureCacheStats g_textureCacheStats;
 TextureDirtyEpochObserver g_textureDirtyEpochObserver = nullptr;
+// For EFB copies (guest_memory_dirty.h's write epoch): unset, the texture one.
+TextureDirtyEpochObserver g_efbCopyEpochObserver = nullptr;
+
+bool efb_copy_epoch(uint32_t address, uint32_t size, uint64_t* epoch) {
+  const auto observer = g_efbCopyEpochObserver != nullptr ? g_efbCopyEpochObserver : g_textureDirtyEpochObserver;
+  return observer != nullptr && observer(address, size, epoch);
+}
 
 // EFB copy allocations mirror GXState::copyTextureCache: one guest destination
 // may be reused with different dimensions or formats, which require distinct GPU
@@ -964,6 +971,8 @@ void set_texture_dirty_epoch_observer(TextureDirtyEpochObserver observer) {
   g_textureDirtyEpochObserver = observer;
 }
 
+void set_efb_copy_epoch_observer(TextureDirtyEpochObserver observer) { g_efbCopyEpochObserver = observer; }
+
 const TextureCacheStats& texture_cache_stats() { return g_textureCacheStats; }
 unsigned long long texture_upload_count() { return g_textureCacheStats.uploads; }
 
@@ -1059,8 +1068,7 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
   }
   uint64_t memoryEpoch = 0;
   const bool memoryEpochValid =
-      g_textureDirtyEpochObserver != nullptr && cmd.byte_size != 0u &&
-      g_textureDirtyEpochObserver(cmd.dest_address, cmd.byte_size, &memoryEpoch);
+      cmd.byte_size != 0u && efb_copy_epoch(cmd.dest_address, cmd.byte_size, &memoryEpoch);
   g_efbCopyTextures.insert_or_assign(
       cmd.dest_address,
       EfbCopyBinding{it->second, cmd.byte_size, memoryEpoch, memoryEpochValid});
@@ -1643,9 +1651,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       uint64_t memoryEpoch = 0;
       const bool memoryUnchanged =
           !efbIt->second.memory_epoch_valid ||
-          (g_textureDirtyEpochObserver != nullptr &&
-           g_textureDirtyEpochObserver(address, efbIt->second.byte_size,
-                                       &memoryEpoch) &&
+          (efb_copy_epoch(address, efbIt->second.byte_size, &memoryEpoch) &&
            memoryEpoch == efbIt->second.memory_epoch);
       if (memoryUnchanged) {
         ++g_textureCacheStats.hits;

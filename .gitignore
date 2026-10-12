@@ -54,3 +54,6 @@ CMakeLists.txt.user
 StrikersRecomp/generated_smc.txt
 StrikersRecomp/generated.c
 StrikersRecomp/generated.h
+
+# Left behind by GXRuntime host tests run from the repository root
+gxruntime-memory-card-*.dolcard*

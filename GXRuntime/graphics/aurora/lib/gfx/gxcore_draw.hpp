@@ -135,6 +135,8 @@ void note_frame_presented();
 using TextureDirtyEpochObserver =
     bool (*)(uint32_t address, uint32_t size, uint64_t* epoch);
 void set_texture_dirty_epoch_observer(TextureDirtyEpochObserver observer);
+// EFB copies: the guest memory's write epoch, which a cache flush doesn't move.
+void set_efb_copy_epoch_observer(TextureDirtyEpochObserver observer);
 
 // Texture-cache telemetry (S13 A3): proves the no-reconvert property. `uploads`
 // counts actual decode+upload (cache miss); `hits` counts cache reuse (no
