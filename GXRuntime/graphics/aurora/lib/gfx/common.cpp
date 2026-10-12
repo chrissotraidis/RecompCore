@@ -1991,13 +1991,13 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
   static uint64_t bloomedFrame = UINT64_MAX;
   const uint64_t frameKey = frame.frameId * 2 + (frame_interp::encoding_interpolated() ? 1 : 0);
   const bool efbPass = !passInfo.offscreen && passInfo.colorView.Get() == webgpu::g_frameBuffer.view.Get();
-  const bool bloomBeforeCopy = post_fx::bloom_enabled() && efbPass && bloomedFrame != frameKey &&
+  const bool bloomBeforeCopy = post_fx::any_enabled() && efbPass && bloomedFrame != frameKey &&
                                passInfo.resolveTarget && !gx::is_depth_format(passInfo.resolveFormat) &&
                                passInfo.resolveRect.x == 0 && passInfo.resolveRect.y == 0 &&
                                static_cast<uint32_t>(passInfo.resolveRect.width) == passInfo.targetSize.width &&
                                static_cast<uint32_t>(passInfo.resolveRect.height) == passInfo.targetSize.height;
   size_t split = SIZE_MAX;
-  if (post_fx::bloom_enabled() && efbPass && passInfo.observable && bloomedFrame != frameKey && !bloomBeforeCopy) {
+  if (post_fx::any_enabled() && efbPass && passInfo.observable && bloomedFrame != frameKey && !bloomBeforeCopy) {
     for (size_t i = passInfo.commands.size(); i-- > 0;) {
       const auto& command = passInfo.commands[i];
       if (command.type == CommandType::Draw && command.data.draw.type != ShaderType::Clear && !command.flat) {
@@ -2012,13 +2012,15 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
   pass.End();
 
   if (bloomBeforeCopy) {
-    post_fx::encode_bloom(cmd, passInfo.copySourceView, passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat(),
-                          passInfo.colorView, passInfo.resolveView, passInfo.msaaSamples);
+    post_fx::encode(cmd, passInfo.copySourceView, passInfo.copySourceDepthView, passInfo.targetSize,
+                    webgpu::g_frameBuffer.texture.GetFormat(), passInfo.colorView, passInfo.resolveView,
+                    passInfo.msaaSamples);
     bloomedFrame = frameKey;
   }
   if (split != SIZE_MAX) {
-    post_fx::encode_bloom(cmd, passInfo.copySourceView, passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat(),
-                          passInfo.colorView, passInfo.resolveView, passInfo.msaaSamples);
+    post_fx::encode(cmd, passInfo.copySourceView, passInfo.copySourceDepthView, passInfo.targetSize,
+                    webgpu::g_frameBuffer.texture.GetFormat(), passInfo.colorView, passInfo.resolveView,
+                    passInfo.msaaSamples);
     bloomedFrame = frameKey;
     if (split < passInfo.commands.size()) {
       auto attachmentsAfter = attachments;
