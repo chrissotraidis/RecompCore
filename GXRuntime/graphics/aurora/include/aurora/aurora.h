@@ -174,6 +174,11 @@ void aurora_set_far_blur(bool enabled);
    depth, before the far blur and bloom. Takes effect at the next frame.
    DOL_AURORA_AO=1 sets the starting value. */
 void aurora_set_ambient_occlusion(bool enabled);
+/* Sun shadows from what is on screen, toward the direction last passed to
+   aurora_set_sun_direction (world space, toward the sun), with the camera last
+   passed to aurora_set_world_view. Takes effect at the next frame. */
+void aurora_set_sun_shadows(bool enabled);
+void aurora_set_sun_direction(float x, float y, float z);
 /* Cloud shadows on the sea and the land, from the camera last passed to
    aurora_set_world_view. Takes effect at the next frame. */
 void aurora_set_cloud_shadows(bool enabled);
