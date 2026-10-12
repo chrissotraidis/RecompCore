@@ -162,6 +162,10 @@ void aurora_set_forced_anisotropy(unsigned samples);
    unchanged (one extra half frame of display latency). Takes effect at the
    next frame. DOL_AURORA_FRAME_INTERP=1 sets the starting value. */
 void aurora_set_frame_interpolation(bool enabled);
+/* Bloom (the Wind Waker HD look): what is brighter than a threshold glows,
+   after the scene and before the HUD. Takes effect at the next frame.
+   DOL_AURORA_BLOOM=1 sets the starting value. */
+void aurora_set_bloom(bool enabled);
 /* A frames-a-second counter at the top of the window (with the game's own
    rate beside it when in-between frames are on). DOL_AURORA_SHOW_FPS=1 sets
    the starting value. */

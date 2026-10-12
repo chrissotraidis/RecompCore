@@ -15,6 +15,7 @@
 #include "../rmlui/pipeline.hpp"
 #endif
 #include "pipeline_cache.hpp"
+#include "post_fx.hpp"
 #include "render_worker.hpp"
 #include "staging_budget.hpp"
 #include "tex_copy_conv.hpp"
@@ -94,6 +95,8 @@ enum class CommandType {
 };
 struct Command {
   CommandType type;
+  // A draw with an orthographic projection (the HUD, menus, screen effects).
+  bool flat = false;
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> debugGroupStack;
 #endif
@@ -623,7 +626,8 @@ static void seal_pass(FramePacket& frame, uint32_t passIndex) {
 
 static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op);
 static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex);
-static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, const RenderPass& passInfo);
+static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, const RenderPass& passInfo,
+                        size_t first = 0, size_t last = SIZE_MAX);
 static void expire_cached_bind_groups();
 static void push_command(CommandType type, const Command::Data& data);
 
@@ -769,6 +773,10 @@ void end_color_pass() {
   g_currentRenderPass = UINT32_MAX;
 }
 
+static int g_nextDrawFlat = -1; // -1: from the legacy GX state
+
+void set_next_draw_flat(bool flat) noexcept { g_nextDrawFlat = flat ? 1 : 0; }
+
 static inline void push_command(CommandType type, const Command::Data& data) {
   if (g_currentRenderPass == UINT32_MAX)
     UNLIKELY {
@@ -780,11 +788,15 @@ static inline void push_command(CommandType type, const Command::Data& data) {
          g_currentRenderPass);
   renderPass.commands.push_back({
       .type = type,
+      .flat = type == CommandType::Draw &&
+              (g_nextDrawFlat >= 0 ? g_nextDrawFlat == 1 : gx::g_gxState.projType == GX_ORTHOGRAPHIC),
 #ifdef AURORA_GFX_DEBUG_GROUPS
       .debugGroupStack = g_debugGroupStack,
 #endif
       .data = data,
   });
+  if (type == CommandType::Draw)
+    g_nextDrawFlat = -1;
 }
 
 template <>
@@ -1146,6 +1158,7 @@ void initialize() {
   // });
   depth_peek::initialize();
   tex_copy_conv::initialize();
+  post_fx::initialize();
   tex_palette_conv::initialize();
   texture_replacement::initialize();
 
@@ -1311,6 +1324,7 @@ void shutdown() {
   shutdown_pipeline_cache();
   depth_peek::shutdown();
   tex_copy_conv::shutdown();
+  post_fx::shutdown();
   tex_palette_conv::shutdown();
   texture_replacement::shutdown();
   gx::shutdown();
@@ -1949,9 +1963,86 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
       .timestampWrites = webgpu::gpu_prof::pass_writes(label),
   };
 
+  // DOL_AURORA_PASS_TRACE=1: the passes of one frame (the 300th) and their draws.
+  static const bool passTrace = std::getenv("DOL_AURORA_PASS_TRACE") != nullptr;
+  if (passTrace) {
+    static uint32_t frames = 0;
+    if (passIndex == 0)
+      frames++;
+    if (frames == 300) {
+      size_t draws = 0, flat = 0;
+      for (const auto& command : passInfo.commands)
+        if (command.type == CommandType::Draw && command.data.draw.type != ShaderType::Clear) {
+          draws++;
+          flat += command.flat;
+        }
+      std::fprintf(stderr, "[pass] %u: %zu draws (%zu flat), efb=%d observable=%d offscreen=%d resolve=%s %dx%d at %d,%d fmt=%d\n",
+                   passIndex, draws, flat, passInfo.colorView.Get() == webgpu::g_frameBuffer.view.Get(),
+                   passInfo.observable, passInfo.offscreen, passInfo.resolveTarget ? "yes" : "no",
+                   passInfo.resolveRect.width, passInfo.resolveRect.height, passInfo.resolveRect.x, passInfo.resolveRect.y,
+                   static_cast<int>(passInfo.resolveFormat));
+    }
+  }
+  // Bloom (post_fx), once a frame, on the EFB before the HUD. The game copies
+  // the finished scene out at full size before it draws the HUD (Wind Waker
+  // does, every frame): bloom goes in just before that copy. Without such a
+  // copy, in the on-screen pass after the scene's last perspective draw; what
+  // follows (the HUD, drawn flat) is drawn after it.
+  static uint64_t bloomedFrame = UINT64_MAX;
+  const uint64_t frameKey = frame.frameId * 2 + (frame_interp::encoding_interpolated() ? 1 : 0);
+  const bool efbPass = !passInfo.offscreen && passInfo.colorView.Get() == webgpu::g_frameBuffer.view.Get();
+  const bool bloomBeforeCopy = post_fx::bloom_enabled() && efbPass && bloomedFrame != frameKey &&
+                               passInfo.resolveTarget && !gx::is_depth_format(passInfo.resolveFormat) &&
+                               passInfo.resolveRect.x == 0 && passInfo.resolveRect.y == 0 &&
+                               static_cast<uint32_t>(passInfo.resolveRect.width) == passInfo.targetSize.width &&
+                               static_cast<uint32_t>(passInfo.resolveRect.height) == passInfo.targetSize.height;
+  size_t split = SIZE_MAX;
+  if (post_fx::bloom_enabled() && efbPass && passInfo.observable && bloomedFrame != frameKey && !bloomBeforeCopy) {
+    for (size_t i = passInfo.commands.size(); i-- > 0;) {
+      const auto& command = passInfo.commands[i];
+      if (command.type == CommandType::Draw && command.data.draw.type != ShaderType::Clear && !command.flat) {
+        split = i + 1;
+        break;
+      }
+    }
+  }
+
   auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
-  render_pass(pass, frame, passInfo);
+  render_pass(pass, frame, passInfo, 0, split);
   pass.End();
+
+  if (bloomBeforeCopy) {
+    post_fx::encode_bloom(cmd, passInfo.copySourceView, passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat(),
+                          passInfo.colorView, passInfo.resolveView, passInfo.msaaSamples);
+    bloomedFrame = frameKey;
+  }
+  if (split != SIZE_MAX) {
+    post_fx::encode_bloom(cmd, passInfo.copySourceView, passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat(),
+                          passInfo.colorView, passInfo.resolveView, passInfo.msaaSamples);
+    bloomedFrame = frameKey;
+    if (split < passInfo.commands.size()) {
+      auto attachmentsAfter = attachments;
+      attachmentsAfter[0].loadOp = wgpu::LoadOp::Load;
+      auto depthStencilAfter = depthStencilAttachment;
+      if (depthStencilAttachmentPtr != nullptr) {
+        if (passInfo.hasDepth)
+          depthStencilAfter.depthLoadOp = wgpu::LoadOp::Load;
+        if (passInfo.hasStencil)
+          depthStencilAfter.stencilLoadOp = wgpu::LoadOp::Load;
+      }
+      const auto labelAfter = label + " (after the scene)";
+      const wgpu::RenderPassDescriptor afterDescriptor{
+          .label = labelAfter.c_str(),
+          .colorAttachmentCount = attachmentsAfter.size(),
+          .colorAttachments = attachmentsAfter.data(),
+          .depthStencilAttachment = depthStencilAttachmentPtr != nullptr ? &depthStencilAfter : nullptr,
+          .timestampWrites = webgpu::gpu_prof::pass_writes(labelAfter),
+      };
+      auto after = cmd.BeginRenderPass(&afterDescriptor);
+      render_pass(after, frame, passInfo, split, SIZE_MAX);
+      after.End();
+    }
+  }
 
   if (passInfo.captureDepthSnapshot && !frame_interp::encoding_interpolated()) {
     depth_peek::encode_frame_snapshot(cmd, passInfo.copySourceDepthView, passInfo.targetSize, passInfo.msaaSamples);
@@ -2483,7 +2574,8 @@ float calculate_fps() noexcept {
   return static_cast<float>(g_presentTimes.size() - 1) / elapsed;
 }
 
-static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, const RenderPass& passInfo) {
+static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, const RenderPass& passInfo,
+                        size_t first, size_t last) {
   ZoneScoped;
   g_currentPipeline = UINTPTR_MAX;
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -2497,8 +2589,38 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
   gxcore::reset_pass_state();
 #endif
 
+  // A pass drawn in two parts (post_fx: the scene, then the HUD) starts its
+  // second part with the viewport and scissor the first part left.
+  last = std::min(last, passInfo.commands.size());
+  if (first > 0) {
+    const Command* viewport = nullptr;
+    const Command* scissor = nullptr;
+    for (size_t i = 0; i < first && i < passInfo.commands.size(); ++i) {
+      if (passInfo.commands[i].type == CommandType::SetViewport)
+        viewport = &passInfo.commands[i];
+      else if (passInfo.commands[i].type == CommandType::SetScissor)
+        scissor = &passInfo.commands[i];
+    }
+    if (viewport != nullptr) {
+      const auto& vp = viewport->data.setViewport;
+      const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
+      const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
+      pass.SetViewport(vp.left, vp.top, vp.width, vp.height, minDepth, maxDepth);
+    }
+    if (scissor != nullptr) {
+      const auto& sc = scissor->data.setScissor;
+      const auto& size = passInfo.targetSize;
+      const auto x = std::clamp(static_cast<uint32_t>(sc.x), 0u, size.width);
+      const auto y = std::clamp(static_cast<uint32_t>(sc.y), 0u, size.height);
+      const auto w = std::clamp(static_cast<uint32_t>(sc.width), 0u, size.width - x);
+      const auto h = std::clamp(static_cast<uint32_t>(sc.height), 0u, size.height - y);
+      pass.SetScissorRect(x, y, w, h);
+    }
+  }
+
   size_t encoded = 0;
-  for (const auto& cmd : passInfo.commands) {
+  for (size_t index = first; index < last; ++index) {
+    const auto& cmd = passInfo.commands[index];
     // A busy pass takes milliseconds to encode: a present that falls due
     // meanwhile (at 120 Hz, the frame before's real frame) goes out on time,
     // from its own encoder.
