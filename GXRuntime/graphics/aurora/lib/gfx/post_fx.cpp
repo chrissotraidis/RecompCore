@@ -16,6 +16,10 @@ using webgpu::g_device;
 namespace {
 std::atomic_bool g_bloom{false};
 std::atomic_bool g_farBlur{false};
+std::atomic_bool g_ao{false};
+float g_aoRadius = 30.f;    // the occlusion radius, in near-plane units
+float g_aoStrength = 0.6f;  // how dark a fully occluded spot gets
+bool g_aoDebug = false;
 float g_farStart = 8000.f;  // distance in near-plane units where the far blur starts
 float g_farEnd = 30000.f;   // and where it is full
 float g_farAmount = 0.8f;  // how much of the blurred scene at full
@@ -33,6 +37,11 @@ wgpu::RenderPipeline g_bright, g_blurH, g_blurV;
 wgpu::RenderPipeline g_composite;
 wgpu::RenderPipeline g_down;           // the scene at a quarter of the size, unfiltered
 wgpu::RenderPipeline g_farComposite;   // blended into the EFB by distance
+wgpu::RenderPipeline g_aoPass;         // occlusion at a quarter of the size
+wgpu::RenderPipeline g_aoApply;        // multiplied into the EFB
+uint32_t g_aoSamples = 0;
+std::array<wgpu::Texture, 2> g_aoTex;
+std::array<wgpu::TextureView, 2> g_aoView;
 uint32_t g_farSamples = 0;
 wgpu::BindGroupLayout g_depthLayout;
 wgpu::PipelineLayout g_depthPipelineLayout;
@@ -114,6 +123,12 @@ fn fs_down(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4(c, 1.0);
 }
 
+// Multiplied into the scene (ambient occlusion); the EFB's alpha is kept.
+@fragment
+fn fs_ao_apply(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4(textureSample(src, samp, in.uv).rgb, 1.0);
+}
+
 // Added onto the scene; the EFB's alpha is kept.
 @fragment
 fn fs_composite(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -171,6 +186,73 @@ fn fs_far(in: VertexOutput) -> @location(0) vec4<f32> {
 )""";
 wgpu::ShaderModule g_farModule;
 
+// Ambient occlusion from depth alone: around each pixel, six pairs of samples
+// on opposite sides, in a ring whose size on screen shrinks with distance; a
+// pair whose average is nearer the camera than the pixel (a crease) occludes it. Where there is no
+// depth (the sky, the horizon) nothing is occluded. Written at a quarter of the
+// size, blurred, then multiplied into the scene (fs_ao_apply).
+constexpr const char* kAoShader = R"""(
+override radius: f32 = 30.0;
+override strength: f32 = 0.6;
+
+@group(0) @binding(0) var samp: sampler;
+@group(0) @binding(1) var unused: texture_2d<f32>;
+@group(0) @binding(2) var depth: texture_depth_2d;
+
+struct VertexOutput {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
+var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(vec2(0.0, 0.0), vec2(0.0, 2.0), vec2(2.0, 0.0));
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VertexOutput {
+    var out: VertexOutput;
+    out.pos = vec4<f32>(pos[i], 0.0, 1.0);
+    out.uv = uvs[i];
+    return out;
+}
+
+fn distance_at(uv: vec2<f32>) -> f32 {
+    let size = vec2<f32>(textureDimensions(depth));
+    let p = clamp(vec2<i32>(uv * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
+    let d = textureLoad(depth, p, 0);
+    return select(1.0 / d, 0.0, d <= 0.0);
+}
+
+@fragment
+fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
+    let dist = distance_at(in.uv);
+    if (dist <= 0.0) {
+        return vec4(1.0);
+    }
+    let size = vec2<f32>(textureDimensions(depth));
+    // About a 60-degree view: a radius r at distance z covers 0.87 r / z of the height.
+    let reach = vec2(size.y / size.x, 1.0) * (0.87 * radius / dist);
+    // Six directions, a sample on each side: a flat surface has its two
+    // samples on either side of the pixel's distance, so only a crease (both
+    // nearer) occludes. A pair with no depth on a side, or a step much larger
+    // than the radius (a silhouette in front of the background), does not.
+    var occluded = 0.0;
+    for (var i = 0; i < 6; i++) {
+        let a = f32(i) * 0.5236 + 0.26;  // 30 degrees apart
+        let r = (f32(i % 3) + 1.0) / 3.0;
+        let o = vec2(cos(a), sin(a)) * reach * r;
+        let n1 = distance_at(in.uv + o);
+        let n2 = distance_at(in.uv - o);
+        if (n1 > 0.0 && n2 > 0.0) {
+            let crease = dist - 0.5 * (n1 + n2);
+            occluded += clamp(crease / (0.25 * radius), 0.0, 1.0) * clamp(2.0 - crease / radius, 0.0, 1.0);
+        }
+    }
+    let ao = 1.0 - strength * occluded / 6.0;
+    return vec4(vec3(ao), 1.0);
+}
+)""";
+wgpu::ShaderModule g_aoModule;
+
 float env_float(const char* name, float fallback, float lo, float hi) {
   const char* value = std::getenv(name);
   if (value == nullptr || value[0] == '\0') {
@@ -184,8 +266,10 @@ float env_float(const char* name, float fallback, float lo, float hi) {
   return parsed;
 }
 
+enum Blend { kReplace, kAdd, kMultiply };
+
 wgpu::RenderPipeline make_pipeline(const char* label, const char* entry, wgpu::TextureFormat format,
-                                   uint32_t samples, bool additive) {
+                                   uint32_t samples, Blend mode) {
   const std::array constants{
       wgpu::ConstantEntry{.key = "threshold", .value = g_threshold},
       wgpu::ConstantEntry{.key = "strength", .value = g_strength},
@@ -198,9 +282,17 @@ wgpu::RenderPipeline make_pipeline(const char* label, const char* entry, wgpu::T
                 .srcFactor = wgpu::BlendFactor::Zero,
                 .dstFactor = wgpu::BlendFactor::One},
   };
+  const wgpu::BlendState multiply{
+      .color = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::Zero,
+                .dstFactor = wgpu::BlendFactor::Src},
+      .alpha = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::Zero,
+                .dstFactor = wgpu::BlendFactor::One},
+  };
   const std::array targets{wgpu::ColorTargetState{
       .format = format,
-      .blend = additive ? &add : nullptr,
+      .blend = mode == kAdd ? &add : mode == kMultiply ? &multiply : nullptr,
       .writeMask = wgpu::ColorWriteMask::All,
   }};
   const wgpu::FragmentState fragment{
@@ -217,6 +309,31 @@ wgpu::RenderPipeline make_pipeline(const char* label, const char* entry, wgpu::T
       .vertex = {.module = g_module, .entryPoint = "vs_main"},
       .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
       .multisample = {.count = samples, .mask = UINT32_MAX},
+      .fragment = &fragment,
+  };
+  return g_device.CreateRenderPipeline(&descriptor);
+}
+
+wgpu::RenderPipeline make_ao_pipeline(wgpu::TextureFormat format) {
+  const std::array constants{
+      wgpu::ConstantEntry{.key = "radius", .value = g_aoRadius},
+      wgpu::ConstantEntry{.key = "strength", .value = g_aoStrength},
+  };
+  const std::array targets{wgpu::ColorTargetState{.format = format, .writeMask = wgpu::ColorWriteMask::All}};
+  const wgpu::FragmentState fragment{
+      .module = g_aoModule,
+      .entryPoint = "fs_ao",
+      .constantCount = constants.size(),
+      .constants = constants.data(),
+      .targetCount = targets.size(),
+      .targets = targets.data(),
+  };
+  const wgpu::RenderPipelineDescriptor descriptor{
+      .label = "Ambient occlusion",
+      .layout = g_depthPipelineLayout,
+      .vertex = {.module = g_aoModule, .entryPoint = "vs_main"},
+      .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+      .multisample = {.count = 1, .mask = UINT32_MAX},
       .fragment = &fragment,
   };
   return g_device.CreateRenderPipeline(&descriptor);
@@ -261,17 +378,24 @@ wgpu::RenderPipeline make_far_pipeline(wgpu::TextureFormat format, uint32_t samp
 void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format, uint32_t samples) {
   if (format != g_format) {
     g_format = format;
-    g_bright = make_pipeline("Bloom bright pass", "fs_bright", format, 1, false);
-    g_blurH = make_pipeline("Bloom blur (horizontal)", "fs_blur_h", format, 1, false);
-    g_blurV = make_pipeline("Bloom blur (vertical)", "fs_blur_v", format, 1, false);
-    g_down = make_pipeline("Far blur downsample", "fs_down", format, 1, false);
+    g_bright = make_pipeline("Bloom bright pass", "fs_bright", format, 1, kReplace);
+    g_blurH = make_pipeline("Bloom blur (horizontal)", "fs_blur_h", format, 1, kReplace);
+    g_blurV = make_pipeline("Bloom blur (vertical)", "fs_blur_v", format, 1, kReplace);
+    g_down = make_pipeline("Far blur downsample", "fs_down", format, 1, kReplace);
+    g_aoPass = make_ao_pipeline(format);
     g_composite = {};
     g_farComposite = {};
+    g_aoApply = {};
     g_size = {};
   }
   if (!g_composite || samples != g_compositeSamples) {
-    g_composite = make_pipeline("Bloom composite", "fs_composite", format, samples, true);
+    g_composite = make_pipeline("Bloom composite", "fs_composite", format, samples, kAdd);
     g_compositeSamples = samples;
+  }
+  if (!g_aoApply || samples != g_aoSamples) {
+    g_aoApply = make_pipeline("Ambient occlusion apply", "fs_ao_apply", format, samples,
+                              g_aoDebug ? kReplace : kMultiply);
+    g_aoSamples = samples;
   }
   if (!g_farComposite || samples != g_farSamples) {
     g_farComposite = make_far_pipeline(format, samples);
@@ -296,6 +420,8 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
     g_view[i] = g_tex[i].CreateView();
     g_farTex[i] = g_device.CreateTexture(&descriptor);
     g_farView[i] = g_farTex[i].CreateView();
+    g_aoTex[i] = g_device.CreateTexture(&descriptor);
+    g_aoView[i] = g_aoTex[i].CreateView();
   }
 }
 
@@ -331,11 +457,12 @@ void draw(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::Render
   pass.Draw(3);
   pass.End();
 }
-void draw_far(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView, const wgpu::TextureView& target,
-              const wgpu::TextureView& resolve) {
+void draw_depth(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::RenderPipeline& pipeline,
+                const wgpu::TextureView& source, const wgpu::TextureView& depthView, const wgpu::TextureView& target,
+                const wgpu::TextureView& resolve, bool load) {
   const std::array entries{
       wgpu::BindGroupEntry{.binding = 0, .sampler = g_sampler},
-      wgpu::BindGroupEntry{.binding = 1, .textureView = g_farView[0]},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = source},
       wgpu::BindGroupEntry{.binding = 2, .textureView = depthView},
   };
   const wgpu::BindGroupDescriptor bindGroupDescriptor{
@@ -347,17 +474,18 @@ void draw_far(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthVie
   const std::array attachments{wgpu::RenderPassColorAttachment{
       .view = target,
       .resolveTarget = resolve,
-      .loadOp = wgpu::LoadOp::Load,
+      .loadOp = load ? wgpu::LoadOp::Load : wgpu::LoadOp::Clear,
       .storeOp = wgpu::StoreOp::Store,
+      .clearValue = {1.0, 1.0, 1.0, 1.0},
   }};
   const wgpu::RenderPassDescriptor descriptor{
-      .label = "Far blur composite",
+      .label = label,
       .colorAttachmentCount = attachments.size(),
       .colorAttachments = attachments.data(),
-      .timestampWrites = webgpu::gpu_prof::pass_writes("Far blur composite"),
+      .timestampWrites = webgpu::gpu_prof::pass_writes(label),
   };
   const auto pass = cmd.BeginRenderPass(&descriptor);
-  pass.SetPipeline(g_farComposite);
+  pass.SetPipeline(pipeline);
   pass.SetBindGroup(0, bindGroup, 0, nullptr);
   pass.Draw(3);
   pass.End();
@@ -375,6 +503,12 @@ void initialize() {
   g_farEnd = env_float("DOL_AURORA_FAR_BLUR_END", g_farEnd, g_farStart + 1.f, 1e9f);
   g_farAmount = env_float("DOL_AURORA_FAR_BLUR_AMOUNT", g_farAmount, 0.f, 1.f);
   g_farBackground = env_float("DOL_AURORA_FAR_BLUR_BACKGROUND", g_farBackground, 0.f, 1.f);
+  const char* ao = std::getenv("DOL_AURORA_AO");
+  g_ao.store(ao != nullptr && ao[0] == '1', std::memory_order_relaxed);
+  g_aoRadius = env_float("DOL_AURORA_AO_RADIUS", g_aoRadius, 0.1f, 1e6f);
+  g_aoStrength = env_float("DOL_AURORA_AO_STRENGTH", g_aoStrength, 0.f, 1.f);
+  const char* aoDebug = std::getenv("DOL_AURORA_AO_DEBUG");
+  g_aoDebug = aoDebug != nullptr && aoDebug[0] == '1';
   const char* farDebug = std::getenv("DOL_AURORA_FAR_BLUR_DEBUG");
   g_farDebug = farDebug != nullptr && farDebug[0] == '1';
 
@@ -415,6 +549,10 @@ void initialize() {
   farSource.code = kFarShader;
   const wgpu::ShaderModuleDescriptor farModuleDescriptor{.nextInChain = &farSource, .label = "Far blur"};
   g_farModule = g_device.CreateShaderModule(&farModuleDescriptor);
+  wgpu::ShaderSourceWGSL aoSource{};
+  aoSource.code = kAoShader;
+  const wgpu::ShaderModuleDescriptor aoModuleDescriptor{.nextInChain = &aoSource, .label = "Ambient occlusion"};
+  g_aoModule = g_device.CreateShaderModule(&aoModuleDescriptor);
   const std::array depthEntries{
       layoutEntries[0],
       layoutEntries[1],
@@ -436,7 +574,11 @@ void initialize() {
 }
 
 void shutdown() {
-  g_bright = g_blurH = g_blurV = g_composite = g_down = g_farComposite = {};
+  g_bright = g_blurH = g_blurV = g_composite = g_down = g_farComposite = g_aoPass = g_aoApply = {};
+  g_aoTex = {};
+  g_aoView = {};
+  g_aoSamples = 0;
+  g_aoModule = {};
   g_tex = {};
   g_view = {};
   g_farTex = {};
@@ -462,12 +604,26 @@ bool far_blur_enabled() noexcept { return g_farBlur.load(std::memory_order_relax
 
 void set_far_blur(bool enabled) noexcept { g_farBlur.store(enabled, std::memory_order_relaxed); }
 
-bool any_enabled() noexcept { return bloom_enabled() || far_blur_enabled(); }
+bool ambient_occlusion_enabled() noexcept { return g_ao.load(std::memory_order_relaxed) && webgpu::g_hasCoreFeatures; }
+
+void set_ambient_occlusion(bool enabled) noexcept { g_ao.store(enabled, std::memory_order_relaxed); }
+
+bool any_enabled() noexcept { return bloom_enabled() || far_blur_enabled() || ambient_occlusion_enabled(); }
 
 void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
             const wgpu::Extent3D& size, wgpu::TextureFormat format, const wgpu::TextureView& dst,
             const wgpu::TextureView& resolve, uint32_t msaaSamples) {
-  // The far blur needs single-sample depth (the depth buffer is multisampled with MSAA).
+  // Ambient occlusion and the far blur need single-sample depth (the depth
+  // buffer is multisampled with MSAA).
+  if (ambient_occlusion_enabled() && g_module && depthView && msaaSamples == 1 && size.width >= 4 && size.height >= 4) {
+    const webgpu::gpu_prof::Zone zone{cmd, "Ambient occlusion"};
+    ensure_targets(size, format, msaaSamples);
+    draw_depth(cmd, "Ambient occlusion", g_aoPass, g_aoView[1], depthView, g_aoView[0], nullptr, false);
+    draw(cmd, "Ambient occlusion blur (horizontal)", g_blurH, g_aoView[0], g_aoView[1], false);
+    draw(cmd, "Ambient occlusion blur (vertical)", g_blurV, g_aoView[1], g_aoView[0], false);
+    // With DOL_AURORA_AO_DEBUG=1 the occlusion replaces the scene.
+    draw(cmd, "Ambient occlusion apply", g_aoApply, g_aoView[0], dst, true, resolve);
+  }
   if (far_blur_enabled() && g_module && depthView && msaaSamples == 1 && size.width >= 4 && size.height >= 4) {
     const webgpu::gpu_prof::Zone zone{cmd, "Far blur"};
     ensure_targets(size, format, msaaSamples);
@@ -476,7 +632,7 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
       draw(cmd, "Far blur (horizontal)", g_blurH, g_farView[0], g_farView[1], false);
       draw(cmd, "Far blur (vertical)", g_blurV, g_farView[1], g_farView[0], false);
     }
-    draw_far(cmd, depthView, dst, resolve);
+    draw_depth(cmd, "Far blur composite", g_farComposite, g_farView[0], depthView, dst, resolve, true);
   }
   if (bloom_enabled())
     encode_bloom(cmd, scene, size, format, dst, resolve, msaaSamples);
@@ -502,3 +658,5 @@ void encode_bloom(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scen
 void aurora_set_bloom(bool enabled) { aurora::gfx::post_fx::set_bloom(enabled); }
 
 void aurora_set_far_blur(bool enabled) { aurora::gfx::post_fx::set_far_blur(enabled); }
+
+void aurora_set_ambient_occlusion(bool enabled) { aurora::gfx::post_fx::set_ambient_occlusion(enabled); }

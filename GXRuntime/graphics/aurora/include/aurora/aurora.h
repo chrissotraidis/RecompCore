@@ -170,6 +170,10 @@ void aurora_set_bloom(bool enabled);
    sharp, before bloom. Takes effect at the next frame. DOL_AURORA_FAR_BLUR=1
    sets the starting value. */
 void aurora_set_far_blur(bool enabled);
+/* Ambient occlusion: creases and contact areas darkened, from the scene's
+   depth, before the far blur and bloom. Takes effect at the next frame.
+   DOL_AURORA_AO=1 sets the starting value. */
+void aurora_set_ambient_occlusion(bool enabled);
 /* A frames-a-second counter at the top of the window (with the game's own
    rate beside it when in-between frames are on). DOL_AURORA_SHOW_FPS=1 sets
    the starting value. */
