@@ -38,6 +38,12 @@
 // Edge light: a warm rim on the sunlit outline of what is near the camera,
 // toward the same sun. DOL_AURORA_EDGE_LIGHT_STRENGTH (default 0.4). Off unless
 // aurora_set_edge_light(true).
+//
+// Torch light: the game's point lights (aurora_set_point_lights: up to 16 of
+// x, y, z, radius, r, g, b, flicker) glow on the surfaces around them.
+// DOL_AURORA_TORCH_LIGHT_STRENGTH (default 0.35) and _REACH (the glow's radius,
+// times the game's lighting radius, default 3). Off unless
+// aurora_set_torch_light(true).
 namespace aurora::gfx::post_fx {
 void initialize();
 void shutdown();
@@ -47,6 +53,9 @@ bool far_blur_enabled() noexcept;
 void set_far_blur(bool enabled) noexcept;
 bool ambient_occlusion_enabled() noexcept;
 void set_ambient_occlusion(bool enabled) noexcept;
+bool torch_light_enabled() noexcept;
+void set_torch_light(bool enabled) noexcept;
+void set_point_lights(const float* lights, uint32_t count) noexcept;
 bool edge_light_enabled() noexcept;
 void set_edge_light(bool enabled) noexcept;
 bool sun_shadows_enabled() noexcept;
@@ -58,7 +67,7 @@ void set_world_view(const float invView[12], float tanHalfFovy, float aspect, fl
                     float seconds) noexcept;
 bool any_enabled() noexcept;
 // Every effect that is on, in order (ambient occlusion, sun shadows, edge
-// light, cloud shadows, far blur, bloom);
+// light, torch light, cloud shadows, far blur, bloom);
 // depthView: the EFB's depth.
 void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
             const wgpu::Extent3D& size, wgpu::TextureFormat format, const wgpu::TextureView& dst,
