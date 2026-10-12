@@ -2681,6 +2681,22 @@ static void test_guest_memory_dirty_epochs(void) {
     assert(epoch == 2u);
     assert(!dol_guest_memory_dirty_epoch(0x82000000u, 1u, &epoch));
     assert(!dol_guest_memory_dirty_epoch(0u, 0u, &epoch));
+    /* A cache flush moves the dirty epoch only; a write moves both. */
+    dol_guest_memory_dirty_reset();
+    u64 write_epoch = 0u;
+    dol_guest_memory_dirty_mark(0x80004000u, 0x20u);
+    assert(dol_guest_memory_write_epoch(0x80004000u, 0x20u, &write_epoch));
+    const u64 written = write_epoch;
+    assert(written != 0u);
+    dol_guest_memory_flush_mark(0x80004040u, 0x20u);
+    assert(dol_guest_memory_dirty_epoch(0x80004000u, 0x20u, &epoch));
+    assert(epoch > written);
+    assert(dol_guest_memory_write_epoch(0x80004000u, 0x20u, &write_epoch));
+    assert(write_epoch == written);
+    dol_guest_memory_dirty_mark(0x80004080u, 0x20u);
+    assert(dol_guest_memory_write_epoch(0x80004000u, 0x20u, &write_epoch));
+    assert(write_epoch > written);
+    assert(!dol_guest_memory_write_epoch(0x82000000u, 1u, &write_epoch));
 }
 
 int main(void) {

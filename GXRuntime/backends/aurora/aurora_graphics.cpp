@@ -43,6 +43,8 @@ void reset_texture_cache();
 void note_frame_presented();
 void set_texture_dirty_epoch_observer(
     bool (*observer)(uint32_t, uint32_t, uint64_t*));
+void set_efb_copy_epoch_observer(
+    bool (*observer)(uint32_t, uint32_t, uint64_t*));
 unsigned long long texture_upload_count();
 } // namespace aurora::gfx::gxcore
 #endif
@@ -58,6 +60,10 @@ std::atomic<bool> g_worker_mode{false};
 bool core_texture_dirty_epoch(uint32_t address, uint32_t size,
                               uint64_t* epoch) {
     return dol_guest_memory_dirty_epoch(address, size, epoch);
+}
+
+bool core_efb_copy_epoch(uint32_t address, uint32_t size, uint64_t* epoch) {
+    return dol_guest_memory_write_epoch(address, size, epoch);
 }
 
 void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
