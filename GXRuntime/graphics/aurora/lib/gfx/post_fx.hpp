@@ -24,6 +24,11 @@
 // depth alone, at a quarter of the size, blurred and multiplied into the
 // scene. DOL_AURORA_AO_RADIUS (near-plane units, default 30) and _STRENGTH
 // (default 0.6). Off unless DOL_AURORA_AO=1 or aurora_set_ambient_occlusion(true).
+//
+// Cloud shadows: soft drifting shadows on the sea and the land, from the
+// camera the game passes in (aurora_set_world_view) and the scene's depth.
+// DOL_AURORA_CLOUD_SHADOWS_STRENGTH (default 0.28) and _SCALE (world units
+// across a cloud, default 7000). Off unless aurora_set_cloud_shadows(true).
 namespace aurora::gfx::post_fx {
 void initialize();
 void shutdown();
@@ -33,8 +38,13 @@ bool far_blur_enabled() noexcept;
 void set_far_blur(bool enabled) noexcept;
 bool ambient_occlusion_enabled() noexcept;
 void set_ambient_occlusion(bool enabled) noexcept;
+bool cloud_shadows_enabled() noexcept;
+void set_cloud_shadows(bool enabled) noexcept;
+void set_world_view(const float invView[12], float tanHalfFovy, float aspect, float nearPlane, float seaLevel,
+                    float seconds) noexcept;
 bool any_enabled() noexcept;
-// Every effect that is on, in order (ambient occlusion, far blur, bloom);
+// Every effect that is on, in order (ambient occlusion, cloud shadows, far
+// blur, bloom);
 // depthView: the EFB's depth.
 void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
             const wgpu::Extent3D& size, wgpu::TextureFormat format, const wgpu::TextureView& dst,
