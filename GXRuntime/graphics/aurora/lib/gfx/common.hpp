@@ -375,6 +375,10 @@ Range push_texture_data(const uint8_t* data, uint32_t bytesPerRow, uint32_t rows
 
 template <typename State>
 const State& get_state();
+// Whether the next draw has an orthographic projection (the HUD, menus), for
+// a draw whose projection is not in the legacy GX state (post_fx).
+void set_next_draw_flat(bool flat) noexcept;
+
 template <typename DrawData>
 void push_draw_command(DrawData data);
 template <typename DrawData>

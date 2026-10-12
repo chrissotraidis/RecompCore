@@ -2221,6 +2221,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     ++g_mergedDrawCallCount;
     return true;
   }
+  set_next_draw_flat(plan.constants.projection[3][3] == 1.f);
   push_draw_command(DrawData{
       .pipeline = pipeline,
       .depthPipeline = depthPipeline,
