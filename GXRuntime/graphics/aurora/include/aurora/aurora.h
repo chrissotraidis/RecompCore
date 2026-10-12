@@ -174,6 +174,16 @@ void aurora_set_far_blur(bool enabled);
    depth, before the far blur and bloom. Takes effect at the next frame.
    DOL_AURORA_AO=1 sets the starting value. */
 void aurora_set_ambient_occlusion(bool enabled);
+/* Cloud shadows on the sea and the land, from the camera last passed to
+   aurora_set_world_view. Takes effect at the next frame. */
+void aurora_set_cloud_shadows(bool enabled);
+/* The game's camera, for effects that need each pixel's place in the world:
+   inv_view, the inverse view matrix (view to world) as three rows of four;
+   tan_half_fovy, the tangent of half the vertical field of view; aspect;
+   near_plane, the projection's near distance; sea_level, the height of the
+   world's sea; seconds, the game's time. */
+void aurora_set_world_view(const float inv_view[12], float tan_half_fovy, float aspect, float near_plane,
+                           float sea_level, float seconds);
 /* A frames-a-second counter at the top of the window (with the game's own
    rate beside it when in-between frames are on). DOL_AURORA_SHOW_FPS=1 sets
    the starting value. */
