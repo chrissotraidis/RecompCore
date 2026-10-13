@@ -778,7 +778,20 @@ static std::string CreateSysDirectoryPath()
 #endif
 #endif
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(LINUX_LOCAL_DEV) && \
+    !defined(__ENVIRONMENT_IPHONE_OS_VERSION_MIN_REQUIRED__) && \
+    !defined(__ENVIRONMENT_TV_OS_VERSION_MIN_REQUIRED__)
+  // Relocatable desktop builds keep Sys beside the executable, including inside
+  // Contents/MacOS. GetBundleDirectory() instead points at the app bundle root.
+  uint32_t size = 0;
+  _NSGetExecutablePath(nullptr, &size);
+  std::string executable_path(size, '\0');
+  if (_NSGetExecutablePath(executable_path.data(), &size) != 0)
+    return {};
+  executable_path.resize(std::strlen(executable_path.c_str()));
+  const std::string sys_directory =
+      PathToString(StringToPath(executable_path).parent_path() / SYSDATA_DIR) + DIR_SEP;
+#elif defined(__APPLE__)
   const std::string sys_directory = GetBundleDirectory() + DIR_SEP SYSDATA_DIR DIR_SEP;
 #elif defined(_WIN32) || defined(LINUX_LOCAL_DEV)
   const std::string sys_directory = GetExeDirectory() + DIR_SEP SYSDATA_DIR DIR_SEP;
