@@ -66,6 +66,8 @@ void write_texture(TextureRef& ref, ArrayRef<uint8_t> data) noexcept;
 // Caller has submitted the texture's writes. Copy on the render worker and
 // wait for GPU mapping; returns empty on unsupported format or map failure.
 std::vector<uint8_t> read_texture_rgba8(const TextureHandle& texture);
+std::vector<uint8_t> read_texture_rgba8(const wgpu::Texture& texture, wgpu::Extent3D size,
+                                        wgpu::TextureFormat format);
 }; // namespace aurora::gfx
 
 struct GXTexObj_ {

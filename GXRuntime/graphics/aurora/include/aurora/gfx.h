@@ -54,6 +54,16 @@ void aurora_pump_framebuffer_readback();
  */
 bool aurora_peek_z(uint16_t x, uint16_t y, uint32_t* z);
 
+/*
+ * EFB color peek for a translated game, whose GXPeekARGB reads
+ * 0xC8000000 + (y << 12) + (x << 2). The Picto Box paints each actor's slot
+ * into alpha and reads it back in the same frame, so this copies the EFB once
+ * on the first peek (after the caller has drained the FIFO) and answers the
+ * rest from that copy. The word is 0xAARRGGBB. False before a copy exists.
+ */
+bool aurora_color_peek_ready(void);
+bool aurora_peek_argb(uint16_t x, uint16_t y, uint32_t* color);
+
 #ifdef __cplusplus
 }
 #endif

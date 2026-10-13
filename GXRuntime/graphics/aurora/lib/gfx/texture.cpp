@@ -221,7 +221,13 @@ TextureHandle new_conv_texture(uint32_t width, uint32_t height, u32 gxFormat, co
 std::vector<uint8_t> read_texture_rgba8(const TextureHandle& texture) {
   if (!texture || render_worker::is_worker_thread())
     return {};
-  const auto format = texture->format;
+  return read_texture_rgba8(texture->texture, texture->size, texture->format);
+}
+
+std::vector<uint8_t> read_texture_rgba8(const wgpu::Texture& texture, wgpu::Extent3D size,
+                                        wgpu::TextureFormat format) {
+  if (!texture || render_worker::is_worker_thread())
+    return {};
   const bool bgra = format == wgpu::TextureFormat::BGRA8Unorm ||
                     format == wgpu::TextureFormat::BGRA8UnormSrgb;
   if (!bgra && format != wgpu::TextureFormat::RGBA8Unorm &&
@@ -235,13 +241,13 @@ std::vector<uint8_t> read_texture_rgba8(const TextureHandle& texture) {
   };
   auto result = std::make_shared<Readback>();
   // Keep all resources in the queued work/callback if the caller times out.
-  render_worker::enqueue_work([texture, result, bgra] {
-    const auto width = texture->size.width, height = texture->size.height;
+  render_worker::enqueue_work([texture, size, result, bgra] {
+    const auto width = size.width, height = size.height;
     const uint32_t stride = (width * 4u + 255u) & ~255u;
-    const uint64_t size = uint64_t(stride) * height;
+    const uint64_t byteSize = uint64_t(stride) * height;
     const wgpu::BufferDescriptor desc{
         .label = "GX copy RAM readback", .usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst,
-        .size = size};
+        .size = byteSize};
     auto buffer = g_device.CreateBuffer(&desc);
     auto encoder = g_device.CreateCommandEncoder();
     if (!buffer || !encoder) {
@@ -250,17 +256,18 @@ std::vector<uint8_t> read_texture_rgba8(const TextureHandle& texture) {
       result->cv.notify_all();
       return;
     }
-    const wgpu::TexelCopyTextureInfo src{.texture = texture->texture};
+    const wgpu::TexelCopyTextureInfo src{.texture = texture};
     const wgpu::TexelCopyBufferInfo dst{
         .layout = {.bytesPerRow = stride, .rowsPerImage = height}, .buffer = buffer};
-    encoder.CopyTextureToBuffer(&src, &dst, &texture->size);
+    const wgpu::Extent3D copySize{.width = width, .height = height, .depthOrArrayLayers = 1};
+    encoder.CopyTextureToBuffer(&src, &dst, &copySize);
     const auto commands = encoder.Finish();
     g_queue.Submit(1, &commands);
-    buffer.MapAsync(wgpu::MapMode::Read, 0, size, wgpu::CallbackMode::AllowSpontaneous,
-        [result, buffer, size, stride, width, height, bgra](wgpu::MapAsyncStatus status, wgpu::StringView) {
+    buffer.MapAsync(wgpu::MapMode::Read, 0, byteSize, wgpu::CallbackMode::AllowSpontaneous,
+        [result, buffer, byteSize, stride, width, height, bgra](wgpu::MapAsyncStatus status, wgpu::StringView) {
           std::lock_guard lock(result->mutex);
           if (status == wgpu::MapAsyncStatus::Success) {
-            const auto* data = static_cast<const uint8_t*>(buffer.GetConstMappedRange(0, size));
+            const auto* data = static_cast<const uint8_t*>(buffer.GetConstMappedRange(0, byteSize));
             if (data != nullptr) {
               result->rgba.resize(size_t(width) * height * 4u);
               for (uint32_t y = 0; y < height; ++y) {
