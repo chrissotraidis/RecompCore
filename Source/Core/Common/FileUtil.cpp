@@ -789,8 +789,12 @@ static std::string CreateSysDirectoryPath()
   if (_NSGetExecutablePath(executable_path.data(), &size) != 0)
     return {};
   executable_path.resize(std::strlen(executable_path.c_str()));
+  std::error_code error;
+  const auto resolved_path = fs::canonical(StringToPath(executable_path), error);
+  if (error)
+    return {};
   const std::string sys_directory =
-      PathToString(StringToPath(executable_path).parent_path() / SYSDATA_DIR) + DIR_SEP;
+      PathToString(resolved_path.parent_path() / SYSDATA_DIR) + DIR_SEP;
 #elif defined(__APPLE__)
   const std::string sys_directory = GetBundleDirectory() + DIR_SEP SYSDATA_DIR DIR_SEP;
 #elif defined(_WIN32) || defined(LINUX_LOCAL_DEV)
