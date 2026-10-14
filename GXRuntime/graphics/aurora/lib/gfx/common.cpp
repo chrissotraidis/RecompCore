@@ -22,11 +22,14 @@
 #include "tex_palette_conv.hpp"
 #include "texture_replacement.hpp"
 #include "texture.hpp"
+#include "../dolphin/vi/vi_internal.hpp"
+#include "../gx/gx.hpp"
 #include "../window.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -41,6 +44,8 @@
 
 namespace aurora::gfx {
 static Module Log("aurora::gfx");
+
+void color_peek_reset() noexcept;
 
 using webgpu::g_device;
 using webgpu::g_instance;
@@ -1535,6 +1540,10 @@ bool begin_frame(bool preserveEfb) {
   frame.frameIndex = g_frameIndex;
   frame.stagingBuffer = *stagingSlot;
   frame.continuation = preserveEfb;
+  // A real frame starts empty. A continuation (the picto id-buffer read splits
+  // the frame) keeps the snapshot just taken of this frame's EFB.
+  if (!preserveEfb)
+    color_peek_reset();
   g_interpJobRanges[frameSlot].clear();
   g_batchDraws[frameSlot].clear();
   if (preserveEfb) {
@@ -2907,6 +2916,72 @@ void insert_debug_marker(std::string label) {
 #endif
 }
 
+// One copy of the EFB color target for the Picto Box's actor-id pass. The guest
+// paints slot ids into alpha (color writes off) and then reads every viewfinder
+// pixel; copying per pixel would submit the frame thousands of times.
+struct ColorPeek {
+  bool valid = false;
+  bool attempted = false;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  float offsetX = 0.f;
+  float offsetY = 0.f;
+  float scaleX = 1.f;
+  float scaleY = 1.f;
+  std::vector<uint8_t> rgba;
+};
+ColorPeek g_colorPeek;
+
+void color_peek_reset() noexcept { g_colorPeek = {}; }
+
+static bool color_peek_capture() {
+  g_colorPeek.attempted = true;
+  if (g_recordingFrame != nullptr && !segment_frame()) {
+    Log.warn("Picto actor-id peek: could not submit the EFB");
+    return false;
+  }
+  const auto& fb = webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved
+                                                            : webgpu::g_frameBuffer;
+  if (!fb.texture || fb.size.width == 0 || fb.size.height == 0) {
+    Log.warn("Picto actor-id peek: no EFB color target");
+    return false;
+  }
+  auto rgba = read_texture_rgba8(fb.texture, fb.size, fb.format);
+  if (rgba.size() != static_cast<size_t>(fb.size.width) * fb.size.height * 4u) {
+    Log.warn("Picto actor-id peek: EFB readback failed");
+    return false;
+  }
+  g_colorPeek.rgba = std::move(rgba);
+  g_colorPeek.width = fb.size.width;
+  g_colorPeek.height = fb.size.height;
+  g_colorPeek.scaleX = 1.f;
+  g_colorPeek.scaleY = 1.f;
+  g_colorPeek.offsetX = 0.f;
+  g_colorPeek.offsetY = 0.f;
+  if (gx::g_gxState.viewportPolicy != AURORA_VIEWPORT_NATIVE) {
+    const auto logical = vi::configured_fb_size();
+    if (logical.x != 0 && logical.y != 0) {
+      const float scaleX = static_cast<float>(fb.size.width) / static_cast<float>(logical.x);
+      const float scaleY = static_cast<float>(fb.size.height) / static_cast<float>(logical.y);
+      const bool stretch = gx::g_gxState.viewportPolicy == AURORA_VIEWPORT_STRETCH;
+      const float scale = std::min(scaleX, scaleY);
+      g_colorPeek.scaleX = stretch ? scaleX : scale;
+      g_colorPeek.scaleY = stretch ? scaleY : scale;
+      g_colorPeek.offsetX = stretch ? 0.f
+                                    : (static_cast<float>(fb.size.width) -
+                                       static_cast<float>(logical.x) * g_colorPeek.scaleX) *
+                                          0.5f;
+      g_colorPeek.offsetY = stretch ? 0.f
+                                    : (static_cast<float>(fb.size.height) -
+                                       static_cast<float>(logical.y) * g_colorPeek.scaleY) *
+                                          0.5f;
+    }
+  }
+  g_colorPeek.valid = true;
+  Log.info("Picto actor-id peek: captured {}x{}", g_colorPeek.width, g_colorPeek.height);
+  return true;
+}
+
 } // namespace aurora::gfx
 
 void aurora::gfx::push_debug_group(std::string label) {
@@ -2939,6 +3014,34 @@ bool aurora_take_framebuffer_readback(const uint8_t** rgba, uint32_t* width, uin
 }
 
 void aurora_pump_framebuffer_readback() { aurora::gfx::enqueue_process_events(); }
+
+bool aurora_color_peek_ready(void) {
+  return aurora::gfx::g_colorPeek.valid || aurora::gfx::g_colorPeek.attempted;
+}
+
+bool aurora_peek_argb(uint16_t x, uint16_t y, uint32_t* color) {
+  using aurora::gfx::g_colorPeek;
+  if (!g_colorPeek.valid && !g_colorPeek.attempted && !aurora::gfx::color_peek_capture())
+    return false;
+  if (!g_colorPeek.valid || g_colorPeek.scaleX <= 0.f || g_colorPeek.scaleY <= 0.f)
+    return false;
+  const auto sourceX = static_cast<int32_t>(
+      std::floor(g_colorPeek.offsetX + (static_cast<float>(x) + 0.5f) * g_colorPeek.scaleX));
+  const auto sourceY = static_cast<int32_t>(
+      std::floor(g_colorPeek.offsetY + (static_cast<float>(y) + 0.5f) * g_colorPeek.scaleY));
+  if (sourceX < 0 || sourceY < 0 || sourceX >= static_cast<int32_t>(g_colorPeek.width) ||
+      sourceY >= static_cast<int32_t>(g_colorPeek.height))
+    return false;
+  const size_t pixel = (static_cast<size_t>(sourceY) * g_colorPeek.width + static_cast<uint32_t>(sourceX)) * 4u;
+  const uint8_t r = g_colorPeek.rgba[pixel];
+  const uint8_t g = g_colorPeek.rgba[pixel + 1u];
+  const uint8_t b = g_colorPeek.rgba[pixel + 2u];
+  const uint8_t a = g_colorPeek.rgba[pixel + 3u];
+  if (color != nullptr)
+    *color = (static_cast<uint32_t>(a) << 24) | (static_cast<uint32_t>(r) << 16) |
+             (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
+  return true;
+}
 
 bool aurora_peek_z(uint16_t x, uint16_t y, uint32_t* z) {
   aurora::gfx::depth_peek::request_snapshot();
