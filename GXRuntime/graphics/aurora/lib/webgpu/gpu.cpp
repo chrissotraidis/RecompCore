@@ -1126,11 +1126,19 @@ void release_surface() noexcept {
   }
 }
 
+// The window's newest size in pixels (width << 32 | height), 0 for none:
+// window::follow_window_size between the game's frames, and every resize
+// here, so a resize from the event path (with the game held by a menu, the
+// retrace service that follows the window does not run) is never undone by
+// follow_surface_size going back to an older cached size.
+static std::atomic_uint64_t g_followSize{0};
+
 static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight,
                                       bool force) {
   if (!g_surface || !g_device || width == 0 || height == 0 || nativeHeight == 0 || nativeWidth == 0) {
     return;
   }
+  g_followSize.store(static_cast<uint64_t>(nativeWidth) << 32 | nativeHeight, std::memory_order_relaxed);
   const bool sizeChanged = g_graphicsConfig.surfaceConfiguration.width != nativeWidth ||
                            g_graphicsConfig.surfaceConfiguration.height != nativeHeight ||
                            g_frameBuffer.size.width != width || g_frameBuffer.size.height != height;
@@ -1161,9 +1169,6 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
   g_depthBuffer = create_depth_texture(width, height);
   g_CopyBindGroup = create_copy_bind_group(present_source());
 }
-
-// The window's newest size in pixels (width << 32 | height), 0 for none.
-static std::atomic_uint64_t g_followSize{0};
 
 void set_follow_size(uint32_t nativeWidth, uint32_t nativeHeight) noexcept {
   g_followSize.store(static_cast<uint64_t>(nativeWidth) << 32 | nativeHeight, std::memory_order_relaxed);
