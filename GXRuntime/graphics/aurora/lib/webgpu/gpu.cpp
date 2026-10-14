@@ -41,6 +41,7 @@ static Module Log("aurora::gpu");
 wgpu::Device g_device;
 wgpu::Queue g_queue;
 wgpu::Surface g_surface;
+std::atomic_uint32_t g_surfaceConfigures{0};
 wgpu::BackendType g_backendType;
 GraphicsConfig g_graphicsConfig;
 TextureWithSampler g_frameBuffer;
@@ -1140,18 +1141,53 @@ static void resize_swapchain_internal(uint32_t width, uint32_t height, uint32_t 
     gx::clear_copy_texture_cache();
     gfx::clear_caches();
   }
-  g_graphicsConfig.surfaceConfiguration.width = nativeWidth;
-  g_graphicsConfig.surfaceConfiguration.height = nativeHeight;
-  auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
-  surfaceConfiguration.device = g_device;
-  {
-    window::SurfaceLock surfaceLock;
-    g_surface.Configure(&surfaceConfiguration);
+  // The render worker may have configured the surface at this size already
+  // (follow_surface_size); then only the frame buffers change.
+  const bool surfaceChanged = g_graphicsConfig.surfaceConfiguration.width != nativeWidth ||
+                              g_graphicsConfig.surfaceConfiguration.height != nativeHeight;
+  if (force || surfaceChanged) {
+    g_graphicsConfig.surfaceConfiguration.width = nativeWidth;
+    g_graphicsConfig.surfaceConfiguration.height = nativeHeight;
+    auto surfaceConfiguration = g_graphicsConfig.surfaceConfiguration;
+    surfaceConfiguration.device = g_device;
+    {
+      window::SurfaceLock surfaceLock;
+      g_surface.Configure(&surfaceConfiguration);
+    }
+    g_surfaceConfigures.fetch_add(1, std::memory_order_relaxed);
   }
   g_frameBuffer = create_render_texture(width, height, true);
   g_frameBufferResolved = create_render_texture(width, height, false);
   g_depthBuffer = create_depth_texture(width, height);
   g_CopyBindGroup = create_copy_bind_group(present_source());
+}
+
+// The window's newest size in pixels (width << 32 | height), 0 for none.
+static std::atomic_uint64_t g_followSize{0};
+
+void set_follow_size(uint32_t nativeWidth, uint32_t nativeHeight) noexcept {
+  g_followSize.store(static_cast<uint64_t>(nativeWidth) << 32 | nativeHeight, std::memory_order_relaxed);
+}
+
+bool follow_surface_size() noexcept {
+  const uint64_t size = g_followSize.load(std::memory_order_relaxed);
+  const auto nativeWidth = static_cast<uint32_t>(size >> 32);
+  const auto nativeHeight = static_cast<uint32_t>(size);
+  auto& config = g_graphicsConfig.surfaceConfiguration;
+  if (!g_surface || !g_device || nativeWidth == 0 || nativeHeight == 0 ||
+      (config.width == nativeWidth && config.height == nativeHeight)) {
+    return false;
+  }
+  config.width = nativeWidth;
+  config.height = nativeHeight;
+  auto surfaceConfiguration = config;
+  surfaceConfiguration.device = g_device;
+  {
+    window::SurfaceLock surfaceLock;
+    g_surface.Configure(&surfaceConfiguration);
+  }
+  g_surfaceConfigures.fetch_add(1, std::memory_order_relaxed);
+  return true;
 }
 
 bool refresh_surface(bool recreate) {

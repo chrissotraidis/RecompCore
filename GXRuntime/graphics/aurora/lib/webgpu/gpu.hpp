@@ -6,6 +6,7 @@
 #include "wgpu.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 
 struct SDL_Window;
@@ -42,6 +43,8 @@ struct Viewport {
 extern wgpu::Device g_device;
 extern wgpu::Queue g_queue;
 extern wgpu::Surface g_surface;
+// How many times the surface has been configured (read on the render worker).
+extern std::atomic_uint32_t g_surfaceConfigures;
 extern wgpu::BackendType g_backendType;
 extern GraphicsConfig g_graphicsConfig;
 extern TextureWithSampler g_frameBuffer;
@@ -66,6 +69,13 @@ void shutdown();
 void release_surface() noexcept;
 bool refresh_surface(bool recreate = true);
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t nativeWidth, uint32_t nativeHeight, bool force = false);
+// The window's newest size (window::follow_window_size, the thread that polls
+// events), and the render worker taking it: the surface alone is configured at
+// it before the next texture is acquired, the frame buffers left as they are
+// (the present stretches them to it until resize_swapchain sizes them too).
+// True when the surface changed.
+void set_follow_size(uint32_t nativeWidth, uint32_t nativeHeight) noexcept;
+bool follow_surface_size() noexcept;
 TextureWithSampler create_render_texture(uint32_t width, uint32_t height, bool multisampled);
 const TextureWithSampler& present_source() noexcept;
 // Render worker: presents `source` in place of the frame buffer while set
