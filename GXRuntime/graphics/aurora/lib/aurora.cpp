@@ -328,6 +328,28 @@ static void draw_fps_overlay() {
 
 static std::atomic_bool g_presentSuppressed{false};
 
+// The surface configure count when its texture was last Lost (render worker
+// only), or kNotLost, and how many times a Lost surface has been configured
+// again since the last frame that had a texture.
+constexpr uint32_t kNotLost = UINT32_MAX;
+static uint32_t g_lostAtConfigure = kNotLost;
+static uint32_t g_lostReconfigures = 0;
+static uint32_t g_lostWaits = 0;
+// A window dragged to a new size can lose the surface again before the frame
+// after its reconfigure: each of those is a new loss, not a surface that stays
+// lost, so it is only released after this many configures in a row without a
+// frame (#325).
+constexpr uint32_t kLostReconfigureLimit = 30;
+// How many more times a Lost or Outdated texture is asked for in the same
+// frame, and how many times that has happened (render worker only).
+constexpr int kAcquireRetries = 2;
+static uint64_t g_acquireRetries = 0;
+static uint64_t g_acquireRecovered = 0;
+// The configure count when a suboptimal texture last asked for a configure.
+static uint32_t g_suboptimalAtConfigure = kNotLost;
+// The configure count at the last texture acquired (render worker only).
+static uint32_t g_configuresAtAcquire = 0;
+
 void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
@@ -353,6 +375,7 @@ void end_frame() noexcept {
 
   gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
                   imguiDrawData = std::move(imguiDrawData)](wgpu::CommandEncoder& encoder) {
+    auto presentViewport = viewport;
     wgpu::Texture currentTexture;
     wgpu::TextureView currentView;
     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
@@ -365,19 +388,64 @@ void end_frame() noexcept {
       window::SurfaceLock surfaceLock;
       if (!suppressed && !occluded && window::is_presentable() && g_surface) {
         ZoneScopedN("Acquire texture");
+        // The window's newest size first (Vulkan, window::follow_window_size):
+        // the picture is placed in the surface at its new size.
+        webgpu::follow_surface_size();
+        presentViewport = webgpu::calculate_present_viewport(
+            webgpu::g_graphicsConfig.surfaceConfiguration.width, webgpu::g_graphicsConfig.surfaceConfiguration.height,
+            webgpu::present_source().size.width, webgpu::present_source().size.height);
         wgpu::SurfaceTexture surfaceTexture;
         const auto acquireStart = std::chrono::steady_clock::now();
         g_surface.GetCurrentTexture(&surfaceTexture);
+        // While a window is being resized, Vulkan's swapchain goes out of date
+        // with every step. Dawn rebuilds it at the window's size and acquires
+        // again, and reports Lost when the window has changed again in
+        // between. Asking again rebuilds it at the newest size, and the frame
+        // is drawn (stretched by Dawn until the main thread resizes the frame
+        // buffers) instead of skipped, which left the window's old contents
+        // trailing behind its edges for the whole drag (#325).
+        bool retried = false;
+        for (int retry = 0; retry < kAcquireRetries &&
+                            (surfaceTexture.status == wgpu::SurfaceGetCurrentTextureStatus::Lost ||
+                             surfaceTexture.status == wgpu::SurfaceGetCurrentTextureStatus::Outdated);
+             ++retry) {
+          surfaceTexture = {};
+          g_surface.GetCurrentTexture(&surfaceTexture);
+          ++g_acquireRetries;
+          retried = true;
+          if (surfaceTexture.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal ||
+              surfaceTexture.status == wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
+            if (++g_acquireRecovered % 50 == 1)
+              Log.info("Surface texture acquired on a retry ({} of {} retries)", g_acquireRecovered,
+                       g_acquireRetries);
+          }
+        }
         const auto acquireMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                    std::chrono::steady_clock::now() - acquireStart)
                                    .count();
         if (acquireMs >= 30)
           std::fprintf(stderr, "[render-slow] acquire-drawable ms=%lld\n", static_cast<long long>(acquireMs));
-        // Every drawable still queued behind the GPU's work: fewer in-between frames.
-        if (acquireMs >= 20)
+        // Every drawable still queued behind the GPU's work: fewer in-between
+        // frames. Not the first texture of a surface configured since the last
+        // one, or one asked for again: that wait is the driver making the new
+        // swapchain, and it turned Smooth Motion's in-between frames off for 3 s
+        // after every step of a window being resized (#325).
+        const uint32_t configures = webgpu::g_surfaceConfigures.load(std::memory_order_relaxed);
+        const bool newSwapchain = configures != g_configuresAtAcquire || retried;
+        g_configuresAtAcquire = configures;
+        if (acquireMs >= 20 && !newSwapchain)
           gfx::note_render_overload();
         surfaceStatus = surfaceTexture.status;
-        if (surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal) {
+        if (surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal ||
+            surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
+          g_lostAtConfigure = kNotLost;
+          g_lostReconfigures = 0;
+          g_lostWaits = 0;
+        }
+        // A suboptimal texture can still be presented: it is drawn, and the
+        // surface is configured again after it (below).
+        if (surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal ||
+            surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
           currentTexture = std::move(surfaceTexture.texture);
           currentView = currentTexture.CreateView();
         }
@@ -390,7 +458,7 @@ void end_frame() noexcept {
       if (rmlBindGroup && !rmlOverlay) {
         presentBindGroup = rmlBindGroup;
       } else {
-        const auto& resampledSource = webgpu::resample_present_source(encoder, viewport);
+        const auto& resampledSource = webgpu::resample_present_source(encoder, presentViewport);
         presentBindGroup = webgpu::create_copy_bind_group(resampledSource);
       }
       {
@@ -411,7 +479,7 @@ void end_frame() noexcept {
         // Copy EFB -> XFB (swapchain)
         pass.SetPipeline(webgpu::g_CopyPipeline);
         pass.SetBindGroup(0, presentBindGroup, 0, nullptr);
-        set_present_viewport(pass, viewport, webgpu::g_graphicsConfig.surfaceConfiguration.width,
+        set_present_viewport(pass, presentViewport, webgpu::g_graphicsConfig.surfaceConfiguration.width,
                              webgpu::g_graphicsConfig.surfaceConfiguration.height);
 
         pass.Draw(3);
@@ -470,6 +538,15 @@ void end_frame() noexcept {
       }
       if (status) {
         gfx::after_present();
+        // Presented, but the swapchain no longer matches the window: configure
+        // it again, once per configure (it stays suboptimal until then).
+        if (surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
+          const uint32_t configures = webgpu::g_surfaceConfigures.load(std::memory_order_relaxed);
+          if (g_suboptimalAtConfigure != configures) {
+            g_suboptimalAtConfigure = configures;
+            window::push_custom_event(window::CustomEvent::RefreshSurface);
+          }
+        }
       } else {
         Log.warn("Surface present failed");
         webgpu::release_surface();
@@ -489,10 +566,39 @@ void end_frame() noexcept {
         Log.info("Surface texture is {}, reconfiguring swapchain", magic_enum::enum_name(surfaceStatus));
         window::push_custom_event(window::CustomEvent::RefreshSurface);
         break;
-      case wgpu::SurfaceGetCurrentTextureStatus::Lost:
-        Log.warn("Surface texture is {}, releasing surface", magic_enum::enum_name(surfaceStatus));
-        webgpu::release_surface();
+      case wgpu::SurfaceGetCurrentTextureStatus::Lost: {
+        // Reconfigure the surface first, as for Outdated. Releasing it at
+        // once made Vulkan on Linux (X11 and Wayland) lose it on a resize or
+        // a fullscreen switch, and the surface made in its place for the same
+        // window then failed with VK_ERROR_NATIVE_WINDOW_IN_USE_KHR while the
+        // old swapchain still held the window (#325). A loss while the
+        // reconfigure asked for is still waiting asks for nothing more; only a
+        // surface lost through kLostReconfigureLimit configures in a row,
+        // with no frame between them, is released and made anew.
+        const uint32_t configures = webgpu::g_surfaceConfigures.load(std::memory_order_relaxed);
+        if (g_lostAtConfigure == configures) {
+          // A refresh can end without a configure (a window not presentable
+          // for a moment): ask again now and then rather than wait for good.
+          if (++g_lostWaits % 60 == 0)
+            window::push_custom_event(window::CustomEvent::RefreshSurface);
+          break;
+        }
+        g_lostWaits = 0;
+        if (g_lostReconfigures < kLostReconfigureLimit) {
+          ++g_lostReconfigures;
+          Log.warn("Surface texture is {}, reconfiguring swapchain ({} in a row)",
+                   magic_enum::enum_name(surfaceStatus), g_lostReconfigures);
+          g_lostAtConfigure = configures;
+          window::push_custom_event(window::CustomEvent::RefreshSurface);
+        } else {
+          Log.warn("Surface texture is still {} after {} reconfigures, releasing surface",
+                   magic_enum::enum_name(surfaceStatus), g_lostReconfigures);
+          g_lostAtConfigure = kNotLost;
+          g_lostReconfigures = 0;
+          webgpu::release_surface();
+        }
         break;
+      }
       case wgpu::SurfaceGetCurrentTextureStatus::Error:
         Log.warn("Surface texture is {}, dropping surface", magic_enum::enum_name(surfaceStatus));
         g_surface = {};

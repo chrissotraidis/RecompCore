@@ -64,6 +64,10 @@ bool aurora_peek_z(uint16_t x, uint16_t y, uint32_t* z);
 bool aurora_color_peek_ready(void);
 bool aurora_peek_argb(uint16_t x, uint16_t y, uint32_t* color);
 
+/* Vulkan: the surface follows the window's size between the game's frames
+   (window.cpp, follow_window_size). Call it on the thread that polls events. */
+void aurora_follow_window_size(void);
+
 #ifdef __cplusplus
 }
 #endif

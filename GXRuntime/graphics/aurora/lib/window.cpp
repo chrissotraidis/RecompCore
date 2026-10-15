@@ -504,6 +504,31 @@ AuroraWindowSize get_window_size() {
   };
 }
 
+// A window dragged to a new size on X11 is shown at that size at once, but
+// its events reach poll_events only once a game frame (20 to 30 times a
+// second while dragging): the swapchain stayed at the old size, Vulkan called
+// it out of date, and the picture grew in steps behind the window's edges.
+// Between frames (at the game's retraces) the window's messages are pumped
+// and left queued, and the render worker configures the surface alone at the
+// window's size before its next texture (webgpu::follow_surface_size); the
+// frame buffers keep theirs until the event's resize_swapchain, the present
+// stretching them to the window meanwhile (#325). Vulkan only: Direct3D 12
+// and Metal never lost the surface on a resize.
+void follow_window_size() noexcept {
+#ifdef AURORA_ENABLE_GX
+  if (g_window == nullptr || webgpu::g_backendType != wgpu::BackendType::Vulkan || !is_presentable()) {
+    return;
+  }
+  SDL_PumpEvents();
+  int width = 0;
+  int height = 0;
+  if (!SDL_GetWindowSizeInPixels(g_window, &width, &height) || width <= 0 || height <= 0) {
+    return;
+  }
+  webgpu::set_follow_size(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+#endif
+}
+
 SDL_Window* get_sdl_window() { return g_window; }
 
 SDL_Renderer* get_sdl_renderer() { return g_renderer; }
@@ -621,3 +646,5 @@ extern "C" JNIEXPORT void JNICALL Java_org_libsdl_app_SDLSurface_auroraNativeSet
   aurora::window::set_surface_ready(ready == JNI_TRUE);
 }
 #endif
+
+extern "C" void aurora_follow_window_size(void) { aurora::window::follow_window_size(); }

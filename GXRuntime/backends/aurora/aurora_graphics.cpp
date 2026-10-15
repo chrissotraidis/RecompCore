@@ -1416,7 +1416,19 @@ void dol_aurora_frame_timing(DolAuroraFrameTiming* out) {
 // ([late] lines, 2026-09-26). The host calls this at every retrace as well.
 void aurora_backend_service_present(void) {
 #if GXRUNTIME_HAS_AURORA_RECOMP
-    if (!gx_aurora::g_initialized || !gx_aurora::g_gx_core_enabled)
+    if (!gx_aurora::g_initialized)
+        return;
+    // The window's size as well, at most every 8 ms of real time (retraces
+    // come in bursts when the game catches up): aurora_follow_window_size.
+    {
+        static Uint64 s_last_follow_ns = 0;
+        const Uint64 now = SDL_GetTicksNS();
+        if (now - s_last_follow_ns >= 8000000u) {
+            s_last_follow_ns = now;
+            aurora_follow_window_size();
+        }
+    }
+    if (!gx_aurora::g_gx_core_enabled)
         return;
     if (gx_aurora::g_display_copy_pending.load(std::memory_order_relaxed) &&
         gx_aurora::g_display_copy_pending.exchange(false))
