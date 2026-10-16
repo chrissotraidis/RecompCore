@@ -2282,6 +2282,33 @@ bool frame_verdict() noexcept {
   return true;
 }
 
+bool camera_steps(CameraStep out[kMaxSteps]) noexcept {
+  const Motion* camera = enabled() ? camera_motion() : nullptr;
+  bool moved = camera != nullptr;
+  for (int step = 0; step < kMaxSteps; ++step) {
+    CameraStep& result = out[step];
+    result.t = step < g_frameSteps ? static_cast<float>(step_weight(step)) : 1.f;
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 4; ++c)
+        result.relative[r][c] = r == c ? 1.f : 0.f;
+    if (!moved || step >= g_frameSteps)
+      continue;
+    // The step's view is P * D^-1 * V for the real frame's view V, the
+    // camera's motion D and its part P (blend_relative()); its inverse view,
+    // V^-1 * D * P^-1.
+    double back[3][4], relative[3][4];
+    if (!affine_inverse(camera->part[step], back)) {
+      moved = false;
+      continue;
+    }
+    affine_multiply(camera->m, back, relative);
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 4; ++c)
+        result.relative[r][c] = static_cast<float>(relative[r][c]);
+  }
+  return moved;
+}
+
 void end_game_frame() noexcept {
   g_gameFrame.fetch_add(1, std::memory_order_relaxed);
   if (!enabled()) {
