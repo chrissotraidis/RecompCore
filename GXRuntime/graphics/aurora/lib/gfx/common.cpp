@@ -1996,9 +1996,12 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
   // the finished scene out at full size before it draws the HUD (Wind Waker
   // does, every frame): bloom goes in just before that copy. Without such a
   // copy, in the on-screen pass after the scene's last perspective draw; what
-  // follows (the HUD, drawn flat) is drawn after it.
+  // follows (the HUD, drawn flat) is drawn after it. Each in-between frame
+  // (Smooth Motion: three a game frame at 120 FPS, five at 180, seven at 240) is a frame of
+  // its own here, so every one of them gets it, not only the first.
   static uint64_t bloomedFrame = UINT64_MAX;
-  const uint64_t frameKey = frame.frameId * 2 + (frame_interp::encoding_interpolated() ? 1 : 0);
+  const uint64_t frameKey = frame.frameId * (frame_interp::kMaxSteps + 1) +
+                            (frame_interp::encoding_interpolated() ? 1 + g_replayStep : 0);
   const bool efbPass = !passInfo.offscreen && passInfo.colorView.Get() == webgpu::g_frameBuffer.view.Get();
   const bool bloomBeforeCopy = post_fx::any_enabled() && efbPass && bloomedFrame != frameKey &&
                                passInfo.resolveTarget && !gx::is_depth_format(passInfo.resolveFormat) &&
