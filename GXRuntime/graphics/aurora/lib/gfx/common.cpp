@@ -1947,6 +1947,67 @@ static post_fx::Camera post_camera(FramePacket& frame) {
   return post_fx::moved_camera(frame.postCamera, step.relative, seconds);
 }
 
+// post_camera() once for each frame encoded (the real frame or one of its
+// in-between frames, frameKey in render()), however many of its passes ask.
+static const post_fx::Camera& frame_camera(FramePacket& frame, uint64_t frameKey) {
+  static uint64_t key = UINT64_MAX;
+  static post_fx::Camera camera;
+  if (key != frameKey) {
+    camera = post_camera(frame);
+    key = frameKey;
+  }
+  return camera;
+}
+
+#ifdef AURORA_ENABLE_GXCORE
+// The sun shadow map (post_fx.hpp): a pass's casters drawn from the sun, the
+// map cleared first when it is the frame's first. In an in-between frame the
+// draws take their blended constants, and `map` that frame's camera.
+static void encode_sun_map(const wgpu::CommandEncoder& cmd, const RenderPass& passInfo, const post_fx::SunMap& map,
+                           bool clear) {
+  size_t casters = 0;
+  for (const auto& command : passInfo.commands)
+    casters += command.type == CommandType::Draw && command.data.draw.type == ShaderType::GXCore && !command.flat &&
+               command.data.draw.gxcore.sunCaster;
+  // DOL_AURORA_SUN_SHADOW_MAP_TRACE=1: each pass's casters and draws, every 300th map.
+  static const bool trace = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_TRACE") != nullptr;
+  if (trace) {
+    static uint32_t maps = 0;
+    maps += clear;
+    if (maps % 300 == 1) {
+      size_t draws = 0;
+      for (const auto& command : passInfo.commands)
+        draws += command.type == CommandType::Draw && command.data.draw.type == ShaderType::GXCore && !command.flat;
+      std::fprintf(stderr, "[sun-map] %s pass: %zu casters of %zu scene draws\n", clear ? "first" : "later", casters,
+                   draws);
+    }
+  }
+  if (casters == 0 && !clear)
+    return;
+  const webgpu::gpu_prof::Zone zone{cmd, "Sun shadow map"};
+  const wgpu::RenderPassDepthStencilAttachment depth{
+      .view = post_fx::sun_map_view(),
+      .depthLoadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+      .depthStoreOp = wgpu::StoreOp::Store,
+      .depthClearValue = 1.f,
+  };
+  const wgpu::RenderPassDescriptor descriptor{
+      .label = "Sun shadow map",
+      .colorAttachmentCount = 0,
+      .depthStencilAttachment = &depth,
+      .timestampWrites = webgpu::gpu_prof::pass_writes("Sun shadow map"),
+  };
+  auto pass = cmd.BeginRenderPass(&descriptor);
+  if (casters != 0) {
+    gxcore::begin_sun_casters(pass, map.caster.data());
+    for (const auto& command : passInfo.commands)
+      if (command.type == CommandType::Draw && command.data.draw.type == ShaderType::GXCore && !command.flat)
+        gxcore::render_sun_caster(command.data.draw.gxcore, pass);
+  }
+  pass.End();
+}
+#endif
+
 static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
   ZoneScoped;
   if (!passInfo.sealed) {
@@ -2052,6 +2113,23 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
     }
   }
 
+  // The sun shadow map, before each pass of the EFB (the HD look's effects
+  // come after the scene, which can take more than one pass).
+  static uint64_t sunMapFrame = UINT64_MAX;
+  static post_fx::SunMap sunMap;
+#ifdef AURORA_ENABLE_GXCORE
+  if (post_fx::sun_shadow_map_enabled() && efbPass && passInfo.msaaSamples == 1) {
+    const bool first = sunMapFrame != frameKey;
+    if (first) {
+      sunMap = post_fx::sun_map(frame_camera(frame, frameKey));
+      sunMapFrame = frameKey;
+    }
+    if (sunMap.valid)
+      encode_sun_map(cmd, passInfo, sunMap, first);
+  }
+#endif
+  const post_fx::SunMap* frameSunMap = sunMapFrame == frameKey && sunMap.valid ? &sunMap : nullptr;
+
   auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
   render_pass(pass, frame, passInfo, 0, split);
   pass.End();
@@ -2059,13 +2137,13 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
   if (bloomBeforeCopy) {
     post_fx::encode(cmd, passInfo.copySourceView, passInfo.copySourceDepthView, passInfo.targetSize,
                     webgpu::g_frameBuffer.texture.GetFormat(), passInfo.colorView, passInfo.resolveView,
-                    passInfo.msaaSamples, post_camera(frame));
+                    passInfo.msaaSamples, frame_camera(frame, frameKey), frameSunMap);
     bloomedFrame = frameKey;
   }
   if (split != SIZE_MAX) {
     post_fx::encode(cmd, passInfo.copySourceView, passInfo.copySourceDepthView, passInfo.targetSize,
                     webgpu::g_frameBuffer.texture.GetFormat(), passInfo.colorView, passInfo.resolveView,
-                    passInfo.msaaSamples, post_camera(frame));
+                    passInfo.msaaSamples, frame_camera(frame, frameKey), frameSunMap);
     bloomedFrame = frameKey;
     if (split < passInfo.commands.size()) {
       auto attachmentsAfter = attachments;
