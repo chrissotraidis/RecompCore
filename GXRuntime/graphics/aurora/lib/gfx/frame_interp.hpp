@@ -81,6 +81,11 @@ struct DrawInput {
   bool screenSpace = false;
   std::array<float, 2> screenCenter{};
   std::array<float, 2> screenExtent{};
+  // An untagged direct-position draw in the scene (a cloud, a wave crest):
+  // the centre of its vertices, which tells apart copies that share one
+  // matrix (the view's).
+  bool haveCentre = false;
+  std::array<float, 3> centre{};
 };
 // `positionsWritten`: whether the game wrote an indexed draw's position array
 // this frame or the one before (gxcore_draw's positions_written()). Only such
