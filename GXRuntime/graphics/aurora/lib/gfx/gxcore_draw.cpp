@@ -1019,12 +1019,14 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
     return;
   }
   const auto fmt = static_cast<GXTexFmt>(cmd.format);
-  const gfx::ClipRect srcRect = gx::map_logical_scissor(gfx::ClipRect{
-      .x = static_cast<int32_t>(cmd.src_x),
-      .y = static_cast<int32_t>(cmd.src_y),
-      .width = static_cast<int32_t>(cmd.width),
-      .height = static_cast<int32_t>(cmd.height),
-  });
+  const gfx::ClipRect srcRect = gx::map_logical_scissor(gx::copy_source(
+      gfx::ClipRect{
+          .x = static_cast<int32_t>(cmd.src_x),
+          .y = static_cast<int32_t>(cmd.src_y),
+          .width = static_cast<int32_t>(cmd.width),
+          .height = static_cast<int32_t>(cmd.height),
+      },
+      cmd.destination_width, cmd.destination_height));
   // The copy is made at the render target's scale, as Aurora's own
   // GXCopyTex does (dolphin/gx/GXFrameBuffer.cpp scale_copy_dst) and as
   // Dolphin's scaled EFB copies do. Allocated at the guest's size, a game

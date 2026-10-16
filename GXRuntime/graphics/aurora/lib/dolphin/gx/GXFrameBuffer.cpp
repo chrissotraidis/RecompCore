@@ -1,6 +1,8 @@
 #include "gx.hpp"
 #include "__gx.h"
 
+#include <aurora/gfx.h>
+
 #include "../../gfx/tex_copy_conv.hpp"
 #include "../../gfx/texture.hpp"
 #include "../../window.hpp"
@@ -9,7 +11,9 @@
 #include "../vi/vi_internal.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstring>
 
 namespace {
 aurora::Vec2<uint32_t> scale_copy_dst(u32 logicalWidth, u32 logicalHeight) {
@@ -32,8 +36,31 @@ aurora::Vec2<uint32_t> scale_copy_dst(u32 logicalWidth, u32 logicalHeight) {
 } // namespace
 
 namespace aurora::gx {
+namespace {
+// aurora_set_copy_crop: the copy size (width << 16 | height) and the fraction's
+// bits, in one word so a copy never reads one without the other. 0: off.
+std::atomic<uint64_t> g_copyCrop{0};
+} // namespace
+
+gfx::ClipRect copy_source(gfx::ClipRect src, u32 dstWidth, u32 dstHeight) noexcept {
+  const uint64_t crop = g_copyCrop.load(std::memory_order_relaxed);
+  if (crop == 0 || dstWidth != (crop >> 48) || dstHeight != ((crop >> 32) & 0xFFFF)) {
+    return src;
+  }
+  float fraction;
+  const auto bits = static_cast<uint32_t>(crop);
+  std::memcpy(&fraction, &bits, sizeof fraction);
+  // A camera widened by 1 / fraction puts what a 4:3 one shows at x on
+  // middle + (x - middle) * fraction: the source is that span of the EFB.
+  const float middle = static_cast<float>(logical_fb_size().x) * 0.5f;
+  src.x = static_cast<int32_t>(std::lround(middle + (static_cast<float>(src.x) - middle) * fraction));
+  src.width = std::max<int32_t>(static_cast<int32_t>(std::lround(static_cast<float>(src.width) * fraction)), 1);
+  return src;
+}
+
 void copy_tex(const void* dest, GXBool clear) noexcept {
-  const auto rect = map_logical_scissor(g_gxState.texCopySrc);
+  const auto rect = map_logical_scissor(
+      copy_source(g_gxState.texCopySrc, g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight));
   const auto [dstWidth, dstHeight] = scale_copy_dst(g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight);
   const auto texCopyFmt = g_gxState.texCopyFmt;
 
@@ -84,6 +111,16 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
   g_gxState.copyTextures[dest] = handle;
 }
 } // namespace aurora::gx
+
+void aurora_set_copy_crop(uint32_t width, uint32_t height, float fraction) {
+  uint64_t crop = 0;
+  if (width != 0 && height != 0 && width <= 0xFFFF && height <= 0xFFFF && fraction > 0.f && fraction < 1.f) {
+    uint32_t bits;
+    std::memcpy(&bits, &fraction, sizeof bits);
+    crop = static_cast<uint64_t>(width) << 48 | static_cast<uint64_t>(height) << 32 | bits;
+  }
+  aurora::gx::g_copyCrop.store(crop, std::memory_order_relaxed);
+}
 
 extern "C" {
 GXRenderModeObj GXNtsc480IntDf = {

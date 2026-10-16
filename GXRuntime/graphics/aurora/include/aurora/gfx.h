@@ -68,6 +68,15 @@ bool aurora_peek_argb(uint16_t x, uint16_t y, uint32_t* color);
    (window.cpp, follow_window_size). Call it on the thread that polls events. */
 void aurora_follow_window_size(void);
 
+/* A texture copy width x height (the game's own sizes) takes `fraction` of
+   its source's width, mapped about the frame's middle, and is scaled back to
+   its full size: what a camera widened by 1 / fraction shows, kept in the
+   shape a 4:3 camera would have taken. For pictures a game takes through its
+   camera (Wind Waker's Picto Box) under a widescreen mod; fraction is
+   (4/3) / aspect. 0 for any argument (the default) turns it off. Takes
+   effect at the next copy. */
+void aurora_set_copy_crop(uint32_t width, uint32_t height, float fraction);
+
 #ifdef __cplusplus
 }
 #endif

@@ -415,6 +415,9 @@ void set_render_viewport(const gfx::Viewport& viewport) noexcept;
 void set_logical_scissor(const gfx::ClipRect& scissor) noexcept;
 void set_render_scissor(const gfx::ClipRect& scissor) noexcept;
 void copy_tex(const void* dest, GXBool clear) noexcept;
+// A texture copy's logical source, after aurora_set_copy_crop (GXFrameBuffer.cpp);
+// both copy paths (GXCopyTex and gxcore) take it.
+gfx::ClipRect copy_source(gfx::ClipRect src, u32 dstWidth, u32 dstHeight) noexcept;
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept;
 void resolve_sampled_textures(const ShaderInfo& info) noexcept;
 
