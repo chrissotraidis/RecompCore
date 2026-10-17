@@ -550,6 +550,22 @@ fn view_depth(uv: vec2<f32>) -> f32 {
     return select(view.lens.z / d, 0.0, d <= 0.0);
 }
 
+// Whether the surface a screen step found (at s, its depth) is one the map
+// holds: its depth from the sun is the map's there. Such a caster casts its
+// own shadow from the map; Link, seen in front of the ground just behind him,
+// also darkened a band of it in his shape.
+fn in_sun_map(s: vec2<f32>, surface: f32, tx: f32, ty: f32) -> bool {
+    let o = vec4(vec3(s.x * tx, s.y * ty, -1.0) * surface, 1.0);
+    let w = vec4(dot(view.rows[0], o), dot(view.rows[1], o), dot(view.rows[2], o), 1.0);
+    let m = vec3(dot(view.light[0], w), dot(view.light[1], w), dot(view.light[2], w));
+    if (max(abs(m.x), abs(m.y)) >= 1.0 || m.z <= 0.0 || m.z >= 1.0) {
+        return false;
+    }
+    let size = vec2<f32>(textureDimensions(sun_map));
+    let texel = clamp(vec2<i32>(vec2(m.x * 0.5 + 0.5, 0.5 - m.y * 0.5) * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
+    return abs(textureLoad(sun_map, texel, 0) - m.z) < 8.0 * view.params.y;
+}
+
 @fragment
 fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
     let z = view_depth(in.uv);
@@ -599,7 +615,7 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
         }
         let surface = view_depth(suv);
         let behind = -q.z - surface;
-        if (surface > 0.0 && behind > 12.0 + 0.004 * surface && behind < 250.0) {
+        if (surface > 0.0 && behind > 12.0 + 0.004 * surface && behind < 250.0 && !in_sun_map(s, surface, tx, ty)) {
             lit = min(lit, smoothstep(1500.0, 4000.0, z));  // near the camera only
             break;
         }
