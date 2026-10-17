@@ -86,6 +86,11 @@ struct DrawInput {
   // matrix (the view's).
   bool haveCentre = false;
   std::array<float, 3> centre{};
+  // The mean distance of its vertices from it. With its positions kept, its
+  // vertices are blended with its counterpart's (a ripple's growing rings).
+  float radius = 0.f;
+  // A strip through an emitter's particles (trail_strip() in frame_interp.cpp).
+  bool trail = false;
 };
 // `positionsWritten`: whether the game wrote an indexed draw's position array
 // this frame or the one before (gxcore_draw's positions_written()). Only such

@@ -96,6 +96,7 @@ struct Record {
   bool haveCentre = false;
   bool centreConsumed = false;
   std::array<float, 3> centre{};
+  float radius = 0.f; // DrawInput::radius
 };
 struct FrameRecords {
   std::vector<gxc::VertexShaderConstants> pool;
@@ -118,6 +119,7 @@ struct FrameRecords {
 constexpr uint32_t kMaxBlendedVertices = 1024;
 // blend_draw()'s in-between positions for its draw (x, y, z per vertex), per step.
 std::vector<float> g_blendedPositions[kMaxSteps];
+std::vector<float> g_alignedThen; // a trail's previous vertices, lined up with its own (blend_draw())
 bool g_haveBlendedPositions = false;
 // And its pixel constants with their colours blended, per step.
 gxc::PixelShaderConstants g_blendedPixel[kMaxSteps];
@@ -1310,6 +1312,30 @@ static bool screen_space_sprite(const gxc::DrawPlan& plan) noexcept {
          !plan.pipeline.depth_test && !plan.pipeline.depth_update;
 }
 
+// An untagged draw in the scene with its own world positions, paired by its
+// vertices' centre (see the copies in match_draw()), whose vertices are
+// blended one by one: a ripple's ring grows from one frame to the next, and
+// the in-between frame drew it at the next frame's size. Not a shadow cast
+// on the ground's triangles (see draw_key_of()): a different list each frame.
+static bool centred_vertices(const gxc::DrawPlan& plan) noexcept {
+  const size_t decoded = plan.vertices.size() / gxc::kVertexFloats;
+  return plan.match_direct_position && plan.draw_tag == 0 && plan.draw_scope_part == 0 &&
+         plan.match_primitive != 0x90 && !screen_space_sprite(plan) && decoded > 0 &&
+         decoded <= kMaxBlendedVertices;
+}
+
+// A strip through an emitter's particles, two vertices for each in order (the
+// wake Link leaves as he swims, the wind's lines): a particle is added at one
+// end each frame and the oldest leaves the other, so the strip's vertex count
+// changes as it grows. It is keyed without its count (see draw_key_of()), and
+// its vertices are paired with the frame before's at the shift that lines
+// them up (see blend_draw()).
+constexpr uint32_t kTrailVertices = 12;
+static bool trail_strip(const gxc::DrawPlan& plan) noexcept {
+  return plan.match_direct_position && plan.draw_tag == 0 && plan.draw_scope_part == 0 &&
+         plan.match_primitive == 0x98 && plan.vertex_count >= kTrailVertices && !screen_space_sprite(plan);
+}
+
 static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
   if (plan.match_payload == nullptr || plan.match_payload_size == 0)
     return 0;
@@ -1337,7 +1363,7 @@ static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
     return h == 0 ? 1 : h;
   }
   uint64_t h = mix64((uint64_t(plan.match_primitive) << 40) ^ (uint64_t(plan.match_vtx_fmt) << 32) ^
-                     plan.vertex_count ^ (uint64_t(plan.match_payload_size) << 48));
+                     (trail_strip(plan) ? 0x7A11u : plan.vertex_count ^ (uint64_t(plan.match_payload_size) << 48)));
   if (plan.match_direct_position) {
     // New positions every frame: the same shape with the same texture, and
     // for a particle the host tagged, that particle (see blend_positions()).
@@ -1402,7 +1428,7 @@ bool may_blend_vertices(const gxc::DrawPlan& plan) noexcept {
   const size_t decoded = plan.vertices.size() / gxc::kVertexFloats;
   return decoded > 0 && decoded <= kMaxBlendedVertices && !plan.pipeline.shader.has_pos_mtx_idx &&
          (!plan.match_direct_position || plan.draw_tag != 0 || plan.draw_scope_part != 0 ||
-          screen_space_sprite(plan));
+          screen_space_sprite(plan) || centred_vertices(plan));
 }
 
 bool blends_vertices(const gxc::DrawPlan& plan, bool positionsWritten) noexcept {
@@ -1428,6 +1454,8 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritt
   out.screenExtent = {};
   out.haveCentre = false;
   out.centre = {};
+  out.radius = 0.f;
+  out.trail = false;
   if (out.key == 0)
     return;
   // Screen sprites and particles the host tagged: an untagged world draw of one
@@ -1484,6 +1512,26 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritt
       for (unsigned r = 0; r < 3; ++r) {
         out.centre[r] = static_cast<float>(sum[r] / double(decoded));
         out.haveCentre = out.haveCentre && std::isfinite(out.centre[r]);
+      }
+      // How far its vertices lie from the centre: a ripple's rings, one
+      // inside another, share it.
+      double radius = 0.0;
+      for (size_t i = 0; i < decoded; ++i) {
+        const float* p = plan.vertices.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float);
+        double d = 0.0;
+        for (unsigned r = 0; r < 3; ++r)
+          d += (double(p[r]) - out.centre[r]) * (double(p[r]) - out.centre[r]);
+        radius += std::sqrt(d);
+      }
+      out.radius = static_cast<float>(radius / double(decoded));
+      out.haveCentre = out.haveCentre && std::isfinite(out.radius);
+      out.trail = out.haveCentre && trail_strip(plan);
+      if (out.haveCentre && centred_vertices(plan)) {
+        out.positions.resize(decoded * 3u);
+        for (size_t i = 0; i < decoded; ++i)
+          std::memcpy(out.positions.data() + i * 3u,
+                      plan.vertices.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float),
+                      sizeof(float) * 3);
       }
     }
     return;
@@ -1605,6 +1653,7 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
     auto& record = frame.records.back();
     record.haveCentre = true;
     record.centre = centred->centre;
+    record.radius = centred->radius;
   }
   ++g_frameCounts.draws;
   KeyState& state = g_keys[key];
@@ -1820,7 +1869,11 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
   // blended toward: a single cloud or crest flashing to its neighbour's alpha.
   // Each is paired with the copy whose vertices' centre is nearest its own,
   // once; with none near enough it is new, and drawn as it is.
-  const bool byCentre = uniformCopies && centred != nullptr;
+  // So are copies whose vertices are blended one by one (centred_vertices()):
+  // a ripple's rings, each with its own colours, so its own block, were paired
+  // by their place in the list, which shifts as a ring comes and goes.
+  const bool byCentre =
+      centred != nullptr && (uniformCopies || (candidates > 1 && !centred->positions.empty()));
   if (byCentre) {
     // The game draws each cloud twice with one shape: once with alpha 1 for
     // every cloud, then with its own. The two copies' centres are some 15
@@ -1828,6 +1881,7 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
     // the nearest centre alone could pair a cloud with its other copy, and its
     // in-between frames went from solid toward alpha 1. A copy's colours count
     // as well: one level of colour difference weighs as one unit of distance.
+    // So does its size: the rings of a ripple share a centre.
     constexpr double kCentreReach = 1000.0; // world units; the boat under full sail goes 100 a frame
     double best = HUGE_VAL;
     for (size_t i = 0; i < candidates; ++i) {
@@ -1838,8 +1892,13 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
         const double e = double(centred->centre[r]) - copies[i].centre[r];
         d += e * e;
       }
-      d = std::sqrt(d);
-      if (d > kCentreReach)
+      d = std::sqrt(d) + std::abs(double(centred->radius) - copies[i].radius);
+      // A copy moves less than half its size in a frame: the rings of the
+      // trail Link leaves as he swims stand a ring's width apart, and a new
+      // one, drawn first, took the last one born as its own, and each ring
+      // after it the one behind it, so the whole trail went back a ring in
+      // the in-between frames each time one was born.
+      if (d > std::min(kCentreReach, 25.0 + 0.5 * std::min<double>(centred->radius, copies[i].radius)))
         continue;
       if (pixel != nullptr && copies[i].pixel != kNoSamples) {
         const gxc::PixelShaderConstants& then = g_frames[g_current ^ 1u].pixels[copies[i].pixel];
@@ -1963,6 +2022,23 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
       }
       return &g_blended[0];
     }
+  }
+  if (byCentre && !placed && view != nullptr && usedMatrixRows == 0) {
+    // A copy with none near enough is new: it stood where the camera's motion
+    // carries it from, as the other copies do, and is drawn as it is now.
+    ++g_frameCounts.unmatched;
+    g_outcome = "new copy, stood still";
+    if (repeat(BlendPath::Unmatched, view, nullptr)) {
+      g_blendRepeated = true;
+      return &g_blended[0];
+    }
+    if (!stood_before(*view, current, g_stoodBefore)) {
+      g_lastBlend.serial = 0;
+      return nullptr;
+    }
+    for (int step = 0; step < g_frameSteps; ++step)
+      blend_relative(*view, g_stoodBefore, current, step, g_blended[step], 0);
+    return &g_blended[0];
   }
   if (previous == nullptr && candidates == 1 && occurrence == 0 && usedMatrixRows == 0 && perspective &&
       constantsOf(0).projection[3][2] != 0.f &&
@@ -2095,11 +2171,51 @@ const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::
   }
   const Record* before = g_match.record;
   if (before == nullptr || g_match.block == nullptr || before->positions == kNoSamples ||
-      before->positionCount != count)
+      (before->positionCount != count && !input.trail))
     return result;
   const FrameRecords& previousFrame = g_frames[g_current ^ 1u];
   const float* now = frame.positions.data() + static_cast<size_t>(record.positions) * 3u;
   const float* then = previousFrame.positions.data() + static_cast<size_t>(before->positions) * 3u;
+  if (input.trail) {
+    // A trail's particles, two vertices each, shifted by up to two particles
+    // either way: the shift whose shared particles lie nearest their places
+    // in the frame before. A particle new at an end grows out of the one
+    // beside it, which was the end.
+    const uint32_t was = before->positionCount;
+    if (was < kTrailVertices || (was & 1u) != 0 || (count & 1u) != 0)
+      return result;
+    int best = INT32_MAX;
+    double bestError = HUGE_VAL;
+    for (int shift = -4; shift <= 4; shift += 2) {
+      const int first = std::max(0, shift);
+      const int last = std::min<int>(count, int(was) + shift);
+      if (last - first < int(count) / 2)
+        continue;
+      double error = 0.0;
+      for (int j = first; j < last; ++j)
+        for (unsigned r = 0; r < 3; ++r) {
+          const double e = double(now[j * 3 + r]) - then[(j - shift) * 3 + r];
+          error += e * e;
+        }
+      error /= double(last - first);
+      if (error < bestError) {
+        bestError = error;
+        best = shift;
+      }
+    }
+    if (best == INT32_MAX)
+      return result;
+    g_alignedThen.resize(static_cast<size_t>(count) * 3u);
+    for (int j = 0; j < int(count); ++j) {
+      int i = j - best;
+      while (i < 0)
+        i += 2;
+      while (i >= int(was))
+        i -= 2;
+      std::memcpy(&g_alignedThen[j * 3u], then + i * 3, sizeof(float) * 3);
+    }
+    then = g_alignedThen.data();
+  }
   // Static geometry already gets its camera motion from the matrix blend.
   const bool staticPositions = !input.tagged &&
       std::memcmp(then, now, static_cast<size_t>(count) * 3u * sizeof(float)) == 0;
