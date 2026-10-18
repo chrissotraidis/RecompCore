@@ -39,7 +39,7 @@ float g_sunMapRange = 5000.f;    // world units from its centre to its edge
 float g_sunMapDepth = 20000.f;   // world units toward and away from the sun it holds, from its centre
 float g_sunMapBias = 12.f;       // world units a surface is moved toward the sun before the lookup
 float g_sunMapContact = 300.f;   // the screen's steps' reach, for what the map leaves out
-bool g_sunMapDebug = false;      // DOL_AURORA_SUN_SHADOW_MAP_DEBUG=1: the map's shadow alone, gray outside it
+int g_sunMapDebug = 0;           // DOL_AURORA_SUN_SHADOW_MAP_DEBUG=1: the map's shadow alone, gray outside it; 2: the map itself, depth as contour bands
 bool g_sunMapSteps = false;      // DOL_AURORA_SUN_SHADOW_MAP_STEPS=1: the screen's steps too, for what the map leaves out
 float g_cloudStrength = 0.28f;  // how dark a cloud's shadow is
 float g_cloudScale = 7000.f;    // world units across one cloud
@@ -573,6 +573,17 @@ fn in_sun_map(s: vec2<f32>, surface: f32, tx: f32, ty: f32) -> bool {
 
 @fragment
 fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
+    // The map itself, straight to the screen: its depth from the sun as
+    // contour bands, so the casters' silhouettes read regardless of range.
+    if (debug_view > 1.5) {
+        let size = vec2<f32>(textureDimensions(sun_map));
+        let p = clamp(vec2<i32>(in.uv * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
+        let d = textureLoad(sun_map, p, 0);
+        if (d >= 1.0) {
+            return vec4(1.0);
+        }
+        return vec4(vec3(0.25 + 0.75 * fract(d * 100.0)), 1.0);
+    }
     let z = view_depth(in.uv);
     let sun = view.time.yzw;
     if (z <= 0.0 || sun.y < 0.05) {
@@ -952,7 +963,7 @@ wgpu::RenderPipeline make_sun_map_pipeline(wgpu::TextureFormat format, bool dire
   const std::array constants{
       wgpu::ConstantEntry{.key = "strength", .value = g_sunStrength},
       wgpu::ConstantEntry{.key = "contact", .value = g_sunMapContact},
-      wgpu::ConstantEntry{.key = "debug_view", .value = g_sunMapDebug ? 1.0 : 0.0},
+      wgpu::ConstantEntry{.key = "debug_view", .value = static_cast<double>(g_sunMapDebug)},
       wgpu::ConstantEntry{.key = "screen_steps", .value = g_sunMapSteps ? 1.0 : 0.0},
       wgpu::ConstantEntry{.key = "direct", .value = direct ? 1.0 : 0.0},
   };
@@ -1361,7 +1372,7 @@ void initialize() {
   g_sunMapBias = env_float("DOL_AURORA_SUN_SHADOW_MAP_BIAS", g_sunMapBias, 0.f, 1000.f);
   g_sunMapContact = env_float("DOL_AURORA_SUN_SHADOW_MAP_CONTACT", g_sunMapContact, 20.f, 5000.f);
   const char* sunMapDebug = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_DEBUG");
-  g_sunMapDebug = sunMapDebug != nullptr && sunMapDebug[0] == '1';
+  g_sunMapDebug = sunMapDebug != nullptr ? sunMapDebug[0] - '0' : 0;
   const char* sunMapSteps = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_STEPS");
   g_sunMapSteps = sunMapSteps != nullptr && sunMapSteps[0] == '1';
   g_edgeStrength = env_float("DOL_AURORA_EDGE_LIGHT_STRENGTH", g_edgeStrength, 0.f, 4.f);
