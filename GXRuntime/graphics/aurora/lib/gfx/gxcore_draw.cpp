@@ -27,6 +27,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -2270,6 +2271,28 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     }
   }
 
+  static const bool s_casterLog = [] {
+    const char* value = std::getenv("DOL_AURORA_SUN_CASTER_LOG");
+    return value != nullptr && value[0] == '1';
+  }();
+  if (s_casterLog && plan.draw_scope_part != 0) {
+    static std::set<uint64_t> seen;
+    const uint64_t state = (uint64_t(plan.pipeline.blend_enable) << 0) | (uint64_t(plan.pipeline.depth_test) << 1) |
+                           (uint64_t(plan.pipeline.depth_update) << 2) | (uint64_t(plan.pipeline.color_update) << 3) |
+                           (uint64_t(plan.pipeline.primitive_topology) << 4) |
+                           (uint64_t(alpha_test_always_passes(plan.pipeline.shader)) << 8) |
+                           (uint64_t(plan.pipeline.shader.textured) << 9) | (uint64_t(plan.texmap_mask) << 16) |
+                           (uint64_t(plan.tex_address) << 24);
+    if (seen.insert(state).second)
+      std::fprintf(stderr,
+                   "[sun-caster] scope=%06X:%u tex=%08X blend=%u depth_test=%u depth_update=%u colour=%u topo=%u "
+                   "alpha_always=%u textured=%u texmap_mask=%02X verts=%u -> solid=%d alpha=%d\n",
+                   plan.draw_scope, plan.draw_scope_part, plan.tex_address, plan.pipeline.blend_enable,
+                   plan.pipeline.depth_test, plan.pipeline.depth_update, plan.pipeline.color_update,
+                   plan.pipeline.primitive_topology, alpha_test_always_passes(plan.pipeline.shader) ? 1u : 0u,
+                   plan.pipeline.shader.textured, plan.texmap_mask, plan.vertex_count,
+                   sun_caster(plan.pipeline) ? 1 : 0, sun_caster_alpha(plan.pipeline) ? 1 : 0);
+  }
   const bool tev = plan.pipeline.shader.tev_valid != 0;
   const size_t vertBytes = plan.vertices.size() * sizeof(float);
   const size_t indexBytes = plan.indices.size() * sizeof(uint16_t);
@@ -2556,6 +2579,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .uberTextureBindGroup = uberTextureBindGroup,
       .sunCaster = sun_caster(plan.pipeline),
       .posMtxIdx = plan.pipeline.shader.has_pos_mtx_idx != 0,
+      // DOL_AURORA_SUN_CASTER_LOG=1: why a cloth's or wake's draw (a scope)
+      // does or does not cast, once per distinct state (local debug).
+
       // The cutout pipeline binds one texture and sampler at group 2, the
       // single-texmap layout: a multi-texmap material keeps the screen's steps.
       .sunCasterAlpha = plan.texmap_mask == 0u && textureBindGroup != 0 && sun_caster_alpha(plan.pipeline),
