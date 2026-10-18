@@ -47,6 +47,16 @@ float g_sunMapFarStart = 1500.f;  // DOL_AURORA_SUN_SHADOW_MAP_FAR_START/_END: w
 float g_sunMapFarEnd = 5000.f;    // bias goes from its near values to its far ones
 float g_sunMapNormalNear = 0.5f;   // DOL_AURORA_SUN_SHADOW_MAP_NORMAL_NEAR: the normal offset near the camera, in texels
 float g_sunMapSlopeNear = 1.f;    // DOL_AURORA_SUN_SHADOW_MAP_SLOPE_NEAR: the same near the camera
+float g_sunMapFadeLow = 0.01f;    // DOL_AURORA_SUN_SHADOW_MAP_FADE_LOW/_HIGH: the light's height (sin of its
+float g_sunMapFadeHigh = 0.05f;   // elevation) where its shadows are gone, and at full strength (0.6 and 2.9 degrees)
+float g_moonStrength = 0.5f;      // DOL_AURORA_MOON_SHADOWS_STRENGTH: the moon's shadows, a share of the sun's
+float g_moonFadeLow = 0.2f;       // DOL_AURORA_MOON_SHADOWS_FADE_LOW/_HIGH: the same for the moon (12 and 27
+float g_moonFadeHigh = 0.45f;     // degrees), so its shadows come in once the dusk has gone
+// GLSL's smoothstep.
+float smoothstep_f(float lo, float hi, float x) noexcept {
+  const float t = std::clamp((x - lo) / (hi - lo), 0.f, 1.f);
+  return t * t * (3.f - 2.f * t);
+}
 float g_sunMapSlope = 10.f;       // DOL_AURORA_SUN_SHADOW_MAP_SLOPE: texels of the surface's own depth slope added to the bias
 float g_sunMapNormalOffset = 2.f; // DOL_AURORA_SUN_SHADOW_MAP_NORMAL_OFFSET: a lookup moved out along the surface's normal, in its cascade's texels      // DOL_AURORA_SUN_SHADOW_MAP_STEPS=1: the screen's steps too, for what the map leaves out
 // A cascade's range (world units from its centre to its edge), and the depth
@@ -542,7 +552,7 @@ struct View {
     lens: vec4<f32>,            // tan(fovy / 2), aspect, near, the sea's height
     time: vec4<f32>,            // seconds, then the direction to the sun (world)
     light: array<vec4<f32>, 12>, // the world to each cascade (post_fx::SunMap::world), three rows each
-    params: vec4<f32>,          // a texel's size in the map, the cascades drawn
+    params: vec4<f32>,          // a texel's size in the map, the cascades drawn, how strongly the shadows show
     bias: vec4<f32>,            // each cascade's depth bias, in its own depth's units
 };
 
@@ -686,7 +696,7 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
         }
         return vec4(vec3(0.25 + 0.75 * fract(d * 100.0)), 1.0);
     }
-    if (z <= 0.0 || sun.y < 0.05) {
+    if (z <= 0.0 || view.params.z <= 0.0) {
         return vec4(1.0);
     }
     let nl = length(normal);
@@ -762,7 +772,7 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
     }
-    let fade = smoothstep(0.05, 0.25, sun.y);
+    let fade = view.params.z;
     let shade = 1.0 - strength * (1.0 - lit) * fade;
     // Multiplied into the 8-bit scene: half a step of noise against bands (fs_ao_apply).
     let noise = (fract(52.9829189 * fract(dot(in.pos.xy, vec2(0.06711056, 0.00583715)))) - 0.5) * (1.5 / 255.0);
@@ -1425,6 +1435,9 @@ void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const S
     std::memcpy(uniform.data() + 20 + cascade * 12, sunMap.world[cascade].data(), sizeof(sunMap.world[cascade]));
   uniform[68] = 1.f / static_cast<float>(g_sunMapSize);
   uniform[69] = static_cast<float>(sunMap.cascades);
+  uniform[70] = sunMap.fade;
+  // The map's light (the moon at night) in the place of the sun.
+  std::memcpy(uniform.data() + 17, sunMap.light.data(), sizeof(sunMap.light));
   for (uint32_t cascade = 0; cascade < kSunMapCascades; ++cascade) {
     // The bias (world units for a cascade 5000 across) follows each
     // cascade's texels: 3 near Link's feet, 12, 48 and 192 further out, in
@@ -1506,6 +1519,11 @@ void initialize() {
   g_sunMapDepth = env_float("DOL_AURORA_SUN_SHADOW_MAP_DEPTH", g_sunMapDepth, 1000.f, 1000000.f);
   g_sunMapBias = env_float("DOL_AURORA_SUN_SHADOW_MAP_BIAS", g_sunMapBias, 0.f, 1000.f);
   g_sunMapSlope = env_float("DOL_AURORA_SUN_SHADOW_MAP_SLOPE", g_sunMapSlope, 0.f, 32.f);
+  g_sunMapFadeLow = env_float("DOL_AURORA_SUN_SHADOW_MAP_FADE_LOW", g_sunMapFadeLow, 0.f, 0.9f);
+  g_sunMapFadeHigh = env_float("DOL_AURORA_SUN_SHADOW_MAP_FADE_HIGH", g_sunMapFadeHigh, g_sunMapFadeLow + 0.001f, 1.f);
+  g_moonStrength = env_float("DOL_AURORA_MOON_SHADOWS_STRENGTH", g_moonStrength, 0.f, 1.f);
+  g_moonFadeLow = env_float("DOL_AURORA_MOON_SHADOWS_FADE_LOW", g_moonFadeLow, 0.f, 0.9f);
+  g_moonFadeHigh = env_float("DOL_AURORA_MOON_SHADOWS_FADE_HIGH", g_moonFadeHigh, g_moonFadeLow + 0.001f, 1.f);
   g_sunMapFarStart = env_float("DOL_AURORA_SUN_SHADOW_MAP_FAR_START", g_sunMapFarStart, 0.f, 100000.f);
   g_sunMapFarEnd = env_float("DOL_AURORA_SUN_SHADOW_MAP_FAR_END", g_sunMapFarEnd, g_sunMapFarStart + 1.f, 200000.f);
   g_sunMapNormalNear = env_float("DOL_AURORA_SUN_SHADOW_MAP_NORMAL_NEAR", g_sunMapNormalNear, 0.f, 16.f);
@@ -1750,9 +1768,18 @@ void set_sun_shadow_map(bool enabled) noexcept { g_sunMapOn.store(enabled, std::
 SunMap sun_map(const Camera& camera) noexcept {
   SunMap map;
   const float* v = camera.view.data();
-  const float sun[3] = {v[17], v[18], v[19]};
-  if (!camera.valid || sun[1] < 0.05f)
+  // The sun, or below the horizon the moon: the game puts it opposite the sun
+  // (dScnKy_env_light_c's mMoonPos is the eye minus the sun's offset). Long
+  // shadows hold until the sun is a few degrees up, then fade; the moon's come
+  // in later, once the dusk has gone (from 12 degrees up, full at 27).
+  const bool moon = v[18] < 0.f;
+  const float sun[3] = {moon ? -v[17] : v[17], moon ? -v[18] : v[18], moon ? -v[19] : v[19]};
+  const float fade = moon ? smoothstep_f(g_moonFadeLow, g_moonFadeHigh, sun[1]) * g_moonStrength
+                          : smoothstep_f(g_sunMapFadeLow, g_sunMapFadeHigh, sun[1]);
+  if (!camera.valid || fade <= 0.f)
     return map;
+  map.light = {sun[0], sun[1], sun[2]};
+  map.fade = fade;
   // Across the map: perpendicular to the sun, the first level.
   const float up[3] = {0.f, std::fabs(sun[1]) > 0.99f ? 0.f : 1.f, std::fabs(sun[1]) > 0.99f ? 1.f : 0.f};
   float x[3] = {up[1] * sun[2] - up[2] * sun[1], up[2] * sun[0] - up[0] * sun[2], up[0] * sun[1] - up[1] * sun[0]};

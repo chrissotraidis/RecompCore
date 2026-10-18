@@ -102,6 +102,11 @@ struct SunMap {
   std::array<std::array<float, 12>, kSunMapCascades> world{};
   std::array<std::array<float, 12>, kSunMapCascades> caster{};
   uint32_t cascades = 0;
+  // The light the map is drawn from: the sun, or at night the moon (opposite
+  // it), and how strongly its shadows show (0 to 1; less for the moon, fading
+  // out as it reaches the horizon).
+  std::array<float, 3> light{};
+  float fade = 0.f;
   bool valid = false;
 };
 SunMap sun_map(const Camera& camera) noexcept;
