@@ -2271,6 +2271,14 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     }
   }
 
+  // A cloth's strips (the boat's sail, a flag: a scope over draws that index
+  // their positions) are solid fabric the game draws blended, with more than
+  // one texmap for the sail's emblem: neither caster rule took them, so the
+  // sail cast nothing. Their shape is their geometry, no cutout needed, so
+  // they cast through the solid pipeline whenever they write depth.
+  const bool clothCaster = plan.draw_scope_part != 0 && !plan.match_direct_position &&
+                           plan.pipeline.depth_test != 0u && plan.pipeline.depth_update != 0u &&
+                           plan.pipeline.color_update != 0u && plan.pipeline.primitive_topology == 0u;
   static const bool s_casterLog = [] {
     const char* value = std::getenv("DOL_AURORA_SUN_CASTER_LOG");
     return value != nullptr && value[0] == '1';
@@ -2291,7 +2299,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                    plan.pipeline.depth_test, plan.pipeline.depth_update, plan.pipeline.color_update,
                    plan.pipeline.primitive_topology, alpha_test_always_passes(plan.pipeline.shader) ? 1u : 0u,
                    plan.pipeline.shader.textured, plan.texmap_mask, plan.vertex_count,
-                   sun_caster(plan.pipeline) ? 1 : 0, sun_caster_alpha(plan.pipeline) ? 1 : 0);
+                   (sun_caster(plan.pipeline) || clothCaster) ? 1 : 0, sun_caster_alpha(plan.pipeline) ? 1 : 0);
   }
   const bool tev = plan.pipeline.shader.tev_valid != 0;
   const size_t vertBytes = plan.vertices.size() * sizeof(float);
@@ -2577,7 +2585,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .uberPipeline = uberPipeline,
       .uberPixelRange = uberPixelRange,
       .uberTextureBindGroup = uberTextureBindGroup,
-      .sunCaster = sun_caster(plan.pipeline),
+      .sunCaster = sun_caster(plan.pipeline) || clothCaster,
       .posMtxIdx = plan.pipeline.shader.has_pos_mtx_idx != 0,
       // DOL_AURORA_SUN_CASTER_LOG=1: why a cloth's or wake's draw (a scope)
       // does or does not cast, once per distinct state (local debug).
