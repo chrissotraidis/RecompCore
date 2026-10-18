@@ -958,15 +958,80 @@ int main() {
     // Untagged, one of its shape (the boat's shadow on the sea's triangles
     // under it): not the same points, so drawn as it is.
     fi::end_game_frame();
-    auto trail = particle(0, 0, 0, 0);
-    trail.match_primitive = 0x98;
-    blend_plan(trail, identity);
+    auto shadow = particle(0, 0, 0, 0);
+    shadow.match_primitive = 0x90;
+    blend_plan(shadow, identity);
     fi::end_game_frame();
     auto moved = particle(0, 0, 8, 0);
-    moved.match_primitive = 0x98;
+    moved.match_primitive = 0x90;
     blend_plan(moved, identity);
     const float* halfway = fi::blended_positions();
     CHECK(halfway == nullptr);
+
+    // A ripple's rings: untagged quads of one shape around one centre, each
+    // growing. Each pairs with its own (by centre and size, whatever the
+    // list's order) and is drawn halfway between its two sizes; a ring born
+    // away from them, with nothing near enough, is drawn as it is.
+    const auto ring = [](float x, float r) {
+      gxc::DrawPlan plan;
+      plan.match_payload = payload;
+      plan.match_payload_size = sizeof(payload);
+      plan.match_primitive = 0x80;
+      plan.match_direct_position = true;
+      plan.vertex_count = 4;
+      plan.tex_address = 0x2345;
+      plan.vertices.assign(4 * gxc::kVertexFloats, 0.f);
+      const float corners[4][2] = {{-1, 1}, {1, 1}, {1, -1}, {-1, -1}};
+      for (int i = 0; i < 4; ++i) {
+        float* v = plan.vertices.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float);
+        v[0] = x + corners[i][0] * r;
+        v[1] = corners[i][1] * r;
+        v[2] = -400.f;
+      }
+      return plan;
+    };
+    fi::end_game_frame();
+    blend_plan(ring(0, 10), identity);
+    blend_plan(ring(0, 30), identity);
+    fi::end_game_frame();
+    blend_plan(ring(0, 32), identity);
+    const float* outer = fi::blended_positions();
+    CHECK(outer != nullptr && near(outer[0], -31.f) && near(outer[1], 31.f));
+    blend_plan(ring(0, 12), identity);
+    const float* inner = fi::blended_positions();
+    CHECK(inner != nullptr && near(inner[0], -11.f) && near(inner[1], 11.f));
+    blend_plan(ring(60, 0.5f), identity);
+    CHECK(fi::blended_positions() == nullptr); // new, 60 units from the others
+
+    // A trail: a strip through an emitter's particles, two vertices each,
+    // that grows by a particle at its start each frame. Keyed without its
+    // count, its particles pair with their own places in the frame before,
+    // and the new one grows out of the end that was there.
+    const auto trail = [](int particles) {
+      gxc::DrawPlan plan;
+      plan.match_payload = payload;
+      plan.match_payload_size = sizeof(payload);
+      plan.match_primitive = 0x98;
+      plan.match_direct_position = true;
+      plan.vertex_count = static_cast<uint32_t>(particles * 2);
+      plan.tex_address = 0x3456;
+      plan.vertices.assign(plan.vertex_count * gxc::kVertexFloats, 0.f);
+      for (int i = 0; i < particles; ++i)
+        for (int side = 0; side < 2; ++side) {
+          float* v = plan.vertices.data() + (i * 2 + side) * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float);
+          v[0] = 20.f * float(i - (particles - 6)); // the newest at the start, the oldest at x = 100
+          v[1] = side == 0 ? 3.f : -3.f;
+          v[2] = -400.f;
+        }
+      return plan;
+    };
+    fi::end_game_frame();
+    blend_plan(trail(6), identity);
+    fi::end_game_frame();
+    blend_plan(trail(7), identity);
+    const float* grown = fi::blended_positions();
+    CHECK(grown != nullptr && near(grown[0], -10.f) && near(grown[1], 3.f) && near(grown[3], -10.f) &&
+          near(grown[6], 0.f) && near(grown[13 * 3], 100.f));
 
     // The camera turns 12 degrees past a spark that hangs still: its corners,
     // sent in the camera's view, change every frame. It is drawn where the

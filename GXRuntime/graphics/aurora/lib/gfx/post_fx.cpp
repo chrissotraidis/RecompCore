@@ -27,7 +27,6 @@ std::atomic_bool g_edge{false};
 std::atomic_bool g_torch{false};
 float g_torchStrength = 0.35f;  // how bright a light's glow is
 float g_torchRadiusScale = 3.f; // the glow's reach, times the radius the game lights with
-constexpr uint32_t kMaxLights = 16;
 // The game's point lights (aurora_set_point_lights): x, y, z, radius, r, g, b, flicker each.
 std::array<float, kMaxLights * 8> g_lights{};
 uint32_t g_lightCount = 0;
@@ -1315,6 +1314,28 @@ void set_world_view(const float invView[12], float tanHalfFovy, float aspect, fl
   g_cameraValid = nearPlane > 0.f && tanHalfFovy > 0.f && aspect > 0.f;
 }
 
+Camera current_camera() noexcept {
+  Camera camera;
+  std::lock_guard lock{g_cameraMutex};
+  camera.view = g_camera;
+  camera.valid = g_cameraValid;
+  camera.lights = g_lights;
+  camera.lightCount = g_lightCount;
+  return camera;
+}
+
+Camera moved_camera(const Camera& camera, const float relative[3][4], float seconds) noexcept {
+  Camera moved = camera;
+  for (int r = 0; r < 3; ++r) {
+    const float* row = &camera.view[r * 4];
+    for (int c = 0; c < 4; ++c)
+      moved.view[r * 4 + c] =
+          row[0] * relative[0][c] + row[1] * relative[1][c] + row[2] * relative[2][c] + (c == 3 ? row[3] : 0.f);
+  }
+  moved.view[16] = seconds;
+  return moved;
+}
+
 bool any_enabled() noexcept {
   return bloom_enabled() || far_blur_enabled() || ambient_occlusion_enabled() || cloud_shadows_enabled() ||
          sun_shadows_enabled() || edge_light_enabled() || torch_light_enabled();
@@ -1322,7 +1343,7 @@ bool any_enabled() noexcept {
 
 void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
             const wgpu::Extent3D& size, wgpu::TextureFormat format, const wgpu::TextureView& dst,
-            const wgpu::TextureView& resolve, uint32_t msaaSamples) {
+            const wgpu::TextureView& resolve, uint32_t msaaSamples, const Camera& camera) {
   // Ambient occlusion and the far blur need single-sample depth (the depth
   // buffer is multisampled with MSAA).
   if (ambient_occlusion_enabled() && g_module && depthView && msaaSamples == 1 && size.width >= 4 && size.height >= 4) {
@@ -1335,47 +1356,28 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
     draw(cmd, "Ambient occlusion apply", g_aoApply, g_aoView[0], dst, true, resolve);
   }
   if (sun_shadows_enabled() && g_module && depthView && msaaSamples == 1) {
-    std::array<float, 20> view;
-    bool valid;
-    {
-      std::lock_guard lock{g_cameraMutex};
-      view = g_camera;
-      valid = g_cameraValid;
-    }
-    if (valid) {
+    if (camera.valid) {
       const webgpu::gpu_prof::Zone zone{cmd, "Sun shadows"};
       ensure_targets(size, format, msaaSamples);
-      draw_with_view(cmd, "Sun shadows", g_sunPass, view, depthView, g_aoView[0], nullptr);
+      draw_with_view(cmd, "Sun shadows", g_sunPass, camera.view, depthView, g_aoView[0], nullptr);
       draw(cmd, "Sun shadows blur (horizontal)", g_blurH, g_aoView[0], g_aoView[1], false);
       draw(cmd, "Sun shadows blur (vertical)", g_blurV, g_aoView[1], g_aoView[0], false);
       draw(cmd, "Sun shadows apply", g_aoApply, g_aoView[0], dst, true, resolve);
     }
   }
   if (edge_light_enabled() && g_module && depthView && msaaSamples == 1) {
-    std::array<float, 20> view;
-    bool valid;
-    {
-      std::lock_guard lock{g_cameraMutex};
-      view = g_camera;
-      valid = g_cameraValid;
-    }
-    if (valid) {
+    if (camera.valid) {
       const webgpu::gpu_prof::Zone zone{cmd, "Edge light"};
       ensure_targets(size, format, msaaSamples);
-      draw_with_view(cmd, "Edge light", g_edgePass, view, depthView, dst, resolve);
+      draw_with_view(cmd, "Edge light", g_edgePass, camera.view, depthView, dst, resolve);
     }
   }
   if (torch_light_enabled() && g_module && depthView && msaaSamples == 1) {
-    std::array<float, kTorchUniformSize / sizeof(float)> uniform{};
-    bool valid;
-    {
-      std::lock_guard lock{g_cameraMutex};
-      std::memcpy(uniform.data(), g_camera.data(), sizeof(g_camera));
-      uniform[20] = static_cast<float>(g_lightCount);
-      std::memcpy(uniform.data() + 24, g_lights.data(), sizeof(g_lights));
-      valid = g_cameraValid && g_lightCount > 0;
-    }
-    if (valid) {
+    if (camera.valid && camera.lightCount > 0) {
+      std::array<float, kTorchUniformSize / sizeof(float)> uniform{};
+      std::memcpy(uniform.data(), camera.view.data(), sizeof(camera.view));
+      uniform[20] = static_cast<float>(camera.lightCount);
+      std::memcpy(uniform.data() + 24, camera.lights.data(), sizeof(camera.lights));
       const webgpu::gpu_prof::Zone zone{cmd, "Torch light"};
       ensure_targets(size, format, msaaSamples);
       draw_with_uniform(cmd, "Torch light", g_torchPass, g_torchLayout, uniform.data(), sizeof(uniform), depthView,
@@ -1383,17 +1385,10 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
     }
   }
   if (cloud_shadows_enabled() && g_module && depthView && msaaSamples == 1) {
-    std::array<float, 20> view;
-    bool valid;
-    {
-      std::lock_guard lock{g_cameraMutex};
-      view = g_camera;
-      valid = g_cameraValid;
-    }
-    if (valid) {
+    if (camera.valid) {
       const webgpu::gpu_prof::Zone zone{cmd, "Cloud shadows"};
       ensure_targets(size, format, msaaSamples);
-      draw_with_view(cmd, "Cloud shadows", g_cloudPass, view, depthView, dst, resolve);
+      draw_with_view(cmd, "Cloud shadows", g_cloudPass, camera.view, depthView, dst, resolve);
     }
   }
   if (far_blur_enabled() && g_module && depthView && msaaSamples == 1 && size.width >= 4 && size.height >= 4) {

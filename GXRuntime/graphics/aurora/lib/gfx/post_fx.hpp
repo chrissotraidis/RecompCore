@@ -2,6 +2,7 @@
 
 #include <webgpu/webgpu_cpp.h>
 
+#include <array>
 #include <cstdint>
 
 // Effects drawn after the game's own frame (the Wind Waker HD look).
@@ -66,12 +67,30 @@ void set_cloud_shadows(bool enabled) noexcept;
 void set_world_view(const float invView[12], float tanHalfFovy, float aspect, float nearPlane, float seaLevel,
                     float seconds) noexcept;
 bool any_enabled() noexcept;
+// The game's point lights, at most (aurora_set_point_lights).
+constexpr uint32_t kMaxLights = 16;
+// What the effects drawn from the camera (sun and cloud shadows, edge and
+// torch light) are drawn with: the inverse view matrix's three rows, then
+// tan(fovy / 2), aspect, near, the sea's height and the time in seconds, then
+// the direction to the sun; and the point lights.
+struct Camera {
+  std::array<float, 20> view{};
+  bool valid = false;
+  std::array<float, kMaxLights * 8> lights{};
+  uint32_t lightCount = 0;
+};
+// The camera the game set last (aurora_set_world_view and the rest).
+Camera current_camera() noexcept;
+// `camera` moved for an in-between frame: its inverse view times `relative`
+// (the step's camera relative to the real frame's, frame_interp::camera_steps),
+// at `seconds`.
+Camera moved_camera(const Camera& camera, const float relative[3][4], float seconds) noexcept;
 // Every effect that is on, in order (ambient occlusion, sun shadows, edge
 // light, torch light, cloud shadows, far blur, bloom);
-// depthView: the EFB's depth.
+// depthView: the EFB's depth; camera: the one the frame is drawn from.
 void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
             const wgpu::Extent3D& size, wgpu::TextureFormat format, const wgpu::TextureView& dst,
-            const wgpu::TextureView& resolve, uint32_t msaaSamples);
+            const wgpu::TextureView& resolve, uint32_t msaaSamples, const Camera& camera);
 // scene: the EFB as a texture (resolved when multisampled), size: its size;
 // dst: the EFB's color attachment, with msaaSamples samples, and resolve its
 // single-sample copy when multisampled (null otherwise).

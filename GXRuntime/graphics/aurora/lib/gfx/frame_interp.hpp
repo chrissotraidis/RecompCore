@@ -81,6 +81,16 @@ struct DrawInput {
   bool screenSpace = false;
   std::array<float, 2> screenCenter{};
   std::array<float, 2> screenExtent{};
+  // An untagged direct-position draw in the scene (a cloud, a wave crest):
+  // the centre of its vertices, which tells apart copies that share one
+  // matrix (the view's).
+  bool haveCentre = false;
+  std::array<float, 3> centre{};
+  // The mean distance of its vertices from it. With its positions kept, its
+  // vertices are blended with its counterpart's (a ripple's growing rings).
+  float radius = 0.f;
+  // A strip through an emitter's particles (trail_strip() in frame_interp.cpp).
+  bool trail = false;
 };
 // `positionsWritten`: whether the game wrote an indexed draw's position array
 // this frame or the one before (gxcore_draw's positions_written()). Only such
@@ -140,6 +150,20 @@ bool tracing() noexcept;
 // Recording thread, when a presenting frame ends: whether it gets an
 // in-between frame.
 bool frame_verdict() noexcept;
+
+// An in-between frame's camera, for what is drawn from the camera after the
+// frame (post_fx's shadows and lights): its inverse view is the real frame's
+// times `relative`, which puts it where the step's matrices put the scenery
+// (blend_relative()); and the step's blend weight from the frame before.
+struct CameraStep {
+  float relative[3][4];
+  float t;
+};
+// Recording thread, after frame_verdict(): each in-between step's camera
+// (frame_steps() of them). Without the frame's camera motion (its scenery was
+// blended from each draw's own matrices) `relative` stays the real frame's,
+// and this returns false.
+bool camera_steps(CameraStep out[kMaxSteps]) noexcept;
 
 // At every present (a game frame boundary), with recording stopped.
 void end_game_frame() noexcept;

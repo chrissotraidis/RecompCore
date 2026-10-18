@@ -646,7 +646,13 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   plan.match_primitive = draw.primitive;
   plan.match_vtx_fmt = draw.vtx_fmt;
   plan.match_vertex_stride = draw.vertex_size;
-  if (bp_valid_[kDrawTagRegister]) {
+  // A particle is drawn with at most eight vertices (a cross is two quads).
+  // A draw with more is not one particle's: an emitter's callback draws it
+  // after its last particle (a strip through all of them, the wind's lines in
+  // the sky) and found that particle's tag, a different particle every frame,
+  // so it never had a counterpart and moved at 30 FPS.
+  constexpr std::uint32_t kParticleVertices = 8;
+  if (bp_valid_[kDrawTagRegister] && draw.vertex_count <= kParticleVertices) {
     plan.draw_tag = bp_regs_[kDrawTagRegister];
     plan.draw_tag_age = bp_valid_[kDrawTagAgeRegister] ? bp_regs_[kDrawTagAgeRegister] : 0u;
   }
