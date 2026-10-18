@@ -40,6 +40,7 @@ float g_sunMapDepth = 20000.f;   // world units toward and away from the sun it 
 float g_sunMapBias = 12.f;       // world units a surface is moved toward the sun before the lookup
 float g_sunMapContact = 300.f;   // the screen's steps' reach, for what the map leaves out
 bool g_sunMapDebug = false;      // DOL_AURORA_SUN_SHADOW_MAP_DEBUG=1: the map's shadow alone, gray outside it
+bool g_sunMapSteps = false;      // DOL_AURORA_SUN_SHADOW_MAP_STEPS=1: the screen's steps too, for what the map leaves out
 float g_cloudStrength = 0.28f;  // how dark a cloud's shadow is
 float g_cloudScale = 7000.f;    // world units across one cloud
 bool g_cloudDebug = false;
@@ -505,12 +506,16 @@ wgpu::ShaderModule g_sunModule;
 // the map (view.light), is in shadow where something nearer the sun was drawn
 // there (nine filtered lookups around it, for a soft edge). The map fades out
 // toward its edge. Alpha-tested draws are not in the map (leaves, fences), so
-// a few of the screen's steps (as fs_sun, out to `contact`) still look for
-// them. Drawn at a quarter of the size, blurred and multiplied in, as fs_sun.
+// a few of the screen's steps (as fs_sun, out to `contact`) could still look
+// for them (screen_steps); they are off unless asked for. Multiplied straight
+// into the scene at its full size (direct), or drawn at a quarter of the size
+// for the debug view.
 constexpr const char* kSunMapShader = R"""(
 override strength: f32 = 0.35;
 override contact: f32 = 300.0;
 override debug_view: f32 = 0.0;
+override screen_steps: f32 = 0.0;
+override direct: f32 = 1.0;
 
 struct View {
     rows: array<vec4<f32>, 3>,  // the inverse view matrix (view to world), by rows
@@ -597,7 +602,10 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
     if (debug_view > 0.5) {
         return vec4(vec3(lit), 1.0);
     }
-    // The screen's steps, a short way (fs_sun).
+    // The screen's steps, a short way (fs_sun), when asked for: on their own
+    // they also found the thin parts of what the map holds (hair, an arm) and
+    // drew dotted rays behind Link.
+    if (screen_steps > 0.5) {
     let l = normalize(vec3(dot(vec3(view.rows[0].x, view.rows[1].x, view.rows[2].x), sun),
                            dot(vec3(view.rows[0].y, view.rows[1].y, view.rows[2].y), sun),
                            dot(vec3(view.rows[0].z, view.rows[1].z, view.rows[2].z), sun)));
@@ -620,14 +628,19 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
             break;
         }
     }
+    }
     let fade = smoothstep(0.05, 0.25, sun.y);
-    return vec4(vec3(1.0 - strength * (1.0 - lit) * fade), 1.0);
+    let shade = 1.0 - strength * (1.0 - lit) * fade;
+    // Multiplied into the 8-bit scene: half a step of noise against bands (fs_ao_apply).
+    let noise = (fract(52.9829189 * fract(dot(in.pos.xy, vec2(0.06711056, 0.00583715)))) - 0.5) * (1.5 / 255.0);
+    return vec4(vec3(shade + select(0.0, noise, direct > 0.5 && shade < 0.999)), 1.0);
 }
 )""";
 wgpu::ShaderModule g_sunMapModule;
 wgpu::BindGroupLayout g_sunMapLayout;
 wgpu::PipelineLayout g_sunMapPipelineLayout;
 wgpu::RenderPipeline g_sunMapPass;
+wgpu::RenderPipeline g_sunMapDirect; // multiplied straight into the scene
 wgpu::Sampler g_sunMapCompare;
 wgpu::Texture g_sunMapTex;
 wgpu::TextureView g_sunMapView;
@@ -928,13 +941,25 @@ wgpu::RenderPipeline make_sun_pipeline(wgpu::TextureFormat format) {
   return g_device.CreateRenderPipeline(&descriptor);
 }
 
-wgpu::RenderPipeline make_sun_map_pipeline(wgpu::TextureFormat format) {
+// direct: multiplied into the scene (the EFB's alpha kept), else written to a target of its own.
+wgpu::RenderPipeline make_sun_map_pipeline(wgpu::TextureFormat format, bool direct) {
   const std::array constants{
       wgpu::ConstantEntry{.key = "strength", .value = g_sunStrength},
       wgpu::ConstantEntry{.key = "contact", .value = g_sunMapContact},
       wgpu::ConstantEntry{.key = "debug_view", .value = g_sunMapDebug ? 1.0 : 0.0},
+      wgpu::ConstantEntry{.key = "screen_steps", .value = g_sunMapSteps ? 1.0 : 0.0},
+      wgpu::ConstantEntry{.key = "direct", .value = direct ? 1.0 : 0.0},
   };
-  const std::array targets{wgpu::ColorTargetState{.format = format, .blend = nullptr, .writeMask = wgpu::ColorWriteMask::All}};
+  const wgpu::BlendState multiply{
+      .color = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::Zero,
+                .dstFactor = wgpu::BlendFactor::Src},
+      .alpha = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::Zero,
+                .dstFactor = wgpu::BlendFactor::One},
+  };
+  const std::array targets{
+      wgpu::ColorTargetState{.format = format, .blend = direct ? &multiply : nullptr, .writeMask = wgpu::ColorWriteMask::All}};
   const wgpu::FragmentState fragment{
       .module = g_sunMapModule,
       .entryPoint = "fs_sun_map",
@@ -1064,6 +1089,7 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
     g_cloudPass = {};
     g_sunPass = {};
     g_sunMapPass = {};
+    g_sunMapDirect = {};
     g_edgePass = {};
     g_torchPass = {};
     g_composite = {};
@@ -1078,8 +1104,10 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
   if (!g_sunPass) {
     g_sunPass = make_sun_pipeline(format);
   }
+  if (!g_sunMapDirect)
+    g_sunMapDirect = make_sun_map_pipeline(format, true);
   if (!g_sunMapPass) {
-    g_sunMapPass = make_sun_map_pipeline(format);
+    g_sunMapPass = make_sun_map_pipeline(format, false);
   }
   if (!g_torchPass || samples != g_torchSamples) {
     g_torchPass = make_torch_pipeline(format, samples);
@@ -1247,8 +1275,10 @@ void draw_with_uniform(const wgpu::CommandEncoder& cmd, const char* label, const
   pass.End();
 }
 // The sun shadows from the shadow map (kSunMapShader) into `target`.
+// direct: multiplied into `target`, the scene (with `resolve`), else drawn into a target of its own.
 void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const SunMap& sunMap,
-                  const wgpu::TextureView& depthView, const wgpu::TextureView& target) {
+                  const wgpu::TextureView& depthView, const wgpu::TextureView& target, bool direct,
+                  const wgpu::TextureView& resolve = nullptr) {
   std::array<float, 36> uniform{};
   std::memcpy(uniform.data(), camera.view.data(), sizeof(camera.view));
   std::memcpy(uniform.data() + 20, sunMap.world.data(), sizeof(sunMap.world));
@@ -1279,7 +1309,8 @@ void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const S
   const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
   const std::array attachments{wgpu::RenderPassColorAttachment{
       .view = target,
-      .loadOp = wgpu::LoadOp::Clear,
+      .resolveTarget = direct ? resolve : nullptr,
+      .loadOp = direct ? wgpu::LoadOp::Load : wgpu::LoadOp::Clear,
       .storeOp = wgpu::StoreOp::Store,
       .clearValue = {1.0, 1.0, 1.0, 1.0},
   }};
@@ -1290,7 +1321,7 @@ void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const S
       .timestampWrites = webgpu::gpu_prof::pass_writes("Sun shadows (shadow map)"),
   };
   const auto pass = cmd.BeginRenderPass(&descriptor);
-  pass.SetPipeline(g_sunMapPass);
+  pass.SetPipeline(direct ? g_sunMapDirect : g_sunMapPass);
   pass.SetBindGroup(0, bindGroup, 0, nullptr);
   pass.Draw(3);
   pass.End();
@@ -1325,6 +1356,8 @@ void initialize() {
   g_sunMapContact = env_float("DOL_AURORA_SUN_SHADOW_MAP_CONTACT", g_sunMapContact, 20.f, 5000.f);
   const char* sunMapDebug = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_DEBUG");
   g_sunMapDebug = sunMapDebug != nullptr && sunMapDebug[0] == '1';
+  const char* sunMapSteps = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_STEPS");
+  g_sunMapSteps = sunMapSteps != nullptr && sunMapSteps[0] == '1';
   g_edgeStrength = env_float("DOL_AURORA_EDGE_LIGHT_STRENGTH", g_edgeStrength, 0.f, 4.f);
   g_torchStrength = env_float("DOL_AURORA_TORCH_LIGHT_STRENGTH", g_torchStrength, 0.f, 4.f);
   g_torchRadiusScale = env_float("DOL_AURORA_TORCH_LIGHT_REACH", g_torchRadiusScale, 0.1f, 50.f);
@@ -1495,6 +1528,7 @@ void shutdown() {
   g_sunSamples = 0;
   g_sunModule = {};
   g_sunMapPass = {};
+  g_sunMapDirect = {};
   g_sunMapModule = {};
   g_sunMapPipelineLayout = {};
   g_sunMapLayout = {};
@@ -1697,13 +1731,22 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
     if (camera.valid) {
       const webgpu::gpu_prof::Zone zone{cmd, "Sun shadows"};
       ensure_targets(size, format, msaaSamples);
-      if (sunMap != nullptr && sunMap->valid && g_sunMapView)
-        draw_sun_map(cmd, camera, *sunMap, depthView, g_aoView[0]);
-      else
-        draw_with_view(cmd, "Sun shadows", g_sunPass, camera.view, depthView, g_aoView[0], nullptr);
-      draw(cmd, "Sun shadows blur (horizontal)", g_blurH, g_aoView[0], g_aoView[1], false);
-      draw(cmd, "Sun shadows blur (vertical)", g_blurV, g_aoView[1], g_aoView[0], false);
-      draw(cmd, "Sun shadows apply", g_aoApply, g_aoView[0], dst, true, resolve);
+      // The map's shadows are filtered in the map, so they are multiplied in at
+      // the scene's size; at a quarter of it, blurred as the screen's version
+      // is, Link's shadow was a blob.
+      if (sunMap != nullptr && sunMap->valid && g_sunMapView && !g_sunMapDebug) {
+        draw_sun_map(cmd, camera, *sunMap, depthView, dst, true, resolve);
+      } else {
+        if (sunMap != nullptr && sunMap->valid && g_sunMapView)
+          draw_sun_map(cmd, camera, *sunMap, depthView, g_aoView[0], false);
+        else
+          draw_with_view(cmd, "Sun shadows", g_sunPass, camera.view, depthView, g_aoView[0], nullptr);
+        if (!g_sunMapDebug) {
+          draw(cmd, "Sun shadows blur (horizontal)", g_blurH, g_aoView[0], g_aoView[1], false);
+          draw(cmd, "Sun shadows blur (vertical)", g_blurV, g_aoView[1], g_aoView[0], false);
+        }
+        draw(cmd, "Sun shadows apply", g_aoApply, g_aoView[0], dst, true, resolve);
+      }
     }
   }
   if (edge_light_enabled() && g_module && depthView && msaaSamples == 1) {
