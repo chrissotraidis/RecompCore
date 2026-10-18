@@ -1968,7 +1968,7 @@ static void encode_sun_map(const wgpu::CommandEncoder& cmd, const RenderPass& pa
   size_t casters = 0;
   for (const auto& command : passInfo.commands)
     casters += command.type == CommandType::Draw && command.data.draw.type == ShaderType::GXCore && !command.flat &&
-               command.data.draw.gxcore.sunCaster;
+               (command.data.draw.gxcore.sunCaster || command.data.draw.gxcore.sunCasterAlpha);
   // DOL_AURORA_SUN_SHADOW_MAP_TRACE=1: each pass's casters and draws, every 300th map.
   static const bool trace = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_TRACE") != nullptr;
   if (trace) {

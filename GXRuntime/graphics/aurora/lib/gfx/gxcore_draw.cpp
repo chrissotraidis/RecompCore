@@ -406,6 +406,36 @@ bool sun_caster(const gxc::PipelineKey& key) {
          key.blend_subtract == 0u && key.primitive_topology == 0u &&
          (s_all || alpha_test_always_passes(key.shader));
 }
+
+// Whether the alpha test is statically guaranteed to drop every pixel (a
+// depth-priming draw): such a draw shows nothing, so it casts nothing.
+bool alpha_test_always_fails(const gxc::ShaderKey& shader) {
+  const bool c0_never = shader.alpha_comp0 == 0u;
+  const bool c1_never = shader.alpha_comp1 == 0u;
+  const bool c0_always = shader.alpha_comp0 == 7u;
+  const bool c1_always = shader.alpha_comp1 == 7u;
+  switch (shader.alpha_logic) {
+  case 0u: // And
+    return c0_never || c1_never;
+  case 1u: // Or
+    return c0_never && c1_never;
+  case 2u: // Xor
+    return (c0_always && c1_always) || (c0_never && c1_never);
+  case 3u: // Xnor
+    return (c0_always && c1_never) || (c0_never && c1_always);
+  }
+  return false;
+}
+
+// A draw the sun shadow map draws again with its texture's cutout
+// (DrawData::sunCasterAlpha): solid scenery whose alpha test drops pixels
+// (roofs, awnings, a tree's leaves, fences). Its caster pipeline samples the
+// texture and discards below half, so it casts its true silhouette.
+bool sun_caster_alpha(const gxc::PipelineKey& key) {
+  return key.depth_test != 0u && key.depth_update != 0u && key.color_update != 0u && key.blend_enable == 0u &&
+         key.blend_subtract == 0u && key.primitive_topology == 0u && key.shader.textured != 0u &&
+         !alpha_test_always_passes(key.shader) && !alpha_test_always_fails(key.shader);
+}
 } // namespace
 
 bool needs_early_depth_emulation(const gxc::PipelineKey& key) {
@@ -990,14 +1020,50 @@ fn vs_indexed(in: VertexIn) -> @builtin(position) vec4f {
     let i = i32(in.posmtx);
     return to_map(vsc.transformmatrices[i], vsc.transformmatrices[i + 1], vsc.transformmatrices[i + 2], in.rawpos);
 }
+// An alpha-tested caster: the first raw texture coordinate rides along, and
+// the fragment keeps the texture's cutout (most such materials sample their
+// texture with the identity, so the raw coordinate is the sample's).
+struct VertexInUv {
+    @location(0) rawpos: vec3f,
+    @location(1) posmtx: u32,
+    @location(2) uv0: vec2f,
+};
+struct VertexOutUv {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+@vertex
+fn vs_current_uv(in: VertexInUv) -> VertexOutUv {
+    var out: VertexOutUv;
+    out.pos = to_map(vsc.posnormalmatrix[0], vsc.posnormalmatrix[1], vsc.posnormalmatrix[2], in.rawpos);
+    out.uv = in.uv0;
+    return out;
+}
+@vertex
+fn vs_indexed_uv(in: VertexInUv) -> VertexOutUv {
+    let i = i32(in.posmtx);
+    var out: VertexOutUv;
+    out.pos = to_map(vsc.transformmatrices[i], vsc.transformmatrices[i + 1], vsc.transformmatrices[i + 2], in.rawpos);
+    out.uv = in.uv0;
+    return out;
+}
+@group(2) @binding(0) var tex: texture_2d<f32>;
+@group(2) @binding(1) var samp: sampler;
+@fragment
+fn fs_alpha(in: VertexOutUv) {
+    if (textureSample(tex, samp, in.uv).a < 0.5) {
+        discard;
+    }
+}
 )""";
 constexpr uint64_t kSunCasterUniformSize = 12 * sizeof(float);
 wgpu::BindGroupLayout g_sunCasterLayout;
-std::array<wgpu::RenderPipeline, 2> g_sunCasterPipelines; // current, indexed
+std::array<wgpu::RenderPipeline, 4> g_sunCasterPipelines; // current, indexed, then the same with the alpha cutout
 struct SunCasterState {
   int pipeline = -1;
   WGPUBindGroup group1 = nullptr;
   uint32_t offset1 = UINT32_MAX;
+  WGPUBindGroup group2 = nullptr; // an alpha caster's texture
   WGPUBuffer vertexBuffer = nullptr;
   uint64_t vertexOffset = 0;
 };
@@ -1020,11 +1086,23 @@ void make_sun_caster_pipelines() {
   const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{
       .label = "Sun shadow map casters", .bindGroupLayoutCount = layouts.size(), .bindGroupLayouts = layouts.data()};
   const auto pipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
+  const std::array alphaLayouts{g_sunCasterLayout, g_uniformBindGroupLayout, texture_bind_group_layout(1u)};
+  const wgpu::PipelineLayoutDescriptor alphaLayoutDescriptor{.label = "Sun shadow map casters (alpha)",
+                                                             .bindGroupLayoutCount = alphaLayouts.size(),
+                                                             .bindGroupLayouts = alphaLayouts.data()};
+  const auto alphaPipelineLayout = g_device.CreatePipelineLayout(&alphaLayoutDescriptor);
   const std::array attributes{
       wgpu::VertexAttribute{.format = wgpu::VertexFormat::Float32x3, .offset = gxc::kVertexPosOffset, .shaderLocation = 0},
       wgpu::VertexAttribute{.format = wgpu::VertexFormat::Uint32, .offset = gxc::kVertexPosMtxOffset, .shaderLocation = 1},
+      wgpu::VertexAttribute{.format = wgpu::VertexFormat::Float32x2, .offset = gxc::kVertexUvOffset, .shaderLocation = 2},
   };
   const wgpu::VertexBufferLayout vertexLayout{
+      .arrayStride = gxc::kVertexStrideBytes,
+      .stepMode = wgpu::VertexStepMode::Vertex,
+      .attributeCount = 2,
+      .attributes = attributes.data(),
+  };
+  const wgpu::VertexBufferLayout alphaVertexLayout{
       .arrayStride = gxc::kVertexStrideBytes,
       .stepMode = wgpu::VertexStepMode::Vertex,
       .attributeCount = attributes.size(),
@@ -1040,19 +1118,26 @@ void make_sun_caster_pipelines() {
       .depthBiasSlopeScale = 2.f,
       .depthBiasClamp = 0.f,
   };
-  for (int indexed = 0; indexed < 2; ++indexed) {
-    const wgpu::RenderPipelineDescriptor descriptor{
-        .label = indexed != 0 ? "Sun shadow map casters (per-vertex matrices)" : "Sun shadow map casters",
-        .layout = pipelineLayout,
-        .vertex = {.module = module,
-                   .entryPoint = indexed != 0 ? "vs_indexed" : "vs_current",
-                   .bufferCount = 1,
-                   .buffers = &vertexLayout},
-        .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList, .cullMode = wgpu::CullMode::None},
-        .depthStencil = &depthStencil,
-        .multisample = {.count = 1, .mask = UINT32_MAX},
-    };
-    g_sunCasterPipelines[indexed] = g_device.CreateRenderPipeline(&descriptor);
+  const wgpu::FragmentState alphaFragment{.module = module, .entryPoint = "fs_alpha", .targetCount = 0};
+  for (int alpha = 0; alpha < 2; ++alpha) {
+    for (int indexed = 0; indexed < 2; ++indexed) {
+      const wgpu::RenderPipelineDescriptor descriptor{
+          .label = alpha != 0 ? "Sun shadow map casters (alpha cutout)"
+                 : indexed != 0 ? "Sun shadow map casters (per-vertex matrices)"
+                                : "Sun shadow map casters",
+          .layout = alpha != 0 ? alphaPipelineLayout : pipelineLayout,
+          .vertex = {.module = module,
+                     .entryPoint = alpha != 0 ? (indexed != 0 ? "vs_indexed_uv" : "vs_current_uv")
+                                              : (indexed != 0 ? "vs_indexed" : "vs_current"),
+                     .bufferCount = 1,
+                     .buffers = alpha != 0 ? &alphaVertexLayout : &vertexLayout},
+          .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList, .cullMode = wgpu::CullMode::None},
+          .depthStencil = &depthStencil,
+          .multisample = {.count = 1, .mask = UINT32_MAX},
+          .fragment = alpha != 0 ? &alphaFragment : nullptr,
+      };
+      g_sunCasterPipelines[alpha * 2 + indexed] = g_device.CreateRenderPipeline(&descriptor);
+    }
   }
 }
 } // namespace
@@ -1078,13 +1163,21 @@ void begin_sun_casters(const wgpu::RenderPassEncoder& pass, const float rows[12]
 }
 
 void render_sun_caster(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
-  if (!data.sunCaster)
+  const bool alpha = data.sunCasterAlpha && data.textureBindGroup != 0;
+  if (!data.sunCaster && !alpha)
     return;
   SunCasterState& state = g_sunCasterState;
-  const int pipeline = data.posMtxIdx ? 1 : 0;
+  const int pipeline = (alpha ? 2 : 0) + (data.posMtxIdx ? 1 : 0);
   if (state.pipeline != pipeline) {
     pass.SetPipeline(g_sunCasterPipelines[pipeline]);
     state.pipeline = pipeline;
+  }
+  if (alpha) {
+    const auto& group = find_bind_group(data.textureBindGroup);
+    if (group.Get() != state.group2) {
+      pass.SetBindGroup(2, group);
+      state.group2 = group.Get();
+    }
   }
   static std::vector<DrawPart> parts;
   collect_parts(data, parts);
@@ -2463,6 +2556,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .uberTextureBindGroup = uberTextureBindGroup,
       .sunCaster = sun_caster(plan.pipeline),
       .posMtxIdx = plan.pipeline.shader.has_pos_mtx_idx != 0,
+      // The cutout pipeline binds one texture and sampler at group 2, the
+      // single-texmap layout: a multi-texmap material keeps the screen's steps.
+      .sunCasterAlpha = plan.texmap_mask == 0u && textureBindGroup != 0 && sun_caster_alpha(plan.pipeline),
   });
   return true;
 }
