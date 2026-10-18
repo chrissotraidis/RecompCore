@@ -1819,6 +1819,21 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     });
   }
 
+  // The game's own shadow under a character or object: the triangles of the
+  // ground under it drawn again, blended, in a texture of its shape (see
+  // frame_interp's draw_key_of()). With the sun shadow map on, the object
+  // casts its shadow from the map, and the game's darkened its feet a second
+  // time, a dark patch inside the shade of a building.
+  // DOL_AURORA_GAME_SHADOWS=1 keeps them.
+  static const bool s_keepGameShadows = [] {
+    const char* value = std::getenv("DOL_AURORA_GAME_SHADOWS");
+    return value != nullptr && value[0] == '1';
+  }();
+  if (!s_keepGameShadows && plan.match_direct_position && plan.draw_tag == 0 && plan.match_primitive == 0x90 &&
+      plan.tex_address != 0 && plan.pipeline.blend_enable != 0u && plan.constants.projection[3][2] != 0.f &&
+      post_fx::sun_shadow_map_enabled())
+    return true;
+
   // Resolve one texmap's texture to a GPU handle: EFB-copy shadow first, else the
   // guest-identity + content-hash decode cache. Shared by the single-texmap fast
   // path and the multi-texmap path (63/Mfin, e.g. THP YUV Y/U/V on texmap 0/1/2).
