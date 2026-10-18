@@ -2287,12 +2287,23 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const bool clothCaster = plan.draw_scope_part != 0 && !plan.match_direct_position &&
                            plan.pipeline.depth_test != 0u && plan.pipeline.depth_update != 0u &&
                            plan.pipeline.color_update != 0u && plan.pipeline.primitive_topology == 0u;
+  // Much of the game's solid furniture is drawn blended (a treasure chest,
+  // Beedle's ship, a Wizrobe), which the solid caster rule refuses so the sea
+  // and glows cast nothing. What tells them apart: the sea rewrites its vertex
+  // grid every frame to follow the player, furniture never does. A blended,
+  // depth-writing, indexed draw whose positions stood still casts.
+  const bool blendedCaster = !plan.match_direct_position && plan.draw_scope_part == 0 &&
+                             plan.pipeline.blend_enable != 0u && plan.pipeline.blend_subtract == 0u &&
+                             plan.pipeline.depth_test != 0u && plan.pipeline.depth_update != 0u &&
+                             plan.pipeline.color_update != 0u && plan.pipeline.primitive_topology == 0u &&
+                             alpha_test_always_passes(plan.pipeline.shader) && plan.pipeline.shader.textured != 0u &&
+                             !positions_written(plan);
   static const bool s_casterLog = [] {
     const char* value = std::getenv("DOL_AURORA_SUN_CASTER_LOG");
     return value != nullptr && value[0] == '1';
   }();
   if (s_casterLog && (plan.draw_scope_part != 0 ||
-                      (plan.vertex_count >= 100 && !sun_caster(plan.pipeline) && !clothCaster &&
+                      (plan.vertex_count >= 100 && !sun_caster(plan.pipeline) && !clothCaster && !blendedCaster &&
                        !sun_caster_alpha(plan.pipeline)))) {
     static std::set<uint64_t> seen;
     const uint64_t state = (uint64_t(plan.pipeline.blend_enable) << 0) | (uint64_t(plan.pipeline.depth_test) << 1) |
@@ -2595,7 +2606,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .uberPipeline = uberPipeline,
       .uberPixelRange = uberPixelRange,
       .uberTextureBindGroup = uberTextureBindGroup,
-      .sunCaster = sun_caster(plan.pipeline) || clothCaster,
+      .sunCaster = sun_caster(plan.pipeline) || clothCaster || blendedCaster,
       .posMtxIdx = plan.pipeline.shader.has_pos_mtx_idx != 0,
       // DOL_AURORA_SUN_CASTER_LOG=1: why a cloth's or wake's draw (a scope)
       // does or does not cast, once per distinct state (local debug).
