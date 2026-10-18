@@ -589,13 +589,19 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
     if (edge < 1.0 && m.z > 0.0 && m.z < 1.0) {
         let uv = vec2(m.x * 0.5 + 0.5, 0.5 - m.y * 0.5);
         let reference = m.z - view.params.y;
-        var sum = 0.0;
-        for (var j = -1; j <= 1; j++) {
-            for (var i = -1; i <= 1; i++) {
-                sum += textureSampleCompareLevel(sun_map, sun_compare, uv + vec2(f32(i), f32(j)) * view.params.x, reference);
-            }
+        // A disc of lookups two texels wide, turned per pixel (stable, from the
+        // pixel alone): the edge comes out soft, and the map's texels break
+        // into fine noise instead of stairs.
+        let turn = 6.2831853 * fract(52.9829189 * fract(dot(in.pos.xy, vec2(0.06711056, 0.00583715))));
+        let rot = mat2x2<f32>(cos(turn), sin(turn), -sin(turn), cos(turn));
+        var sum = textureSampleCompareLevel(sun_map, sun_compare, uv, reference);
+        for (var i = 0; i < 11; i++) {
+            let r = 2.0 * sqrt((f32(i) + 0.5) / 11.0);
+            let a = 2.3999632 * f32(i);
+            sum += textureSampleCompareLevel(sun_map, sun_compare,
+                                             uv + (rot * (vec2(cos(a), sin(a)) * r)) * view.params.x, reference);
         }
-        lit = mix(sum / 9.0, 1.0, smoothstep(0.85, 1.0, edge));
+        lit = mix(sum / 12.0, 1.0, smoothstep(0.85, 1.0, edge));
     } else if (debug_view > 0.5) {
         return vec4(vec3(0.5), 1.0);
     }
