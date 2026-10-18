@@ -396,8 +396,15 @@ bool alpha_test_always_passes(const gxc::ShaderKey& shader) {
 // particles, the game's own blob shadows), what writes no depth (the sky) and
 // lines and points are left out.
 bool sun_caster(const gxc::PipelineKey& key) {
+  // DOL_AURORA_SUN_SHADOW_MAP_ALL=1: alpha-tested draws cast too, as solid
+  // shapes (local test: which shadows the alpha-test exclusion is costing).
+  static const bool s_all = [] {
+    const char* value = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_ALL");
+    return value != nullptr && value[0] == '1';
+  }();
   return key.depth_test != 0u && key.depth_update != 0u && key.color_update != 0u && key.blend_enable == 0u &&
-         key.blend_subtract == 0u && key.primitive_topology == 0u && alpha_test_always_passes(key.shader);
+         key.blend_subtract == 0u && key.primitive_topology == 0u &&
+         (s_all || alpha_test_always_passes(key.shader));
 }
 } // namespace
 
