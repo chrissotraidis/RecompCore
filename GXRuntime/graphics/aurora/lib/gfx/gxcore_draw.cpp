@@ -1934,6 +1934,14 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       plan.tex_address != 0 && plan.pipeline.blend_enable != 0u && plan.constants.projection[3][2] != 0.f &&
       post_fx::sun_shadow_map_enabled())
     return true;
+  // The rest of the game's own shadows: every one, real or simple (the blob
+  // under a pot, a rupee or a character, and the shadow-volume passes),
+  // indexes its positions from one of two fixed arrays (d_drawlist's
+  // l_shadowVolPos and l_simpleShadowPos). The map casts the real shadows.
+  if (!s_keepGameShadows && !plan.match_direct_position &&
+      (plan.match_position_base == 0x8037C554u || plan.match_position_base == 0x8037C7DCu) &&
+      post_fx::sun_shadow_map_enabled())
+    return true;
 
   // Resolve one texmap's texture to a GPU handle: EFB-copy shadow first, else the
   // guest-identity + content-hash decode cache. Shared by the single-texmap fast
@@ -2283,7 +2291,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     const char* value = std::getenv("DOL_AURORA_SUN_CASTER_LOG");
     return value != nullptr && value[0] == '1';
   }();
-  if (s_casterLog && plan.draw_scope_part != 0) {
+  if (s_casterLog && (plan.draw_scope_part != 0 ||
+                      (plan.vertex_count >= 100 && !sun_caster(plan.pipeline) && !clothCaster &&
+                       !sun_caster_alpha(plan.pipeline)))) {
     static std::set<uint64_t> seen;
     const uint64_t state = (uint64_t(plan.pipeline.blend_enable) << 0) | (uint64_t(plan.pipeline.depth_test) << 1) |
                            (uint64_t(plan.pipeline.depth_update) << 2) | (uint64_t(plan.pipeline.color_update) << 3) |
