@@ -1985,26 +1985,31 @@ static void encode_sun_map(const wgpu::CommandEncoder& cmd, const RenderPass& pa
   if (casters == 0 && !clear)
     return;
   const webgpu::gpu_prof::Zone zone{cmd, "Sun shadow map"};
-  const wgpu::RenderPassDepthStencilAttachment depth{
-      .view = post_fx::sun_map_view(),
-      .depthLoadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
-      .depthStoreOp = wgpu::StoreOp::Store,
-      .depthClearValue = 1.f,
-  };
-  const wgpu::RenderPassDescriptor descriptor{
-      .label = "Sun shadow map",
-      .colorAttachmentCount = 0,
-      .depthStencilAttachment = &depth,
-      .timestampWrites = webgpu::gpu_prof::pass_writes("Sun shadow map"),
-  };
-  auto pass = cmd.BeginRenderPass(&descriptor);
-  if (casters != 0) {
-    gxcore::begin_sun_casters(pass, map.caster.data());
-    for (const auto& command : passInfo.commands)
-      if (command.type == CommandType::Draw && command.data.draw.type == ShaderType::GXCore && !command.flat)
-        gxcore::render_sun_caster(command.data.draw.gxcore, pass);
+  // Each cascade has its own pass: the same casters, its own matrix.
+  static constexpr const char* kCascadeNames[post_fx::kSunMapCascades] = {
+      "Sun shadow map", "Sun shadow map (cascade 2)", "Sun shadow map (cascade 3)", "Sun shadow map (cascade 4)"};
+  for (uint32_t cascade = 0; cascade < map.cascades; ++cascade) {
+    const wgpu::RenderPassDepthStencilAttachment depth{
+        .view = post_fx::sun_map_layer(cascade),
+        .depthLoadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+        .depthStoreOp = wgpu::StoreOp::Store,
+        .depthClearValue = 1.f,
+    };
+    const wgpu::RenderPassDescriptor descriptor{
+        .label = "Sun shadow map",
+        .colorAttachmentCount = 0,
+        .depthStencilAttachment = &depth,
+        .timestampWrites = webgpu::gpu_prof::pass_writes(kCascadeNames[cascade]),
+    };
+    auto pass = cmd.BeginRenderPass(&descriptor);
+    if (casters != 0) {
+      gxcore::begin_sun_casters(pass, map.caster[cascade].data());
+      for (const auto& command : passInfo.commands)
+        if (command.type == CommandType::Draw && command.data.draw.type == ShaderType::GXCore && !command.flat)
+          gxcore::render_sun_caster(command.data.draw.gxcore, pass);
+    }
+    pass.End();
   }
-  pass.End();
 }
 #endif
 

@@ -88,20 +88,28 @@ Camera current_camera() noexcept;
 // (the step's camera relative to the real frame's, frame_interp::camera_steps),
 // at `seconds`.
 Camera moved_camera(const Camera& camera, const float relative[3][4], float seconds) noexcept;
-// The sun shadow map's depth format, and where a frame's map is drawn from:
-// `world` takes a place in the world to the map (three rows of a 3x4 matrix:
-// x and y -1 to 1 across it, z 0 to 1, nearer the sun less), `caster` takes
-// the camera's view space there (world after the camera's inverse view), for
-// the draws' positions. Not valid with the camera unknown or the sun too low.
+// The sun shadow map's depth format, and where a frame's maps are drawn from.
+// The map is a few cascades, each wider than the one before (the first
+// DOL_AURORA_SUN_SHADOW_MAP_RANGE across, each next _SPREAD times that), so
+// what is near is sharp and an island far ahead still casts. For each cascade,
+// `world` takes a place in the world to it (three rows of a 3x4 matrix: x and y
+// -1 to 1 across it, z 0 to 1, nearer the sun less), `caster` takes the
+// camera's view space there (world after the camera's inverse view), for the
+// draws' positions. Not valid with the camera unknown or the sun too low.
 constexpr wgpu::TextureFormat kSunMapFormat = wgpu::TextureFormat::Depth32Float;
+constexpr uint32_t kSunMapCascades = 4;
 struct SunMap {
-  std::array<float, 12> world{};
-  std::array<float, 12> caster{};
+  std::array<std::array<float, 12>, kSunMapCascades> world{};
+  std::array<std::array<float, 12>, kSunMapCascades> caster{};
+  uint32_t cascades = 0;
   bool valid = false;
 };
 SunMap sun_map(const Camera& camera) noexcept;
-// The map's depth texture, made at its size on first use.
+// The map's depth texture (one layer a cascade), made at its size on first
+// use: all of it, for the lookups.
 const wgpu::TextureView& sun_map_view();
+// One cascade's layer, for drawing its casters into.
+const wgpu::TextureView& sun_map_layer(uint32_t cascade);
 // Every effect that is on, in order (ambient occlusion, sun shadows, edge
 // light, torch light, cloud shadows, far blur, bloom);
 // depthView: the EFB's depth; camera: the one the frame is drawn from;

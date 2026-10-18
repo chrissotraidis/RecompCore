@@ -35,12 +35,26 @@ float g_sunStrength = 0.35f;  // how dark a sun shadow is
 float g_sunReach = 1500.f;    // how far toward the sun a shadow is looked for, in world units
 std::atomic_bool g_sunMapOn{false};
 uint32_t g_sunMapSize = 2048;    // the shadow map's texels a side
-float g_sunMapRange = 5000.f;    // world units from its centre to its edge
-float g_sunMapDepth = 20000.f;   // world units toward and away from the sun it holds, from its centre
-float g_sunMapBias = 12.f;       // world units a surface is moved toward the sun before the lookup
+float g_sunMapRange = 1250.f;    // world units from the first cascade's centre to its edge (a texel about Link's leg)
+float g_sunMapSpread = 4.f;      // each next cascade this many times wider
+uint32_t g_sunMapCascades = 4;   // DOL_AURORA_SUN_SHADOW_MAP_CASCADES, 1 to kSunMapCascades
+float g_sunMapDepth = 20000.f;   // world units toward and away from the sun it holds, from its centre (at least twice a cascade's range)
+float g_sunMapBias = 12.f;       // world units a surface is moved toward the sun before the lookup (first cascade; scaled with the texels)
 float g_sunMapContact = 300.f;   // the screen's steps' reach, for what the map leaves out
 int g_sunMapDebug = 0;           // DOL_AURORA_SUN_SHADOW_MAP_DEBUG=1: the map's shadow alone, gray outside it; 2: the map itself, depth as contour bands
-bool g_sunMapSteps = false;      // DOL_AURORA_SUN_SHADOW_MAP_STEPS=1: the screen's steps too, for what the map leaves out
+bool g_sunMapSteps = false;
+float g_sunMapFarStart = 1500.f;  // DOL_AURORA_SUN_SHADOW_MAP_FAR_START/_END: world units from the camera over which the
+float g_sunMapFarEnd = 5000.f;    // bias goes from its near values to its far ones
+float g_sunMapNormalNear = 0.5f;   // DOL_AURORA_SUN_SHADOW_MAP_NORMAL_NEAR: the normal offset near the camera, in texels
+float g_sunMapSlopeNear = 1.f;    // DOL_AURORA_SUN_SHADOW_MAP_SLOPE_NEAR: the same near the camera
+float g_sunMapSlope = 10.f;       // DOL_AURORA_SUN_SHADOW_MAP_SLOPE: texels of the surface's own depth slope added to the bias
+float g_sunMapNormalOffset = 2.f; // DOL_AURORA_SUN_SHADOW_MAP_NORMAL_OFFSET: a lookup moved out along the surface's normal, in its cascade's texels      // DOL_AURORA_SUN_SHADOW_MAP_STEPS=1: the screen's steps too, for what the map leaves out
+// A cascade's range (world units from its centre to its edge), and the depth
+// toward and away from the sun it holds: enough for what stands in it.
+float cascade_range(uint32_t cascade) noexcept { return g_sunMapRange * std::pow(g_sunMapSpread, static_cast<float>(cascade)); }
+float cascade_depth(float range) noexcept { return std::max(g_sunMapDepth, 2.f * range); }
+// The sun shadow pass's uniform (kSunMapShader's View).
+constexpr size_t kSunMapUniformFloats = 76;
 float g_cloudStrength = 0.28f;  // how dark a cloud's shadow is
 float g_cloudScale = 7000.f;    // world units across one cloud
 bool g_cloudDebug = false;
@@ -515,21 +529,28 @@ override strength: f32 = 0.35;
 override contact: f32 = 300.0;
 override debug_view: f32 = 0.0;
 override screen_steps: f32 = 0.0;
+override normal_offset: f32 = 2.0;
+override slope_texels: f32 = 10.0;
+override slope_near: f32 = 1.0;
+override normal_near: f32 = 0.5;
+override far_start: f32 = 1500.0;
+override far_end: f32 = 5000.0;
 override direct: f32 = 1.0;
 
 struct View {
     rows: array<vec4<f32>, 3>,  // the inverse view matrix (view to world), by rows
     lens: vec4<f32>,            // tan(fovy / 2), aspect, near, the sea's height
     time: vec4<f32>,            // seconds, then the direction to the sun (world)
-    light: array<vec4<f32>, 3>, // the world to the map (post_fx::SunMap::world)
-    params: vec4<f32>,          // a texel's size in the map, the depth bias
+    light: array<vec4<f32>, 12>, // the world to each cascade (post_fx::SunMap::world), three rows each
+    params: vec4<f32>,          // a texel's size in the map, the cascades drawn
+    bias: vec4<f32>,            // each cascade's depth bias, in its own depth's units
 };
 
 @group(0) @binding(0) var samp: sampler;
 @group(0) @binding(1) var unused: texture_2d<f32>;
 @group(0) @binding(2) var depth: texture_depth_2d;
 @group(0) @binding(3) var<uniform> view: View;
-@group(0) @binding(4) var sun_map: texture_depth_2d;
+@group(0) @binding(4) var sun_map: texture_depth_2d_array;
 @group(0) @binding(5) var sun_compare: sampler_comparison;
 
 struct VertexOutput {
@@ -562,57 +583,152 @@ fn view_depth(uv: vec2<f32>) -> f32 {
 fn in_sun_map(s: vec2<f32>, surface: f32, tx: f32, ty: f32) -> bool {
     let o = vec4(vec3(s.x * tx, s.y * ty, -1.0) * surface, 1.0);
     let w = vec4(dot(view.rows[0], o), dot(view.rows[1], o), dot(view.rows[2], o), 1.0);
-    let m = vec3(dot(view.light[0], w), dot(view.light[1], w), dot(view.light[2], w));
-    if (max(abs(m.x), abs(m.y)) >= 1.0 || m.z <= 0.0 || m.z >= 1.0) {
+    let k = first_cascade(w);
+    if (k < 0) {
         return false;
     }
+    let m = to_cascade(k, w);
     let size = vec2<f32>(textureDimensions(sun_map));
     let texel = clamp(vec2<i32>(vec2(m.x * 0.5 + 0.5, 0.5 - m.y * 0.5) * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
-    return abs(textureLoad(sun_map, texel, 0) - m.z) < 8.0 * view.params.y;
+    return abs(textureLoad(sun_map, texel, k, 0) - m.z) < 8.0 * view.bias[k];
+}
+
+// A place in the world in cascade k: x and y -1 to 1 across it, z 0 to 1.
+fn to_cascade(k: i32, w: vec4<f32>) -> vec3<f32> {
+    return vec3(dot(view.light[k * 3], w), dot(view.light[k * 3 + 1], w), dot(view.light[k * 3 + 2], w));
+}
+
+fn inside(m: vec3<f32>) -> bool {
+    return max(abs(m.x), abs(m.y)) < 1.0 && m.z > 0.0 && m.z < 1.0;
+}
+
+// A place moved out along its surface's normal by about two of cascade k's
+// texels (the reach of its filter), so a coarse cascade doesn't shade the
+// surface it was drawn from: on a beach under a low sun the ground's own depth
+// from the sun changes more across a texel than the depth bias allows.
+fn offset_world(k: i32, w: vec4<f32>, normal: vec3<f32>) -> vec4<f32> {
+    let texel = 2.0 / (length(view.light[k * 3].xyz) * f32(textureDimensions(sun_map).x));
+    return vec4(w.xyz + normal * texel, 1.0);
+}
+
+// The sharpest cascade that holds a place, or -1.
+fn first_cascade(w: vec4<f32>) -> i32 {
+    for (var k = 0; k < i32(view.params.y); k++) {
+        if (inside(to_cascade(k, w))) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+// How lit a place is in cascade k (m: its place there): a disc of lookups two
+// texels wide, turned per pixel (stable, from the pixel alone), so the edge
+// comes out soft and the map's texels break into fine noise instead of stairs.
+fn lit_in(k: i32, m: vec3<f32>, rot: mat2x2<f32>, slope: f32, world_y: f32) -> f32 {
+    let uv = vec2(m.x * 0.5 + 0.5, 0.5 - m.y * 0.5);
+    // The surface's own depth from the sun changes by `slope` world units per
+    // unit across the map: over the filter's reach that is how much farther a
+    // lit surface can read than its neighbours, so the bias grows with it
+    // (`slope` already holds how many texels of it, more far from the camera).
+    // With the sun low over flat ground (20 degrees at Outset in the evening)
+    // the ground shaded itself, and the sea in rings, without it.
+    let size = vec2<f32>(textureDimensions(sun_map));
+    let texel = 2.0 / (length(view.light[k * 3].xyz) * size.x);
+    let per_unit = length(view.light[k * 3 + 2].xyz);  // the map's depth per world unit along the sun
+    let reference = m.z - view.bias[k] - texel * slope * per_unit;
+    // Nothing at the sea's height or below shades the water or the sand at its
+    // edge: the islands' models carry their sea floor up to the waterline, and
+    // the waves dip below it, so the sea read it as something above.
+    let low = world_y < view.lens.w + 40.0;
+    var sum = 0.0;
+    for (var i = 0; i < 12; i++) {
+        var o = vec2(0.0);
+        if (i > 0) {
+            let r = 2.0 * sqrt((f32(i - 1) + 0.5) / 11.0);
+            let a = 2.3999632 * f32(i - 1);
+            o = rot * (vec2(cos(a), sin(a)) * r) * view.params.x;
+        }
+        let t = clamp(vec2<i32>((uv + o) * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
+        let d = textureLoad(sun_map, t, k, 0);
+        var lit = select(0.0, 1.0, reference <= d);
+        if (lit < 0.5 && low) {
+            // How high the surface in the way stands: up the sun's ray by
+            // its distance in front.
+            let height = world_y + view.time.z * (m.z - d) / per_unit;
+            lit = select(0.0, 1.0, height < view.lens.w + 15.0);
+        }
+        sum += lit;
+    }
+    return sum / 12.0;
 }
 
 @fragment
 fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
-    // The map itself, straight to the screen: its depth from the sun as
-    // contour bands, so the casters' silhouettes read regardless of range.
-    if (debug_view > 1.5) {
-        let size = vec2<f32>(textureDimensions(sun_map));
-        let p = clamp(vec2<i32>(in.uv * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
-        let d = textureLoad(sun_map, p, 0);
-        if (d >= 1.0) {
-            return vec4(1.0);
-        }
-        return vec4(vec3(0.25 + 0.75 * fract(d * 100.0)), 1.0);
-    }
     let z = view_depth(in.uv);
     let sun = view.time.yzw;
-    if (z <= 0.0 || sun.y < 0.05) {
-        return vec4(1.0);
-    }
     let ndc = vec2(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
     let tx = view.lens.x * view.lens.y;
     let ty = view.lens.x;
     let p = vec3(ndc.x * tx, ndc.y * ty, -1.0) * z;
     let world = vec4(dot(view.rows[0], vec4(p, 1.0)), dot(view.rows[1], vec4(p, 1.0)), dot(view.rows[2], vec4(p, 1.0)), 1.0);
-    let m = vec3(dot(view.light[0], world), dot(view.light[1], world), dot(view.light[2], world));
+    // The surface's normal from its neighbours (before any early return: the
+    // derivatives need every pixel), turned toward the camera.
+    var normal = cross(dpdx(world.xyz), dpdy(world.xyz));
+    // The map itself, straight to the screen: its depth from the sun as
+    // contour bands, so the casters' silhouettes read regardless of range.
+    // 2 shows the first cascade, 3 the second, 4 the third, 5 the fourth.
+    if (debug_view > 1.5 && debug_view < 5.5) {
+        let size = vec2<f32>(textureDimensions(sun_map));
+        let p = clamp(vec2<i32>(in.uv * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
+        let d = textureLoad(sun_map, p, min(i32(debug_view + 0.5) - 2, i32(view.params.y) - 1), 0);
+        if (d >= 1.0) {
+            return vec4(1.0);
+        }
+        return vec4(vec3(0.25 + 0.75 * fract(d * 100.0)), 1.0);
+    }
+    if (z <= 0.0 || sun.y < 0.05) {
+        return vec4(1.0);
+    }
+    let nl = length(normal);
+    normal = select(vec3(0.0), normal / nl, nl > 1e-6);
+    let eye = vec3(view.rows[0].w, view.rows[1].w, view.rows[2].w);
+    normal = select(normal, -normal, dot(normal, eye - world.xyz) < 0.0);
     var lit = 1.0;
-    let edge = max(abs(m.x), abs(m.y));
-    if (edge < 1.0 && m.z > 0.0 && m.z < 1.0) {
-        let uv = vec2(m.x * 0.5 + 0.5, 0.5 - m.y * 0.5);
-        let reference = m.z - view.params.y;
-        // A disc of lookups two texels wide, turned per pixel (stable, from the
-        // pixel alone): the edge comes out soft, and the map's texels break
-        // into fine noise instead of stairs.
+    // 0 near the camera, 1 far off: the bias terms grow with it.
+    let far = smoothstep(far_start, far_end, z);
+    let k = first_cascade(world);
+    if (k >= 0) {
         let turn = 6.2831853 * fract(52.9829189 * fract(dot(in.pos.xy, vec2(0.06711056, 0.00583715))));
         let rot = mat2x2<f32>(cos(turn), sin(turn), -sin(turn), cos(turn));
-        var sum = textureSampleCompareLevel(sun_map, sun_compare, uv, reference);
-        for (var i = 0; i < 11; i++) {
-            let r = 2.0 * sqrt((f32(i) + 0.5) / 11.0);
-            let a = 2.3999632 * f32(i);
-            sum += textureSampleCompareLevel(sun_map, sun_compare,
-                                             uv + (rot * (vec2(cos(a), sin(a)) * r)) * view.params.x, reference);
+        let m = to_cascade(k, offset_world(k, world, normal * mix(normal_near, normal_offset, far)));
+        // tan of the angle between the surface and the sun (capped), times how
+        // many texels of it the bias takes: few near the camera, so shadows
+        // stay at their casters' feet, more far off, where the surface's
+        // direction from the depth buffer is rough.
+        let ndl = dot(normal, sun);
+        let cap = mix(4.0, 8.0, far);
+        let tilt = select(cap, min(sqrt(max(1.0 - ndl * ndl, 0.0)) / ndl, cap), ndl > 0.0);
+        let slope = tilt * mix(slope_near, slope_texels, far);
+        lit = lit_in(k, m, rot, slope, world.y);
+        // Near a cascade's edge, blend into the next (or, past the last, into
+        // the light), so the step in sharpness doesn't show as a line.
+        let edge = max(abs(m.x), abs(m.y));
+        let blend = smoothstep(0.85, 1.0, edge);
+        if (blend > 0.0) {
+            var next = 1.0;
+            if (k + 1 < i32(view.params.y)) {
+                let n = to_cascade(k + 1, offset_world(k + 1, world, normal * mix(normal_near, normal_offset, far)));
+                if (inside(n)) {
+                    next = lit_in(k + 1, n, rot, slope, world.y);
+                }
+            }
+            lit = mix(lit, next, blend);
         }
-        lit = mix(sum / 12.0, 1.0, smoothstep(0.85, 1.0, edge));
+        // 6: each cascade tinted (red, green, blue, yellow), to see where they reach.
+        if (debug_view > 5.5) {
+            var tint = array<vec3<f32>, 4>(vec3(1.0, 0.6, 0.6), vec3(0.6, 1.0, 0.6), vec3(0.6, 0.6, 1.0), vec3(1.0, 1.0, 0.5))[k];
+            return vec4(tint * (0.4 + 0.6 * lit), 1.0);
+        }
     } else if (debug_view > 0.5) {
         return vec4(vec3(0.5), 1.0);
     }
@@ -661,6 +777,7 @@ wgpu::RenderPipeline g_sunMapDirect; // multiplied straight into the scene
 wgpu::Sampler g_sunMapCompare;
 wgpu::Texture g_sunMapTex;
 wgpu::TextureView g_sunMapView;
+std::array<wgpu::TextureView, kSunMapCascades> g_sunMapLayers;
 
 // Edge light: a warm rim on the sunlit outline of what is near the camera (Link,
 // people, objects). A pixel is on such an outline when, a few pixels from it
@@ -965,6 +1082,12 @@ wgpu::RenderPipeline make_sun_map_pipeline(wgpu::TextureFormat format, bool dire
       wgpu::ConstantEntry{.key = "contact", .value = g_sunMapContact},
       wgpu::ConstantEntry{.key = "debug_view", .value = static_cast<double>(g_sunMapDebug)},
       wgpu::ConstantEntry{.key = "screen_steps", .value = g_sunMapSteps ? 1.0 : 0.0},
+      wgpu::ConstantEntry{.key = "normal_offset", .value = g_sunMapNormalOffset},
+      wgpu::ConstantEntry{.key = "slope_texels", .value = g_sunMapSlope},
+      wgpu::ConstantEntry{.key = "slope_near", .value = g_sunMapSlopeNear},
+      wgpu::ConstantEntry{.key = "normal_near", .value = g_sunMapNormalNear},
+      wgpu::ConstantEntry{.key = "far_start", .value = g_sunMapFarStart},
+      wgpu::ConstantEntry{.key = "far_end", .value = g_sunMapFarEnd},
       wgpu::ConstantEntry{.key = "direct", .value = direct ? 1.0 : 0.0},
   };
   const wgpu::BlendState multiply{
@@ -1296,11 +1419,19 @@ void draw_with_uniform(const wgpu::CommandEncoder& cmd, const char* label, const
 void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const SunMap& sunMap,
                   const wgpu::TextureView& depthView, const wgpu::TextureView& target, bool direct,
                   const wgpu::TextureView& resolve = nullptr) {
-  std::array<float, 36> uniform{};
+  std::array<float, kSunMapUniformFloats> uniform{};
   std::memcpy(uniform.data(), camera.view.data(), sizeof(camera.view));
-  std::memcpy(uniform.data() + 20, sunMap.world.data(), sizeof(sunMap.world));
-  uniform[32] = 1.f / static_cast<float>(g_sunMapSize);
-  uniform[33] = g_sunMapBias / (2.f * g_sunMapDepth);
+  for (uint32_t cascade = 0; cascade < kSunMapCascades; ++cascade)
+    std::memcpy(uniform.data() + 20 + cascade * 12, sunMap.world[cascade].data(), sizeof(sunMap.world[cascade]));
+  uniform[68] = 1.f / static_cast<float>(g_sunMapSize);
+  uniform[69] = static_cast<float>(sunMap.cascades);
+  for (uint32_t cascade = 0; cascade < kSunMapCascades; ++cascade) {
+    // The bias (world units for a cascade 5000 across) follows each
+    // cascade's texels: 3 near Link's feet, 12, 48 and 192 further out, in
+    // each one's own depth's units.
+    const float range = cascade_range(cascade);
+    uniform[72 + cascade] = g_sunMapBias * (range / 5000.f) / (2.f * cascade_depth(range));
+  }
   const wgpu::BufferDescriptor bufferDescriptor{
       .label = "Sun shadow map view",
       .usage = wgpu::BufferUsage::Uniform,
@@ -1368,8 +1499,18 @@ void initialize() {
   g_sunMapOn.store(sunMap != nullptr && sunMap[0] == '1', std::memory_order_relaxed);
   g_sunMapSize = static_cast<uint32_t>(env_float("DOL_AURORA_SUN_SHADOW_MAP_SIZE", static_cast<float>(g_sunMapSize), 256.f, 8192.f));
   g_sunMapRange = env_float("DOL_AURORA_SUN_SHADOW_MAP_RANGE", g_sunMapRange, 500.f, 100000.f);
+  g_sunMapSpread = env_float("DOL_AURORA_SUN_SHADOW_MAP_SPREAD", g_sunMapSpread, 1.5f, 16.f);
+  g_sunMapCascades = static_cast<uint32_t>(env_float("DOL_AURORA_SUN_SHADOW_MAP_CASCADES",
+                                                     static_cast<float>(g_sunMapCascades), 1.f,
+                                                     static_cast<float>(kSunMapCascades)));
   g_sunMapDepth = env_float("DOL_AURORA_SUN_SHADOW_MAP_DEPTH", g_sunMapDepth, 1000.f, 1000000.f);
   g_sunMapBias = env_float("DOL_AURORA_SUN_SHADOW_MAP_BIAS", g_sunMapBias, 0.f, 1000.f);
+  g_sunMapSlope = env_float("DOL_AURORA_SUN_SHADOW_MAP_SLOPE", g_sunMapSlope, 0.f, 32.f);
+  g_sunMapFarStart = env_float("DOL_AURORA_SUN_SHADOW_MAP_FAR_START", g_sunMapFarStart, 0.f, 100000.f);
+  g_sunMapFarEnd = env_float("DOL_AURORA_SUN_SHADOW_MAP_FAR_END", g_sunMapFarEnd, g_sunMapFarStart + 1.f, 200000.f);
+  g_sunMapNormalNear = env_float("DOL_AURORA_SUN_SHADOW_MAP_NORMAL_NEAR", g_sunMapNormalNear, 0.f, 16.f);
+  g_sunMapSlopeNear = env_float("DOL_AURORA_SUN_SHADOW_MAP_SLOPE_NEAR", g_sunMapSlopeNear, 0.f, 32.f);
+  g_sunMapNormalOffset = env_float("DOL_AURORA_SUN_SHADOW_MAP_NORMAL_OFFSET", g_sunMapNormalOffset, 0.f, 16.f);
   g_sunMapContact = env_float("DOL_AURORA_SUN_SHADOW_MAP_CONTACT", g_sunMapContact, 20.f, 5000.f);
   const char* sunMapDebug = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_DEBUG");
   g_sunMapDebug = sunMapDebug != nullptr ? sunMapDebug[0] - '0' : 0;
@@ -1504,7 +1645,8 @@ void initialize() {
       wgpu::BindGroupLayoutEntry{
           .binding = 4,
           .visibility = wgpu::ShaderStage::Fragment,
-          .texture = {.sampleType = wgpu::TextureSampleType::Depth, .viewDimension = wgpu::TextureViewDimension::e2D},
+          .texture = {.sampleType = wgpu::TextureSampleType::Depth,
+                      .viewDimension = wgpu::TextureViewDimension::e2DArray},
       },
       wgpu::BindGroupLayoutEntry{
           .binding = 5,
@@ -1512,7 +1654,7 @@ void initialize() {
           .sampler = {.type = wgpu::SamplerBindingType::Comparison},
       },
   };
-  sunMapEntries[3].buffer.minBindingSize = 36 * sizeof(float);
+  sunMapEntries[3].buffer.minBindingSize = kSunMapUniformFloats * sizeof(float);
   const wgpu::BindGroupLayoutDescriptor sunMapLayoutDescriptor{
       .label = "Sun shadows (shadow map)",
       .entryCount = sunMapEntries.size(),
@@ -1551,6 +1693,7 @@ void shutdown() {
   g_sunMapLayout = {};
   g_sunMapCompare = {};
   g_sunMapView = {};
+  g_sunMapLayers = {};
   g_sunMapTex = {};
   g_edgePass = {};
   g_edgeSamples = 0;
@@ -1617,32 +1760,44 @@ SunMap sun_map(const Camera& camera) noexcept {
   for (float& c : x)
     c /= xl;
   const float y[3] = {sun[1] * x[2] - sun[2] * x[1], sun[2] * x[0] - sun[0] * x[2], sun[0] * x[1] - sun[1] * x[0]};
-  // The centre: half the range ahead of the camera, level (the view looks down
-  // its -z, the inverse view's third column in the world).
+  // Each cascade's centre: half its range ahead of the camera, level (the view
+  // looks down its -z, the inverse view's third column in the world).
   float ahead[3] = {-v[2], 0.f, -v[10]};
   const float al = std::sqrt(ahead[0] * ahead[0] + ahead[2] * ahead[2]);
-  const float centre[3] = {v[3] + (al > 1e-4f ? ahead[0] / al : 0.f) * g_sunMapRange * 0.5f, v[7],
-                           v[11] + (al > 1e-4f ? ahead[2] / al : 0.f) * g_sunMapRange * 0.5f};
-  // Moved by whole texels across the map, so its texels stay where they are on
-  // the ground while the camera moves and the shadows' edges don't crawl.
-  const float texel = 2.f * g_sunMapRange / static_cast<float>(g_sunMapSize);
-  const float cx = std::floor((x[0] * centre[0] + x[1] * centre[1] + x[2] * centre[2]) / texel) * texel;
-  const float cy = std::floor((y[0] * centre[0] + y[1] * centre[1] + y[2] * centre[2]) / texel) * texel;
-  const float cz = sun[0] * centre[0] + sun[1] * centre[1] + sun[2] * centre[2];
-  const float r = 1.f / g_sunMapRange, d = 1.f / (2.f * g_sunMapDepth);
-  map.world = {x[0] * r,    x[1] * r,    x[2] * r,    -cx * r,  //
-               y[0] * r,    y[1] * r,    y[2] * r,    -cy * r,  //
-               -sun[0] * d, -sun[1] * d, -sun[2] * d, 0.5f + cz * d};
-  // The camera's view space there: world = A view + t, the inverse view.
-  for (int row = 0; row < 3; ++row) {
-    const float* w = &map.world[row * 4];
-    for (int c = 0; c < 4; ++c) {
-      float sum = c == 3 ? w[3] : 0.f;
-      for (int k = 0; k < 3; ++k)
-        sum += w[k] * v[k * 4 + c];
-      map.caster[row * 4 + c] = sum;
+  for (uint32_t cascade = 0; cascade < g_sunMapCascades; ++cascade) {
+    const float range = cascade_range(cascade), depth = cascade_depth(range);
+    const float centre[3] = {v[3] + (al > 1e-4f ? ahead[0] / al : 0.f) * range * 0.5f, v[7],
+                             v[11] + (al > 1e-4f ? ahead[2] / al : 0.f) * range * 0.5f};
+    // Moved by whole texels across the map, so its texels stay where they are on
+    // the ground while the camera moves and the shadows' edges don't crawl.
+    const float texel = 2.f * range / static_cast<float>(g_sunMapSize);
+    const float cx = std::floor((x[0] * centre[0] + x[1] * centre[1] + x[2] * centre[2]) / texel) * texel;
+    const float cy = std::floor((y[0] * centre[0] + y[1] * centre[1] + y[2] * centre[2]) / texel) * texel;
+    const float cz = sun[0] * centre[0] + sun[1] * centre[1] + sun[2] * centre[2];
+    const float r = 1.f / range, d = 1.f / (2.f * depth);
+    auto& world = map.world[cascade];
+    world = {x[0] * r,    x[1] * r,    x[2] * r,    -cx * r,  //
+             y[0] * r,    y[1] * r,    y[2] * r,    -cy * r,  //
+             -sun[0] * d, -sun[1] * d, -sun[2] * d, 0.5f + cz * d};
+    // The camera's view space there: world = A view + t, the inverse view.
+    for (int row = 0; row < 3; ++row) {
+      const float* w = &world[row * 4];
+      for (int c = 0; c < 4; ++c) {
+        float sum = c == 3 ? w[3] : 0.f;
+        for (int k = 0; k < 3; ++k)
+          sum += w[k] * v[k * 4 + c];
+        map.caster[cascade][row * 4 + c] = sum;
+      }
     }
   }
+  map.cascades = g_sunMapCascades;
+  // DOL_AURORA_SUN_SHADOW_MAP_TRACE: the sun and the camera, every 300th map.
+  static const bool s_trace = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_TRACE") != nullptr;
+  static uint32_t s_maps = 0;
+  if (s_trace && s_maps++ % 300 == 0)
+    std::fprintf(stderr, "[sun-map] sun=%.3f,%.3f,%.3f (elevation %.1f deg) eye=%.0f,%.0f,%.0f looking=%.3f,%.3f,%.3f\n",
+                 sun[0], sun[1], sun[2], std::asin(std::clamp(sun[1], -1.f, 1.f)) * 57.29578f, v[3], v[7], v[11],
+                 -v[2], -v[6], -v[10]);
   map.valid = true;
   return map;
 }
@@ -1653,15 +1808,28 @@ const wgpu::TextureView& sun_map_view() {
         .label = "Sun shadow map",
         .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
         .dimension = wgpu::TextureDimension::e2D,
-        .size = {g_sunMapSize, g_sunMapSize, 1},
+        .size = {g_sunMapSize, g_sunMapSize, kSunMapCascades},
         .format = kSunMapFormat,
         .mipLevelCount = 1,
         .sampleCount = 1,
     };
     g_sunMapTex = g_device.CreateTexture(&descriptor);
-    g_sunMapView = g_sunMapTex.CreateView();
+    const wgpu::TextureViewDescriptor all{.dimension = wgpu::TextureViewDimension::e2DArray,
+                                          .arrayLayerCount = kSunMapCascades};
+    g_sunMapView = g_sunMapTex.CreateView(&all);
+    for (uint32_t cascade = 0; cascade < kSunMapCascades; ++cascade) {
+      const wgpu::TextureViewDescriptor layer{.dimension = wgpu::TextureViewDimension::e2D,
+                                              .baseArrayLayer = cascade,
+                                              .arrayLayerCount = 1};
+      g_sunMapLayers[cascade] = g_sunMapTex.CreateView(&layer);
+    }
   }
   return g_sunMapView;
+}
+
+const wgpu::TextureView& sun_map_layer(uint32_t cascade) {
+  sun_map_view();
+  return g_sunMapLayers[cascade];
 }
 
 bool torch_light_enabled() noexcept { return g_torch.load(std::memory_order_relaxed) && webgpu::g_hasCoreFeatures; }

@@ -1110,13 +1110,14 @@ void make_sun_caster_pipelines() {
       .attributes = attributes.data(),
   };
   // Nearer the sun is less (the map is cleared to 1). The slope bias keeps a
-  // surface steep to the sun from shadowing itself (post_fx adds a constant one).
+  // surface steep to the sun from shadowing itself (post_fx adds a constant one);
+  // at 2 texels it lifted the shadow off a thin caster's base, Link's shoes.
   const wgpu::DepthStencilState depthStencil{
       .format = post_fx::kSunMapFormat,
       .depthWriteEnabled = true,
       .depthCompare = wgpu::CompareFunction::Less,
       .depthBias = 0,
-      .depthBiasSlopeScale = 2.f,
+      .depthBiasSlopeScale = 1.f,
       .depthBiasClamp = 0.f,
   };
   const wgpu::FragmentState alphaFragment{.module = module, .entryPoint = "fs_alpha", .targetCount = 0};
