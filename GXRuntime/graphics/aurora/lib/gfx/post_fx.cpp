@@ -34,7 +34,7 @@ float g_edgeStrength = 0.4f;  // how bright a sunlit edge gets
 float g_sunStrength = 0.35f;  // how dark a sun shadow is
 float g_sunReach = 1500.f;    // how far toward the sun a shadow is looked for, in world units
 std::atomic_bool g_sunMapOn{false};
-uint32_t g_sunMapSize = 2048;    // the shadow map's texels a side
+uint32_t g_sunMapSize = 4096;    // the shadow map's texels a side (4096 high, 2048 medium, 1024 low)
 float g_sunMapRange = 1250.f;    // world units from the first cascade's centre to its edge (a texel about Link's leg)
 float g_sunMapSpread = 4.f;      // each next cascade this many times wider
 uint32_t g_sunMapCascades = 4;   // DOL_AURORA_SUN_SHADOW_MAP_CASCADES, 1 to kSunMapCascades
@@ -43,6 +43,11 @@ float g_sunMapBias = 12.f;       // world units a surface is moved toward the su
 float g_sunMapContact = 300.f;   // the screen's steps' reach, for what the map leaves out
 int g_sunMapDebug = 0;           // DOL_AURORA_SUN_SHADOW_MAP_DEBUG=1: the map's shadow alone, gray outside it; 2: the map itself, depth as contour bands
 bool g_sunMapSteps = false;
+float g_sunMapSeaLow = 40.f;      // DOL_AURORA_SUN_SHADOW_MAP_SEA_LOW: below the sea's height plus this, a surface counts as sea
+float g_sunMapSeaRise = 15.f;     // DOL_AURORA_SUN_SHADOW_MAP_SEA_RISE: what stands no higher than this above the sea doesn't shade it
+bool g_sunMapSmooth = true;
+bool g_sunMapGapFill = true;
+uint32_t g_sunMapTaps = 12;       // DOL_AURORA_SUN_SHADOW_MAP_TAPS: lookups in each shadow's filter disc (6 to 12)      // DOL_AURORA_SUN_SHADOW_MAP_GAP_FILL=0: no steps over the bias's reach (shadows start that far from their casters)       // DOL_AURORA_SUN_SHADOW_MAP_SMOOTH=0: each cascade's bias and offsets step at its edge (before)
 float g_sunMapFarStart = 1500.f;  // DOL_AURORA_SUN_SHADOW_MAP_FAR_START/_END: world units from the camera over which the
 float g_sunMapFarEnd = 5000.f;    // bias goes from its near values to its far ones
 float g_sunMapNormalNear = 0.5f;   // DOL_AURORA_SUN_SHADOW_MAP_NORMAL_NEAR: the normal offset near the camera, in texels
@@ -546,6 +551,12 @@ override normal_near: f32 = 0.5;
 override far_start: f32 = 1500.0;
 override far_end: f32 = 5000.0;
 override direct: f32 = 1.0;
+override spread: f32 = 4.0;
+override smooth_terms: f32 = 1.0;
+override sea_low: f32 = 40.0;
+override gap_fill: f32 = 1.0;
+override taps: f32 = 12.0;
+override sea_rise: f32 = 15.0;
 
 struct View {
     rows: array<vec4<f32>, 3>,  // the inverse view matrix (view to world), by rows
@@ -608,8 +619,18 @@ fn to_cascade(k: i32, w: vec4<f32>) -> vec3<f32> {
     return vec3(dot(view.light[k * 3], w), dot(view.light[k * 3 + 1], w), dot(view.light[k * 3 + 2], w));
 }
 
-fn inside(m: vec3<f32>) -> bool {
-    return max(abs(m.x), abs(m.y)) < 1.0 && m.z > 0.0 && m.z < 1.0;
+// How far out a place is in cascade k (m: its place there), 1 at the edge:
+// across the sun's view and along the sun's rays alike, in the cascade's range.
+// Measured across only, the sea far below Link along the sun's rays from him
+// (where the platform's shadow falls) was in the sharpest cascade, a square of
+// other terms amid the coarser cascades' water.
+fn reach(k: i32, m: vec3<f32>) -> f32 {
+    let along = abs(m.z - 0.5) * length(view.light[k * 3].xyz) / length(view.light[k * 3 + 2].xyz);
+    return max(max(abs(m.x), abs(m.y)), along);
+}
+
+fn inside(k: i32, m: vec3<f32>) -> bool {
+    return reach(k, m) < 1.0 && m.z > 0.0 && m.z < 1.0;
 }
 
 // A place moved out along its surface's normal by about two of cascade k's
@@ -621,10 +642,35 @@ fn offset_world(k: i32, w: vec4<f32>, normal: vec3<f32>) -> vec4<f32> {
     return vec4(w.xyz + normal * texel, 1.0);
 }
 
+// How much cascade k's bias, normal offset, slope term and filter reach are
+// scaled up at a place: a continuous function of how far out it is, so they
+// grow by `spread` from one cascade's inner edge to its outer one and match the
+// next cascade's where the two meet. With a step at each edge, the sea's own
+// crest shading stopped there in a square around Link. In cascade k, `t` runs
+// 0 at the edge of cascade k-1 to 1 at k's own; in the first, from a quarter
+// of the way out (Link's surroundings keep the near terms).
+fn grow_at(k: i32, w: vec4<f32>) -> f32 {
+    if (smooth_terms < 0.5) {
+        return 1.0;
+    }
+    let mk = to_cascade(k, w);
+    let outer = reach(k, mk);
+    var t = 0.0;
+    if (k == 0) {
+        t = clamp((outer - 0.25) / 0.75, 0.0, 1.0);
+    } else {
+        let mi = to_cascade(k - 1, w);
+        let inner = reach(k - 1, mi);
+        // inner >= 1 outside cascade k-1, outer <= 1 inside k.
+        t = clamp((inner - 1.0) / max((inner - 1.0) + (1.0 - outer), 1e-4), 0.0, 1.0);
+    }
+    return pow(spread, t);
+}
+
 // The sharpest cascade that holds a place, or -1.
 fn first_cascade(w: vec4<f32>) -> i32 {
     for (var k = 0; k < i32(view.params.y); k++) {
-        if (inside(to_cascade(k, w))) {
+        if (inside(k, to_cascade(k, w))) {
             return k;
         }
     }
@@ -634,7 +680,7 @@ fn first_cascade(w: vec4<f32>) -> i32 {
 // How lit a place is in cascade k (m: its place there): a disc of lookups two
 // texels wide, turned per pixel (stable, from the pixel alone), so the edge
 // comes out soft and the map's texels break into fine noise instead of stairs.
-fn lit_in(k: i32, m: vec3<f32>, rot: mat2x2<f32>, slope: f32, world_y: f32) -> f32 {
+fn lit_in(k: i32, m: vec3<f32>, rot: mat2x2<f32>, slope: f32, world_y: f32, grow: f32) -> f32 {
     let uv = vec2(m.x * 0.5 + 0.5, 0.5 - m.y * 0.5);
     // The surface's own depth from the sun changes by `slope` world units per
     // unit across the map: over the filter's reach that is how much farther a
@@ -645,31 +691,46 @@ fn lit_in(k: i32, m: vec3<f32>, rot: mat2x2<f32>, slope: f32, world_y: f32) -> f
     let size = vec2<f32>(textureDimensions(sun_map));
     let texel = 2.0 / (length(view.light[k * 3].xyz) * size.x);
     let per_unit = length(view.light[k * 3 + 2].xyz);  // the map's depth per world unit along the sun
-    let reference = m.z - view.bias[k] - texel * slope * per_unit;
+    let reference = m.z - (view.bias[k] + texel * slope * per_unit) * grow;
     // Nothing at the sea's height or below shades the water or the sand at its
     // edge: the islands' models carry their sea floor up to the waterline, and
     // the waves dip below it, so the sea read it as something above.
-    let low = world_y < view.lens.w + 40.0;
+    // How much the surface counts as sea: fully below sea_low over the sea's
+    // height, not at all 40 units higher (no hard line for the waves to cross).
+    let low = 1.0 - smoothstep(sea_low, sea_low + 40.0, world_y - view.lens.w);
     var sum = 0.0;
-    for (var i = 0; i < 12; i++) {
+    let n = i32(taps);
+    for (var i = 0; i < n; i++) {
         var o = vec2(0.0);
         if (i > 0) {
-            let r = 2.0 * sqrt((f32(i - 1) + 0.5) / 11.0);
+            let r = 2.0 * sqrt((f32(i - 1) + 0.5) / (taps - 1.0));
             let a = 2.3999632 * f32(i - 1);
-            o = rot * (vec2(cos(a), sin(a)) * r) * view.params.x;
+            o = rot * (vec2(cos(a), sin(a)) * r) * view.params.x * grow;
         }
         let t = clamp(vec2<i32>((uv + o) * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
         let d = textureLoad(sun_map, t, k, 0);
         var lit = select(0.0, 1.0, reference <= d);
-        if (lit < 0.5 && low) {
+        if (lit < 0.5 && low > 0.0) {
             // How high the surface in the way stands: up the sun's ray by
-            // its distance in front.
-            let height = world_y + view.time.z * (m.z - d) / per_unit;
-            lit = select(0.0, 1.0, height < view.lens.w + 15.0);
+            // its distance in front. Lit below sea_rise over the sea, shaded
+            // from 45 units higher, smoothly between: with a hard line, the
+            // foot of a tower standing in the sea flickered as the waves
+            // moved the water's height across it.
+            // The rule's heights shrink with the sun's: what it leaves out casts
+            // a strip rise / tan(elevation) long, so with fixed heights a
+            // tower standing in the sea had its shadow start ever further from
+            // its foot as the sun set (170 units at 5 degrees for 15 units).
+            // Measured from the water here, not the sea's level: in a deep
+            // sea's swell a tower's foot stood in troughs well below that
+            // level, the part of it above the water counted as sea and its
+            // shadow came away from the foot and back with every swell.
+            let rise = view.time.z * (m.z - d) / per_unit;
+            let scale = clamp(view.time.z * 2.0, 0.1, 1.0);
+            lit = low * (1.0 - smoothstep(sea_rise * scale, (sea_rise + 45.0) * scale, rise));
         }
         sum += lit;
     }
-    return sum / 12.0;
+    return sum / taps;
 }
 
 @fragment
@@ -703,6 +764,16 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
     normal = select(vec3(0.0), normal / nl, nl > 1e-6);
     let eye = vec3(view.rows[0].w, view.rows[1].w, view.rows[2].w);
     normal = select(normal, -normal, dot(normal, eye - world.xyz) < 0.0);
+    // The lookup is moved out along a level normal on the sea: the waves'
+    // own normals swing with every wave, and the lookup wobbled across the
+    // edges of shadows on the water. The slope term keeps the waves' normals,
+    // so a wave's face away from the sun doesn't shade itself (with a level
+    // normal there too, the crests' shading boiled).
+    let sea = 1.0 - smoothstep(sea_low, sea_low + 40.0, world.y - view.lens.w);
+    var push = normal;
+    if (sea > 0.0) {
+        push = normalize(mix(normal, vec3(0.0, 1.0, 0.0), sea) + vec3(0.0, 1e-6, 0.0));
+    }
     var lit = 1.0;
     // 0 near the camera, 1 far off: the bias terms grow with it.
     let far = smoothstep(far_start, far_end, z);
@@ -710,7 +781,8 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
     if (k >= 0) {
         let turn = 6.2831853 * fract(52.9829189 * fract(dot(in.pos.xy, vec2(0.06711056, 0.00583715))));
         let rot = mat2x2<f32>(cos(turn), sin(turn), -sin(turn), cos(turn));
-        let m = to_cascade(k, offset_world(k, world, normal * mix(normal_near, normal_offset, far)));
+        let grow = grow_at(k, world);
+        let m = to_cascade(k, offset_world(k, world, push * mix(normal_near, normal_offset, far) * grow));
         // tan of the angle between the surface and the sun (capped), times how
         // many texels of it the bias takes: few near the camera, so shadows
         // stay at their casters' feet, more far off, where the surface's
@@ -719,20 +791,70 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
         let cap = mix(4.0, 8.0, far);
         let tilt = select(cap, min(sqrt(max(1.0 - ndl * ndl, 0.0)) / ndl, cap), ndl > 0.0);
         let slope = tilt * mix(slope_near, slope_texels, far);
-        lit = lit_in(k, m, rot, slope, world.y);
+        lit = lit_in(k, m, rot, slope, world.y, grow);
         // Near a cascade's edge, blend into the next (or, past the last, into
         // the light), so the step in sharpness doesn't show as a line.
-        let edge = max(abs(m.x), abs(m.y));
+        let edge = reach(k, m);
         let blend = smoothstep(0.85, 1.0, edge);
         if (blend > 0.0) {
             var next = 1.0;
             if (k + 1 < i32(view.params.y)) {
-                let n = to_cascade(k + 1, offset_world(k + 1, world, normal * mix(normal_near, normal_offset, far)));
-                if (inside(n)) {
-                    next = lit_in(k + 1, n, rot, slope, world.y);
+                let grow_next = grow_at(k + 1, world);
+                let n = to_cascade(k + 1, offset_world(k + 1, world, push * mix(normal_near, normal_offset, far) * grow_next));
+                if (inside(k + 1, n)) {
+                    next = lit_in(k + 1, n, rot, slope, world.y, grow_next);
                 }
             }
             lit = mix(lit, next, blend);
+        }
+        // The bias leaves out what stands within its reach of a surface toward
+        // the sun, so a shadow started that far from its caster's foot, and
+        // further the further out (the bias grows with the camera's distance
+        // and the cascade's texels): zoomed out, shadows came away from the
+        // things that cast them. A few steps toward the sun through the depth
+        // buffer, over just that reach, find the foot again. Not on the sea,
+        // where a wave in front of the step would count as a caster.
+        if (gap_fill > 0.5 && lit > 0.0 && sea < 0.5) {
+            let size = f32(textureDimensions(sun_map).x);
+            let texel_world = 2.0 / (length(view.light[k * 3].xyz) * size);
+            let per_unit = length(view.light[k * 3 + 2].xyz);
+            let bias_world = (view.bias[k] / per_unit + texel_world * slope) * grow
+                + texel_world * mix(normal_near, normal_offset, far) * grow;
+            let reach = min(bias_world * 1.25, 800.0);
+            if (reach > 4.0) {
+                let l = normalize(vec3(dot(vec3(view.rows[0].x, view.rows[1].x, view.rows[2].x), sun),
+                                       dot(vec3(view.rows[0].y, view.rows[1].y, view.rows[2].y), sun),
+                                       dot(vec3(view.rows[0].z, view.rows[1].z, view.rows[2].z), sun)));
+                let jitter = fract(52.9829189 * fract(dot(in.pos.xy, vec2(0.00583715, 0.06711056))));
+                // Steps close enough together not to pass through a leg
+                // (16 over the reach): with 6, Link's calves fell between
+                // them and his feet's shadow stood apart from the rest.
+                for (var i = 0; i < 16; i++) {
+                    let t = reach * (f32(i) + jitter) / 16.0 + 2.0;
+                    let q = p + l * t;
+                    if (-q.z <= view.lens.z) {
+                        break;
+                    }
+                    let sq = vec2(q.x / -q.z / tx, q.y / -q.z / ty);
+                    let suv = vec2(sq.x * 0.5 + 0.5, 0.5 - sq.y * 0.5);
+                    if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) {
+                        break;
+                    }
+                    let surface = view_depth(suv);
+                    let behind = -q.z - surface;
+                    // Only just behind the surface found: a step deep behind
+                    // something nearer the camera drew a copy of it, standing
+                    // behind it, on whatever was further back.
+                    if (surface > 0.0 && behind > 2.0 + 0.002 * surface && behind < min(reach, 120.0)) {
+                        // Full at the foot, where the map holds nothing, and
+                        // fading toward the reach's end, where the map's own
+                        // shadow takes over (at full strength there, the foot
+                        // stood in a dark blob larger than the shadow).
+                        lit = min(lit, smoothstep(0.7, 1.0, t / reach));
+                        break;
+                    }
+                }
+            }
         }
         // 6: each cascade tinted (red, green, blue, yellow), to see where they reach.
         if (debug_view > 5.5) {
@@ -1099,6 +1221,12 @@ wgpu::RenderPipeline make_sun_map_pipeline(wgpu::TextureFormat format, bool dire
       wgpu::ConstantEntry{.key = "far_start", .value = g_sunMapFarStart},
       wgpu::ConstantEntry{.key = "far_end", .value = g_sunMapFarEnd},
       wgpu::ConstantEntry{.key = "direct", .value = direct ? 1.0 : 0.0},
+      wgpu::ConstantEntry{.key = "spread", .value = g_sunMapSpread},
+      wgpu::ConstantEntry{.key = "smooth_terms", .value = g_sunMapSmooth ? 1.0 : 0.0},
+      wgpu::ConstantEntry{.key = "sea_low", .value = g_sunMapSeaLow},
+      wgpu::ConstantEntry{.key = "gap_fill", .value = g_sunMapGapFill ? 1.0 : 0.0},
+      wgpu::ConstantEntry{.key = "taps", .value = static_cast<double>(g_sunMapTaps)},
+      wgpu::ConstantEntry{.key = "sea_rise", .value = g_sunMapSeaRise},
   };
   const wgpu::BlendState multiply{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -1512,6 +1640,22 @@ void initialize() {
   if (const char* sunMap = std::getenv("DOL_AURORA_SUN_SHADOW_MAP"); sunMap != nullptr) {
     g_sunMapOn.store(sunMap[0] == '1', std::memory_order_relaxed);
   }
+  // DOL_AURORA_SUN_SHADOW_QUALITY=high (the default), medium or low sets the
+  // map's size, its cascades, the filter's lookups and the gap fill together;
+  // each of their own variables still wins. Low keeps medium's sharpness (at
+  // 1024 every texel term grew and small shapes became blobs) and saves a
+  // cascade, half the lookups and the gap fill's steps instead.
+  if (const char* quality = std::getenv("DOL_AURORA_SUN_SHADOW_QUALITY"); quality != nullptr) {
+    if (std::strcmp(quality, "medium") == 0) {
+      g_sunMapSize = 2048;
+    } else if (std::strcmp(quality, "low") == 0) {
+      g_sunMapSize = 2048;
+      g_sunMapCascades = 3;
+      g_sunMapTaps = 6;
+      g_sunMapGapFill = false;
+    }
+  }
+  g_sunMapTaps = static_cast<uint32_t>(env_float("DOL_AURORA_SUN_SHADOW_MAP_TAPS", static_cast<float>(g_sunMapTaps), 6.f, 12.f));
   g_sunMapSize = static_cast<uint32_t>(env_float("DOL_AURORA_SUN_SHADOW_MAP_SIZE", static_cast<float>(g_sunMapSize), 256.f, 8192.f));
   g_sunMapRange = env_float("DOL_AURORA_SUN_SHADOW_MAP_RANGE", g_sunMapRange, 500.f, 100000.f);
   g_sunMapSpread = env_float("DOL_AURORA_SUN_SHADOW_MAP_SPREAD", g_sunMapSpread, 1.5f, 16.f);
@@ -1536,6 +1680,12 @@ void initialize() {
   g_sunMapDebug = sunMapDebug != nullptr ? sunMapDebug[0] - '0' : 0;
   const char* sunMapSteps = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_STEPS");
   g_sunMapSteps = sunMapSteps != nullptr && sunMapSteps[0] == '1';
+  g_sunMapSeaLow = env_float("DOL_AURORA_SUN_SHADOW_MAP_SEA_LOW", g_sunMapSeaLow, 0.f, 1000.f);
+  g_sunMapSeaRise = env_float("DOL_AURORA_SUN_SHADOW_MAP_SEA_RISE", g_sunMapSeaRise, 0.f, 1000.f);
+  if (const char* gapFill = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_GAP_FILL"); gapFill != nullptr)
+    g_sunMapGapFill = gapFill[0] != '0';
+  if (const char* sunMapSmooth = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_SMOOTH"); sunMapSmooth != nullptr)
+    g_sunMapSmooth = sunMapSmooth[0] != '0';
   g_edgeStrength = env_float("DOL_AURORA_EDGE_LIGHT_STRENGTH", g_edgeStrength, 0.f, 4.f);
   g_torchStrength = env_float("DOL_AURORA_TORCH_LIGHT_STRENGTH", g_torchStrength, 0.f, 4.f);
   g_torchRadiusScale = env_float("DOL_AURORA_TORCH_LIGHT_REACH", g_torchRadiusScale, 0.1f, 50.f);
