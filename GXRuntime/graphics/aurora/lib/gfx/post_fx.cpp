@@ -1508,8 +1508,10 @@ void initialize() {
   g_cloudScale = env_float("DOL_AURORA_CLOUD_SHADOWS_SCALE", g_cloudScale, 1.f, 1e7f);
   g_sunStrength = env_float("DOL_AURORA_SUN_SHADOWS_STRENGTH", g_sunStrength, 0.f, 1.f);
   g_sunReach = env_float("DOL_AURORA_SUN_SHADOWS_REACH", g_sunReach, 1.f, 1e6f);
-  const char* sunMap = std::getenv("DOL_AURORA_SUN_SHADOW_MAP");
-  g_sunMapOn.store(sunMap != nullptr && sunMap[0] == '1', std::memory_order_relaxed);
+  // The host decides through set_sun_shadow_map(); the variable overrides it only when it is set.
+  if (const char* sunMap = std::getenv("DOL_AURORA_SUN_SHADOW_MAP"); sunMap != nullptr) {
+    g_sunMapOn.store(sunMap[0] == '1', std::memory_order_relaxed);
+  }
   g_sunMapSize = static_cast<uint32_t>(env_float("DOL_AURORA_SUN_SHADOW_MAP_SIZE", static_cast<float>(g_sunMapSize), 256.f, 8192.f));
   g_sunMapRange = env_float("DOL_AURORA_SUN_SHADOW_MAP_RANGE", g_sunMapRange, 500.f, 100000.f);
   g_sunMapSpread = env_float("DOL_AURORA_SUN_SHADOW_MAP_SPREAD", g_sunMapSpread, 1.5f, 16.f);
