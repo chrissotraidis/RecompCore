@@ -1931,6 +1931,27 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     const char* value = std::getenv("DOL_AURORA_GAME_SHADOWS");
     return value != nullptr && value[0] == '1';
   }();
+  // DOL_AURORA_GAME_SHADOW_LOG=1 (local debug): every 120th frame, each blended
+  // textured draw with what the two rules below test, to find a game shadow
+  // they let through.
+  static const bool s_shadowLog = std::getenv("DOL_AURORA_GAME_SHADOW_LOG") != nullptr;
+  if (s_shadowLog && plan.tex_address != 0 && plan.pipeline.blend_enable != 0u &&
+      !(plan.tex_width == 32 && plan.tex_height == 32)) {
+    static uint64_t s_frame = 0;
+    static uint32_t s_count = 0;
+    const uint64_t frame = frame_interp::game_frame_number();
+    if (frame != s_frame) {
+      s_frame = frame;
+      s_count = 0;
+    }
+    if (frame % 120u == 0u && s_count++ < 400u)
+      std::fprintf(stderr,
+                   "[game-shadow] frame %llu direct=%d base=%08X prim=%02X tag=%u proj32=%g tex=%08X %ux%u fmt=%u map=%d\n",
+                   static_cast<unsigned long long>(frame), plan.match_direct_position ? 1 : 0,
+                   plan.match_position_base, plan.match_primitive, static_cast<unsigned>(plan.draw_tag),
+                   plan.constants.projection[3][2], plan.tex_address, plan.tex_width, plan.tex_height,
+                   plan.tex_format, post_fx::sun_shadow_map_enabled() ? 1 : 0);
+  }
   if (!s_keepGameShadows && plan.match_direct_position && plan.draw_tag == 0 && plan.match_primitive == 0x90 &&
       plan.tex_address != 0 && plan.pipeline.blend_enable != 0u && plan.constants.projection[3][2] != 0.f &&
       post_fx::sun_shadow_map_enabled())
