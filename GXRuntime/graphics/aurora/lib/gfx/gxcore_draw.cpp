@@ -1939,8 +1939,11 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // under a pot, a rupee or a character, and the shadow-volume passes),
   // indexes its positions from one of two fixed arrays (d_drawlist's
   // l_shadowVolPos and l_simpleShadowPos). The map casts the real shadows.
+  // The base is compared without its top bits: on Linux it comes as the
+  // physical address (0x0037C7DC), and the simple shadows got through.
   if (!s_keepGameShadows && !plan.match_direct_position &&
-      (plan.match_position_base == 0x8037C554u || plan.match_position_base == 0x8037C7DCu) &&
+      ((plan.match_position_base & 0x3FFFFFFFu) == 0x0037C554u ||
+       (plan.match_position_base & 0x3FFFFFFFu) == 0x0037C7DCu) &&
       post_fx::sun_shadow_map_enabled())
     return true;
 
