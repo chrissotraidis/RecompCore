@@ -64,6 +64,9 @@ void set_sun_shadows(bool enabled) noexcept;
 // Sun shadows on, and drawn from the shadow map.
 bool sun_shadow_map_enabled() noexcept;
 void set_sun_shadow_map(bool enabled) noexcept;
+// The shadow quality, 0 low, 1 medium, 2 high (DOL_AURORA_SUN_SHADOW_QUALITY's
+// levels); applied by the render thread before its next frame.
+void set_sun_shadow_quality(int level) noexcept;
 void set_sun_direction(float x, float y, float z) noexcept;
 bool cloud_shadows_enabled() noexcept;
 void set_cloud_shadows(bool enabled) noexcept;

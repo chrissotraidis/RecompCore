@@ -46,8 +46,11 @@ bool g_sunMapSteps = false;
 float g_sunMapSeaLow = 40.f;      // DOL_AURORA_SUN_SHADOW_MAP_SEA_LOW: below the sea's height plus this, a surface counts as sea
 float g_sunMapSeaRise = 15.f;     // DOL_AURORA_SUN_SHADOW_MAP_SEA_RISE: what stands no higher than this above the sea doesn't shade it
 bool g_sunMapSmooth = true;
-bool g_sunMapGapFill = true;
-uint32_t g_sunMapTaps = 12;       // DOL_AURORA_SUN_SHADOW_MAP_TAPS: lookups in each shadow's filter disc (6 to 12)      // DOL_AURORA_SUN_SHADOW_MAP_GAP_FILL=0: no steps over the bias's reach (shadows start that far from their casters)       // DOL_AURORA_SUN_SHADOW_MAP_SMOOTH=0: each cascade's bias and offsets step at its edge (before)
+bool g_sunMapGapFill = true;      // DOL_AURORA_SUN_SHADOW_MAP_GAP_FILL=0: no steps over the bias's reach
+uint32_t g_sunMapTaps = 12;       // DOL_AURORA_SUN_SHADOW_MAP_TAPS: lookups in each shadow's filter disc (6 to 12)
+// The shadow quality set while running (set_sun_shadow_quality), 0 low to 2
+// high, until the render thread applies it; -1 when nothing is waiting.
+std::atomic_int g_sunQualityPending{-1};
 float g_sunMapFarStart = 1500.f;  // DOL_AURORA_SUN_SHADOW_MAP_FAR_START/_END: world units from the camera over which the
 float g_sunMapFarEnd = 5000.f;    // bias goes from its near values to its far ones
 float g_sunMapNormalNear = 0.5f;   // DOL_AURORA_SUN_SHADOW_MAP_NORMAL_NEAR: the normal offset near the camera, in texels
@@ -1356,7 +1359,33 @@ wgpu::RenderPipeline make_far_pipeline(wgpu::TextureFormat format, uint32_t samp
   return g_device.CreateRenderPipeline(&descriptor);
 }
 
+// A shadow quality's map size, cascades, filter lookups and gap fill (0 low,
+// 1 medium, 2 high), then each of their own variables on top. Low keeps
+// medium's sharpness (at 1024 every texel term grew and small shapes became
+// blobs) and saves a cascade, half the lookups and the gap fill's steps.
+void apply_sun_quality(int level) {
+  g_sunMapSize = level >= 2 ? 4096 : 2048;
+  g_sunMapCascades = level <= 0 ? 3 : kSunMapCascades;
+  g_sunMapTaps = level <= 0 ? 6 : 12;
+  g_sunMapGapFill = level > 0;
+  g_sunMapTaps = static_cast<uint32_t>(env_float("DOL_AURORA_SUN_SHADOW_MAP_TAPS", static_cast<float>(g_sunMapTaps), 6.f, 12.f));
+  g_sunMapSize = static_cast<uint32_t>(env_float("DOL_AURORA_SUN_SHADOW_MAP_SIZE", static_cast<float>(g_sunMapSize), 256.f, 8192.f));
+  g_sunMapCascades = static_cast<uint32_t>(env_float("DOL_AURORA_SUN_SHADOW_MAP_CASCADES",
+                                                     static_cast<float>(g_sunMapCascades), 1.f,
+                                                     static_cast<float>(kSunMapCascades)));
+  if (const char* gapFill = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_GAP_FILL"); gapFill != nullptr)
+    g_sunMapGapFill = gapFill[0] != '0';
+}
+
 void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format, uint32_t samples) {
+  // A quality set while running: its map is made at its size when next used
+  // (sun_map_view), and the two pipelines that take its lookups and gap fill
+  // as constants are made again below.
+  if (const int level = g_sunQualityPending.exchange(-1, std::memory_order_relaxed); level >= 0) {
+    apply_sun_quality(level);
+    g_sunMapPass = {};
+    g_sunMapDirect = {};
+  }
   if (format != g_format) {
     g_format = format;
     g_bright = make_pipeline("Bloom bright pass", "fs_bright", format, 1, kReplace);
@@ -1642,26 +1671,14 @@ void initialize() {
   }
   // DOL_AURORA_SUN_SHADOW_QUALITY=high (the default), medium or low sets the
   // map's size, its cascades, the filter's lookups and the gap fill together;
-  // each of their own variables still wins. Low keeps medium's sharpness (at
-  // 1024 every texel term grew and small shapes became blobs) and saves a
-  // cascade, half the lookups and the gap fill's steps instead.
-  if (const char* quality = std::getenv("DOL_AURORA_SUN_SHADOW_QUALITY"); quality != nullptr) {
-    if (std::strcmp(quality, "medium") == 0) {
-      g_sunMapSize = 2048;
-    } else if (std::strcmp(quality, "low") == 0) {
-      g_sunMapSize = 2048;
-      g_sunMapCascades = 3;
-      g_sunMapTaps = 6;
-      g_sunMapGapFill = false;
-    }
+  // each of their own variables still wins. The host can change it while
+  // running (aurora_set_sun_shadow_quality).
+  {
+    const char* quality = std::getenv("DOL_AURORA_SUN_SHADOW_QUALITY");
+    apply_sun_quality(quality == nullptr ? 2 : std::strcmp(quality, "low") == 0 ? 0 : std::strcmp(quality, "medium") == 0 ? 1 : 2);
   }
-  g_sunMapTaps = static_cast<uint32_t>(env_float("DOL_AURORA_SUN_SHADOW_MAP_TAPS", static_cast<float>(g_sunMapTaps), 6.f, 12.f));
-  g_sunMapSize = static_cast<uint32_t>(env_float("DOL_AURORA_SUN_SHADOW_MAP_SIZE", static_cast<float>(g_sunMapSize), 256.f, 8192.f));
   g_sunMapRange = env_float("DOL_AURORA_SUN_SHADOW_MAP_RANGE", g_sunMapRange, 500.f, 100000.f);
   g_sunMapSpread = env_float("DOL_AURORA_SUN_SHADOW_MAP_SPREAD", g_sunMapSpread, 1.5f, 16.f);
-  g_sunMapCascades = static_cast<uint32_t>(env_float("DOL_AURORA_SUN_SHADOW_MAP_CASCADES",
-                                                     static_cast<float>(g_sunMapCascades), 1.f,
-                                                     static_cast<float>(kSunMapCascades)));
   g_sunMapDepth = env_float("DOL_AURORA_SUN_SHADOW_MAP_DEPTH", g_sunMapDepth, 1000.f, 1000000.f);
   g_sunMapBias = env_float("DOL_AURORA_SUN_SHADOW_MAP_BIAS", g_sunMapBias, 0.f, 1000.f);
   g_sunMapSlope = env_float("DOL_AURORA_SUN_SHADOW_MAP_SLOPE", g_sunMapSlope, 0.f, 32.f);
@@ -1682,8 +1699,6 @@ void initialize() {
   g_sunMapSteps = sunMapSteps != nullptr && sunMapSteps[0] == '1';
   g_sunMapSeaLow = env_float("DOL_AURORA_SUN_SHADOW_MAP_SEA_LOW", g_sunMapSeaLow, 0.f, 1000.f);
   g_sunMapSeaRise = env_float("DOL_AURORA_SUN_SHADOW_MAP_SEA_RISE", g_sunMapSeaRise, 0.f, 1000.f);
-  if (const char* gapFill = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_GAP_FILL"); gapFill != nullptr)
-    g_sunMapGapFill = gapFill[0] != '0';
   if (const char* sunMapSmooth = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_SMOOTH"); sunMapSmooth != nullptr)
     g_sunMapSmooth = sunMapSmooth[0] != '0';
   g_edgeStrength = env_float("DOL_AURORA_EDGE_LIGHT_STRENGTH", g_edgeStrength, 0.f, 4.f);
@@ -1916,6 +1931,11 @@ void set_sun_shadows(bool enabled) noexcept { g_sun.store(enabled, std::memory_o
 bool sun_shadow_map_enabled() noexcept { return sun_shadows_enabled() && g_sunMapOn.load(std::memory_order_relaxed); }
 
 void set_sun_shadow_map(bool enabled) noexcept { g_sunMapOn.store(enabled, std::memory_order_relaxed); }
+
+void set_sun_shadow_quality(int level) noexcept {
+  if (level >= 0 && level <= 2)
+    g_sunQualityPending.store(level, std::memory_order_relaxed);
+}
 
 SunMap sun_map(const Camera& camera) noexcept {
   SunMap map;
@@ -2188,6 +2208,8 @@ void aurora_set_sun_shadows(bool enabled) { aurora::gfx::post_fx::set_sun_shadow
 void aurora_set_sun_direction(float x, float y, float z) { aurora::gfx::post_fx::set_sun_direction(x, y, z); }
 
 void aurora_set_sun_shadow_map(bool enabled) { aurora::gfx::post_fx::set_sun_shadow_map(enabled); }
+
+void aurora_set_sun_shadow_quality(int quality) { aurora::gfx::post_fx::set_sun_shadow_quality(quality); }
 
 void aurora_set_edge_light(bool enabled) { aurora::gfx::post_fx::set_edge_light(enabled); }
 
