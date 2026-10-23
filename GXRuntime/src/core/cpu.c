@@ -325,6 +325,44 @@ GXRUNTIME_EXPORT bool ppc_guest_alias_resolve(u32 address, u32 size,
     return false;
 }
 
+GXRUNTIME_EXPORT bool ppc_guest_alias_range_overlaps(u32 address, u32 size) {
+    if (size == 0u)
+        return false;
+
+    const u64 range_start = address;
+    const u64 range_end = range_start + size;
+    if (range_end <= g_guest_alias_min_start ||
+        range_start >= g_guest_alias_max_end)
+        return false;
+
+    if (!g_guest_alias_overlapping) {
+        u32 lo = 0u, hi = g_guest_alias_count;
+        while (lo < hi) { // first alias whose start is at or after range_end
+            const u32 mid = lo + (hi - lo) / 2u;
+            if (g_guest_aliases[g_guest_alias_sorted[mid]].linked_start < range_end)
+                lo = mid + 1u;
+            else
+                hi = mid;
+        }
+        if (lo == 0u)
+            return false;
+        const PPCGuestAlias* alias =
+            &g_guest_aliases[g_guest_alias_sorted[lo - 1u]];
+        return (u64)alias->linked_start + alias->size > range_start;
+    }
+
+    // Overlapping aliases preserve registration-order resolution semantics,
+    // so the sorted predecessor alone cannot prove that no earlier, larger
+    // alias intersects the range.
+    for (u32 i = 0u; i < g_guest_alias_count; ++i) {
+        const PPCGuestAlias* alias = &g_guest_aliases[i];
+        if ((u64)alias->linked_start < range_end &&
+            (u64)alias->linked_start + alias->size > range_start)
+            return true;
+    }
+    return false;
+}
+
 bool cpu_init(CPUState* cpu) {
     memset(cpu, 0, sizeof(*cpu));
 

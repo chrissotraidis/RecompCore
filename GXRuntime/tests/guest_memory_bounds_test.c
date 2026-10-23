@@ -7,7 +7,7 @@
 #include "core/cpu.h"
 
 u8 bw_test_mem1[0x02000000u];
-static u8 exram[4096], aliased[16], upper_alias[16];
+static u8 exram[4096], aliased[16], upper_alias[16], overlap_alias[16];
 static u32 journal_count, journal_offset, journal_size, io_count, io_addr, io_size;
 static u64 io_value;
 static void journal(u32 offset, u32 size, void* user) {
@@ -26,6 +26,7 @@ int main(void) {
     cpu.ram = bw_test_mem1; cpu.ram_size = sizeof bw_test_mem1;
     cpu.exram = exram; cpu.exram_size = sizeof exram;
     ppc_guest_alias_clear();
+    assert(!ppc_guest_alias_range_overlaps(GC_RAM_BASE, 4));
     u32 offset = 123;
     assert(get_ram_ptr(&cpu, GC_RAM_BASE, 4, &offset) == bw_test_mem1 && offset == 0);
     const u32 ram_size = sizeof bw_test_mem1;
@@ -42,12 +43,21 @@ int main(void) {
         assert(get_ram_ptr(&cpu, starts[i], UINT32_MAX, NULL) == NULL);
     }
     assert(ppc_guest_alias_add_shared(GC_RAM_BASE + 256, sizeof aliased, aliased));
+    assert(!ppc_guest_alias_range_overlaps(GC_RAM_BASE + 240, 16));
+    assert(ppc_guest_alias_range_overlaps(GC_RAM_BASE + 240, 17));
+    assert(ppc_guest_alias_range_overlaps(GC_RAM_BASE + 256, 1));
+    assert(ppc_guest_alias_range_overlaps(GC_RAM_BASE + 260, 4));
+    assert(ppc_guest_alias_range_overlaps(GC_RAM_BASE + 271, 2));
+    assert(!ppc_guest_alias_range_overlaps(GC_RAM_BASE + 272, 4));
+    assert(!ppc_guest_alias_range_overlaps(GC_RAM_BASE + 256, 0));
     assert(get_ram_ptr(&cpu, GC_RAM_BASE + 256, sizeof aliased, NULL) == aliased);
     assert(get_ram_ptr(&cpu, 0xC0000000u + 256, sizeof aliased, NULL) == aliased);
     assert(get_ram_ptr(&cpu, GC_RAM_BASE + 256, UINT32_MAX, NULL) == NULL);
     /* BlueWake expands MEM1 to 32 MiB for linked REL data. An alias there
      * must bypass direct RAM both when inserted and after registry changes. */
     assert(ppc_guest_alias_add_shared(0x81F00000u, sizeof upper_alias, upper_alias));
+    assert(ppc_guest_alias_range_overlaps(0x81EFFFFFu, 2));
+    assert(!ppc_guest_alias_range_overlaps(0xC1F00000u, 4));
     assert(ppc_guest_alias_remove(GC_RAM_BASE + 256, sizeof aliased));
     assert(g_ppc_guest_aliases_overlap_mem1);
     assert(!ppc_dispatch_poll_read_stable(&cpu, 0x81F00000u, 4));
@@ -63,6 +73,12 @@ int main(void) {
     assert(get_ram_ptr(&cpu, 0x81F00000u, 4, NULL) == upper_alias);
     assert(ppc_guest_alias_remove(0x81F00000u, sizeof upper_alias));
     assert(!g_ppc_guest_aliases_overlap_mem1);
+    assert(ppc_guest_alias_add_shared(GC_RAM_BASE + 32, sizeof aliased, aliased));
+    assert(ppc_guest_alias_add_shared(GC_RAM_BASE + 36, sizeof overlap_alias,
+                                      overlap_alias));
+    assert(ppc_guest_alias_range_overlaps(GC_RAM_BASE + 47, 2));
+    assert(!ppc_guest_alias_range_overlaps(GC_RAM_BASE + 52, 4));
+    ppc_guest_alias_clear();
 
     g_mem_write_journal = journal; g_mem_write_journal_user = &journal_count;
     cpu.reserve_valid = true; cpu.reserve_addr = GC_RAM_BASE + 64;
