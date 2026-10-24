@@ -256,6 +256,13 @@ struct FramePacket {
   bool interpolate = false;
   int interpSteps = 1;
   uint64_t gameFrame = 0;
+  // The camera the real frame's HD look (post_fx) was drawn from, the time of
+  // the real frame's before it, and each in-between frame's camera relative to
+  // it (see post_camera()).
+  post_fx::Camera postCamera;
+  bool havePostCamera = false;
+  float previousSeconds = 0.f;
+  std::array<frame_interp::CameraStep, frame_interp::kMaxSteps> cameraSteps{};
 };
 
 static std::array<FramePacket, FrameSlotCount> g_framePackets;
@@ -1696,6 +1703,8 @@ void end_frame(EndFrameCallback callback) {
   frame.interpolate = frame.presents && !frame.continuation && interpSlot.staging != nullptr &&
                       !interpSlot.overflowed && frame_interp::frame_verdict();
   frame.interpSteps = frame_interp::frame_steps();
+  if (frame.interpolate)
+    frame_interp::camera_steps(frame.cameraSteps.data());
   if (frame_interp::tracing() || g_presentLog ||
       (frame.interpolate && frame_interp::dump_frame(frame_interp::game_frame_number()))) {
     Log.info("In-between data for game frame {}: {} bytes of constants and {} of vertices, {} blocks did not fit; "
@@ -1914,6 +1923,30 @@ static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const Frame
   }
 }
 
+// The camera the HD look's effects are drawn from (post_fx). The real frame
+// takes the one the game set last and keeps it; an in-between frame takes
+// that one moved where its matrices put the scenery (frame_interp's
+// CameraStep), at its own time between the two frames'. Drawn from the latest
+// camera instead, an in-between frame's shadows sat where the next frame's
+// camera sees them, and slid against the scenery as the camera turned.
+static post_fx::Camera post_camera(FramePacket& frame) {
+  if (!frame_interp::encoding_interpolated()) {
+    static float lastSeconds = 0.f;
+    frame.postCamera = post_fx::current_camera();
+    frame.havePostCamera = true;
+    frame.previousSeconds = lastSeconds;
+    lastSeconds = frame.postCamera.view[16];
+    return frame.postCamera;
+  }
+  if (!frame.havePostCamera)
+    return post_fx::current_camera();
+  const auto& step = frame.cameraSteps[std::clamp(g_replayStep, 0, frame_interp::kMaxSteps - 1)];
+  const float now = frame.postCamera.view[16];
+  const float before = frame.previousSeconds;
+  const float seconds = now > before && now - before < 0.25f ? before + (now - before) * step.t : now;
+  return post_fx::moved_camera(frame.postCamera, step.relative, seconds);
+}
+
 static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
   ZoneScoped;
   if (!passInfo.sealed) {
@@ -1996,9 +2029,12 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
   // the finished scene out at full size before it draws the HUD (Wind Waker
   // does, every frame): bloom goes in just before that copy. Without such a
   // copy, in the on-screen pass after the scene's last perspective draw; what
-  // follows (the HUD, drawn flat) is drawn after it.
+  // follows (the HUD, drawn flat) is drawn after it. Each in-between frame
+  // (Smooth Motion: three a game frame at 120 FPS, five at 180, seven at 240) is a frame of
+  // its own here, so every one of them gets it, not only the first.
   static uint64_t bloomedFrame = UINT64_MAX;
-  const uint64_t frameKey = frame.frameId * 2 + (frame_interp::encoding_interpolated() ? 1 : 0);
+  const uint64_t frameKey = frame.frameId * (frame_interp::kMaxSteps + 1) +
+                            (frame_interp::encoding_interpolated() ? 1 + g_replayStep : 0);
   const bool efbPass = !passInfo.offscreen && passInfo.colorView.Get() == webgpu::g_frameBuffer.view.Get();
   const bool bloomBeforeCopy = post_fx::any_enabled() && efbPass && bloomedFrame != frameKey &&
                                passInfo.resolveTarget && !gx::is_depth_format(passInfo.resolveFormat) &&
@@ -2023,13 +2059,13 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
   if (bloomBeforeCopy) {
     post_fx::encode(cmd, passInfo.copySourceView, passInfo.copySourceDepthView, passInfo.targetSize,
                     webgpu::g_frameBuffer.texture.GetFormat(), passInfo.colorView, passInfo.resolveView,
-                    passInfo.msaaSamples);
+                    passInfo.msaaSamples, post_camera(frame));
     bloomedFrame = frameKey;
   }
   if (split != SIZE_MAX) {
     post_fx::encode(cmd, passInfo.copySourceView, passInfo.copySourceDepthView, passInfo.targetSize,
                     webgpu::g_frameBuffer.texture.GetFormat(), passInfo.colorView, passInfo.resolveView,
-                    passInfo.msaaSamples);
+                    passInfo.msaaSamples, post_camera(frame));
     bloomedFrame = frameKey;
     if (split < passInfo.commands.size()) {
       auto attachmentsAfter = attachments;
