@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -973,12 +974,15 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     Log.info("Enabling features: {}", featureList);
     Log.info("Device lock (implicit device synchronization): {}", g_deviceLock ? "on" : "off");
 #ifdef WEBGPU_DAWN
-    wgpu::DawnCacheDeviceDescriptor cacheDescriptor({
-        .isolationKey = nullptr,
-        .loadDataFunction = load_from_cache,
-        .storeDataFunction = store_to_cache,
-        .functionUserdata = nullptr,
-    });
+    wgpu::DawnCacheDeviceDescriptor cacheDescriptor({.nextInChain = nullptr});
+    cacheDescriptor.SetDawnLoadCacheDataCallback(
+        [](std::span<const std::byte> key, std::span<std::byte> value) -> size_t {
+          return load_from_cache(key.data(), key.size(), value.data(), value.size(), nullptr);
+        });
+    cacheDescriptor.SetDawnStoreCacheDataCallback(
+        [](std::span<const std::byte> key, std::span<const std::byte> value) {
+          store_to_cache(key.data(), key.size(), value.data(), value.size(), nullptr);
+        });
 
     constexpr std::array enableToggles{
 #if _WIN32
