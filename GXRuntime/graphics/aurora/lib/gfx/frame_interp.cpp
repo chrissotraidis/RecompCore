@@ -2582,10 +2582,65 @@ const char* dump_directory() noexcept {
   return directory != nullptr && directory[0] != '\0' ? directory : nullptr;
 }
 
+#ifndef _WIN32
+#include <SDL3/SDL_keyboard.h>
+#endif
+#ifdef _WIN32
+extern "C" __declspec(dllimport) void* __stdcall GetModuleHandleA(const char* name);
+extern "C" __declspec(dllimport) void* __stdcall GetProcAddress(void* module, const char* name);
+#endif
+
 bool dump_frame(uint64_t frame) noexcept {
   static const uint64_t from = env_u64("DOL_AURORA_FRAME_INTERP_DUMP_FROM", 0);
   static const uint64_t to = env_u64("DOL_AURORA_FRAME_INTERP_DUMP_TO", 0);
-  return dump_directory() != nullptr && frame >= from && frame <= to;
+  if (dump_directory() == nullptr)
+    return false;
+#ifdef _WIN32
+  // DOL_AURORA_FRAME_INTERP_DUMP_KEY=N: F3 dumps the next N game frames (local debug).
+  static const uint64_t keyFrames = env_u64("DOL_AURORA_FRAME_INTERP_DUMP_KEY", 0);
+  if (keyFrames != 0) {
+    using KeyState = short(__stdcall*)(int);
+    static const KeyState keyState = [] {
+      void* user32 = GetModuleHandleA("user32.dll");
+      return user32 != nullptr ? reinterpret_cast<KeyState>(GetProcAddress(user32, "GetAsyncKeyState")) : nullptr;
+    }();
+    static std::atomic<uint64_t> keyFrom{0}, keyTo{0};
+    static std::atomic<bool> held{false};
+    if (keyState != nullptr) {
+      const bool down = (keyState(0x72 /* VK_F3 */) & 0x8000) != 0;
+      if (down && !held.exchange(true) && frame > keyTo.load()) {
+        keyFrom.store(frame);
+        keyTo.store(frame + keyFrames);
+        std::fprintf(stderr, "[frame-interp-dump] F3: frames %llu-%llu\n", static_cast<unsigned long long>(frame),
+                     static_cast<unsigned long long>(frame + keyFrames));
+      } else if (!down) {
+        held.store(false);
+      }
+    }
+    if (frame >= keyFrom.load() && frame <= keyTo.load() && keyTo.load() != 0)
+      return true;
+  }
+#else
+  // The same through SDL's keyboard state (Linux and macOS).
+  static const uint64_t keyFrames = env_u64("DOL_AURORA_FRAME_INTERP_DUMP_KEY", 0);
+  if (keyFrames != 0) {
+    static std::atomic<uint64_t> keyFrom{0}, keyTo{0};
+    static std::atomic<bool> held{false};
+    const bool* keys = SDL_GetKeyboardState(nullptr);
+    const bool down = keys != nullptr && keys[SDL_SCANCODE_F3];
+    if (down && !held.exchange(true) && frame > keyTo.load()) {
+      keyFrom.store(frame);
+      keyTo.store(frame + keyFrames);
+      std::fprintf(stderr, "[frame-interp-dump] F3: frames %llu-%llu\n", static_cast<unsigned long long>(frame),
+                   static_cast<unsigned long long>(frame + keyFrames));
+    } else if (!down) {
+      held.store(false);
+    }
+    if (frame >= keyFrom.load() && frame <= keyTo.load() && keyTo.load() != 0)
+      return true;
+  }
+#endif
+  return frame >= from && frame <= to;
 }
 
 const char* last_outcome() noexcept { return g_outcome; }

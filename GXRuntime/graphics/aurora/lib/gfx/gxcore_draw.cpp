@@ -6,6 +6,7 @@
 #include "../gx/gx.hpp" // UseReversedZ + set_logical_viewport (substrate glue)
 #include "frame_interp.hpp"
 #include "pipeline_cache.hpp"
+#include "post_fx.hpp" // the sun shadow map
 #include "thread_cpu.hpp"
 #include "texture.hpp"
 #include "tex_copy_conv.hpp" // EFB-copy format conversion (63/S16)
@@ -26,6 +27,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -368,37 +370,83 @@ absl::flat_hash_map<uint32_t, EfbCopyBinding> g_efbCopyTextures;
 
 } // namespace
 
+namespace {
+// Whether the alpha test is statically guaranteed to keep every pixel (Mirror
+// AlphaTest::TestResult enough to tell).
+bool alpha_test_always_passes(const gxc::ShaderKey& shader) {
+  const bool c0_never = shader.alpha_comp0 == 0u;
+  const bool c1_never = shader.alpha_comp1 == 0u;
+  const bool c0_always = shader.alpha_comp0 == 7u;
+  const bool c1_always = shader.alpha_comp1 == 7u;
+  switch (shader.alpha_logic) {
+  case 0u: // And
+    return c0_always && c1_always;
+  case 1u: // Or
+    return c0_always || c1_always;
+  case 2u: // Xor
+    return (c0_always && c1_never) || (c0_never && c1_always);
+  case 3u: // Xnor
+    return (c0_always && c1_always) || (c0_never && c1_never);
+  }
+  return false;
+}
+
+// A draw the sun shadow map draws again (DrawData::sunCaster): opaque scenery
+// and characters. Leaves, fences and grass (alpha-tested: the map has no
+// textures, so they would cast solid cards), what is blended (water, clouds,
+// particles, the game's own blob shadows), what writes no depth (the sky) and
+// lines and points are left out.
+bool sun_caster(const gxc::PipelineKey& key) {
+  // DOL_AURORA_SUN_SHADOW_MAP_ALL=1: alpha-tested draws cast too, as solid
+  // shapes (local test: which shadows the alpha-test exclusion is costing).
+  static const bool s_all = [] {
+    const char* value = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_ALL");
+    return value != nullptr && value[0] == '1';
+  }();
+  return key.depth_test != 0u && key.depth_update != 0u && key.color_update != 0u && key.blend_enable == 0u &&
+         key.blend_subtract == 0u && key.primitive_topology == 0u &&
+         (s_all || alpha_test_always_passes(key.shader));
+}
+
+// Whether the alpha test is statically guaranteed to drop every pixel (a
+// depth-priming draw): such a draw shows nothing, so it casts nothing.
+bool alpha_test_always_fails(const gxc::ShaderKey& shader) {
+  const bool c0_never = shader.alpha_comp0 == 0u;
+  const bool c1_never = shader.alpha_comp1 == 0u;
+  const bool c0_always = shader.alpha_comp0 == 7u;
+  const bool c1_always = shader.alpha_comp1 == 7u;
+  switch (shader.alpha_logic) {
+  case 0u: // And
+    return c0_never || c1_never;
+  case 1u: // Or
+    return c0_never && c1_never;
+  case 2u: // Xor
+    return (c0_always && c1_always) || (c0_never && c1_never);
+  case 3u: // Xnor
+    return (c0_always && c1_never) || (c0_never && c1_always);
+  }
+  return false;
+}
+
+// A draw the sun shadow map draws again with its texture's cutout
+// (DrawData::sunCasterAlpha): solid scenery whose alpha test drops pixels
+// (roofs, awnings, a tree's leaves, fences). Its caster pipeline samples the
+// texture and discards below half, so it casts its true silhouette.
+bool sun_caster_alpha(const gxc::PipelineKey& key) {
+  return key.depth_test != 0u && key.depth_update != 0u && key.color_update != 0u && key.blend_enable == 0u &&
+         key.blend_subtract == 0u && key.primitive_topology == 0u && key.shader.textured != 0u &&
+         !alpha_test_always_passes(key.shader) && !alpha_test_always_fails(key.shader);
+}
+} // namespace
+
 bool needs_early_depth_emulation(const gxc::PipelineKey& key) {
   if (key.depth_test == 0u || key.depth_update == 0u ||
       key.early_depth_test == 0u || key.shader.tev_valid == 0u) {
     return false;
   }
-
-  // Mirror AlphaTest::TestResult enough to omit the extra pass when the test is
-  // statically guaranteed to pass. Fail and undetermined both need an early
-  // depth write; the ordinary color shader will discard failures afterward.
-  const bool c0_never = key.shader.alpha_comp0 == 0u;
-  const bool c1_never = key.shader.alpha_comp1 == 0u;
-  const bool c0_always = key.shader.alpha_comp0 == 7u;
-  const bool c1_always = key.shader.alpha_comp1 == 7u;
-  bool always_passes = false;
-  switch (key.shader.alpha_logic) {
-  case 0u: // And
-    always_passes = c0_always && c1_always;
-    break;
-  case 1u: // Or
-    always_passes = c0_always || c1_always;
-    break;
-  case 2u: // Xor
-    always_passes = (c0_always && c1_never) ||
-                    (c0_never && c1_always);
-    break;
-  case 3u: // Xnor
-    always_passes = (c0_always && c1_always) ||
-                    (c0_never && c1_never);
-    break;
-  }
-  return !always_passes;
+  // Fail and undetermined both need an early depth write; the ordinary color
+  // shader will discard failures afterward.
+  return !alpha_test_always_passes(key.shader);
 }
 
 wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
@@ -742,6 +790,62 @@ struct DrawPart {
 };
 } // namespace
 
+namespace {
+// The parts render() encodes a draw as, with the constants and vertices of the
+// frame being encoded (an in-between frame's step, or the frame's own).
+void collect_parts(const DrawData& data, std::vector<DrawPart>& parts) {
+  // The in-between frame being encoded: its step's block and vertices (a
+  // traced frame's own, matched while recording, are one step's).
+  const bool interpolated = frame_interp::encoding_interpolated();
+  const int step = interpolated ? interp_replay_step() : 0;
+  const auto job_ranges = [&](uint32_t job, Range& uniform, Range& verts, Range& pixel) {
+    uniform = verts = pixel = {};
+    if (!interpolated)
+      return;
+    if (data.interpJob != UINT32_MAX) {
+      const InterpRanges& ranges = interp_job_ranges(job);
+      uniform = ranges.uniform[step];
+      verts = ranges.verts[step];
+      pixel = ranges.pixel[step];
+    } else if (step == 0) {
+      uniform = data.interpUniformRange;
+      verts = data.interpVertRange;
+    }
+  };
+  const uint32_t firstIndex = data.idxRange.offset / sizeof(uint16_t);
+  // One draw, or a batch as one; a batch whose draws' in-between blocks (or a
+  // particle's vertices, laid out apart from the batch's) differ, one by one.
+  parts.clear();
+  DrawPart whole{.firstIndex = firstIndex, .indexCount = data.indexCount, .firstVertex = 0};
+  job_ranges(data.interpJob, whole.uniform, whole.verts, whole.pixel);
+  bool asOne = true;
+  if (interpolated && data.batchSize > 1 && data.interpJob != UINT32_MAX) {
+    for (uint32_t i = 1; i < data.batchSize && asOne; ++i) {
+      Range uniform, verts, pixel;
+      job_ranges(data.interpJob + i, uniform, verts, pixel);
+      const uint32_t first = batch_draw(data.batch + i).firstVertex;
+      asOne = uniform.offset == whole.uniform.offset && uniform.size == whole.uniform.size &&
+              pixel.offset == whole.pixel.offset && pixel.size == whole.pixel.size &&
+              (whole.verts.size == 0 ? verts.size == 0
+                                     : verts.size != 0 && verts.offset == whole.verts.offset +
+                                                                              first * gxc::kVertexStrideBytes);
+    }
+    if (!asOne) {
+      uint32_t index = firstIndex;
+      for (uint32_t i = 0; i < data.batchSize; ++i) {
+        const BatchDraw& part = batch_draw(data.batch + i);
+        DrawPart& draw = parts.emplace_back(
+            DrawPart{.firstIndex = index, .indexCount = part.indexCount, .firstVertex = part.firstVertex});
+        job_ranges(data.interpJob + i, draw.uniform, draw.verts, draw.pixel);
+        index += part.indexCount;
+      }
+    }
+  }
+  if (asOne)
+    parts.push_back(whole);
+}
+} // namespace
+
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   const auto bind = [&](PipelineRef ref) {
     if (!bind_pipeline(ref, pass))
@@ -772,56 +876,8 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     uberDraw = true;
     note_ubershader_draw();
   }
-  // The in-between frame being encoded: its step's block and vertices (a
-  // traced frame's own, matched while recording, are one step's).
-  const bool interpolated = frame_interp::encoding_interpolated();
-  const int step = interpolated ? interp_replay_step() : 0;
-  const auto job_ranges = [&](uint32_t job, Range& uniform, Range& verts, Range& pixel) {
-    uniform = verts = pixel = {};
-    if (!interpolated)
-      return;
-    if (data.interpJob != UINT32_MAX) {
-      const InterpRanges& ranges = interp_job_ranges(job);
-      uniform = ranges.uniform[step];
-      verts = ranges.verts[step];
-      pixel = ranges.pixel[step];
-    } else if (step == 0) {
-      uniform = data.interpUniformRange;
-      verts = data.interpVertRange;
-    }
-  };
-  const uint32_t firstIndex = data.idxRange.offset / sizeof(uint16_t);
-  // One draw, or a batch as one; a batch whose draws' in-between blocks (or a
-  // particle's vertices, laid out apart from the batch's) differ, one by one.
   static std::vector<DrawPart> parts;
-  parts.clear();
-  DrawPart whole{.firstIndex = firstIndex, .indexCount = data.indexCount, .firstVertex = 0};
-  job_ranges(data.interpJob, whole.uniform, whole.verts, whole.pixel);
-  bool asOne = true;
-  if (interpolated && data.batchSize > 1 && data.interpJob != UINT32_MAX) {
-    for (uint32_t i = 1; i < data.batchSize && asOne; ++i) {
-      Range uniform, verts, pixel;
-      job_ranges(data.interpJob + i, uniform, verts, pixel);
-      const uint32_t first = batch_draw(data.batch + i).firstVertex;
-      asOne = uniform.offset == whole.uniform.offset && uniform.size == whole.uniform.size &&
-              pixel.offset == whole.pixel.offset && pixel.size == whole.pixel.size &&
-              (whole.verts.size == 0 ? verts.size == 0
-                                     : verts.size != 0 && verts.offset == whole.verts.offset +
-                                                                              first * gxc::kVertexStrideBytes);
-    }
-    if (!asOne) {
-      uint32_t index = firstIndex;
-      for (uint32_t i = 0; i < data.batchSize; ++i) {
-        const BatchDraw& part = batch_draw(data.batch + i);
-        DrawPart& draw = parts.emplace_back(
-            DrawPart{.firstIndex = index, .indexCount = part.indexCount, .firstVertex = part.firstVertex});
-        job_ranges(data.interpJob + i, draw.uniform, draw.verts, draw.pixel);
-        index += part.indexCount;
-      }
-    }
-  }
-  if (asOne)
-    parts.push_back(whole);
+  collect_parts(data, parts);
 
   const auto setGroup1 = [&](const DrawPart& part) {
     const bool blended = part.uniform.size != 0;
@@ -927,6 +983,242 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   draw(data.tev);
 }
 
+// The sun shadow map's casters (post_fx.hpp). Every draw has the one decoded
+// vertex layout and keeps its transforms in its constants, so two pipelines
+// draw them all: one for positions through the current matrix, one through the
+// per-vertex ones (a skinned model). Each takes the position to the camera's
+// view space exactly as the draw's own shader does (gxcore_shader.cpp), then
+// through `rows` to the map. Depth only, no fragment shader: nothing is
+// compiled per draw, so no draw is left out of the map while it compiles.
+namespace {
+constexpr const char* kSunCasterShader = R"""(
+struct Caster {
+    rows: array<vec4f, 3>,
+};
+struct VertexShaderConstants {
+    posnormalmatrix: array<vec4f, 6>,
+    projection: array<vec4f, 4>,
+    texmatrices: array<vec4f, 24>,
+    transformmatrices: array<vec4f, 64>,
+};
+@group(0) @binding(0) var<uniform> caster: Caster;
+@group(1) @binding(0) var<uniform> vsc: VertexShaderConstants;
+struct VertexIn {
+    @location(0) rawpos: vec3f,
+    @location(1) posmtx: u32,
+};
+fn to_map(p0: vec4f, p1: vec4f, p2: vec4f, raw: vec3f) -> vec4f {
+    let pos4 = vec4f(raw, 1.0);
+    let viewpos = vec4f(dot(p0, pos4), dot(p1, pos4), dot(p2, pos4), 1.0);
+    return vec4f(dot(caster.rows[0], viewpos), dot(caster.rows[1], viewpos), dot(caster.rows[2], viewpos), 1.0);
+}
+@vertex
+fn vs_current(in: VertexIn) -> @builtin(position) vec4f {
+    return to_map(vsc.posnormalmatrix[0], vsc.posnormalmatrix[1], vsc.posnormalmatrix[2], in.rawpos);
+}
+@vertex
+fn vs_indexed(in: VertexIn) -> @builtin(position) vec4f {
+    let i = i32(in.posmtx);
+    return to_map(vsc.transformmatrices[i], vsc.transformmatrices[i + 1], vsc.transformmatrices[i + 2], in.rawpos);
+}
+// An alpha-tested caster: the first raw texture coordinate rides along, and
+// the fragment keeps the texture's cutout (most such materials sample their
+// texture with the identity, so the raw coordinate is the sample's).
+struct VertexInUv {
+    @location(0) rawpos: vec3f,
+    @location(1) posmtx: u32,
+    @location(2) uv0: vec2f,
+};
+struct VertexOutUv {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+@vertex
+fn vs_current_uv(in: VertexInUv) -> VertexOutUv {
+    var out: VertexOutUv;
+    out.pos = to_map(vsc.posnormalmatrix[0], vsc.posnormalmatrix[1], vsc.posnormalmatrix[2], in.rawpos);
+    out.uv = in.uv0;
+    return out;
+}
+@vertex
+fn vs_indexed_uv(in: VertexInUv) -> VertexOutUv {
+    let i = i32(in.posmtx);
+    var out: VertexOutUv;
+    out.pos = to_map(vsc.transformmatrices[i], vsc.transformmatrices[i + 1], vsc.transformmatrices[i + 2], in.rawpos);
+    out.uv = in.uv0;
+    return out;
+}
+@group(2) @binding(0) var tex: texture_2d<f32>;
+@group(2) @binding(1) var samp: sampler;
+@fragment
+fn fs_alpha(in: VertexOutUv) {
+    if (textureSample(tex, samp, in.uv).a < 0.5) {
+        discard;
+    }
+}
+)""";
+constexpr uint64_t kSunCasterUniformSize = 12 * sizeof(float);
+wgpu::BindGroupLayout g_sunCasterLayout;
+std::array<wgpu::RenderPipeline, 4> g_sunCasterPipelines; // current, indexed, then the same with the alpha cutout
+struct SunCasterState {
+  int pipeline = -1;
+  WGPUBindGroup group1 = nullptr;
+  uint32_t offset1 = UINT32_MAX;
+  WGPUBindGroup group2 = nullptr; // an alpha caster's texture
+  WGPUBuffer vertexBuffer = nullptr;
+  uint64_t vertexOffset = 0;
+};
+SunCasterState g_sunCasterState;
+
+void make_sun_caster_pipelines() {
+  wgpu::ShaderSourceWGSL source{};
+  source.code = kSunCasterShader;
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &source, .label = "Sun shadow map casters"};
+  const auto module = g_device.CreateShaderModule(&moduleDescriptor);
+  const wgpu::BindGroupLayoutEntry entry{
+      .binding = 0,
+      .visibility = wgpu::ShaderStage::Vertex,
+      .buffer = {.type = wgpu::BufferBindingType::Uniform, .minBindingSize = kSunCasterUniformSize},
+  };
+  const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+      .label = "Sun shadow map casters", .entryCount = 1, .entries = &entry};
+  g_sunCasterLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
+  const std::array layouts{g_sunCasterLayout, g_uniformBindGroupLayout};
+  const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{
+      .label = "Sun shadow map casters", .bindGroupLayoutCount = layouts.size(), .bindGroupLayouts = layouts.data()};
+  const auto pipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
+  const std::array alphaLayouts{g_sunCasterLayout, g_uniformBindGroupLayout, texture_bind_group_layout(1u)};
+  const wgpu::PipelineLayoutDescriptor alphaLayoutDescriptor{.label = "Sun shadow map casters (alpha)",
+                                                             .bindGroupLayoutCount = alphaLayouts.size(),
+                                                             .bindGroupLayouts = alphaLayouts.data()};
+  const auto alphaPipelineLayout = g_device.CreatePipelineLayout(&alphaLayoutDescriptor);
+  const std::array attributes{
+      wgpu::VertexAttribute{.format = wgpu::VertexFormat::Float32x3, .offset = gxc::kVertexPosOffset, .shaderLocation = 0},
+      wgpu::VertexAttribute{.format = wgpu::VertexFormat::Uint32, .offset = gxc::kVertexPosMtxOffset, .shaderLocation = 1},
+      wgpu::VertexAttribute{.format = wgpu::VertexFormat::Float32x2, .offset = gxc::kVertexUvOffset, .shaderLocation = 2},
+  };
+  const wgpu::VertexBufferLayout vertexLayout{
+      .arrayStride = gxc::kVertexStrideBytes,
+      .stepMode = wgpu::VertexStepMode::Vertex,
+      .attributeCount = 2,
+      .attributes = attributes.data(),
+  };
+  const wgpu::VertexBufferLayout alphaVertexLayout{
+      .arrayStride = gxc::kVertexStrideBytes,
+      .stepMode = wgpu::VertexStepMode::Vertex,
+      .attributeCount = attributes.size(),
+      .attributes = attributes.data(),
+  };
+  // Nearer the sun is less (the map is cleared to 1). The slope bias keeps a
+  // surface steep to the sun from shadowing itself (post_fx adds a constant one);
+  // at 2 texels it lifted the shadow off a thin caster's base, Link's shoes.
+  const wgpu::DepthStencilState depthStencil{
+      .format = post_fx::kSunMapFormat,
+      .depthWriteEnabled = true,
+      .depthCompare = wgpu::CompareFunction::Less,
+      .depthBias = 0,
+      .depthBiasSlopeScale = 1.f,
+      .depthBiasClamp = 0.f,
+  };
+  const wgpu::FragmentState alphaFragment{.module = module, .entryPoint = "fs_alpha", .targetCount = 0};
+  for (int alpha = 0; alpha < 2; ++alpha) {
+    for (int indexed = 0; indexed < 2; ++indexed) {
+      const wgpu::RenderPipelineDescriptor descriptor{
+          .label = alpha != 0 ? "Sun shadow map casters (alpha cutout)"
+                 : indexed != 0 ? "Sun shadow map casters (per-vertex matrices)"
+                                : "Sun shadow map casters",
+          .layout = alpha != 0 ? alphaPipelineLayout : pipelineLayout,
+          .vertex = {.module = module,
+                     .entryPoint = alpha != 0 ? (indexed != 0 ? "vs_indexed_uv" : "vs_current_uv")
+                                              : (indexed != 0 ? "vs_indexed" : "vs_current"),
+                     .bufferCount = 1,
+                     .buffers = alpha != 0 ? &alphaVertexLayout : &vertexLayout},
+          .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList, .cullMode = wgpu::CullMode::None},
+          .depthStencil = &depthStencil,
+          .multisample = {.count = 1, .mask = UINT32_MAX},
+          .fragment = alpha != 0 ? &alphaFragment : nullptr,
+      };
+      g_sunCasterPipelines[alpha * 2 + indexed] = g_device.CreateRenderPipeline(&descriptor);
+    }
+  }
+}
+} // namespace
+
+void begin_sun_casters(const wgpu::RenderPassEncoder& pass, const float rows[12]) {
+  if (!g_sunCasterPipelines[0])
+    make_sun_caster_pipelines();
+  // A small buffer for each pass, so a frame still in flight keeps its matrix.
+  const wgpu::BufferDescriptor bufferDescriptor{
+      .label = "Sun shadow map casters",
+      .usage = wgpu::BufferUsage::Uniform,
+      .size = kSunCasterUniformSize,
+      .mappedAtCreation = true,
+  };
+  const auto buffer = g_device.CreateBuffer(&bufferDescriptor);
+  std::memcpy(buffer.GetMappedRange(0, kSunCasterUniformSize), rows, kSunCasterUniformSize);
+  buffer.Unmap();
+  const wgpu::BindGroupEntry entry{.binding = 0, .buffer = buffer, .offset = 0, .size = kSunCasterUniformSize};
+  const wgpu::BindGroupDescriptor groupDescriptor{.layout = g_sunCasterLayout, .entryCount = 1, .entries = &entry};
+  pass.SetBindGroup(0, g_device.CreateBindGroup(&groupDescriptor));
+  pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16);
+  g_sunCasterState = SunCasterState{};
+}
+
+void render_sun_caster(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+  const bool alpha = data.sunCasterAlpha && data.textureBindGroup != 0;
+  if (!data.sunCaster && !alpha)
+    return;
+  SunCasterState& state = g_sunCasterState;
+  const int pipeline = (alpha ? 2 : 0) + (data.posMtxIdx ? 1 : 0);
+  if (state.pipeline != pipeline) {
+    pass.SetPipeline(g_sunCasterPipelines[pipeline]);
+    state.pipeline = pipeline;
+  }
+  if (alpha) {
+    const auto& group = find_bind_group(data.textureBindGroup);
+    if (group.Get() != state.group2) {
+      pass.SetBindGroup(2, group);
+      state.group2 = group.Get();
+    }
+  }
+  static std::vector<DrawPart> parts;
+  collect_parts(data, parts);
+  for (const DrawPart& part : parts) {
+    const bool blended = part.uniform.size != 0;
+    const auto& group = blended ? g_interpUniformBindGroup : g_uniformBindGroup;
+    const uint32_t offset = blended ? part.uniform.offset : data.uniformRange.offset;
+    if (group.Get() != state.group1 || offset != state.offset1) {
+      pass.SetBindGroup(1, group, 1, &offset);
+      state.group1 = group.Get();
+      state.offset1 = offset;
+    }
+    // As render(): the whole vertex buffer at the draw's base vertex, or a
+    // particle's blended vertices.
+    int32_t baseVertex = 0;
+    const uint64_t back = uint64_t{part.firstVertex} * gxc::kVertexStrideBytes;
+    if (part.verts.size != 0 && part.verts.offset >= back) {
+      const uint64_t vertexOffset = part.verts.offset - back;
+      if (state.vertexBuffer != g_interpVertexBuffer.Get() || state.vertexOffset != vertexOffset) {
+        pass.SetVertexBuffer(0, g_interpVertexBuffer, vertexOffset);
+        state.vertexBuffer = g_interpVertexBuffer.Get();
+        state.vertexOffset = vertexOffset;
+      }
+    } else if (data.vertRange.offset % gxc::kVertexStrideBytes == 0) {
+      if (state.vertexBuffer != g_vertexBuffer.Get() || state.vertexOffset != 0) {
+        pass.SetVertexBuffer(0, g_vertexBuffer);
+        state.vertexBuffer = g_vertexBuffer.Get();
+        state.vertexOffset = 0;
+      }
+      baseVertex = static_cast<int32_t>(data.vertRange.offset / gxc::kVertexStrideBytes);
+    } else {
+      pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset, data.vertRange.size);
+      state.vertexBuffer = g_vertexBuffer.Get();
+      state.vertexOffset = data.vertRange.offset;
+    }
+    pass.DrawIndexed(part.indexCount, 1, part.firstIndex, baseVertex);
+  }
+}
+
 void note_frame_presented() {
   g_textureVerifyFrame.fetch_add(1u, std::memory_order_relaxed);
   frame_interp::end_game_frame();
@@ -965,6 +1257,8 @@ void shutdown() {
     g_emptyTexmapOwner = {};
   }
   reset_texture_cache();
+  g_sunCasterPipelines = {};
+  g_sunCasterLayout = {};
 }
 
 void set_texture_dirty_epoch_observer(TextureDirtyEpochObserver observer) {
@@ -1627,6 +1921,53 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     });
   }
 
+  // The game's own shadow under a character or object: the triangles of the
+  // ground under it drawn again, blended, in a texture of its shape (see
+  // frame_interp's draw_key_of()). With the sun shadow map on, the object
+  // casts its shadow from the map, and the game's darkened its feet a second
+  // time, a dark patch inside the shade of a building.
+  // DOL_AURORA_GAME_SHADOWS=1 keeps them.
+  static const bool s_keepGameShadows = [] {
+    const char* value = std::getenv("DOL_AURORA_GAME_SHADOWS");
+    return value != nullptr && value[0] == '1';
+  }();
+  // DOL_AURORA_GAME_SHADOW_LOG=1 (local debug): every 120th frame, each blended
+  // textured draw with what the two rules below test, to find a game shadow
+  // they let through.
+  static const bool s_shadowLog = std::getenv("DOL_AURORA_GAME_SHADOW_LOG") != nullptr;
+  if (s_shadowLog && plan.tex_address != 0 && plan.pipeline.blend_enable != 0u &&
+      !(plan.tex_width == 32 && plan.tex_height == 32)) {
+    static uint64_t s_frame = 0;
+    static uint32_t s_count = 0;
+    const uint64_t frame = frame_interp::game_frame_number();
+    if (frame != s_frame) {
+      s_frame = frame;
+      s_count = 0;
+    }
+    if (frame % 120u == 0u && s_count++ < 400u)
+      std::fprintf(stderr,
+                   "[game-shadow] frame %llu direct=%d base=%08X prim=%02X tag=%u proj32=%g tex=%08X %ux%u fmt=%u map=%d\n",
+                   static_cast<unsigned long long>(frame), plan.match_direct_position ? 1 : 0,
+                   plan.match_position_base, plan.match_primitive, static_cast<unsigned>(plan.draw_tag),
+                   plan.constants.projection[3][2], plan.tex_address, plan.tex_width, plan.tex_height,
+                   plan.tex_format, post_fx::sun_shadow_map_enabled() ? 1 : 0);
+  }
+  if (!s_keepGameShadows && plan.match_direct_position && plan.draw_tag == 0 && plan.match_primitive == 0x90 &&
+      plan.tex_address != 0 && plan.pipeline.blend_enable != 0u && plan.constants.projection[3][2] != 0.f &&
+      post_fx::sun_shadow_map_enabled())
+    return true;
+  // The rest of the game's own shadows: every one, real or simple (the blob
+  // under a pot, a rupee or a character, and the shadow-volume passes),
+  // indexes its positions from one of two fixed arrays (d_drawlist's
+  // l_shadowVolPos and l_simpleShadowPos). The map casts the real shadows.
+  // The base is compared without its top bits: on Linux it comes as the
+  // physical address (0x0037C7DC), and the simple shadows got through.
+  if (!s_keepGameShadows && !plan.match_direct_position &&
+      ((plan.match_position_base & 0x3FFFFFFFu) == 0x0037C554u ||
+       (plan.match_position_base & 0x3FFFFFFFu) == 0x0037C7DCu) &&
+      post_fx::sun_shadow_map_enabled())
+    return true;
+
   // Resolve one texmap's texture to a GPU handle: EFB-copy shadow first, else the
   // guest-identity + content-hash decode cache. Shared by the single-texmap fast
   // path and the multi-texmap path (63/Mfin, e.g. THP YUV Y/U/V on texmap 0/1/2).
@@ -1963,6 +2304,49 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     }
   }
 
+  // A cloth's strips (the boat's sail, a flag: a scope over draws that index
+  // their positions) are solid fabric the game draws blended, with more than
+  // one texmap for the sail's emblem: neither caster rule took them, so the
+  // sail cast nothing. Their shape is their geometry, no cutout needed, so
+  // they cast through the solid pipeline whenever they write depth.
+  const bool clothCaster = plan.draw_scope_part != 0 && !plan.match_direct_position &&
+                           plan.pipeline.depth_test != 0u && plan.pipeline.depth_update != 0u &&
+                           plan.pipeline.color_update != 0u && plan.pipeline.primitive_topology == 0u;
+  // Much of the game's solid furniture is drawn blended (a treasure chest,
+  // Beedle's ship, a Wizrobe), which the solid caster rule refuses so the sea
+  // and glows cast nothing. What tells them apart: the sea rewrites its vertex
+  // grid every frame to follow the player, furniture never does. A blended,
+  // depth-writing, indexed draw whose positions stood still casts.
+  const bool blendedCaster = !plan.match_direct_position && plan.draw_scope_part == 0 &&
+                             plan.pipeline.blend_enable != 0u && plan.pipeline.blend_subtract == 0u &&
+                             plan.pipeline.depth_test != 0u && plan.pipeline.depth_update != 0u &&
+                             plan.pipeline.color_update != 0u && plan.pipeline.primitive_topology == 0u &&
+                             alpha_test_always_passes(plan.pipeline.shader) && plan.pipeline.shader.textured != 0u &&
+                             !positions_written(plan);
+  static const bool s_casterLog = [] {
+    const char* value = std::getenv("DOL_AURORA_SUN_CASTER_LOG");
+    return value != nullptr && value[0] == '1';
+  }();
+  if (s_casterLog && (plan.draw_scope_part != 0 ||
+                      (plan.vertex_count >= 100 && !sun_caster(plan.pipeline) && !clothCaster && !blendedCaster &&
+                       !sun_caster_alpha(plan.pipeline)))) {
+    static std::set<uint64_t> seen;
+    const uint64_t state = (uint64_t(plan.pipeline.blend_enable) << 0) | (uint64_t(plan.pipeline.depth_test) << 1) |
+                           (uint64_t(plan.pipeline.depth_update) << 2) | (uint64_t(plan.pipeline.color_update) << 3) |
+                           (uint64_t(plan.pipeline.primitive_topology) << 4) |
+                           (uint64_t(alpha_test_always_passes(plan.pipeline.shader)) << 8) |
+                           (uint64_t(plan.pipeline.shader.textured) << 9) | (uint64_t(plan.texmap_mask) << 16) |
+                           (uint64_t(plan.tex_address) << 24);
+    if (seen.insert(state).second)
+      std::fprintf(stderr,
+                   "[sun-caster] scope=%06X:%u tex=%08X blend=%u depth_test=%u depth_update=%u colour=%u topo=%u "
+                   "alpha_always=%u textured=%u texmap_mask=%02X verts=%u -> solid=%d alpha=%d\n",
+                   plan.draw_scope, plan.draw_scope_part, plan.tex_address, plan.pipeline.blend_enable,
+                   plan.pipeline.depth_test, plan.pipeline.depth_update, plan.pipeline.color_update,
+                   plan.pipeline.primitive_topology, alpha_test_always_passes(plan.pipeline.shader) ? 1u : 0u,
+                   plan.pipeline.shader.textured, plan.texmap_mask, plan.vertex_count,
+                   (sun_caster(plan.pipeline) || clothCaster) ? 1 : 0, sun_caster_alpha(plan.pipeline) ? 1 : 0);
+  }
   const bool tev = plan.pipeline.shader.tev_valid != 0;
   const size_t vertBytes = plan.vertices.size() * sizeof(float);
   const size_t indexBytes = plan.indices.size() * sizeof(uint16_t);
@@ -2247,6 +2631,14 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .uberPipeline = uberPipeline,
       .uberPixelRange = uberPixelRange,
       .uberTextureBindGroup = uberTextureBindGroup,
+      .sunCaster = sun_caster(plan.pipeline) || clothCaster || blendedCaster,
+      .posMtxIdx = plan.pipeline.shader.has_pos_mtx_idx != 0,
+      // DOL_AURORA_SUN_CASTER_LOG=1: why a cloth's or wake's draw (a scope)
+      // does or does not cast, once per distinct state (local debug).
+
+      // The cutout pipeline binds one texture and sampler at group 2, the
+      // single-texmap layout: a multi-texmap material keeps the screen's steps.
+      .sunCasterAlpha = plan.texmap_mask == 0u && textureBindGroup != 0 && sun_caster_alpha(plan.pipeline),
   });
   return true;
 }

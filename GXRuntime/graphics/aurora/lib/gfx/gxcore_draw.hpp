@@ -63,6 +63,15 @@ struct DrawData {
   // jobs interpJob + i.
   uint32_t batch = UINT32_MAX;
   uint32_t batchSize = 1;
+  // The HD look's sun shadow map (post_fx.hpp): the draw is solid scenery or a
+  // character that casts a shadow (it writes depth and colour, is not blended,
+  // is triangles and keeps every pixel), and whether its positions use the
+  // per-vertex matrices (a skinned model) or the current one.
+  bool sunCaster = false;
+  bool posMtxIdx = false;
+  // Alpha-tested solid scenery (a roof, an awning, leaves, a fence): drawn
+  // into the map with its texture's cutout (sun_caster_alpha()).
+  bool sunCasterAlpha = false;
 };
 
 // Recording: the pass's last command, when it is a GXCore draw a following
@@ -102,6 +111,13 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 // At a render pass's start, and after anything else draws in it: what
 // render() last bound is not known.
 void reset_pass_state();
+// The sun shadow map (post_fx.hpp): a depth-only pass drawing each caster again
+// from the sun. begin_sun_casters() binds `rows` (the camera's view space to
+// the map's clip space, three rows of a 3x4 matrix) for the pass;
+// render_sun_caster() draws one draw with its own constants and vertices (or,
+// in an in-between frame, the blended ones render() would use).
+void begin_sun_casters(const wgpu::RenderPassEncoder& pass, const float rows[12]);
+void render_sun_caster(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 
 // Perform one EFB copy-to-texture (63/S16): resolve the current EFB region into
 // a texture keyed by the copy destination address, so a later draw binding that

@@ -179,6 +179,15 @@ void aurora_set_ambient_occlusion(bool enabled);
    passed to aurora_set_world_view. Takes effect at the next frame. */
 void aurora_set_sun_shadows(bool enabled);
 void aurora_set_sun_direction(float x, float y, float z);
+/* Sun shadows from a shadow map: with sun shadows on, the scene's solid draws
+   are drawn again from the sun, so what is off screen still casts. Takes
+   effect at the next frame. DOL_AURORA_SUN_SHADOW_MAP=1 sets the starting
+   value. */
+void aurora_set_sun_shadow_map(bool enabled);
+/* The sun shadow map's quality: 0 low, 1 medium, 2 high (the levels of
+   DOL_AURORA_SUN_SHADOW_QUALITY, which sets the starting one). The map is made
+   again at its size before the next frame, a one-frame hitch. */
+void aurora_set_sun_shadow_quality(int quality);
 /* Edge light: a warm rim on the sunlit outline of what is near the camera,
    from the same sun and camera. Takes effect at the next frame. */
 void aurora_set_edge_light(bool enabled);
