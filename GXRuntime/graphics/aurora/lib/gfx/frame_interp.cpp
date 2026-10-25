@@ -177,6 +177,9 @@ struct Motion {
   bool bounded;
   double inverse[3][4];
   double part[kMaxSteps][3][4];
+  // The last matrices that voted for it (see vote_motion()).
+  std::array<std::array<float, 12>, 16> voters;
+  uint32_t voterCount;
 };
 constexpr int kMaxMotions = 6;
 constexpr uint32_t kMinMotionVotes = 4;
@@ -443,6 +446,34 @@ bool motion_agrees(const double motion[3][4], const float current[][4], const fl
   return linear <= 1e-6 * scale && moved <= tolerance * tolerance;
 }
 
+// A model's parts are drawn with one matrix, and each part with a key of its
+// own voted for the model's motion: thirteen parts of one model at Link,
+// close to the camera, outvoted a cave's room and its torches as he ran and
+// rolled, and what was drawn after him moved with him in the in-between
+// frames (the room shook, the walls parted from the floor, the torches'
+// flames flew across). With object votes (DOL_AURORA_FRAME_INTERP_OBJECT_VOTES=1)
+// a matrix weighs once in its motion; every vote still counts toward
+// kMinMotionVotes.
+std::atomic_bool g_objectVotes{env_flag("DOL_AURORA_FRAME_INTERP_OBJECT_VOTES", false)};
+
+// Whether `current` already voted for `motion` (its linear part within float
+// rounding, its place within half a unit); remembers it if not.
+bool voted_before(Motion& motion, const float current[][4]) {
+  std::array<float, 12> matrix;
+  std::memcpy(matrix.data(), current, sizeof(matrix));
+  const uint32_t kept = std::min<uint32_t>(motion.voterCount, motion.voters.size());
+  for (uint32_t i = 0; i < kept; ++i) {
+    const auto& other = motion.voters[i];
+    bool same = true;
+    for (int k = 0; same && k < 12; ++k)
+      same = std::fabs(other[k] - matrix[k]) <= (k % 4 == 3 ? 0.5f : 1e-4f * (1.f + std::fabs(matrix[k])));
+    if (same)
+      return true;
+  }
+  motion.voters[motion.voterCount++ % motion.voters.size()] = matrix;
+  return false;
+}
+
 // The camera's motion is the one the scenery shares, and what stands farthest
 // pins it down: a vote weighs as much as its draw is far from the camera, in
 // thousands of units (one at least, so near the camera every draw counts the
@@ -451,8 +482,10 @@ bool motion_agrees(const double motion[3][4], const float current[][4], const fl
 // on its motion before the islands and the sea voted, so the boat's motion
 // was taken for the camera's through most of the frame. The sky, drawn around
 // the camera, turns with it but does not move with it, and weighs little too.
+// With object votes, a matrix weighs once in its motion (see g_objectVotes).
 void vote_motion(const float current[][4], const float previous[][4]) {
   const double weight = std::max(1.0, translation_length(current) / kVoteReach);
+  const bool objectVotes = g_objectVotes.load(std::memory_order_relaxed);
   int agreed = -1;
   if (g_leadingMotion >= 0 && motion_agrees(g_motions[g_leadingMotion].m, current, previous))
     agreed = g_leadingMotion;
@@ -462,7 +495,8 @@ void vote_motion(const float current[][4], const float previous[][4]) {
   }
   if (agreed >= 0) {
     ++g_motions[agreed].votes;
-    g_motions[agreed].weight += weight;
+    if (!objectVotes || !voted_before(g_motions[agreed], current))
+      g_motions[agreed].weight += weight;
   } else {
     double inverse[3][4];
     if (!affine_inverse(previous, inverse))
@@ -489,6 +523,9 @@ void vote_motion(const float current[][4], const float previous[][4]) {
     g_motions[agreed].votes = 1;
     g_motions[agreed].weight = weight;
     g_motions[agreed].derived = false;
+    g_motions[agreed].voterCount = 0;
+    if (objectVotes)
+      voted_before(g_motions[agreed], current);
     ++g_motionGeneration;
   }
   // The motion with the most weight is the camera's.
@@ -1306,6 +1343,7 @@ void log_counts() {
 
 bool enabled() noexcept { return g_enabled.load(std::memory_order_relaxed); }
 void set_enabled(bool enabled) noexcept { g_enabled.store(enabled, std::memory_order_relaxed); }
+void set_object_votes(bool on) noexcept { g_objectVotes.store(on, std::memory_order_relaxed); }
 
 static bool screen_space_sprite(const gxc::DrawPlan& plan) noexcept {
   return plan.match_direct_position && plan.constants.projection[3][2] == 0.f &&
