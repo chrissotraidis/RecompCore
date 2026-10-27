@@ -102,6 +102,9 @@ struct Command {
   CommandType type;
   // A draw with an orthographic projection (the HUD, menus, screen effects).
   bool flat = false;
+  // A flat draw of a copy of the frame, laid back over it (Wind Waker's motion
+  // blur while the camera shakes, its depth of field).
+  bool composite = false;
 #ifdef AURORA_GFX_DEBUG_GROUPS
   std::vector<std::string> debugGroupStack;
 #endif
@@ -789,6 +792,10 @@ static int g_nextDrawFlat = -1; // -1: from the legacy GX state
 
 void set_next_draw_flat(bool flat) noexcept { g_nextDrawFlat = flat ? 1 : 0; }
 
+static bool g_nextDrawComposite = false;
+
+void set_next_draw_composite(bool composite) noexcept { g_nextDrawComposite = composite; }
+
 static inline void push_command(CommandType type, const Command::Data& data) {
   if (g_currentRenderPass == UINT32_MAX)
     UNLIKELY {
@@ -802,13 +809,16 @@ static inline void push_command(CommandType type, const Command::Data& data) {
       .type = type,
       .flat = type == CommandType::Draw &&
               (g_nextDrawFlat >= 0 ? g_nextDrawFlat == 1 : gx::g_gxState.projType == GX_ORTHOGRAPHIC),
+      .composite = type == CommandType::Draw && g_nextDrawComposite,
 #ifdef AURORA_GFX_DEBUG_GROUPS
       .debugGroupStack = g_debugGroupStack,
 #endif
       .data = data,
   });
-  if (type == CommandType::Draw)
+  if (type == CommandType::Draw) {
     g_nextDrawFlat = -1;
+    g_nextDrawComposite = false;
+  }
 }
 
 template <>
@@ -2102,13 +2112,31 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
   const uint64_t frameKey = frame.frameId * (frame_interp::kMaxSteps + 1) +
                             (frame_interp::encoding_interpolated() ? 1 + g_replayStep : 0);
   const bool efbPass = !passInfo.offscreen && passInfo.colorView.Get() == webgpu::g_frameBuffer.view.Get();
-  const bool bloomBeforeCopy = post_fx::any_enabled() && efbPass && bloomedFrame != frameKey &&
+  // A copy of the frame laid back over the scene (Wind Waker's motion blur
+  // while the camera shakes, as when Link's sword hits a tree) holds the
+  // effects from the frame it was copied from: they go in before it. After it,
+  // they were multiplied into the copy a second time, and shadows went darker
+  // and lighter again with every frame of the blur (bluewake #491).
+  size_t composite = SIZE_MAX;
+  if (post_fx::any_enabled() && efbPass && bloomedFrame != frameKey) {
+    bool scene = false;
+    for (size_t i = 0; i < passInfo.commands.size() && composite == SIZE_MAX; ++i) {
+      const auto& command = passInfo.commands[i];
+      if (command.type != CommandType::Draw || command.data.draw.type == ShaderType::Clear)
+        continue;
+      if (command.composite && scene)
+        composite = i;
+      scene = scene || !command.flat;
+    }
+  }
+  const bool bloomBeforeCopy = composite == SIZE_MAX && post_fx::any_enabled() && efbPass && bloomedFrame != frameKey &&
                                passInfo.resolveTarget && !gx::is_depth_format(passInfo.resolveFormat) &&
                                passInfo.resolveRect.x == 0 && passInfo.resolveRect.y == 0 &&
                                static_cast<uint32_t>(passInfo.resolveRect.width) == passInfo.targetSize.width &&
                                static_cast<uint32_t>(passInfo.resolveRect.height) == passInfo.targetSize.height;
-  size_t split = SIZE_MAX;
-  if (post_fx::any_enabled() && efbPass && passInfo.observable && bloomedFrame != frameKey && !bloomBeforeCopy) {
+  size_t split = composite;
+  if (split == SIZE_MAX && post_fx::any_enabled() && efbPass && passInfo.observable && bloomedFrame != frameKey &&
+      !bloomBeforeCopy) {
     for (size_t i = passInfo.commands.size(); i-- > 0;) {
       const auto& command = passInfo.commands[i];
       if (command.type == CommandType::Draw && command.data.draw.type != ShaderType::Clear && !command.flat) {

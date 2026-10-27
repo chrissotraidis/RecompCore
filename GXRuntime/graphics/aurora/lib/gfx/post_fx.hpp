@@ -72,6 +72,7 @@ bool cloud_shadows_enabled() noexcept;
 void set_cloud_shadows(bool enabled) noexcept;
 void set_world_view(const float invView[12], float tanHalfFovy, float aspect, float nearPlane, float seaLevel,
                     float seconds) noexcept;
+void set_world_view_far(float farPlane) noexcept;
 bool any_enabled() noexcept;
 // The game's point lights, at most (aurora_set_point_lights).
 constexpr uint32_t kMaxLights = 16;
@@ -81,6 +82,7 @@ constexpr uint32_t kMaxLights = 16;
 // the direction to the sun; and the point lights.
 struct Camera {
   std::array<float, 20> view{};
+  float farPlane = 0.f;  // 0: infinitely far (aurora_set_world_view_far)
   bool valid = false;
   std::array<float, kMaxLights * 8> lights{};
   uint32_t lightCount = 0;

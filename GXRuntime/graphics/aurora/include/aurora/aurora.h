@@ -207,6 +207,11 @@ void aurora_set_cloud_shadows(bool enabled);
    world's sea; seconds, the game's time. */
 void aurora_set_world_view(const float inv_view[12], float tan_half_fovy, float aspect, float near_plane,
                            float sea_level, float seconds);
+/* The same camera's far distance, for reading distances from the scene's
+   depth exactly (0, the default, takes the far plane as infinitely far: at a
+   tenth of the far distance that read them a tenth too far, and distant
+   surfaces shaded themselves in the sun shadow map). */
+void aurora_set_world_view_far(float far_plane);
 /* A frames-a-second counter at the top of the window (with the game's own
    rate beside it when in-between frames are on). DOL_AURORA_SHOW_FPS=1 sets
    the starting value. */

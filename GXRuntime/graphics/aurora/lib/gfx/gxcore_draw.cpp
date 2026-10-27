@@ -1971,6 +1971,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // Resolve one texmap's texture to a GPU handle: EFB-copy shadow first, else the
   // guest-identity + content-hash decode cache. Shared by the single-texmap fast
   // path and the multi-texmap path (63/Mfin, e.g. THP YUV Y/U/V on texmap 0/1/2).
+  // A texture that is a copy of the EFB marks a flat draw as the frame laid back
+  // over itself (post_fx goes in before it: common.cpp).
+  bool samplesCopy = false;
   auto resolve_texture_handle =
       [&](uint32_t address, uint32_t tsize, uint32_t format, uint32_t width,
           uint32_t height, const void* data, uint32_t available, bool has_tlut,
@@ -1998,6 +2001,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
            memoryEpoch == efbIt->second.memory_epoch);
       if (memoryUnchanged) {
         ++g_textureCacheStats.hits;
+        samplesCopy = true;
         return efbIt->second.handle;
       }
       g_efbCopyTextures.erase(efbIt);
@@ -2443,14 +2447,26 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         sizeof(plan.pixel_constants));
     pixelRepeats = g_pixelUniformCache.hits != hits;
   }
+  // A lightning strike (dThunder_c) draws, with its bolt, an invisible model
+  // that writes depth only, about 100,000 units out: a strip from the sea to
+  // the clouds. The HD look's effects read the depth, so the far blur and the
+  // cloud shadows took that strip of sky for something solid and drew it as a
+  // grey column. A depth-only draw that far out writes none while they are on.
+  gxc::PipelineKey key = plan.pipeline;
+  if (key.depth_update != 0u && key.color_update == 0u && key.alpha_update == 0u && post_fx::any_enabled() &&
+      plan.constants.projection[3][3] != 1.f) {
+    const auto& m = plan.constants.posnormalmatrix;
+    if (m[0][3] * m[0][3] + m[1][3] * m[1][3] + m[2][3] * m[2][3] > 50000.f * 50000.f)
+      key.depth_update = 0u;
+  }
   const PipelineConfig colorConfig{
       .version = GXCorePipelineConfigVersion,
-      .key = plan.pipeline,
+      .key = key,
       .msaaSamples = get_sample_count(),
   };
   const PipelineRef pipeline = pipeline_ref(colorConfig);
   PipelineRef depthPipeline = 0;
-  if (needs_early_depth_emulation(plan.pipeline)) {
+  if (needs_early_depth_emulation(key)) {
     PipelineConfig depthConfig = colorConfig;
     depthConfig.depthOnly = 1u;
     depthPipeline = pipeline_ref(depthConfig);
@@ -2614,6 +2630,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     return true;
   }
   set_next_draw_flat(plan.constants.projection[3][3] == 1.f);
+  set_next_draw_composite(plan.constants.projection[3][3] == 1.f && samplesCopy);
   push_draw_command(DrawData{
       .pipeline = pipeline,
       .depthPipeline = depthPipeline,
