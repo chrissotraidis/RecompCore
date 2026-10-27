@@ -27,6 +27,17 @@ int main(void) {
     cpu.exram = exram; cpu.exram_size = sizeof exram;
     ppc_guest_alias_clear();
     assert(!ppc_guest_alias_range_overlaps(GC_RAM_BASE, 4));
+    u32 alias_generation = g_ppc_guest_alias_generation;
+    assert(ppc_guest_alias_add_shared(0x8C008000u, sizeof overlap_alias,
+                                      overlap_alias));
+    assert(g_ppc_guest_alias_generation != alias_generation);
+    assert(ppc_guest_alias_range_overlaps(0x8C008000u, 1u));
+    alias_generation = g_ppc_guest_alias_generation;
+    assert(ppc_guest_alias_remove(0x8C008000u, sizeof overlap_alias));
+    assert(g_ppc_guest_alias_generation != alias_generation);
+    alias_generation = g_ppc_guest_alias_generation;
+    ppc_guest_alias_clear();
+    assert(g_ppc_guest_alias_generation != alias_generation);
     u32 offset = 123;
     assert(get_ram_ptr(&cpu, GC_RAM_BASE, 4, &offset) == bw_test_mem1 && offset == 0);
     const u32 ram_size = sizeof bw_test_mem1;

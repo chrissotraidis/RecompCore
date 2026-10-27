@@ -115,7 +115,6 @@ u32 g_ppc_guest_alias_generation;
 
 static void ppc_guest_alias_set_overlap_mem1(bool overlaps) {
     g_ppc_guest_aliases_overlap_mem1 = overlaps;
-    g_ppc_guest_alias_generation++;
 }
 // Cost census for the alias path (docs/status/REORGANIZATION_2026-09-17.md, W4).
 // get_ram_ptr sends every untagged MEM1 access through ppc_guest_alias_resolve
@@ -183,6 +182,7 @@ GXRUNTIME_EXPORT void ppc_guest_alias_clear(void) {
     g_guest_alias_max_end = 0u;
     g_guest_alias_overlapping = false;
     ppc_guest_alias_set_overlap_mem1(false);
+    g_ppc_guest_alias_generation++;
 }
 
 static bool ppc_guest_alias_add_storage(u32 linked_start, u32 size,
@@ -205,6 +205,7 @@ static bool ppc_guest_alias_add_storage(u32 linked_start, u32 size,
     if (alias->linked_start < GC_MEM1_ADDRESS_END &&
         alias_end > GC_RAM_BASE)
         ppc_guest_alias_set_overlap_mem1(true);
+    g_ppc_guest_alias_generation++;
     if (getenv("BLUEWAKE_TRACE_GUEST_ALIASES") != NULL &&
         alias->linked_start < 0x81516E20u &&
         (u64)alias->linked_start + alias->size > 0x81512AC0u) {
@@ -265,6 +266,7 @@ GXRUNTIME_EXPORT bool ppc_guest_alias_remove(u32 linked_start, u32 size) {
         g_guest_aliases[g_guest_alias_count] = (PPCGuestAlias){0};
         ppc_guest_alias_index_rebuild();
         ppc_guest_alias_recompute_bounds();
+        g_ppc_guest_alias_generation++;
         return true;
     }
     return false;
