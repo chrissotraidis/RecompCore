@@ -1163,9 +1163,15 @@ ReplacementGroup load_replacement_directory(const std::filesystem::path& root, R
       continue;
     }
 
+    // A pack's optional/ folder holds alternatives that load over it only when
+    // asked for (DOL_AURORA_TEXTURE_PACK_OPTIONAL, aurora_backend.cpp).
+    auto components = path_components(root, path);
+    if (components.size() > 1 && compare_ascii_ci(components.front(), "optional") == 0) {
+      continue;
+    }
     candidates.push_back({
         .path = path,
-        .components = path_components(root, path),
+        .components = std::move(components),
     });
   }
 
