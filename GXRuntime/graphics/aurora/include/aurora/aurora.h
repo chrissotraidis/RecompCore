@@ -179,6 +179,10 @@ void aurora_set_ambient_occlusion(bool enabled);
    passed to aurora_set_world_view. Takes effect at the next frame. */
 void aurora_set_sun_shadows(bool enabled);
 void aurora_set_sun_direction(float x, float y, float z);
+/* The scene's brightness, from the game (Wind Waker HD's factor for the hour):
+   what is lit and stands above the sea is multiplied by it, before bloom. 0
+   (or 1) leaves the scene as it is. */
+void aurora_set_exposure(float gain);
 /* Sun shadows from a shadow map: with sun shadows on, the scene's solid draws
    are drawn again from the sun, so what is off screen still casts. Takes
    effect at the next frame. DOL_AURORA_SUN_SHADOW_MAP=1 sets the starting

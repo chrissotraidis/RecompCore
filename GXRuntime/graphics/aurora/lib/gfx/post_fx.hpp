@@ -69,6 +69,19 @@ void set_sun_shadow_map(bool enabled) noexcept;
 void set_sun_shadow_quality(int level) noexcept;
 void set_sun_shadow_strength(float strength) noexcept;
 void set_sun_direction(float x, float y, float z) noexcept;
+void set_exposure(float gain) noexcept;
+// The scene is brightened this frame (the game's gain over 1): the sea's draws
+// are then marked for the sea mask (gxcore_draw.hpp render_sea_mask()).
+bool exposure_active() noexcept;
+// The sea mask the brightness leaves the sea out by: 1 where the sea is the
+// nearest surface, from the frame's solid draws and the sea drawn again into
+// it and a depth of its own (gxcore_draw.hpp render_sea_mask()), the scene's
+// size and single-sampled. common.cpp clears both at a frame's first scene
+// pass and adds each scene pass, before encode().
+constexpr wgpu::TextureFormat kSeaMaskFormat = wgpu::TextureFormat::R8Unorm;
+constexpr wgpu::TextureFormat kSeaMaskDepthFormat = wgpu::TextureFormat::Depth32Float;
+wgpu::TextureView sea_mask_target(const wgpu::Extent3D& sceneSize);
+wgpu::TextureView sea_mask_depth(const wgpu::Extent3D& sceneSize);
 bool cloud_shadows_enabled() noexcept;
 void set_cloud_shadows(bool enabled) noexcept;
 void set_world_view(const float invView[12], float tanHalfFovy, float aspect, float nearPlane, float seaLevel,
@@ -84,6 +97,7 @@ constexpr uint32_t kMaxLights = 16;
 struct Camera {
   std::array<float, 20> view{};
   float farPlane = 0.f;  // 0: infinitely far (aurora_set_world_view_far)
+  float exposure = 0.f;  // aurora_set_exposure; 0: unset
   bool valid = false;
   std::array<float, kMaxLights * 8> lights{};
   uint32_t lightCount = 0;

@@ -32,6 +32,21 @@ std::array<float, kMaxLights * 8> g_lights{};
 uint32_t g_lightCount = 0;
 float g_edgeStrength = 0.4f;  // how bright a sunlit edge gets
 float g_sunStrength = 0.35f;  // how dark a sun shadow is
+// The scene's brightness the game asks for (aurora_set_exposure), after the
+// HD look's effects and before its bloom: Wind Waker HD's own factor for the
+// hour's palettes (its sunlight 3 times at noon on actors and scenery, 1.65
+// after gamma). 0 while unset, and the pass is left out. Under g_cameraMutex.
+float g_exposureGain = 0.f;
+// The frame buffer copied before the exposure, which reads its colours for
+// the highlights' roll-off (it can't read the target it draws into).
+wgpu::Texture g_exposureScene;
+wgpu::TextureView g_exposureSceneView;
+// The sea mask (sea_mask_target()) and its own depth.
+wgpu::Texture g_seaMask;
+wgpu::TextureView g_seaMaskView;
+wgpu::Texture g_seaMaskDepth;
+wgpu::TextureView g_seaMaskDepthView;
+wgpu::Extent3D g_seaMaskSize{};
 // The sun shadow map's full shadow as a colour the scene is multiplied by, the
 // shade lit by the sky as in Wind Waker HD: Link's shadow on Windfall's dock at
 // noon kept 0.21, 0.39 and 0.56 of the sunlit planks' red, green and blue (0.65
@@ -130,6 +145,7 @@ wgpu::Sampler g_sampler;
 wgpu::TextureFormat g_format = wgpu::TextureFormat::Undefined;
 wgpu::RenderPipeline g_bright, g_blurH, g_blurV;
 wgpu::RenderPipeline g_composite;
+wgpu::RenderPipeline g_exposureDepth; // the scene brightened (g_exposureGain), where there is depth
 wgpu::RenderPipeline g_down;           // the scene at a quarter of the size, unfiltered
 wgpu::RenderPipeline g_farComposite;   // blended into the EFB by distance
 wgpu::RenderPipeline g_aoPass;         // occlusion at a quarter of the size
@@ -306,6 +322,7 @@ fn fs_far(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     return vec4(textureSampleLevel(blurred, samp, in.uv, 0.0).rgb, f);
 }
+
 )""";
 wgpu::ShaderModule g_farModule;
 
@@ -551,7 +568,8 @@ struct View {
 };
 
 @group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var unused: texture_2d<f32>;
+@group(0) @binding(1) var sea_mask: texture_2d<f32>; // the exposure's sea mask; the cloud shadows leave it
+@group(0) @binding(4) var scene: texture_2d<f32>;    // the scene before the effects, for the exposure
 @group(0) @binding(2) var depth: texture_depth_2d;
 @group(0) @binding(3) var<uniform> view: View;
 
@@ -654,6 +672,45 @@ fn fs_clouds(in: VertexOutput) -> @location(0) vec4<f32> {
     let n = fbm(world.xz / scale + drift);
     let shade = smoothstep(0.42, 0.6, n) * strength * (1.0 - smoothstep(60000.0, 160000.0, distance));
     return vec4(vec3(1.0 - shade + select(0.0, dither(in.pos.xy), shade > 0.0)), 1.0);
+}
+
+// DOL_AURORA_SEA_MASK_DEBUG=1: the sea mask over the scene instead (local debug).
+override sea_debug: bool = false;
+// Fading out from far_start to far_end units away (DOL_AURORA_EXPOSURE_FAR=start,end):
+// what is that far is the haze's colour, and brightened it stood out pale cyan
+// against the sky (the islands seen from the Private Oasis).
+override far_start: f32 = 10000.0;
+override far_end: f32 = 25000.0;
+// What is already bright takes less of it (DOL_AURORA_EXPOSURE_HIGHLIGHTS=from,to):
+// the gain tapers from full where a colour's brightest channel is `from` to
+// none at `to`, so ice and white rock keep their shading (at 1.5 times they
+// went flat white, a sixth of the screen clipped, at Ice Ring Isle), and the
+// taper is gentle enough that a brighter colour still comes out brighter.
+override highlight_from: f32 = 0.4;
+override highlight_to: f32 = 1.0;
+// The game's brightness (kBoost: scene * (1 + this) - the scene), carried in
+// time.x of this pass's view, where there is depth and not the sea's surface
+// (the sea mask): Wind Waker HD brightens the sun's light on actors and
+// scenery, not on the sea or the sky. A beach below a swell's height takes it,
+// and the swell doesn't.
+@fragment
+fn fs_exposure(in: VertexOutput) -> @location(0) vec4<f32> {
+    let p = vec2<i32>(in.pos.xy);
+    let d = textureLoad(depth, p, 0);
+    if (d <= 0.0) {
+        return vec4(0.0); // no depth: left as it is
+    }
+    let land = 1.0 - textureLoad(sea_mask, p, 0).r;
+    if (sea_debug) {
+        // The sea mask: the sea twice as bright, the rest left as it is (the pass scales the scene by
+        // one more than this; the target clamps what is below zero).
+        return vec4(select(vec3(0.0), vec3(1.0), land < 0.5), 0.0);
+    }
+    let near = 1.0 - smoothstep(far_start, far_end, view.lens.z / d);
+    var gain = (view.time.x - 1.0) * land * near;
+    let c = textureLoad(scene, p, 0).rgb;
+    gain *= 1.0 - smoothstep(highlight_from, highlight_to, max(max(c.r, c.g), c.b));
+    return vec4(vec3(select(0.0, gain + dither(in.pos.xy), gain > 0.0)), 0.0);
 }
 )""";
 wgpu::ShaderModule g_cloudModule;
@@ -1460,11 +1517,19 @@ wgpu::RenderPipeline make_ao_pipeline(const char* label, const char* entry, wgpu
   return g_device.CreateRenderPipeline(&descriptor);
 }
 
-wgpu::RenderPipeline make_cloud_pipeline(wgpu::TextureFormat format, uint32_t samples) {
+wgpu::RenderPipeline make_cloud_pipeline(wgpu::TextureFormat format, uint32_t samples, bool exposure = false) {
   const std::array constants{
       wgpu::ConstantEntry{.key = "strength", .value = g_cloudStrength},
       wgpu::ConstantEntry{.key = "scale", .value = g_cloudScale},
       wgpu::ConstantEntry{.key = "debug_view", .value = g_cloudDebug ? 1.0 : 0.0},
+  };
+  const wgpu::BlendState boost{
+      .color = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::Dst,
+                .dstFactor = wgpu::BlendFactor::One},
+      .alpha = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::Zero,
+                .dstFactor = wgpu::BlendFactor::One},
   };
   const wgpu::BlendState multiply{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -1474,17 +1539,38 @@ wgpu::RenderPipeline make_cloud_pipeline(wgpu::TextureFormat format, uint32_t sa
                 .srcFactor = wgpu::BlendFactor::Zero,
                 .dstFactor = wgpu::BlendFactor::One},
   };
-  const std::array targets{wgpu::ColorTargetState{.format = format, .blend = &multiply, .writeMask = wgpu::ColorWriteMask::All}};
+  const std::array targets{
+      wgpu::ColorTargetState{.format = format, .blend = exposure ? &boost : &multiply, .writeMask = wgpu::ColorWriteMask::All}};
+  static const bool seaDebug = std::getenv("DOL_AURORA_SEA_MASK_DEBUG") != nullptr;
+  static const std::array<float, 2> exposureFar = [] {
+    std::array<float, 2> far{10000.f, 25000.f};
+    if (const char* value = std::getenv("DOL_AURORA_EXPOSURE_FAR"); value != nullptr)
+      if (std::sscanf(value, "%f,%f", &far[0], &far[1]) != 2 || !(far[1] > far[0]) || !(far[0] >= 0.f))
+        far = {10000.f, 25000.f};
+    return far;
+  }();
+  static const std::array<float, 2> exposureHighlights = [] {
+    std::array<float, 2> range{0.4f, 1.0f};
+    if (const char* value = std::getenv("DOL_AURORA_EXPOSURE_HIGHLIGHTS"); value != nullptr)
+      if (std::sscanf(value, "%f,%f", &range[0], &range[1]) != 2 || !(range[1] > range[0]))
+        range = {0.4f, 1.0f};
+    return range;
+  }();
+  const std::array exposureConstants{wgpu::ConstantEntry{.key = "sea_debug", .value = seaDebug ? 1.0 : 0.0},
+                                     wgpu::ConstantEntry{.key = "far_start", .value = exposureFar[0]},
+                                     wgpu::ConstantEntry{.key = "far_end", .value = exposureFar[1]},
+                                     wgpu::ConstantEntry{.key = "highlight_from", .value = exposureHighlights[0]},
+                                     wgpu::ConstantEntry{.key = "highlight_to", .value = exposureHighlights[1]}};
   const wgpu::FragmentState fragment{
       .module = g_cloudModule,
-      .entryPoint = "fs_clouds",
-      .constantCount = constants.size(),
-      .constants = constants.data(),
+      .entryPoint = exposure ? "fs_exposure" : "fs_clouds",
+      .constantCount = exposure ? exposureConstants.size() : constants.size(),
+      .constants = exposure ? exposureConstants.data() : constants.data(),
       .targetCount = targets.size(),
       .targets = targets.data(),
   };
   const wgpu::RenderPipelineDescriptor descriptor{
-      .label = "Cloud shadows",
+      .label = exposure ? "Exposure" : "Cloud shadows",
       .layout = g_cloudPipelineLayout,
       .vertex = {.module = g_cloudModule, .entryPoint = "vs_main"},
       .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
@@ -1721,6 +1807,7 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
     g_torchPass = {};
     g_composite = {};
     g_farComposite = {};
+    g_exposureDepth = {};
     g_aoApply = {};
     g_size = {};
   }
@@ -1757,6 +1844,7 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
   }
   if (!g_farComposite || samples != g_farSamples) {
     g_farComposite = make_far_pipeline(format, samples);
+    g_exposureDepth = make_cloud_pipeline(format, samples, true);
     g_farSamples = samples;
   }
   const wgpu::Extent3D size{std::max(1u, sceneSize.width / 4), std::max(1u, sceneSize.height / 4), 1};
@@ -1851,18 +1939,22 @@ void draw_depth(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::
 void draw_with_uniform(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::RenderPipeline& pipeline,
                        const wgpu::BindGroupLayout& layout, const void* uniform, size_t uniformSize,
                        const wgpu::TextureView& depthView, const wgpu::TextureView& target,
-                       const wgpu::TextureView& resolve);
+                       const wgpu::TextureView& resolve, const wgpu::TextureView* texture = nullptr,
+                       const wgpu::TextureView* scene = nullptr);
 
 void draw_with_view(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::RenderPipeline& pipeline,
                     const std::array<float, 20>& view, const wgpu::TextureView& depthView,
-                    const wgpu::TextureView& target, const wgpu::TextureView& resolve) {
-  draw_with_uniform(cmd, label, pipeline, g_cloudLayout, view.data(), sizeof(view), depthView, target, resolve);
+                    const wgpu::TextureView& target, const wgpu::TextureView& resolve,
+                    const wgpu::TextureView* texture = nullptr, const wgpu::TextureView* scene = nullptr) {
+  draw_with_uniform(cmd, label, pipeline, g_cloudLayout, view.data(), sizeof(view), depthView, target, resolve,
+                    texture, scene);
 }
 
 void draw_with_uniform(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::RenderPipeline& pipeline,
                        const wgpu::BindGroupLayout& layout, const void* uniform, size_t uniformSize,
                        const wgpu::TextureView& depthView, const wgpu::TextureView& target,
-                       const wgpu::TextureView& resolve) {
+                       const wgpu::TextureView& resolve, const wgpu::TextureView* texture,
+                       const wgpu::TextureView* scene) {
   // A small buffer for each frame, so a frame still in flight keeps its camera.
   const wgpu::BufferDescriptor bufferDescriptor{
       .label = "Post effects view",
@@ -1875,9 +1967,10 @@ void draw_with_uniform(const wgpu::CommandEncoder& cmd, const char* label, const
   buffer.Unmap();
   const std::array entries{
       wgpu::BindGroupEntry{.binding = 0, .sampler = g_sampler},
-      wgpu::BindGroupEntry{.binding = 1, .textureView = g_farView[0]},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = texture != nullptr ? *texture : g_farView[0]},
       wgpu::BindGroupEntry{.binding = 2, .textureView = depthView},
       wgpu::BindGroupEntry{.binding = 3, .buffer = buffer, .offset = 0, .size = uniformSize},
+      wgpu::BindGroupEntry{.binding = 4, .textureView = scene != nullptr ? *scene : g_farView[0]},
   };
   const wgpu::BindGroupDescriptor bindGroupDescriptor{
       .layout = layout,
@@ -2126,14 +2219,28 @@ void initialize() {
   const wgpu::PipelineLayoutDescriptor depthPipelineLayoutDescriptor{.bindGroupLayoutCount = 1,
                                                                      .bindGroupLayouts = &g_depthLayout};
   g_depthPipelineLayout = g_device.CreatePipelineLayout(&depthPipelineLayoutDescriptor);
+  // Binding 1 is the exposure's sea mask (read with textureLoad);
+  // the cloud shadows, sun shadows and edge light leave it.
   const std::array cloudEntries{
       depthEntries[0],
-      depthEntries[1],
+      wgpu::BindGroupLayoutEntry{
+          .binding = 1,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .texture = {.sampleType = wgpu::TextureSampleType::UnfilterableFloat,
+                      .viewDimension = wgpu::TextureViewDimension::e2D},
+      },
       depthEntries[2],
       wgpu::BindGroupLayoutEntry{
           .binding = 3,
           .visibility = wgpu::ShaderStage::Fragment,
           .buffer = {.type = wgpu::BufferBindingType::Uniform, .minBindingSize = sizeof(g_camera)},
+      },
+      // The scene before the effects, for the exposure's highlights (read with textureLoad).
+      wgpu::BindGroupLayoutEntry{
+          .binding = 4,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .texture = {.sampleType = wgpu::TextureSampleType::UnfilterableFloat,
+                      .viewDimension = wgpu::TextureViewDimension::e2D},
       },
   };
   const wgpu::BindGroupLayoutDescriptor cloudLayoutDescriptor{
@@ -2201,7 +2308,7 @@ void initialize() {
 }
 
 void shutdown() {
-  g_bright = g_blurH = g_blurV = g_composite = g_down = g_farComposite = g_aoPass = g_aoApply = {};
+  g_bright = g_blurH = g_blurV = g_composite = g_down = g_farComposite = g_aoPass = g_aoApply = g_exposureDepth = {};
   g_aoBlurH = g_aoBlurV = g_aoUpscale = {};
   g_aoTex = {};
   g_aoView = {};
@@ -2232,6 +2339,13 @@ void shutdown() {
   g_cloudPipelineLayout = {};
   g_cloudLayout = {};
   g_cloudModule = {};
+  g_seaMaskView = {};
+  g_seaMask = {};
+  g_exposureSceneView = {};
+  g_exposureScene = {};
+  g_seaMaskDepthView = {};
+  g_seaMaskDepth = {};
+  g_seaMaskSize = {};
   g_tex = {};
   g_view = {};
   g_farTex = {};
@@ -2420,6 +2534,44 @@ bool edge_light_enabled() noexcept { return g_edge.load(std::memory_order_relaxe
 
 void set_edge_light(bool enabled) noexcept { g_edge.store(enabled, std::memory_order_relaxed); }
 
+void set_exposure(float gain) noexcept {
+  std::lock_guard lock{g_cameraMutex};
+  g_exposureGain = gain > 0.f ? gain : 0.f;
+}
+
+bool exposure_active() noexcept {
+  std::lock_guard lock{g_cameraMutex};
+  return g_exposureGain > 1.f;
+}
+
+wgpu::TextureView sea_mask_target(const wgpu::Extent3D& sceneSize) {
+  if (!g_seaMask || g_seaMaskSize.width != sceneSize.width || g_seaMaskSize.height != sceneSize.height) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Sea mask",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+        .size = {sceneSize.width, sceneSize.height, 1},
+        .format = kSeaMaskFormat,
+    };
+    g_seaMask = g_device.CreateTexture(&descriptor);
+    g_seaMaskView = g_seaMask.CreateView();
+    const wgpu::TextureDescriptor depthDescriptor{
+        .label = "Sea mask depth",
+        .usage = wgpu::TextureUsage::RenderAttachment,
+        .size = {sceneSize.width, sceneSize.height, 1},
+        .format = kSeaMaskDepthFormat,
+    };
+    g_seaMaskDepth = g_device.CreateTexture(&depthDescriptor);
+    g_seaMaskDepthView = g_seaMaskDepth.CreateView();
+    g_seaMaskSize = sceneSize;
+  }
+  return g_seaMaskView;
+}
+
+wgpu::TextureView sea_mask_depth(const wgpu::Extent3D& sceneSize) {
+  sea_mask_target(sceneSize);
+  return g_seaMaskDepthView;
+}
+
 void set_sun_direction(float x, float y, float z) noexcept {
   const float length = std::sqrt(x * x + y * y + z * z);
   std::lock_guard lock{g_cameraMutex};
@@ -2454,6 +2606,7 @@ Camera current_camera() noexcept {
   std::lock_guard lock{g_cameraMutex};
   camera.view = g_camera;
   camera.farPlane = g_cameraFar;
+  camera.exposure = g_exposureGain;
   camera.valid = g_cameraValid;
   camera.lights = g_lights;
   camera.lightCount = g_lightCount;
@@ -2477,9 +2630,38 @@ bool any_enabled() noexcept {
          sun_shadows_enabled() || edge_light_enabled() || torch_light_enabled();
 }
 
+// The frame buffer's colours before the effects, for the exposure's
+// highlights: taken after the sun shadows, a shadow on ice was darker than the
+// lit ice beside it, took more of the gain and came out washed out. False
+// where the target isn't the frame buffer (the exposure then has no taper).
+bool copy_exposure_scene(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& size, const wgpu::TextureView& dst) {
+  const auto& frame = webgpu::g_frameBuffer;
+  if (!frame.texture || dst.Get() != frame.view.Get() || frame.texture.GetWidth() != size.width ||
+      frame.texture.GetHeight() != size.height)
+    return false;
+  if (!g_exposureScene || g_exposureScene.GetWidth() != size.width || g_exposureScene.GetHeight() != size.height ||
+      g_exposureScene.GetFormat() != frame.texture.GetFormat()) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Exposure scene",
+        .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding,
+        .size = {size.width, size.height, 1},
+        .format = frame.texture.GetFormat(),
+    };
+    g_exposureScene = g_device.CreateTexture(&descriptor);
+    g_exposureSceneView = g_exposureScene.CreateView();
+  }
+  const wgpu::TexelCopyTextureInfo from{.texture = frame.texture};
+  const wgpu::TexelCopyTextureInfo to{.texture = g_exposureScene};
+  const wgpu::Extent3D extent{size.width, size.height, 1};
+  cmd.CopyTextureToTexture(&from, &to, &extent);
+  return true;
+}
+
 void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
             const wgpu::Extent3D& size, wgpu::TextureFormat format, const wgpu::TextureView& dst,
             const wgpu::TextureView& resolve, uint32_t msaaSamples, const Camera& camera, const SunMap* sunMap) {
+  const bool exposureScene = camera.exposure > 1.f && g_module && msaaSamples == 1 && camera.valid &&
+                             size.width >= 4 && size.height >= 4 && copy_exposure_scene(cmd, size, dst);
   // Ambient occlusion and the far blur need single-sample depth (the depth
   // buffer is multisampled with MSAA).
   if (ambient_occlusion_enabled() && g_module && depthView && msaaSamples == 1 && size.width >= 4 && size.height >= 4) {
@@ -2551,6 +2733,18 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
     }
     draw_depth(cmd, "Far blur composite", g_farComposite, g_farView[0], depthView, dst, resolve, true);
   }
+  if (camera.exposure > 1.f && g_module && size.width >= 4 && size.height >= 4) {
+    const webgpu::gpu_prof::Zone zone{cmd, "Exposure"};
+    ensure_targets(size, format, msaaSamples);
+    // The game's brightness rides in the seconds, which the pass doesn't use.
+    std::array<float, 20> view = camera.view;
+    view[16] = camera.exposure;
+    if (g_exposureDepth && depthView && msaaSamples == 1 && camera.valid && g_seaMaskView)
+    {
+      draw_with_view(cmd, "Exposure", g_exposureDepth, view, depthView, dst, resolve, &g_seaMaskView,
+                     exposureScene ? &g_exposureSceneView : &g_seaMaskView); // the mask: no taper where it is 0
+    }
+  }
   if (bloom_enabled())
     encode_bloom(cmd, scene, size, format, dst, resolve, msaaSamples);
 }
@@ -2590,6 +2784,8 @@ void aurora_set_world_view_far(float far_plane) { aurora::gfx::post_fx::set_worl
 void aurora_set_sun_shadows(bool enabled) { aurora::gfx::post_fx::set_sun_shadows(enabled); }
 
 void aurora_set_sun_direction(float x, float y, float z) { aurora::gfx::post_fx::set_sun_direction(x, y, z); }
+
+void aurora_set_exposure(float gain) { aurora::gfx::post_fx::set_exposure(gain); }
 
 void aurora_set_sun_shadow_map(bool enabled) { aurora::gfx::post_fx::set_sun_shadow_map(enabled); }
 
