@@ -86,7 +86,26 @@ static u32 g_guest_alias_page_count; // 0: no page index, use the search
 // the answer; a stale index (another thread's store, a remove that moved the
 // registry) is only a miss. A relaxed atomic rather than a thread-local: a
 // thread-local in a Mach-O dylib costs a call per access (RecompCore #34).
+// MSVC has no <stdatomic.h> here (cpu.c includes <intrin.h> instead, as
+// ppc_memory_fence does): its plain 32-bit volatile accesses are the same
+// relaxed, untorn load and store.
+#if defined(_MSC_VER)
+static u32 g_guest_alias_last = PPC_GUEST_ALIAS_MAX;
+static inline u32 ppc_guest_alias_last_load(void) {
+    return (u32)__iso_volatile_load32((const volatile __int32*)&g_guest_alias_last);
+}
+static inline void ppc_guest_alias_last_store(u32 index) {
+    __iso_volatile_store32((volatile __int32*)&g_guest_alias_last, (__int32)index);
+}
+#else
 static _Atomic u32 g_guest_alias_last = PPC_GUEST_ALIAS_MAX;
+static inline u32 ppc_guest_alias_last_load(void) {
+    return atomic_load_explicit(&g_guest_alias_last, memory_order_relaxed);
+}
+static inline void ppc_guest_alias_last_store(u32 index) {
+    atomic_store_explicit(&g_guest_alias_last, index, memory_order_relaxed);
+}
+#endif
 
 static bool ppc_guest_alias_pair_overlaps(const PPCGuestAlias* a,
                                           const PPCGuestAlias* b) {
@@ -128,7 +147,7 @@ static void ppc_guest_alias_index_rebuild(void) {
 
 // After the sorted index and the bounds have changed.
 static void ppc_guest_alias_pages_rebuild(void) {
-    atomic_store_explicit(&g_guest_alias_last, PPC_GUEST_ALIAS_MAX, memory_order_relaxed);
+    ppc_guest_alias_last_store(PPC_GUEST_ALIAS_MAX);
     g_guest_alias_page_count = 0u;
     if (g_guest_alias_count == 0u || g_guest_alias_overlapping)
         return;
@@ -351,7 +370,7 @@ GXRUNTIME_EXPORT bool ppc_guest_alias_resolve(u32 address, u32 size,
     }
     if (!g_guest_alias_overlapping) {
         // The alias the last lookup found, first (see g_guest_alias_last).
-        const u32 last = atomic_load_explicit(&g_guest_alias_last, memory_order_relaxed);
+        const u32 last = ppc_guest_alias_last_load();
         if (last < g_guest_alias_count) {
             const PPCGuestAlias* alias = &g_guest_aliases[last];
             if (address >= alias->linked_start && size <= alias->size &&
@@ -400,7 +419,7 @@ GXRUNTIME_EXPORT bool ppc_guest_alias_resolve(u32 address, u32 size,
         if (size > alias->size ||
             address - alias->linked_start > alias->size - size)
             return false;
-        atomic_store_explicit(&g_guest_alias_last, found, memory_order_relaxed);
+        ppc_guest_alias_last_store(found);
         if (cost)
             g_alias_cost_hits++;
         *pointer = alias->storage + (address - alias->linked_start);
