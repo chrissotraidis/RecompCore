@@ -437,6 +437,31 @@ bool sun_caster_alpha(const gxc::PipelineKey& key) {
          key.blend_subtract == 0u && key.primitive_topology == 0u && key.shader.textured != 0u &&
          !alpha_test_always_passes(key.shader) && !alpha_test_always_fails(key.shader);
 }
+
+// The sea's surface, which the solid caster rule takes (it is opaque and
+// writes depth): strips the game lays around the player in world space, about
+// 51,000 units across, and flat quads out to 450,000 for the distance, flat
+// but for the waves. Nothing else is that wide and that flat. As in Wind Waker
+// HD it takes shadows but casts none: in the map a swell's crest shaded the
+// trough behind it, and a tower standing there lost the foot of its shadow.
+// DOL_AURORA_SUN_SHADOW_MAP_SEA_CASTS=1 puts it back in the map.
+bool sea_surface(const gxc::DrawPlan& plan) {
+  static const bool s_seaCasts = [] {
+    const char* value = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_SEA_CASTS");
+    return value != nullptr && value[0] == '1';
+  }();
+  if (s_seaCasts || plan.constants.projection[3][3] == 1.f || plan.vertices.size() < 3)
+    return false;
+  float lo[3] = {plan.vertices[0], plan.vertices[1], plan.vertices[2]};
+  float hi[3] = {lo[0], lo[1], lo[2]};
+  for (size_t v = gxc::kVertexFloats; v + 2 < plan.vertices.size(); v += gxc::kVertexFloats)
+    for (int c = 0; c < 3; ++c) {
+      lo[c] = std::min(lo[c], plan.vertices[v + c]);
+      hi[c] = std::max(hi[c], plan.vertices[v + c]);
+    }
+  const float wide = std::max(hi[0] - lo[0], hi[2] - lo[2]);
+  return wide >= 20000.f && hi[1] - lo[1] <= 0.02f * wide;
+}
 } // namespace
 
 bool needs_early_depth_emulation(const gxc::PipelineKey& key) {
@@ -2648,7 +2673,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .uberPipeline = uberPipeline,
       .uberPixelRange = uberPixelRange,
       .uberTextureBindGroup = uberTextureBindGroup,
-      .sunCaster = sun_caster(plan.pipeline) || clothCaster || blendedCaster,
+      .sunCaster = (sun_caster(plan.pipeline) || clothCaster || blendedCaster) &&
+                   !(sun_caster(plan.pipeline) && post_fx::sun_shadow_map_enabled() && sea_surface(plan)),
       .posMtxIdx = plan.pipeline.shader.has_pos_mtx_idx != 0,
       // DOL_AURORA_SUN_CASTER_LOG=1: why a cloth's or wake's draw (a scope)
       // does or does not cast, once per distinct state (local debug).
