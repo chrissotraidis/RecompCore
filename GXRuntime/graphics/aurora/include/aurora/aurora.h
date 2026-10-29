@@ -188,6 +188,10 @@ void aurora_set_sun_shadow_map(bool enabled);
    DOL_AURORA_SUN_SHADOW_QUALITY, which sets the starting one). The map is made
    again at its size before the next frame, a one-frame hitch. */
 void aurora_set_sun_shadow_quality(int quality);
+/* How dark the sun shadow map's shadows are, 0 to 1 (1, the default, is Wind
+   Waker HD's): the full shadow's colour is blended in by this much, the
+   moon's shadows too. Takes effect at the next frame. */
+void aurora_set_sun_shadow_strength(float strength);
 /* Edge light: a warm rim on the sunlit outline of what is near the camera,
    from the same sun and camera. Takes effect at the next frame. */
 void aurora_set_edge_light(bool enabled);
