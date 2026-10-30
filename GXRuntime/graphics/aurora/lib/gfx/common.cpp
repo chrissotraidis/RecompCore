@@ -1415,7 +1415,7 @@ static size_t acquire_frame_slot() {
       TracyPlot("aurora: frameSlotWaitMs", waitMs);
       // The game waited for the render worker: fewer in-between frames.
       if (waitMs >= 3.0 && !fastForward)
-        frame_interp::note_overload("the game waited for the render worker");
+        frame_interp::note_overload(frame_interp::OverloadCause::RenderWorker, waitMs);
       return *slot;
     }
     wait_for_gpu_progress(std::chrono::microseconds{100});
@@ -1429,8 +1429,10 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
     if (auto slot = g_stagingSlots.try_acquire()) {
       const bool mapped = wait_for_staging_buffer(*slot);
       // The game waited for the GPU.
-      if (PresentClock::now() - waitStart >= std::chrono::milliseconds{3})
-        frame_interp::note_overload("the game waited for the GPU");
+      const auto waited = PresentClock::now() - waitStart;
+      if (waited >= std::chrono::milliseconds{3})
+        frame_interp::note_overload(frame_interp::OverloadCause::GpuStaging,
+                                    std::chrono::duration<double, std::milli>{waited}.count());
       if (mapped) {
         return *slot;
       }
@@ -1492,7 +1494,8 @@ static void acquire_interp_staging(size_t frameSlot) {
   // processed its events (once a frame, at the end of each): one that looked
   // busy for that alone was taken for an overload and dropped 120 Hz to 60.
   // Up to 4 ms for it, with the worker asked to look.
-  const auto deadline = PresentClock::now() + std::chrono::milliseconds{4};
+  const auto waitStart = PresentClock::now();
+  const auto deadline = waitStart + std::chrono::milliseconds{4};
   while (true) {
     if ((slot.staging = take_interp_staging()) != nullptr)
       return;
@@ -1502,7 +1505,8 @@ static void acquire_interp_staging(size_t frameSlot) {
   }
   // All still on their way through the GPU: it is more than a game frame
   // behind. This frame shows none, and the next ones fewer.
-  frame_interp::note_overload("the GPU is a game frame behind");
+  frame_interp::note_overload(frame_interp::OverloadCause::GpuBehind,
+                              std::chrono::duration<double, std::milli>{PresentClock::now() - waitStart}.count());
 }
 
 // Render worker, after a frame's in-between frames are submitted (or it had
@@ -1700,8 +1704,10 @@ void end_frame(EndFrameCallback callback) {
   frame.stats.lastTextureUploadSize = frame.textureUpload.size();
   frame.presents = !g_segmentEnding;
   const auto& interpSlot = g_interpSlots[g_recordingFrameSlot];
-  frame.interpolate = frame.presents && !frame.continuation && interpSlot.staging != nullptr &&
-                      !interpSlot.overflowed && frame_interp::frame_verdict();
+  const bool staged = interpSlot.staging != nullptr && !interpSlot.overflowed;
+  if (frame.presents && !frame.continuation && !staged && frame_interp::enabled())
+    frame_interp::note_unstaged();
+  frame.interpolate = frame.presents && !frame.continuation && staged && frame_interp::frame_verdict();
   frame.interpSteps = frame_interp::frame_steps();
   if (frame.interpolate)
     frame_interp::camera_steps(frame.cameraSteps.data());
@@ -2455,8 +2461,15 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
   auto between = g_device.CreateCommandEncoder(&EncoderDescriptor);
   g_replayFrameSlot = frameSlot;
   g_replayStep = 0;
-  frame_interp::set_encoding_interpolated(true);
+  // A [gpu-prof] frame of its own, closed by the present callback: the
+  // replay's passes nest in one zone, so its cost reads apart from the real
+  // frame's. Not when dumping passes: that finishes the encoder midway.
   static const bool dumpPasses = std::getenv("DOL_AURORA_FRAME_INTERP_DUMP_PASSES") != nullptr;
+  webgpu::gpu_prof::frame_begin(between);
+  std::optional<webgpu::gpu_prof::Zone> replayZone;
+  if (!(dump && dumpPasses))
+    replayZone.emplace(between, "In-between replay");
+  frame_interp::set_encoding_interpolated(true);
   for (size_t i = 0; i < frame.ops.size(); ++i) {
     replay_op(between, frame, frame.ops[i]);
     if (dump && dumpPasses) {
@@ -2473,6 +2486,7 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
     }
   }
   frame_interp::set_encoding_interpolated(false);
+  replayZone.reset();
   log_present("in-between", frame.gameFrame, 0, {});
   callback(between);
   const auto shown = PresentClock::now();
@@ -2539,13 +2553,19 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
     auto between = g_device.CreateCommandEncoder(&EncoderDescriptor);
     g_replayStep = step;
     const auto encodeStart = PresentClock::now();
+    webgpu::gpu_prof::frame_begin(between);
     frame_interp::set_encoding_interpolated(true);
-    for (const auto& op : frame.ops)
-      replay_op(between, frame, op);
+    {
+      const webgpu::gpu_prof::Zone zone{between, "In-between replay"};
+      for (const auto& op : frame.ops)
+        replay_op(between, frame, op);
+    }
     frame_interp::set_encoding_interpolated(false);
     keep(between, held[step]);
+    webgpu::gpu_prof::frame_end(between);
     const auto buffer = between.Finish();
     g_queue.Submit(1, &buffer);
+    webgpu::gpu_prof::after_submit();
     if (g_presentLog)
       std::fprintf(stderr, "[encode-took] step=%d %.2f\n", step,
                    std::chrono::duration<double, std::milli>(PresentClock::now() - encodeStart).count());
@@ -2664,7 +2684,9 @@ void gpu_synchronize() { render_worker::synchronize(); }
 
 void flush_deferred_presents() { run_deferred_present(); }
 
-void note_render_overload() noexcept { frame_interp::note_overload("a drawable came late"); }
+void note_render_overload(double waitMs) noexcept {
+  frame_interp::note_overload(frame_interp::OverloadCause::LateDrawable, waitMs);
+}
 
 static std::atomic<unsigned long long> g_shownFrames{0};
 

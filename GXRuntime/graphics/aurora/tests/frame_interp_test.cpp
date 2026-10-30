@@ -1404,7 +1404,7 @@ int main() {
   {
     const auto overload_frames = [](int n) {
       for (int i = 0; i < n; ++i) {
-        fi::note_overload("test");
+        fi::note_overload(fi::OverloadCause::LateDrawable, 25.0);
         fi::end_game_frame();
       }
     };
@@ -1448,6 +1448,54 @@ int main() {
     fi::set_steps(1);
     fi::end_game_frame();
     CHECK(fi::frame_steps() == 1 && !fi::frame_skipped());
+  }
+
+  // Stats: each overload counted under its cause with its wait, and pacing's
+  // budget changes; a paused frame's verdict counts as skipped, a cut as cut.
+  {
+    using fi::OverloadCause;
+    const auto at = [](OverloadCause cause) { return static_cast<size_t>(cause); };
+    const fi::Stats before = fi::stats();
+    fi::note_overload(OverloadCause::RenderWorker, 4.0);
+    fi::note_overload(OverloadCause::GpuBehind, 4.5);
+    fi::note_overload(OverloadCause::GpuBehind, 5.5);
+    fi::note_overload(OverloadCause::Count, 9.0); // not a cause: ignored
+    fi::end_game_frame();
+    fi::Stats after = fi::stats();
+    CHECK(after.overloads[at(OverloadCause::RenderWorker)] - before.overloads[at(OverloadCause::RenderWorker)] == 1);
+    CHECK(after.overloads[at(OverloadCause::GpuBehind)] - before.overloads[at(OverloadCause::GpuBehind)] == 2);
+    CHECK(after.overloads[at(OverloadCause::GpuStaging)] == before.overloads[at(OverloadCause::GpuStaging)]);
+    CHECK(near(static_cast<float>(after.waitMs[at(OverloadCause::GpuBehind)] -
+                                  before.waitMs[at(OverloadCause::GpuBehind)]),
+               10.f));
+    CHECK(std::strcmp(fi::overload_reason(OverloadCause::LateDrawable), "a drawable came late") == 0);
+
+    // Overloads in 3 of 8 frames at 60 Hz: one drop to none, then paused
+    // frames are skipped and a cut is a cut.
+    fi::set_steps(1);
+    fi::end_game_frame();
+    const fi::Stats calm = fi::stats();
+    for (int i = 0; i < 3; ++i) {
+      fi::note_overload(OverloadCause::GpuStaging, 3.0);
+      fi::end_game_frame();
+    }
+    CHECK(fi::frame_skipped());
+    after = fi::stats();
+    CHECK(after.drops - calm.drops == 1);
+    CHECK(after.overloads[at(OverloadCause::GpuStaging)] - calm.overloads[at(OverloadCause::GpuStaging)] == 3);
+    CHECK(!fi::frame_verdict());
+    fi::note_unstaged();
+    CHECK(fi::stats().skipped - after.skipped == 2);
+    CHECK(fi::stats().unstaged == after.unstaged);
+    fi::request_cut();
+    CHECK(!fi::frame_verdict());
+    CHECK(fi::stats().cut - after.cut == 1);
+    for (int i = 0; i < 90; ++i)
+      fi::end_game_frame();
+    CHECK(!fi::frame_skipped());
+    CHECK(fi::stats().raises - after.raises == 1);
+    fi::note_unstaged(); // not paused: no staging is its own count
+    CHECK(fi::stats().unstaged - after.unstaged == 1);
   }
 
   if (g_failures == 0)

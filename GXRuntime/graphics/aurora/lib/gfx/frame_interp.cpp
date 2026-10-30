@@ -43,7 +43,15 @@ int g_frameSteps = g_steps.load(std::memory_order_relaxed);
 // or the render worker keeps falling behind (note_overload), 60 Hz drops to
 // none, and comes back after a calm spell (120 Hz to 60 only when asked).
 std::atomic_bool g_overloaded{false};
-std::atomic<const char*> g_overloadWhy{nullptr}; // the latest overload's cause, for the log
+std::atomic<int> g_overloadWhy{-1}; // the latest overload's cause, for the log
+// stats(): each cause's overloads and their waits (microseconds), from the
+// threads that wait; the verdicts and budget changes, from the recording
+// thread. Relaxed: they are counts, read for the log.
+constexpr size_t kCauses = static_cast<size_t>(OverloadCause::Count);
+std::array<std::atomic<uint64_t>, kCauses> g_overloadCount{};
+std::array<std::atomic<uint64_t>, kCauses> g_overloadWaitUs{};
+std::atomic<uint64_t> g_unstaged{0}, g_delivered{0}, g_skipped{0}, g_cut{0}, g_rejected{0}, g_idle{0}, g_drops{0}, g_raises{0};
+void count(std::atomic<uint64_t>& counter) noexcept { counter.fetch_add(1, std::memory_order_relaxed); }
 bool g_frameSkipped = false; // the recording frame has none (recording thread)
 struct Pacing {
   uint64_t frame = 0;
@@ -2312,9 +2320,84 @@ bool frame_skipped() noexcept { return g_frameSkipped; }
 
 std::atomic<bool> g_cutRequested{false};
 void request_cut() noexcept { g_cutRequested.store(true, std::memory_order_release); }
-void note_overload(const char* why) noexcept {
-  g_overloadWhy.store(why, std::memory_order_relaxed);
+const char* overload_reason(OverloadCause cause) noexcept {
+  switch (cause) {
+  case OverloadCause::RenderWorker:
+    return "the game waited for the render worker";
+  case OverloadCause::GpuStaging:
+    return "the game waited for the GPU";
+  case OverloadCause::GpuBehind:
+    return "the GPU is a game frame behind";
+  case OverloadCause::LateDrawable:
+    return "a drawable came late";
+  case OverloadCause::Count:
+    break;
+  }
+  return "rendering fell behind";
+}
+
+void note_overload(OverloadCause cause, double waitMs) noexcept {
+  const auto i = static_cast<size_t>(cause);
+  if (i >= kCauses)
+    return;
+  count(g_overloadCount[i]);
+  g_overloadWaitUs[i].fetch_add(static_cast<uint64_t>(std::max(waitMs, 0.0) * 1000.0), std::memory_order_relaxed);
+  g_overloadWhy.store(static_cast<int>(i), std::memory_order_relaxed);
   g_overloaded.store(true, std::memory_order_relaxed);
+}
+
+// Paused frames get no staging (acquire_interp_staging): they count as skipped.
+void note_unstaged() noexcept { count(g_frameSkipped ? g_skipped : g_unstaged); }
+
+Stats stats() noexcept {
+  Stats out{};
+  for (size_t i = 0; i < kCauses; ++i) {
+    out.overloads[i] = g_overloadCount[i].load(std::memory_order_relaxed);
+    out.waitMs[i] = static_cast<double>(g_overloadWaitUs[i].load(std::memory_order_relaxed)) / 1000.0;
+  }
+  out.delivered = g_delivered.load(std::memory_order_relaxed);
+  out.skipped = g_skipped.load(std::memory_order_relaxed);
+  out.cut = g_cut.load(std::memory_order_relaxed);
+  out.rejected = g_rejected.load(std::memory_order_relaxed);
+  out.idle = g_idle.load(std::memory_order_relaxed);
+  out.unstaged = g_unstaged.load(std::memory_order_relaxed);
+  out.drops = g_drops.load(std::memory_order_relaxed);
+  out.raises = g_raises.load(std::memory_order_relaxed);
+  return out;
+}
+
+// DOL_AURORA_FRAME_INTERP_STATS=1: once a second (30 game frames), what the
+// presenting frames got and what overloaded since the line before.
+static void log_stats() {
+  static const bool on = [] {
+    const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_STATS");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+  }();
+  static Stats last{};
+  static int frames = 0;
+  if (!on || ++frames < 30)
+    return;
+  frames = 0;
+  const Stats now = stats();
+  std::fprintf(stderr,
+               "[interp-stats] budget=%d delivered=%llu skipped=%llu cut=%llu rejected=%llu idle=%llu unstaged=%llu drops=%llu "
+               "raises=%llu",
+               g_pacing.budget, static_cast<unsigned long long>(now.delivered - last.delivered),
+               static_cast<unsigned long long>(now.skipped - last.skipped),
+               static_cast<unsigned long long>(now.cut - last.cut),
+               static_cast<unsigned long long>(now.rejected - last.rejected),
+               static_cast<unsigned long long>(now.idle - last.idle),
+               static_cast<unsigned long long>(now.unstaged - last.unstaged),
+               static_cast<unsigned long long>(now.drops - last.drops),
+               static_cast<unsigned long long>(now.raises - last.raises));
+  static constexpr const char* kNames[] = {"render_worker", "gpu_staging", "gpu_behind", "late_drawable"};
+  static_assert(std::size(kNames) == kCauses);
+  for (size_t i = 0; i < kCauses; ++i)
+    std::fprintf(stderr, " %s=%llu/%.0fms", kNames[i],
+                 static_cast<unsigned long long>(now.overloads[i] - last.overloads[i]),
+                 now.waitMs[i] - last.waitMs[i]);
+  std::fputc('\n', stderr);
+  last = now;
 }
 
 // The game itself below full speed: the median gap between its last 60
@@ -2417,7 +2500,8 @@ static void pace_steps() {
       p.budget = p.budget > 1 ? 1 : 0;
       p.lastDrop = p.frame;
       p.recent = 0;
-      const char* why = g_overloadWhy.load(std::memory_order_relaxed);
+      const int why = g_overloadWhy.load(std::memory_order_relaxed);
+      count(g_drops);
       if (slow) {
         std::fprintf(stderr,
                      "[interp-pace] in-between frames %d -> %d (the game ran below full speed, %.1f game "
@@ -2429,7 +2513,7 @@ static void pace_steps() {
         p.slowChecks = 0;
       } else {
         std::fprintf(stderr, "[interp-pace] in-between frames %d -> %d (%s; back after %.0f s calm)\n", before,
-                     p.budget, why != nullptr ? why : "rendering fell behind", p.calmNeeded / 30.0);
+                     p.budget, overload_reason(static_cast<OverloadCause>(why < 0 ? kCauses : why)), p.calmNeeded / 30.0);
       }
     }
   } else if (p.budget < wanted) {
@@ -2438,6 +2522,7 @@ static void pace_steps() {
       p.budget = p.budget == 0 ? 1 : wanted;
       p.calm = 0;
       p.lastRaise = p.frame;
+      count(g_raises);
       std::fprintf(stderr, "[interp-pace] in-between frames %d -> %d\n", before, p.budget);
     }
   } else if (p.lastRaise != 0 && p.frame - p.lastRaise >= kSoon) {
@@ -2447,16 +2532,25 @@ static void pace_steps() {
   }
   g_frameSteps = std::clamp(std::min(p.budget, wanted), 1, kMaxSteps);
   g_frameSkipped = p.budget == 0;
+  log_stats();
 }
 
 bool last_blend_repeated() noexcept { return g_blendRepeated; }
 
 bool frame_verdict() noexcept {
   g_lastVerdict = false;
-  if (g_cutRequested.exchange(false, std::memory_order_acq_rel))
+  if (g_cutRequested.exchange(false, std::memory_order_acq_rel)) {
+    count(g_cut);
     return false;
-  if (!enabled() || g_frameSkipped || !g_havePrevious || g_frameCounts.blended == 0)
+  }
+  if (enabled() && g_frameSkipped) {
+    count(g_skipped);
     return false;
+  }
+  if (!enabled() || !g_havePrevious || g_frameCounts.blended == 0) {
+    count(g_idle);
+    return false;
+  }
   // A cut: most draws have a counterpart that is not plausibly the same thing.
   // Copies just come into view count too (after a cut every copy of a model
   // looks new), unless the frame's camera motion is a turn: a fast turn can
@@ -2464,8 +2558,11 @@ bool frame_verdict() noexcept {
   const uint64_t rejected =
       g_frameCounts.rejected - (camera_motion() != nullptr ? g_frameCounts.fresh : 0u);
   const uint64_t considered = g_frameCounts.matched + rejected;
-  if (considered >= 16 && rejected * 10 > considered * 4)
+  if (considered >= 16 && rejected * 10 > considered * 4) {
+    count(g_rejected);
     return false;
+  }
+  count(g_delivered);
   g_lastVerdict = true;
   return true;
 }
