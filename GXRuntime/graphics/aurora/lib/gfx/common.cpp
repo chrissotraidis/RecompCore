@@ -2490,6 +2490,7 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
   std::optional<webgpu::gpu_prof::Zone> replayZone;
   if (!(dump && dumpPasses))
     replayZone.emplace(between, "In-between replay");
+  webgpu::gpu_prof::set_name_prefix("IB ");
   frame_interp::set_encoding_interpolated(true);
   for (size_t i = 0; i < frame.ops.size(); ++i) {
     replay_op(between, frame, frame.ops[i]);
@@ -2507,6 +2508,7 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
     }
   }
   frame_interp::set_encoding_interpolated(false);
+  webgpu::gpu_prof::set_name_prefix({});
   replayZone.reset();
   log_present("in-between", frame.gameFrame, 0, {});
   callback(between);
@@ -2578,8 +2580,10 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
     frame_interp::set_encoding_interpolated(true);
     {
       const webgpu::gpu_prof::Zone zone{between, "In-between replay"};
+      webgpu::gpu_prof::set_name_prefix("IB ");
       for (const auto& op : frame.ops)
         replay_op(between, frame, op);
+      webgpu::gpu_prof::set_name_prefix({});
     }
     frame_interp::set_encoding_interpolated(false);
     keep(between, held[step]);

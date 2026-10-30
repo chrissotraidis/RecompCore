@@ -234,7 +234,7 @@ void log_frame(const Slot& slot, const uint64_t* ts, uint64_t frameBegin, uint64
                double(g_logBytes[0]) / 1024.0 / frames, double(g_logBytes[1]) / 1024.0 / frames,
                double(g_logBytes[2]) / 1024.0 / frames, double(g_logBytes[3]) / 1024.0 / frames,
                double(g_logBytes[4]) / 1024.0 / frames);
-  for (size_t i = 0; i < kinds.size() && i < 12; ++i) {
+  for (size_t i = 0; i < kinds.size() && i < 24; ++i) {
     std::fprintf(stderr, " | %s %.3f x%.1f", kinds[i].first.c_str(), kinds[i].second.ms / frames,
                  double(kinds[i].second.count) / frames);
   }
@@ -372,6 +372,16 @@ void emit_frame(Slot& slot) {
 }
 
 Slot& record_slot() { return g_slots[g_recordSlot]; }
+
+std::string g_namePrefix; // set_name_prefix (render worker)
+
+const char* prefixed_name(std::string_view name) {
+  if (g_namePrefix.empty())
+    return intern_name(name);
+  std::string full = g_namePrefix;
+  full += name;
+  return intern_name(full);
+}
 
 uint32_t alloc_zone() {
   if (!g_frameActive || g_zoneCount >= MaxZones) {
@@ -515,7 +525,7 @@ const wgpu::PassTimestampWrites* pass_writes(std::string_view name) {
     return nullptr;
   }
   auto& slot = record_slot();
-  slot.events.push_back({intern_name(name), index * 2, EventKind::PassBegin});
+  slot.events.push_back({prefixed_name(name), index * 2, EventKind::PassBegin});
   slot.events.push_back({nullptr, index * 2 + 1, EventKind::End});
   ++slot.passCount;
 
@@ -529,6 +539,8 @@ const wgpu::PassTimestampWrites* pass_writes(std::string_view name) {
   };
   return &out;
 }
+
+void set_name_prefix(std::string_view prefix) { g_namePrefix.assign(prefix); }
 
 void count_copy(CopyKind kind, uint64_t bytes) {
   if (g_log) {
@@ -544,7 +556,7 @@ Zone::Zone(const wgpu::CommandEncoder& encoder, std::string_view name) {
   if (index == UINT32_MAX) {
     return;
   }
-  record_slot().events.push_back({intern_name(name), index * 2, EventKind::ZoneBegin});
+  record_slot().events.push_back({prefixed_name(name), index * 2, EventKind::ZoneBegin});
   encoder.WriteTimestamp(g_querySet, index * 2);
   m_encoder = &encoder;
   m_endQuery = index * 2 + 1;
