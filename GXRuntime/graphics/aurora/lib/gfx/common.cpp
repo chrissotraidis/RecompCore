@@ -32,6 +32,7 @@
 #include <cmath>
 #include <deque>
 #include <mutex>
+#include <cstring>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -418,6 +419,7 @@ static bool note_game_frame_end();
 static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::CommandEncoder& encoder,
                                     const EndFrameCallback& callback);
 static void present_held(wgpu::CommandEncoder& encoder, const EndFrameCallback& callback, int steps);
+static void upload_interp_data(size_t frameSlot);
 static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEncoder& encoder,
                           const EndFrameCallback& callback, int steps);
 static void flush_presents_from(const webgpu::TextureWithSampler* first, const webgpu::TextureWithSampler* last);
@@ -1781,6 +1783,25 @@ void end_frame(EndFrameCallback callback) {
       // In-between frames on, but nothing in this frame to blend (a still
       // scene, a menu, a cut): the same cadence (present_held).
       hold = !interpolate && callback && periodKnown && frame_interp::enabled();
+    }
+    // DOL_AURORA_FRAME_INTERP_ABLATE (diagnostic, for attributing Smooth
+    // Motion's cost): "match" keeps the helper's matching and blending but
+    // shows the real frame again where the in-between frame would go
+    // (present_held); "upload" also copies the in-between data to the GPU.
+    // Neither draws the in-between frame.
+    static const int ablate = [] {
+      const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_ABLATE");
+      if (env == nullptr)
+        return 0;
+      if (std::strcmp(env, "match") == 0)
+        return 1;
+      return std::strcmp(env, "upload") == 0 ? 2 : 0;
+    }();
+    if (interpolate && ablate != 0) {
+      if (ablate == 2)
+        upload_interp_data(frameSlot);
+      interpolate = false;
+      hold = true;
     }
     if (!interpolate) {
       packet = {};
