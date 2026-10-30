@@ -1498,6 +1498,36 @@ int main() {
     CHECK(fi::stats().unstaged - after.unstaged == 1);
   }
 
+  // Per-draw work: a job's own copy of the constants is counted apart from
+  // jobs that repeat them; a block is pooled once per run of identical ones,
+  // and a moving draw's blended block is counted.
+  {
+    const fi::Stats before = fi::stats();
+    fi::note_job(true);
+    fi::note_job(false);
+    fi::note_job(false);
+    fi::Stats after = fi::stats();
+    CHECK(after.jobs - before.jobs == 3);
+    CHECK(after.copied - before.copied == 1);
+    fi::set_steps(1);
+    fi::end_game_frame();
+    for (int i = 0; i < 90; ++i)
+      fi::end_game_frame();
+    gxc::DrawPlan plan;
+    const uint8_t payload[] = {7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7};
+    plan.match_payload = payload;
+    plan.match_payload_size = sizeof(payload);
+    plan.match_primitive = 0x90;
+    plan.vertex_count = 3;
+    const fi::Stats start = fi::stats();
+    blend_plan(plan, draw_at(0.f, 0.f, -10.f));
+    fi::end_game_frame();
+    blend_plan(plan, draw_at(1.f, 0.f, -10.f));
+    after = fi::stats();
+    CHECK(after.pooled - start.pooled == 2);
+    CHECK(after.blended - start.blended == 1);
+  }
+
   if (g_failures == 0)
     std::puts("frame_interp_test: all checks passed");
   return g_failures == 0 ? 0 : 1;

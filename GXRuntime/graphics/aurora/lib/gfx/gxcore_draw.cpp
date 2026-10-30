@@ -1746,6 +1746,7 @@ uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool 
   // are those of this packet's job before (the helper's copy). The first job
   // of a packet carries its own.
   job.constantsCopied = !repeatsLastDraw || h->jobs == 0u;
+  frame_interp::note_job(job.constantsCopied);
   if (job.constantsCopied)
     std::memcpy(&job.constants, &plan.constants, sizeof(plan.constants));
   // pixelRepeats: the pixel constants are those last pushed in this frame

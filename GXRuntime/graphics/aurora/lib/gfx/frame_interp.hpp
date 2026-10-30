@@ -71,9 +71,16 @@ struct Stats {
   uint64_t delivered, skipped, cut, rejected, idle;
   uint64_t unstaged; // presenting frames with no in-between staging (or it overflowed)
   uint64_t drops, raises; // pacing budget changes
+  // Per-draw work: jobs queued to the helper, jobs that copied the whole
+  // constants block, blocks pooled for the next frame's matching, and draws
+  // that produced a blended block.
+  uint64_t jobs, copied, pooled, blended;
 };
 Stats stats() noexcept;
 void note_unstaged() noexcept;
+// Recording thread: a job queued for the helper, and whether it carried its own
+// copy of the constants block.
+void note_job(bool copiedConstants) noexcept;
 // A save state was loaded: the next game frame gets no in-between frames, as
 // the frame before it is not the one it follows.
 void request_cut() noexcept;
