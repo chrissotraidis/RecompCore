@@ -10,10 +10,15 @@
 #endif
 #include <SDL3/SDL_init.h>
 #include <imgui.h>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <string>
+#include <system_error>
+#include <vector>
 #include <window.hpp>
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -386,6 +391,30 @@ bool dol_aurora_initialize(int argc, char** argv,
         s_texture_pack = aurora::texture::load_replacement_directory(pack);
         std::fprintf(stderr, "[mods] texture-pack=%s replacements=%zu\n", pack,
                      s_texture_pack.registrations.size());
+        // DOL_AURORA_TEXTURE_PACK_OPTIONAL: comma-separated folders of the
+        // pack's optional/ (which the pack itself leaves out), loaded over it.
+        static std::vector<aurora::texture::ReplacementGroup> s_optional;
+        if (const char* names = std::getenv("DOL_AURORA_TEXTURE_PACK_OPTIONAL"); names != nullptr) {
+            std::string list = names;
+            for (size_t start = 0; start <= list.size();) {
+                const size_t end = std::min(list.find(',', start), list.size());
+                const std::string name = list.substr(start, end - start);
+                start = end + 1;
+                if (name.empty() || name.find_first_of("/\\") != std::string::npos || name == "..")
+                    continue;
+                const std::filesystem::path folder = std::filesystem::path(pack) / "optional" / name;
+                std::error_code ec;
+                if (!std::filesystem::is_directory(folder, ec)) {
+                    // A pack imported before it had this folder (the loader
+                    // would make an empty one).
+                    std::fprintf(stderr, "[mods] texture-pack optional=%s missing\n", name.c_str());
+                    continue;
+                }
+                s_optional.push_back(aurora::texture::load_replacement_directory(folder, {.priority = 1}));
+                std::fprintf(stderr, "[mods] texture-pack optional=%s replacements=%zu\n", name.c_str(),
+                             s_optional.back().registrations.size());
+            }
+        }
     }
 
     gx_aurora::g_graphics_log = backend_config->graphics_logging;

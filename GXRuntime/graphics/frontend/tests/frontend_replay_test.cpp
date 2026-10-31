@@ -1218,6 +1218,12 @@ int main() {
 
       // Count-only (out == nullptr) must agree.
       assert(build_topology_indices(GxPrimitive::Quads, 0u, 8u, nullptr) == 12u);
+      // Three vertices left over draw a triangle (Wind Waker's stars); one or two nothing.
+      idx.clear();
+      assert(build_topology_indices(GxPrimitive::Quads, 5u, 3u, &idx) == 3u);
+      assert(idx[0] == 5u && idx[1] == 6u && idx[2] == 7u);
+      assert(build_topology_indices(GxPrimitive::Quads, 0u, 7u, nullptr) == 9u);
+      assert(build_topology_indices(GxPrimitive::Quads, 0u, 6u, nullptr) == 6u);
       idx.clear();
       assert(build_topology_indices(GxPrimitive::Lines, 3u, 5u, &idx) == 4u);
       const std::uint16_t expect_lines[] = {3, 4, 5, 6};
@@ -1248,12 +1254,13 @@ int main() {
     // The live consumer accumulates the same draw-input byte extents an issued
     // draw would submit, via the cutover builders, when a draw is assembled.
     // flush_assembly() folds the frame's final draw. For this Quads/3-vertex
-    // fixture: raw verts = 6 (3×2), topology indices = 0 (a quad needs 4 verts
-    // so no complete primitive), storage = the single indexed span (72). These
+    // fixture: raw verts = 6 (3×2), topology indices = 6 (three vertices left
+    // over draw one triangle, three 16-bit indices), storage = the single
+    // indexed span (72). These
     // are what the backend diffs against Aurora lastVertSize/Index/Storage.
     consume_sink.flush_assembly();
     assert(consume_sink.raw_vertex_bytes() == 6u);
-    assert(consume_sink.topology_index_bytes() == 0u);
+    assert(consume_sink.topology_index_bytes() == 6u);
     assert(consume_sink.storage_bytes() == 72u);
 
     // Streaming mode keeps only the latest draw, but the cumulative count must

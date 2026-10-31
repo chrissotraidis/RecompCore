@@ -222,15 +222,16 @@ void test_fixture_digest(const char* path) {
   assert(!result.truncated);
   assert(result.frames.size() == 2u);
 
-  // Hand-checked frame 1: one 3-vertex quad draw, 3*2 payload bytes, no
-  // complete quad -> no topology indices, indexed span 72 -> storage, 3
-  // assembled elements (one indexed attr x 3 vertices).
+  // Hand-checked frame 1: one 3-vertex quad draw, 3*2 payload bytes, the
+  // three vertices left over drawn as one triangle -> three 16-bit topology
+  // indices (as on the hardware), indexed span 72 -> storage, 3 assembled
+  // elements (one indexed attr x 3 vertices).
   const replay::FrameDigest& f1 = result.frames[0];
   assert(f1.frame_index == 1u);
   assert(f1.draws == 1u);
   assert(f1.zero_draws == 1u);
   assert(f1.vert_bytes == 6u);
-  assert(f1.topo_bytes == 0u);
+  assert(f1.topo_bytes == 6u);
   assert(f1.store_bytes == 72u);
   assert(f1.elements == 3u);
   assert(f1.has_stats);
@@ -238,7 +239,7 @@ void test_fixture_digest(const char* path) {
 
   const std::string line1 = replay::format_digest_line(f1);
   const char* expected_prefix =
-      "frame 1 draws 1 zdraws 1 verts 6 topo 0 store 72 elems 3 fnv ";
+      "frame 1 draws 1 zdraws 1 verts 6 topo 6 store 72 elems 3 fnv ";
   assert(line1.compare(0u, std::strlen(expected_prefix), expected_prefix) ==
          0);
 

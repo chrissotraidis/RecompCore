@@ -387,9 +387,18 @@ void test_state_to_plan_and_wgsl() {
     CHECK(point_plan.pipeline.primitive_topology == 2u);
     CHECK(point_plan.indices.size() == 4u);
 
+    // Three vertices left over in a quad draw draw a triangle, as on the
+    // hardware (Wind Waker's night stars); two draw nothing.
+    ar::ConsumedDraw star = draw;
+    star.vertex_count = 3u;
+    star.vertex_payload.resize(3u * star.vertex_size);
+    const gxc::DrawPlan star_plan = state.build_draw_plan(star, counters);
+    CHECK(star_plan.ok);
+    CHECK(star_plan.indices.size() == 3u);
+
     ar::ConsumedDraw partial_quad = draw;
-    partial_quad.vertex_count = 3u;
-    partial_quad.vertex_payload.resize(3u * partial_quad.vertex_size);
+    partial_quad.vertex_count = 2u;
+    partial_quad.vertex_payload.resize(2u * partial_quad.vertex_size);
     const gxc::DrawPlan partial_plan =
         state.build_draw_plan(partial_quad, counters);
     CHECK(!partial_plan.ok);

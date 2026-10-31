@@ -32,19 +32,43 @@ std::array<float, kMaxLights * 8> g_lights{};
 uint32_t g_lightCount = 0;
 float g_edgeStrength = 0.4f;  // how bright a sunlit edge gets
 float g_sunStrength = 0.35f;  // how dark a sun shadow is
+// The scene's brightness the game asks for (aurora_set_exposure), after the
+// HD look's effects and before its bloom: Wind Waker HD's own factor for the
+// hour's palettes (its sunlight 3 times at noon on actors and scenery, 1.65
+// after gamma). 0 while unset, and the pass is left out. Under g_cameraMutex.
+float g_exposureGain = 0.f;
+// The frame buffer copied before the exposure, which reads its colours for
+// the highlights' roll-off (it can't read the target it draws into).
+wgpu::Texture g_exposureScene;
+wgpu::TextureView g_exposureSceneView;
+// The sea mask (sea_mask_target()) and its own depth.
+wgpu::Texture g_seaMask;
+wgpu::TextureView g_seaMaskView;
+wgpu::Texture g_seaMaskDepth;
+wgpu::TextureView g_seaMaskDepthView;
+wgpu::Extent3D g_seaMaskSize{};
+// The sun shadow map's full shadow as a colour the scene is multiplied by, the
+// shade lit by the sky as in Wind Waker HD: Link's shadow on Windfall's dock at
+// noon kept 0.21, 0.39 and 0.56 of the sunlit planks' red, green and blue (0.65
+// of each before). DOL_AURORA_SUN_SHADOWS_COLOUR=R,G,B; =0.65,0.65,0.65 is the
+// old grey.
+float g_sunShadowColour[3] = {0.22f, 0.41f, 0.60f};
 float g_sunReach = 1500.f;    // how far toward the sun a shadow is looked for, in world units
 std::atomic_bool g_sunMapOn{false};
 uint32_t g_sunMapSize = 4096;    // the shadow map's texels a side (4096 high, 2048 medium, 1024 low)
 float g_sunMapRange = 1250.f;    // world units from the first cascade's centre to its edge (a texel about Link's leg)
 float g_sunMapSpread = 4.f;      // each next cascade this many times wider
-uint32_t g_sunMapCascades = 4;   // DOL_AURORA_SUN_SHADOW_MAP_CASCADES, 1 to kSunMapCascades
+uint32_t g_sunMapCascades = 3;   // DOL_AURORA_SUN_SHADOW_MAP_CASCADES, 1 to kSunMapCascades
 float g_sunMapDepth = 20000.f;   // world units toward and away from the sun it holds, from its centre (at least twice a cascade's range)
 float g_sunMapBias = 12.f;       // world units a surface is moved toward the sun before the lookup (first cascade; scaled with the texels)
 float g_sunMapContact = 300.f;   // the screen's steps' reach, for what the map leaves out
 int g_sunMapDebug = 0;           // DOL_AURORA_SUN_SHADOW_MAP_DEBUG=1: the map's shadow alone, gray outside it; 2: the map itself, depth as contour bands
 bool g_sunMapSteps = false;
 float g_sunMapSeaLow = 40.f;      // DOL_AURORA_SUN_SHADOW_MAP_SEA_LOW: below the sea's height plus this, a surface counts as sea
-float g_sunMapSeaRise = 15.f;     // DOL_AURORA_SUN_SHADOW_MAP_SEA_RISE: what stands no higher than this above the sea doesn't shade it
+float g_sunMapSeaBias = 0.f;      // DOL_AURORA_SUN_SHADOW_MAP_SEA_BIAS: the share of the slope and normal bias the sea keeps (1 before it left the map)
+float g_sunMapSoft = 0.01f;       // DOL_AURORA_SUN_SHADOW_MAP_SOFT: the filter's reach grows this many units per unit from the caster
+float g_sunMapSoftMax = 4.f;      // DOL_AURORA_SUN_SHADOW_MAP_SOFT_MAX: by at most this many times its own reach again
+float g_sunMapSeaRise = 0.f;      // DOL_AURORA_SUN_SHADOW_MAP_SEA_RISE: what stands no higher than this above the sea doesn't shade it (15 before the sea left the map)
 bool g_sunMapSmooth = true;
 bool g_sunMapGapFill = true;      // DOL_AURORA_SUN_SHADOW_MAP_GAP_FILL=0: no steps over the bias's reach
 uint32_t g_sunMapTaps = 12;       // DOL_AURORA_SUN_SHADOW_MAP_TAPS: lookups in each shadow's filter disc (6 to 12)
@@ -53,19 +77,36 @@ uint32_t g_sunMapTaps = 12;       // DOL_AURORA_SUN_SHADOW_MAP_TAPS: lookups in 
 std::atomic_int g_sunQualityPending{-1};
 float g_sunMapFarStart = 1500.f;  // DOL_AURORA_SUN_SHADOW_MAP_FAR_START/_END: world units from the camera over which the
 float g_sunMapFarEnd = 5000.f;    // bias goes from its near values to its far ones
-float g_sunMapNormalNear = 0.5f;   // DOL_AURORA_SUN_SHADOW_MAP_NORMAL_NEAR: the normal offset near the camera, in texels
-float g_sunMapSlopeNear = 1.f;    // DOL_AURORA_SUN_SHADOW_MAP_SLOPE_NEAR: the same near the camera
-float g_sunMapFadeLow = 0.01f;    // DOL_AURORA_SUN_SHADOW_MAP_FADE_LOW/_HIGH: the light's height (sin of its
-float g_sunMapFadeHigh = 0.05f;   // elevation) where its shadows are gone, and at full strength (0.6 and 2.9 degrees)
+float g_sunMapNormalNear = 2.f;    // DOL_AURORA_SUN_SHADOW_MAP_NORMAL_NEAR: the normal offset near the camera, in texels
+                                   // (with 0.5 and 1 below, a wall the sun only grazed was striped light and dark)
+float g_sunMapSlopeNear = 10.f;   // DOL_AURORA_SUN_SHADOW_MAP_SLOPE_NEAR: the same near the camera
+float g_sunMapFadeLow = -0.139f;  // DOL_AURORA_SUN_SHADOW_MAP_FADE_LOW/_HIGH: the sun's height (sin of its elevation)
+float g_sunMapFadeHigh = -0.122f; // where its shadows are gone, and where they start to go (-8 and -7 degrees). The
+                                  // game draws its large sun disk down to -7.5 (06:30-19:30), and HD casts while it shows
+float g_sunMapHold = 0.407f;      // DOL_AURORA_SUN_SHADOW_MAP_HOLD: below this height (24 degrees) the shadows are cast
+                                  // from the sun held there, as in HD: at the Private Oasis its shadows stopped
+                                  // moving between 25 and 23 degrees (17:15-17:25) and stayed put until they went.
+                                  // Held at 2 degrees, a low cliff's shadow reached the horizon at sunset
+constexpr float kMoonHold = 0.035f; // the moon's, 2 degrees (its timing at dawn was matched with it)
+// How dark the sun shadow map's shadows are, as the player chose (1 is HD's;
+// aurora_set_sun_shadow_strength): the full shadow's colour is blended in by
+// this much, the moon's too.
+std::atomic<float> g_sunMapStrength{1.f};
+float g_sunMapDim = 0.5f;         // DOL_AURORA_SUN_SHADOW_MAP_DIM: how strong the shadows still are as the sun reaches
+                                  // FADE_LOW, from full where they are held: in HD they thin out steadily from there,
+                                  // to about half at -7 degrees (a beached boat's shadow on the sand, 18:00-19:30)
 float g_moonStrength = 0.5f;      // DOL_AURORA_MOON_SHADOWS_STRENGTH: the moon's shadows, a share of the sun's
-float g_moonFadeLow = 0.2f;       // DOL_AURORA_MOON_SHADOWS_FADE_LOW/_HIGH: the same for the moon (12 and 27
-float g_moonFadeHigh = 0.45f;     // degrees), so its shadows come in once the dusk has gone
+float g_moonFadeLow = 0.42f;      // DOL_AURORA_MOON_SHADOWS_FADE_LOW/_HIGH: the same for the moon (25 and 30
+float g_moonFadeHigh = 0.5f;      // degrees) as the night comes on, as in HD
+float g_moonDawnLow = 0.139f;     // DOL_AURORA_MOON_SHADOWS_DAWN_LOW/_HIGH: the same at dawn, when HD keeps them down
+float g_moonDawnHigh = 0.17f;     // to 8 degrees (the moon setting in the west), then hands over to the sun
 // GLSL's smoothstep.
 float smoothstep_f(float lo, float hi, float x) noexcept {
   const float t = std::clamp((x - lo) / (hi - lo), 0.f, 1.f);
   return t * t * (3.f - 2.f * t);
 }
-float g_sunMapSlope = 10.f;       // DOL_AURORA_SUN_SHADOW_MAP_SLOPE: texels of the surface's own depth slope added to the bias
+float g_sunMapSlope = 20.f;       // DOL_AURORA_SUN_SHADOW_MAP_SLOPE: texels of the surface's own depth slope added to the bias
+                                  // far off (10 left acne in stripes on Ice Ring Isle's walls edge-on to the sun)
 float g_sunMapNormalOffset = 2.f; // DOL_AURORA_SUN_SHADOW_MAP_NORMAL_OFFSET: a lookup moved out along the surface's normal, in its cascade's texels      // DOL_AURORA_SUN_SHADOW_MAP_STEPS=1: the screen's steps too, for what the map leaves out
 // A cascade's range (world units from its centre to its edge), and the depth
 // toward and away from the sun it holds: enough for what stands in it.
@@ -82,10 +123,13 @@ bool g_cloudDebug = false;
 // Written by the game thread, read when a frame is encoded.
 std::mutex g_cameraMutex;
 std::array<float, 20> g_camera{};
+float g_cameraFar = 0.f;  // aurora_set_world_view_far; 0: infinitely far
 bool g_cameraValid = false;
 float g_aoRadius = 30.f;    // the occlusion radius, in near-plane units
 float g_aoStrength = 0.6f;  // how dark a fully occluded spot gets
-bool g_aoDebug = false;
+float g_aoFadeStart = 1000.f;  // distance in near-plane units where the occlusion starts to fade
+float g_aoFadeEnd = 2500.f;    // and where it is gone (the sea's swells beyond darkened it in a band)
+int g_aoDebug = 0;  // DOL_AURORA_AO_DEBUG=1: the occlusion alone; 2: what it darkens tinted red over the scene
 float g_farStart = 8000.f;  // distance in near-plane units where the far blur starts
 float g_farEnd = 30000.f;   // and where it is full
 float g_farAmount = 0.8f;  // how much of the blurred scene at full
@@ -101,10 +145,13 @@ wgpu::Sampler g_sampler;
 wgpu::TextureFormat g_format = wgpu::TextureFormat::Undefined;
 wgpu::RenderPipeline g_bright, g_blurH, g_blurV;
 wgpu::RenderPipeline g_composite;
+wgpu::RenderPipeline g_exposureDepth; // the scene brightened (g_exposureGain), where there is depth
 wgpu::RenderPipeline g_down;           // the scene at a quarter of the size, unfiltered
 wgpu::RenderPipeline g_farComposite;   // blended into the EFB by distance
 wgpu::RenderPipeline g_aoPass;         // occlusion at a quarter of the size
-wgpu::RenderPipeline g_aoApply;        // multiplied into the EFB
+wgpu::RenderPipeline g_aoBlurH, g_aoBlurV;  // blurred along each surface
+wgpu::RenderPipeline g_aoUpscale;      // multiplied into the EFB along each surface
+wgpu::RenderPipeline g_aoApply;        // multiplied into the EFB (sun shadows)
 uint32_t g_aoSamples = 0;
 std::array<wgpu::Texture, 2> g_aoTex;
 std::array<wgpu::TextureView, 2> g_aoView;
@@ -195,14 +242,14 @@ fn dither(pos: vec2<f32>) -> f32 {
     return (fract(52.9829189 * fract(dot(pos, vec2(0.06711056, 0.00583715)))) - 0.5) * (1.5 / 255.0);
 }
 
-// Multiplied into the scene (ambient occlusion, sun shadows); the EFB's alpha is kept.
+// Multiplied into the scene (sun shadows); the EFB's alpha is kept.
 @fragment
 fn fs_ao_apply(in: VertexOutput) -> @location(0) vec4<f32> {
     let shade = textureSample(src, samp, in.uv).rgb;
     return vec4(shade + select(0.0, dither(in.pos.xy), shade.g < 0.999), 1.0);
 }
 
-// Added onto the scene; the EFB's alpha is kept.
+// Screened onto the scene (glow * (1 - scene) + scene); the EFB's alpha is kept.
 @fragment
 fn fs_composite(in: VertexOutput) -> @location(0) vec4<f32> {
     let glow = textureSample(src, samp, in.uv).rgb * strength;
@@ -247,7 +294,25 @@ fn fs_far(in: VertexOutput) -> @location(0) vec4<f32> {
     let d = textureLoad(depth, vec2<i32>(in.pos.xy), 0);
     // No depth: what the game draws behind the scene without it (the sky, the
     // sea toward the horizon, the islands' far models).
-    let f = select(smoothstep(far_start, far_end, 1.0 / max(d, 1e-9)) * amount, background, d <= 0.0);
+    var f = select(smoothstep(far_start, far_end, 1.0 / max(d, 1e-9)) * amount, background, d <= 0.0);
+    // Within the blur's reach of where there is no depth, less of it, as much
+    // less as the sky is left sharp: there the blurred picture is part sky,
+    // and with the sky sharp the sea along the horizon took a bright band and
+    // a distant lightning strike (it has depth) spread into a wide grey column
+    // from the sea to the clouds. Wind Waker HD keeps the line sharp.
+    if (d > 0.0 && background < amount) {
+        let size = vec2<i32>(textureDimensions(depth));
+        var sky = 0.0;
+        for (var r = 1; r <= 3; r++) {
+            let o = r * 8;
+            let p = vec2<i32>(in.pos.xy);
+            sky += select(0.0, 1.0, textureLoad(depth, clamp(p + vec2(o, 0), vec2(0), size - 1), 0) <= 0.0);
+            sky += select(0.0, 1.0, textureLoad(depth, clamp(p - vec2(o, 0), vec2(0), size - 1), 0) <= 0.0);
+            sky += select(0.0, 1.0, textureLoad(depth, clamp(p + vec2(0, o), vec2(0), size - 1), 0) <= 0.0);
+            sky += select(0.0, 1.0, textureLoad(depth, clamp(p - vec2(0, o), vec2(0), size - 1), 0) <= 0.0);
+        }
+        f = mix(f, background, min(sky / 4.0, 1.0));
+    }
     if (debug_view) {
         // log2 of the distance as brightness (0 at 1, 1 at 2^24), the sky blue.
         if (d <= 0.0) {
@@ -257,21 +322,29 @@ fn fs_far(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     return vec4(textureSampleLevel(blurred, samp, in.uv, 0.0).rgb, f);
 }
+
 )""";
 wgpu::ShaderModule g_farModule;
 
-// Ambient occlusion from depth alone: around each pixel, six pairs of samples
-// on opposite sides, in a ring whose size on screen shrinks with distance; a
-// pair whose average is nearer the camera than the pixel (a crease) occludes it. Where there is no
-// depth (the sky, the horizon) nothing is occluded. Written at a quarter of the
-// size, blurred, then multiplied into the scene (fs_ao_apply).
+// Ambient occlusion from depth alone: around each pixel, twelve samples in a
+// ring whose size on screen shrinks with distance; a sample above the pixel's
+// surface (from the depth around it) and within the radius of it in the scene
+// occludes it. Where there is no depth (the sky, the horizon) nothing is occluded. Written at a quarter of the
+// size, blurred, then multiplied into the scene (fs_ao_upscale). The blur and
+// the upscale take only what is at about the same distance: blurred and
+// stretched as one, Link's own shade spread onto the sea behind him, a dark
+// outline around him (#491).
 constexpr const char* kAoShader = R"""(
 override radius: f32 = 30.0;
 override strength: f32 = 0.6;
+override fade_start: f32 = 1000.0;
+override fade_end: f32 = 2500.0;
+override debug_view: f32 = 0.0;
 
 @group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var unused: texture_2d<f32>;
+@group(0) @binding(1) var src: texture_2d<f32>;
 @group(0) @binding(2) var depth: texture_depth_2d;
+var<private> weights: array<f32, 5> = array<f32, 5>(0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
 
 struct VertexOutput {
     @builtin(position) pos: vec4<f32>,
@@ -296,33 +369,186 @@ fn distance_at(uv: vec2<f32>) -> f32 {
     return select(1.0 / d, 0.0, d <= 0.0);
 }
 
+// The distance at one pixel of the depth, 0 where there is none (or off the
+// picture).
+fn depth_distance(p: vec2<i32>) -> f32 {
+    let size = vec2<i32>(textureDimensions(depth));
+    if (any(p < vec2<i32>(0)) || any(p >= size)) {
+        return 0.0;
+    }
+    let d = textureLoad(depth, p, 0);
+    return select(1.0 / d, 0.0, d <= 0.0);
+}
+
 @fragment
 fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
+    let size = vec2<f32>(textureDimensions(depth));
+    // Whole pixels of the depth, each placed at its centre: a position taken
+    // from where a sample was aimed rather than the pixel it read, and a
+    // neighbour found by adding a pixel's width to a position on a pixel's
+    // edge (sometimes the same pixel again), bent the surface in rows on a
+    // floor and in columns on a wall seen from the side.
+    let p = vec2<i32>(floor(in.uv * size));
+    let dist = depth_distance(p);
+    // Faded out with distance: further away, the ring is a few pixels across
+    // and the sea's swells darkened it in a band toward the horizon.
+    let fade = 1.0 - smoothstep(fade_start, fade_end, dist);
+    if (dist <= 0.0 || fade <= 0.0) {
+        return vec4(1.0);
+    }
+    // About a 60-degree view: a radius r at distance z covers 0.87 r / z of the height.
+    let reach = vec2(size.y / size.x, 1.0) * (0.87 * radius / dist);
+    let here = texel_position(p, dist, size);
+    let normal = surface_normal(p, here, size);
+    // Six directions, a sample on each side. A sample shades the pixel when it
+    // is above the pixel's surface and within the radius of it in the scene,
+    // not just on screen: across a floor seen at a low angle a short step on
+    // screen is a long way along the floor, and Link's legs darkened floor well
+    // in front of him. A flat surface is not shaded at any angle, and something
+    // far in front (a silhouette against the background) is out of reach.
+    var occluded = 0.0;
+    for (var i = 0; i < 12; i++) {
+        let a = f32(i % 6) * 0.5236 + 0.26 + select(0.0, 3.14159, i >= 6);  // 30 degrees apart, both sides
+        let r = (f32(i % 3) + 1.0) / 3.0;
+        let q = vec2<i32>(floor((in.uv + vec2(cos(a), sin(a)) * reach * r) * size));
+        let n = depth_distance(q);
+        if (n > 0.0) {
+            let v = texel_position(q, n, size) - here;
+            let l2 = dot(v, v);
+            if (l2 < radius * radius && l2 > 1e-6) {
+                // How far above the surface, as the sine of the angle (a little
+                // left out for the depth's own steps), less with distance.
+                let rise = max(dot(v, normal) * inverseSqrt(l2) - 0.1, 0.0);
+                occluded += rise * (1.0 - l2 / (radius * radius));
+            }
+        }
+    }
+    let ao = 1.0 - strength * fade * clamp(occluded / 4.0, 0.0, 1.0);
+    return vec4(vec3(ao), 1.0);
+}
+
+// A pixel's place in view space, in near-plane units, with the same 60-degree
+// view as the reach above (a different field of view only stretches the
+// picture sideways, so a flat surface stays flat).
+fn view_position(uv: vec2<f32>, dist: f32, size: vec2<f32>) -> vec3<f32> {
+    let ndc = uv * 2.0 - 1.0;
+    return vec3(ndc.x * 0.57735 * size.x / size.y, -ndc.y * 0.57735, 1.0) * dist;
+}
+
+fn texel_position(p: vec2<i32>, dist: f32, size: vec2<f32>) -> vec3<f32> {
+    return view_position((vec2<f32>(p) + 0.5) / size, dist, size);
+}
+
+// The surface's normal from the depth around the pixel, facing the camera.
+// On each axis the side nearer the pixel's distance, so an edge (Link in front
+// of the floor) does not bend it.
+fn surface_normal(p: vec2<i32>, here: vec3<f32>, size: vec2<f32>) -> vec3<f32> {
+    let dx = side(p, here, vec2<i32>(1, 0), size);
+    let dy = side(p, here, vec2<i32>(0, 1), size);
+    var n = normalize(cross(dx, dy));
+    if (dot(n, here) > 0.0) {
+        n = -n;
+    }
+    return n;
+}
+
+fn side(p: vec2<i32>, here: vec3<f32>, delta: vec2<i32>, size: vec2<f32>) -> vec3<f32> {
+    let a = depth_distance(p + delta);
+    let b = depth_distance(p - delta);
+    let da = select(abs(a - here.z), 3.4e38, a <= 0.0);
+    let db = select(abs(b - here.z), 3.4e38, b <= 0.0);
+    if (da <= db) {
+        return texel_position(p + delta, select(a, here.z, a <= 0.0), size) - here;
+    }
+    return here - texel_position(p - delta, select(b, here.z, b <= 0.0), size);
+}
+
+// How much a neighbour's shade counts at a distance: fully on the same
+// surface, nothing across an edge to something nearer or further away, or
+// where there is no depth.
+fn same_surface(dist: f32, other: f32) -> f32 {
+    let e = (other - dist) / (0.25 * dist + radius);
+    return select(exp(-e * e), 0.0, other <= 0.0);
+}
+
+// The quarter-size texel's distance: where fs_ao read it.
+fn texel_distance(t: vec2<i32>) -> f32 {
+    return distance_at((vec2<f32>(t) + 0.5) / vec2<f32>(textureDimensions(src)));
+}
+
+fn blur(p: vec2<i32>, dir: vec2<i32>) -> vec4<f32> {
+    let dist = texel_distance(p);
+    if (dist <= 0.0) {
+        return vec4(1.0);
+    }
+    let last = vec2<i32>(textureDimensions(src)) - vec2<i32>(1);
+    var sum = textureLoad(src, p, 0).r * weights[0];
+    var total = weights[0];
+    for (var i = 1; i < 5; i++) {
+        for (var s = -1; s <= 1; s += 2) {
+            let t = clamp(p + dir * (i * s), vec2<i32>(0), last);
+            let w = weights[i] * same_surface(dist, texel_distance(t));
+            sum += textureLoad(src, t, 0).r * w;
+            total += w;
+        }
+    }
+    return vec4(vec3(sum / total), 1.0);
+}
+
+@fragment
+fn fs_ao_blur_h(in: VertexOutput) -> @location(0) vec4<f32> {
+    return blur(vec2<i32>(in.pos.xy), vec2(1, 0));
+}
+
+@fragment
+fn fs_ao_blur_v(in: VertexOutput) -> @location(0) vec4<f32> {
+    return blur(vec2<i32>(in.pos.xy), vec2(0, 1));
+}
+
+// Half an 8-bit step of noise, as fs_ao_apply: the shade multiplied into the
+// 8-bit scene otherwise shows as bands.
+fn dither(pos: vec2<f32>) -> f32 {
+    return (fract(52.9829189 * fract(dot(pos, vec2(0.06711056, 0.00583715)))) - 0.5) * (1.5 / 255.0);
+}
+
+// To the scene's size: the four nearest texels, as a bilinear filter weighs
+// them, each by how near its distance is to the pixel's. Where none is on the
+// pixel's surface (a thin edge), the nearest in distance.
+@fragment
+fn fs_ao_upscale(in: VertexOutput) -> @location(0) vec4<f32> {
     let dist = distance_at(in.uv);
     if (dist <= 0.0) {
         return vec4(1.0);
     }
-    let size = vec2<f32>(textureDimensions(depth));
-    // About a 60-degree view: a radius r at distance z covers 0.87 r / z of the height.
-    let reach = vec2(size.y / size.x, 1.0) * (0.87 * radius / dist);
-    // Six directions, a sample on each side: a flat surface has its two
-    // samples on either side of the pixel's distance, so only a crease (both
-    // nearer) occludes. A pair with no depth on a side, or a step much larger
-    // than the radius (a silhouette in front of the background), does not.
-    var occluded = 0.0;
-    for (var i = 0; i < 6; i++) {
-        let a = f32(i) * 0.5236 + 0.26;  // 30 degrees apart
-        let r = (f32(i % 3) + 1.0) / 3.0;
-        let o = vec2(cos(a), sin(a)) * reach * r;
-        let n1 = distance_at(in.uv + o);
-        let n2 = distance_at(in.uv - o);
-        if (n1 > 0.0 && n2 > 0.0) {
-            let crease = dist - 0.5 * (n1 + n2);
-            occluded += clamp(crease / (0.25 * radius), 0.0, 1.0) * clamp(2.0 - crease / radius, 0.0, 1.0);
+    let f = in.uv * vec2<f32>(textureDimensions(src)) - 0.5;
+    let base = vec2<i32>(floor(f));
+    let within = f - floor(f);
+    let last = vec2<i32>(textureDimensions(src)) - vec2<i32>(1);
+    var sum = 0.0;
+    var total = 0.0;
+    var closest = 1.0;
+    var gap = 3.4e38;
+    for (var i = 0; i < 4; i++) {
+        let o = vec2(i % 2, i / 2);
+        let t = clamp(base + o, vec2<i32>(0), last);
+        let shade = textureLoad(src, t, 0).r;
+        let other = texel_distance(t);
+        let bilinear = select(1.0 - within.x, within.x, o.x == 1) * select(1.0 - within.y, within.y, o.y == 1);
+        let w = bilinear * same_surface(dist, other);
+        sum += shade * w;
+        total += w;
+        if (other > 0.0 && abs(other - dist) < gap) {
+            gap = abs(other - dist);
+            closest = shade;
         }
     }
-    let ao = 1.0 - strength * occluded / 6.0;
-    return vec4(vec3(ao), 1.0);
+    let shade = select(closest, sum / total, total > 1e-3);
+    // DOL_AURORA_AO_DEBUG=2: what the occlusion darkens, tinted red over the
+    // scene (four times as strong, so a faint shade shows), as the cascades are.
+    if (debug_view > 1.5) {
+        return vec4(mix(vec3(1.0), vec3(1.0, 0.15, 0.15), clamp((1.0 - shade) * 4.0, 0.0, 1.0)), 1.0);
+    }
+    return vec4(vec3(shade + select(0.0, dither(in.pos.xy), shade < 0.999)), 1.0);
 }
 )""";
 wgpu::ShaderModule g_aoModule;
@@ -342,7 +568,8 @@ struct View {
 };
 
 @group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var unused: texture_2d<f32>;
+@group(0) @binding(1) var sea_mask: texture_2d<f32>; // the exposure's sea mask; the cloud shadows leave it
+@group(0) @binding(4) var scene: texture_2d<f32>;    // the scene before the effects, for the exposure
 @group(0) @binding(2) var depth: texture_depth_2d;
 @group(0) @binding(3) var<uniform> view: View;
 
@@ -446,6 +673,45 @@ fn fs_clouds(in: VertexOutput) -> @location(0) vec4<f32> {
     let shade = smoothstep(0.42, 0.6, n) * strength * (1.0 - smoothstep(60000.0, 160000.0, distance));
     return vec4(vec3(1.0 - shade + select(0.0, dither(in.pos.xy), shade > 0.0)), 1.0);
 }
+
+// DOL_AURORA_SEA_MASK_DEBUG=1: the sea mask over the scene instead (local debug).
+override sea_debug: bool = false;
+// Fading out from far_start to far_end units away (DOL_AURORA_EXPOSURE_FAR=start,end):
+// what is that far is the haze's colour, and brightened it stood out pale cyan
+// against the sky (the islands seen from the Private Oasis).
+override far_start: f32 = 10000.0;
+override far_end: f32 = 25000.0;
+// What is already bright takes less of it (DOL_AURORA_EXPOSURE_HIGHLIGHTS=from,to):
+// the gain tapers from full where a colour's brightest channel is `from` to
+// none at `to`, so ice and white rock keep their shading (at 1.5 times they
+// went flat white, a sixth of the screen clipped, at Ice Ring Isle), and the
+// taper is gentle enough that a brighter colour still comes out brighter.
+override highlight_from: f32 = 0.4;
+override highlight_to: f32 = 1.0;
+// The game's brightness (kBoost: scene * (1 + this) - the scene), carried in
+// time.x of this pass's view, where there is depth and not the sea's surface
+// (the sea mask): Wind Waker HD brightens the sun's light on actors and
+// scenery, not on the sea or the sky. A beach below a swell's height takes it,
+// and the swell doesn't.
+@fragment
+fn fs_exposure(in: VertexOutput) -> @location(0) vec4<f32> {
+    let p = vec2<i32>(in.pos.xy);
+    let d = textureLoad(depth, p, 0);
+    if (d <= 0.0) {
+        return vec4(0.0); // no depth: left as it is
+    }
+    let land = 1.0 - textureLoad(sea_mask, p, 0).r;
+    if (sea_debug) {
+        // The sea mask: the sea twice as bright, the rest left as it is (the pass scales the scene by
+        // one more than this; the target clamps what is below zero).
+        return vec4(select(vec3(0.0), vec3(1.0), land < 0.5), 0.0);
+    }
+    let near = 1.0 - smoothstep(far_start, far_end, view.lens.z / d);
+    var gain = (view.time.x - 1.0) * land * near;
+    let c = textureLoad(scene, p, 0).rgb;
+    gain *= 1.0 - smoothstep(highlight_from, highlight_to, max(max(c.r, c.g), c.b));
+    return vec4(vec3(select(0.0, gain + dither(in.pos.xy), gain > 0.0)), 0.0);
+}
 )""";
 wgpu::ShaderModule g_cloudModule;
 
@@ -548,9 +814,9 @@ override contact: f32 = 300.0;
 override debug_view: f32 = 0.0;
 override screen_steps: f32 = 0.0;
 override normal_offset: f32 = 2.0;
-override slope_texels: f32 = 10.0;
-override slope_near: f32 = 1.0;
-override normal_near: f32 = 0.5;
+override slope_texels: f32 = 20.0;
+override slope_near: f32 = 10.0;
+override normal_near: f32 = 2.0;
 override far_start: f32 = 1500.0;
 override far_end: f32 = 5000.0;
 override direct: f32 = 1.0;
@@ -559,14 +825,20 @@ override smooth_terms: f32 = 1.0;
 override sea_low: f32 = 40.0;
 override gap_fill: f32 = 1.0;
 override taps: f32 = 12.0;
-override sea_rise: f32 = 15.0;
+override sea_rise: f32 = 0.0;
+override sea_bias: f32 = 0.0;
+override shadow_r: f32 = 0.22;
+override shadow_g: f32 = 0.41;
+override shadow_b: f32 = 0.60;
+override soft: f32 = 0.01;
+override soft_max: f32 = 4.0;
 
 struct View {
     rows: array<vec4<f32>, 3>,  // the inverse view matrix (view to world), by rows
     lens: vec4<f32>,            // tan(fovy / 2), aspect, near, the sea's height
     time: vec4<f32>,            // seconds, then the direction to the sun (world)
     light: array<vec4<f32>, 12>, // the world to each cascade (post_fx::SunMap::world), three rows each
-    params: vec4<f32>,          // a texel's size in the map, the cascades drawn, how strongly the shadows show
+    params: vec4<f32>,          // a texel's size in the map, the cascades drawn, how strongly the shadows show, near / (far - near)
     bias: vec4<f32>,            // each cascade's depth bias, in its own depth's units
 };
 
@@ -597,7 +869,9 @@ fn view_depth(uv: vec2<f32>) -> f32 {
     let size = vec2<f32>(textureDimensions(depth));
     let p = clamp(vec2<i32>(uv * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
     let d = textureLoad(depth, p, 0);
-    return select(view.lens.z / d, 0.0, d <= 0.0);
+    // near / depth is the distance only for a far plane infinitely far; with
+    // the camera's own (params.w: near / (far - near)) it is exact.
+    return select(view.lens.z / (d + view.params.w), 0.0, d <= 0.0);
 }
 
 // Whether the surface a screen step found (at s, its depth) is one the map
@@ -694,26 +968,59 @@ fn lit_in(k: i32, m: vec3<f32>, rot: mat2x2<f32>, slope: f32, world_y: f32, grow
     let size = vec2<f32>(textureDimensions(sun_map));
     let texel = 2.0 / (length(view.light[k * 3].xyz) * size.x);
     let per_unit = length(view.light[k * 3 + 2].xyz);  // the map's depth per world unit along the sun
-    let reference = m.z - (view.bias[k] + texel * slope * per_unit) * grow;
+    let reach_bias = texel * slope * per_unit * grow;  // the slope term, which grows with the filter's reach
+    let base_reference = m.z - view.bias[k] * grow - reach_bias;
     // Nothing at the sea's height or below shades the water or the sand at its
     // edge: the islands' models carry their sea floor up to the waterline, and
     // the waves dip below it, so the sea read it as something above.
     // How much the surface counts as sea: fully below sea_low over the sea's
     // height, not at all 40 units higher (no hard line for the waves to cross).
     let low = 1.0 - smoothstep(sea_low, sea_low + 40.0, world_y - view.lens.w);
+    // How far the caster is, along the sun's rays: a few lookups over the
+    // widest the filter may get, averaging what stands in the way. The
+    // filter widens with it, so a long shadow's tip is soft, as in Wind Waker
+    // HD. (Growing the bias with it too moved shadows along the ground as the
+    // camera neared an island, since the widening changes with distance.
+    // Fading the shadow with the caster's distance as well was tried:
+    // where two shadows overlap the map keeps only the caster nearer the sun,
+    // so the overlap came out lighter than the shadow under it.) Where no
+    // lookup finds anything in the way the place is lit, and the filter's own
+    // lookups are skipped.
+    var widen = 1.0;
+    let reference = base_reference;
+    if (soft > 0.0) {
+        let probes = max(4, n_probes());
+        var found = 0.0;
+        var distance = 0.0;
+        for (var i = 0; i < probes; i++) {
+            let r = 2.0 * (1.0 + soft_max) * sqrt((f32(i) + 0.5) / f32(probes));
+            let a = 2.3999632 * f32(i) + 1.2;
+            let o = rot * (vec2(cos(a), sin(a)) * r) * view.params.x * grow;
+            let t = clamp(vec2<i32>((uv + o) * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
+            let d = textureLoad(sun_map, t, k, 0);
+            if (d < base_reference) {
+                found += 1.0;
+                distance += (m.z - d) / per_unit;
+            }
+        }
+        if (found < 0.5 && !(low > 0.0 && sea_rise > 0.0)) {
+            return 1.0;
+        }
+        widen = 1.0 + min(soft * distance / max(found, 1.0) / (2.0 * texel * grow), soft_max);
+    }
     var sum = 0.0;
     let n = i32(taps);
     for (var i = 0; i < n; i++) {
         var o = vec2(0.0);
         if (i > 0) {
-            let r = 2.0 * sqrt((f32(i - 1) + 0.5) / (taps - 1.0));
+            let r = 2.0 * widen * sqrt((f32(i - 1) + 0.5) / (taps - 1.0));
             let a = 2.3999632 * f32(i - 1);
             o = rot * (vec2(cos(a), sin(a)) * r) * view.params.x * grow;
         }
         let t = clamp(vec2<i32>((uv + o) * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
         let d = textureLoad(sun_map, t, k, 0);
         var lit = select(0.0, 1.0, reference <= d);
-        if (lit < 0.5 && low > 0.0) {
+        if (lit < 0.5 && low > 0.0 && sea_rise > 0.0) {
             // How high the surface in the way stands: up the sun's ray by
             // its distance in front. Lit below sea_rise over the sea, shaded
             // from 45 units higher, smoothly between: with a hard line, the
@@ -734,6 +1041,11 @@ fn lit_in(k: i32, m: vec3<f32>, rot: mat2x2<f32>, slope: f32, world_y: f32, grow
         sum += lit;
     }
     return sum / taps;
+}
+
+// The caster search's lookups: half the filter's.
+fn n_probes() -> i32 {
+    return i32(taps) / 2;
 }
 
 @fragment
@@ -785,7 +1097,12 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
         let turn = 6.2831853 * fract(52.9829189 * fract(dot(in.pos.xy, vec2(0.06711056, 0.00583715))));
         let rot = mat2x2<f32>(cos(turn), sin(turn), -sin(turn), cos(turn));
         let grow = grow_at(k, world);
-        let m = to_cascade(k, offset_world(k, world, push * mix(normal_near, normal_offset, far) * grow));
+        // The sea casts nothing, so it can't shade itself and needs neither
+        // the normal offset nor the slope bias: with them, a tower standing in
+        // the water at a low sun had its shadow start well away from its foot.
+        let unbiased = mix(1.0, sea_bias, sea);
+        let offset = mix(normal_near, normal_offset, far) * unbiased;
+        let m = to_cascade(k, offset_world(k, world, push * offset * grow));
         // tan of the angle between the surface and the sun (capped), times how
         // many texels of it the bias takes: few near the camera, so shadows
         // stay at their casters' feet, more far off, where the surface's
@@ -793,7 +1110,7 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
         let ndl = dot(normal, sun);
         let cap = mix(4.0, 8.0, far);
         let tilt = select(cap, min(sqrt(max(1.0 - ndl * ndl, 0.0)) / ndl, cap), ndl > 0.0);
-        let slope = tilt * mix(slope_near, slope_texels, far);
+        let slope = tilt * mix(slope_near, slope_texels, far) * unbiased;
         lit = lit_in(k, m, rot, slope, world.y, grow);
         // Near a cascade's edge, blend into the next (or, past the last, into
         // the light), so the step in sharpness doesn't show as a line.
@@ -803,7 +1120,7 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
             var next = 1.0;
             if (k + 1 < i32(view.params.y)) {
                 let grow_next = grow_at(k + 1, world);
-                let n = to_cascade(k + 1, offset_world(k + 1, world, push * mix(normal_near, normal_offset, far) * grow_next));
+                let n = to_cascade(k + 1, offset_world(k + 1, world, push * offset * grow_next));
                 if (inside(k + 1, n)) {
                     next = lit_in(k + 1, n, rot, slope, world.y, grow_next);
                 }
@@ -815,9 +1132,11 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
         // further the further out (the bias grows with the camera's distance
         // and the cascade's texels): zoomed out, shadows came away from the
         // things that cast them. A few steps toward the sun through the depth
-        // buffer, over just that reach, find the foot again. Not on the sea,
-        // where a wave in front of the step would count as a caster.
-        if (gap_fill > 0.5 && lit > 0.0 && sea < 0.5) {
+        // buffer, over just that reach, find the foot again. A surface a step
+        // finds counts only if the map holds it, so what casts nothing (the
+        // sea: a swell's crest dotted the sea with shade at sunrise) can't
+        // cast here either, and the sea gets its feet back too.
+        if (gap_fill > 0.5 && lit > 0.0) {
             let size = f32(textureDimensions(sun_map).x);
             let texel_world = 2.0 / (length(view.light[k * 3].xyz) * size);
             let per_unit = length(view.light[k * 3 + 2].xyz);
@@ -848,7 +1167,26 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
                     // Only just behind the surface found: a step deep behind
                     // something nearer the camera drew a copy of it, standing
                     // behind it, on whatever was further back.
+                    // One-sided: what the map has nothing at (the sea's crests)
+                    // casts nothing, but a surface the map holds something
+                    // nearer the sun than counts (it is solid, in its own
+                    // shadow): checked both ways, an island's far side, which
+                    // the map holds only in patches far off, came out in
+                    // blotches.
+                    var held = true;
                     if (surface > 0.0 && behind > 2.0 + 0.002 * surface && behind < min(reach, 120.0)) {
+                        let hp = vec4(vec3(sq.x * tx, sq.y * ty, -1.0) * surface, 1.0);
+                        let hw = vec4(dot(view.rows[0], hp), dot(view.rows[1], hp), dot(view.rows[2], hp), 1.0);
+                        let hm = to_cascade(k, hw);
+                        if (inside(k, hm)) {
+                            let hsize = vec2<f32>(textureDimensions(sun_map));
+                            let huv = vec2(hm.x * 0.5 + 0.5, 0.5 - hm.y * 0.5);
+                            let ht = clamp(vec2<i32>(huv * hsize), vec2<i32>(0), vec2<i32>(hsize) - vec2<i32>(1));
+                            let hd = textureLoad(sun_map, ht, k, 0);
+                            held = (hd - hm.z) / per_unit < max(40.0, texel_world * 4.0 * grow);
+                        }
+                    }
+                    if (held && surface > 0.0 && behind > 2.0 + 0.002 * surface && behind < min(reach, 120.0)) {
                         // Full at the foot, where the map holds nothing, and
                         // fading toward the reach's end, where the map's own
                         // shadow takes over (at full strength there, the foot
@@ -859,13 +1197,26 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
                 }
             }
         }
+        // 7: how the surface faces the sun (green toward it, red away, white
+        // edge-on) and, dimmed, how lit it came out.
+        if (debug_view > 6.5 && debug_view < 7.5) {
+            let nd = dot(normal, sun);
+            let c = select(vec3(1.0, 1.0 - min(-nd * 8.0, 1.0), 1.0 - min(-nd * 8.0, 1.0)),
+                           vec3(1.0 - min(nd * 8.0, 1.0), 1.0, 1.0 - min(nd * 8.0, 1.0)), nd >= 0.0);
+            return vec4(c * (0.4 + 0.6 * lit), 1.0);
+        }
         // 6: each cascade tinted (red, green, blue, yellow), to see where they reach.
-        if (debug_view > 5.5) {
+        if (debug_view > 5.5 && debug_view < 6.5) {
             var tint = array<vec3<f32>, 4>(vec3(1.0, 0.6, 0.6), vec3(0.6, 1.0, 0.6), vec3(0.6, 0.6, 1.0), vec3(1.0, 1.0, 0.5))[k];
             return vec4(tint * (0.4 + 0.6 * lit), 1.0);
         }
-    } else if (debug_view > 0.5) {
+    } else if (debug_view > 0.5 && debug_view < 7.5) {
         return vec4(vec3(0.5), 1.0);
+    }
+    // 8: the scene as it is, with the map's shadow in pink (its green taken
+    // out by how shaded it is), to find shadows on what shouldn't have any.
+    if (debug_view > 7.5) {
+        return vec4(1.0, lit, 1.0, 1.0);
     }
     if (debug_view > 0.5) {
         return vec4(vec3(lit), 1.0);
@@ -898,10 +1249,10 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     }
     let fade = view.params.z;
-    let shade = 1.0 - strength * (1.0 - lit) * fade;
+    let shade = mix(vec3(1.0), vec3(shadow_r, shadow_g, shadow_b), (1.0 - lit) * fade);
     // Multiplied into the 8-bit scene: half a step of noise against bands (fs_ao_apply).
     let noise = (fract(52.9829189 * fract(dot(in.pos.xy, vec2(0.06711056, 0.00583715)))) - 0.5) * (1.5 / 255.0);
-    return vec4(vec3(shade + select(0.0, noise, direct > 0.5 && shade < 0.999)), 1.0);
+    return vec4(shade + select(0.0, noise, direct > 0.5 && shade.r < 0.999), 1.0);
 }
 )""";
 wgpu::ShaderModule g_sunMapModule;
@@ -1078,7 +1429,7 @@ float env_float(const char* name, float fallback, float lo, float hi) {
   return parsed;
 }
 
-enum Blend { kReplace, kAdd, kMultiply };
+enum Blend { kReplace, kScreen, kMultiply };
 
 wgpu::RenderPipeline make_pipeline(const char* label, const char* entry, wgpu::TextureFormat format,
                                    uint32_t samples, Blend mode) {
@@ -1086,9 +1437,11 @@ wgpu::RenderPipeline make_pipeline(const char* label, const char* entry, wgpu::T
       wgpu::ConstantEntry{.key = "threshold", .value = g_threshold},
       wgpu::ConstantEntry{.key = "strength", .value = g_strength},
   };
-  const wgpu::BlendState add{
+  // Screen: the glow brightens what is darker and tends to white instead of
+  // passing it. Added, it clipped Wind Waker's near-white clouds to flat white.
+  const wgpu::BlendState screen{
       .color = {.operation = wgpu::BlendOperation::Add,
-                .srcFactor = wgpu::BlendFactor::One,
+                .srcFactor = wgpu::BlendFactor::OneMinusDst,
                 .dstFactor = wgpu::BlendFactor::One},
       .alpha = {.operation = wgpu::BlendOperation::Add,
                 .srcFactor = wgpu::BlendFactor::Zero,
@@ -1104,7 +1457,7 @@ wgpu::RenderPipeline make_pipeline(const char* label, const char* entry, wgpu::T
   };
   const std::array targets{wgpu::ColorTargetState{
       .format = format,
-      .blend = mode == kAdd ? &add : mode == kMultiply ? &multiply : nullptr,
+      .blend = mode == kScreen ? &screen : mode == kMultiply ? &multiply : nullptr,
       .writeMask = wgpu::ColorWriteMask::All,
   }};
   const wgpu::FragmentState fragment{
@@ -1126,36 +1479,14 @@ wgpu::RenderPipeline make_pipeline(const char* label, const char* entry, wgpu::T
   return g_device.CreateRenderPipeline(&descriptor);
 }
 
-wgpu::RenderPipeline make_ao_pipeline(wgpu::TextureFormat format) {
+wgpu::RenderPipeline make_ao_pipeline(const char* label, const char* entry, wgpu::TextureFormat format,
+                                      uint32_t samples, Blend mode) {
   const std::array constants{
       wgpu::ConstantEntry{.key = "radius", .value = g_aoRadius},
       wgpu::ConstantEntry{.key = "strength", .value = g_aoStrength},
-  };
-  const std::array targets{wgpu::ColorTargetState{.format = format, .writeMask = wgpu::ColorWriteMask::All}};
-  const wgpu::FragmentState fragment{
-      .module = g_aoModule,
-      .entryPoint = "fs_ao",
-      .constantCount = constants.size(),
-      .constants = constants.data(),
-      .targetCount = targets.size(),
-      .targets = targets.data(),
-  };
-  const wgpu::RenderPipelineDescriptor descriptor{
-      .label = "Ambient occlusion",
-      .layout = g_depthPipelineLayout,
-      .vertex = {.module = g_aoModule, .entryPoint = "vs_main"},
-      .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
-      .multisample = {.count = 1, .mask = UINT32_MAX},
-      .fragment = &fragment,
-  };
-  return g_device.CreateRenderPipeline(&descriptor);
-}
-
-wgpu::RenderPipeline make_cloud_pipeline(wgpu::TextureFormat format, uint32_t samples) {
-  const std::array constants{
-      wgpu::ConstantEntry{.key = "strength", .value = g_cloudStrength},
-      wgpu::ConstantEntry{.key = "scale", .value = g_cloudScale},
-      wgpu::ConstantEntry{.key = "debug_view", .value = g_cloudDebug ? 1.0 : 0.0},
+      wgpu::ConstantEntry{.key = "fade_start", .value = g_aoFadeStart},
+      wgpu::ConstantEntry{.key = "fade_end", .value = g_aoFadeEnd},
+      wgpu::ConstantEntry{.key = "debug_view", .value = static_cast<double>(g_aoDebug)},
   };
   const wgpu::BlendState multiply{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -1165,17 +1496,81 @@ wgpu::RenderPipeline make_cloud_pipeline(wgpu::TextureFormat format, uint32_t sa
                 .srcFactor = wgpu::BlendFactor::Zero,
                 .dstFactor = wgpu::BlendFactor::One},
   };
-  const std::array targets{wgpu::ColorTargetState{.format = format, .blend = &multiply, .writeMask = wgpu::ColorWriteMask::All}};
+  const std::array targets{wgpu::ColorTargetState{
+      .format = format, .blend = mode == kMultiply ? &multiply : nullptr, .writeMask = wgpu::ColorWriteMask::All}};
   const wgpu::FragmentState fragment{
-      .module = g_cloudModule,
-      .entryPoint = "fs_clouds",
+      .module = g_aoModule,
+      .entryPoint = entry,
       .constantCount = constants.size(),
       .constants = constants.data(),
       .targetCount = targets.size(),
       .targets = targets.data(),
   };
   const wgpu::RenderPipelineDescriptor descriptor{
-      .label = "Cloud shadows",
+      .label = label,
+      .layout = g_depthPipelineLayout,
+      .vertex = {.module = g_aoModule, .entryPoint = "vs_main"},
+      .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+      .multisample = {.count = samples, .mask = UINT32_MAX},
+      .fragment = &fragment,
+  };
+  return g_device.CreateRenderPipeline(&descriptor);
+}
+
+wgpu::RenderPipeline make_cloud_pipeline(wgpu::TextureFormat format, uint32_t samples, bool exposure = false) {
+  const std::array constants{
+      wgpu::ConstantEntry{.key = "strength", .value = g_cloudStrength},
+      wgpu::ConstantEntry{.key = "scale", .value = g_cloudScale},
+      wgpu::ConstantEntry{.key = "debug_view", .value = g_cloudDebug ? 1.0 : 0.0},
+  };
+  const wgpu::BlendState boost{
+      .color = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::Dst,
+                .dstFactor = wgpu::BlendFactor::One},
+      .alpha = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::Zero,
+                .dstFactor = wgpu::BlendFactor::One},
+  };
+  const wgpu::BlendState multiply{
+      .color = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::Zero,
+                .dstFactor = wgpu::BlendFactor::Src},
+      .alpha = {.operation = wgpu::BlendOperation::Add,
+                .srcFactor = wgpu::BlendFactor::Zero,
+                .dstFactor = wgpu::BlendFactor::One},
+  };
+  const std::array targets{
+      wgpu::ColorTargetState{.format = format, .blend = exposure ? &boost : &multiply, .writeMask = wgpu::ColorWriteMask::All}};
+  static const bool seaDebug = std::getenv("DOL_AURORA_SEA_MASK_DEBUG") != nullptr;
+  static const std::array<float, 2> exposureFar = [] {
+    std::array<float, 2> far{10000.f, 25000.f};
+    if (const char* value = std::getenv("DOL_AURORA_EXPOSURE_FAR"); value != nullptr)
+      if (std::sscanf(value, "%f,%f", &far[0], &far[1]) != 2 || !(far[1] > far[0]) || !(far[0] >= 0.f))
+        far = {10000.f, 25000.f};
+    return far;
+  }();
+  static const std::array<float, 2> exposureHighlights = [] {
+    std::array<float, 2> range{0.4f, 1.0f};
+    if (const char* value = std::getenv("DOL_AURORA_EXPOSURE_HIGHLIGHTS"); value != nullptr)
+      if (std::sscanf(value, "%f,%f", &range[0], &range[1]) != 2 || !(range[1] > range[0]))
+        range = {0.4f, 1.0f};
+    return range;
+  }();
+  const std::array exposureConstants{wgpu::ConstantEntry{.key = "sea_debug", .value = seaDebug ? 1.0 : 0.0},
+                                     wgpu::ConstantEntry{.key = "far_start", .value = exposureFar[0]},
+                                     wgpu::ConstantEntry{.key = "far_end", .value = exposureFar[1]},
+                                     wgpu::ConstantEntry{.key = "highlight_from", .value = exposureHighlights[0]},
+                                     wgpu::ConstantEntry{.key = "highlight_to", .value = exposureHighlights[1]}};
+  const wgpu::FragmentState fragment{
+      .module = g_cloudModule,
+      .entryPoint = exposure ? "fs_exposure" : "fs_clouds",
+      .constantCount = exposure ? exposureConstants.size() : constants.size(),
+      .constants = exposure ? exposureConstants.data() : constants.data(),
+      .targetCount = targets.size(),
+      .targets = targets.data(),
+  };
+  const wgpu::RenderPipelineDescriptor descriptor{
+      .label = exposure ? "Exposure" : "Cloud shadows",
       .layout = g_cloudPipelineLayout,
       .vertex = {.module = g_cloudModule, .entryPoint = "vs_main"},
       .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
@@ -1214,6 +1609,9 @@ wgpu::RenderPipeline make_sun_pipeline(wgpu::TextureFormat format) {
 wgpu::RenderPipeline make_sun_map_pipeline(wgpu::TextureFormat format, bool direct) {
   const std::array constants{
       wgpu::ConstantEntry{.key = "strength", .value = g_sunStrength},
+      wgpu::ConstantEntry{.key = "shadow_r", .value = g_sunShadowColour[0]},
+      wgpu::ConstantEntry{.key = "shadow_g", .value = g_sunShadowColour[1]},
+      wgpu::ConstantEntry{.key = "shadow_b", .value = g_sunShadowColour[2]},
       wgpu::ConstantEntry{.key = "contact", .value = g_sunMapContact},
       wgpu::ConstantEntry{.key = "debug_view", .value = static_cast<double>(g_sunMapDebug)},
       wgpu::ConstantEntry{.key = "screen_steps", .value = g_sunMapSteps ? 1.0 : 0.0},
@@ -1230,6 +1628,9 @@ wgpu::RenderPipeline make_sun_map_pipeline(wgpu::TextureFormat format, bool dire
       wgpu::ConstantEntry{.key = "gap_fill", .value = g_sunMapGapFill ? 1.0 : 0.0},
       wgpu::ConstantEntry{.key = "taps", .value = static_cast<double>(g_sunMapTaps)},
       wgpu::ConstantEntry{.key = "sea_rise", .value = g_sunMapSeaRise},
+      wgpu::ConstantEntry{.key = "sea_bias", .value = g_sunMapSeaBias},
+      wgpu::ConstantEntry{.key = "soft", .value = g_sunMapSoft},
+      wgpu::ConstantEntry{.key = "soft_max", .value = g_sunMapSoftMax},
   };
   const wgpu::BlendState multiply{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -1362,10 +1763,13 @@ wgpu::RenderPipeline make_far_pipeline(wgpu::TextureFormat format, uint32_t samp
 // A shadow quality's map size, cascades, filter lookups and gap fill (0 low,
 // 1 medium, 2 high), then each of their own variables on top. Low keeps
 // medium's sharpness (at 1024 every texel term grew and small shapes became
-// blobs) and saves a cascade, half the lookups and the gap fill's steps.
+// blobs) and saves half the lookups and the gap fill's steps. Every quality
+// has three cascades (out to 20,000 units): the fourth reached only islands
+// deep in the haze, and its coarse texels shaded Windfall in light-blue
+// blocks from across the sea, which went as it sailed into the third.
 void apply_sun_quality(int level) {
   g_sunMapSize = level >= 2 ? 4096 : 2048;
-  g_sunMapCascades = level <= 0 ? 3 : kSunMapCascades;
+  g_sunMapCascades = 3;
   g_sunMapTaps = level <= 0 ? 6 : 12;
   g_sunMapGapFill = level > 0;
   g_sunMapTaps = static_cast<uint32_t>(env_float("DOL_AURORA_SUN_SHADOW_MAP_TAPS", static_cast<float>(g_sunMapTaps), 6.f, 12.f));
@@ -1392,7 +1796,9 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
     g_blurH = make_pipeline("Bloom blur (horizontal)", "fs_blur_h", format, 1, kReplace);
     g_blurV = make_pipeline("Bloom blur (vertical)", "fs_blur_v", format, 1, kReplace);
     g_down = make_pipeline("Far blur downsample", "fs_down", format, 1, kReplace);
-    g_aoPass = make_ao_pipeline(format);
+    g_aoPass = make_ao_pipeline("Ambient occlusion", "fs_ao", format, 1, kReplace);
+    g_aoBlurH = make_ao_pipeline("Ambient occlusion blur (horizontal)", "fs_ao_blur_h", format, 1, kReplace);
+    g_aoBlurV = make_ao_pipeline("Ambient occlusion blur (vertical)", "fs_ao_blur_v", format, 1, kReplace);
     g_cloudPass = {};
     g_sunPass = {};
     g_sunMapPass = {};
@@ -1401,11 +1807,12 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
     g_torchPass = {};
     g_composite = {};
     g_farComposite = {};
+    g_exposureDepth = {};
     g_aoApply = {};
     g_size = {};
   }
   if (!g_composite || samples != g_compositeSamples) {
-    g_composite = make_pipeline("Bloom composite", "fs_composite", format, samples, kAdd);
+    g_composite = make_pipeline("Bloom composite", "fs_composite", format, samples, kScreen);
     g_compositeSamples = samples;
   }
   if (!g_sunPass) {
@@ -1429,12 +1836,15 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
     g_cloudSamples = samples;
   }
   if (!g_aoApply || samples != g_aoSamples) {
-    g_aoApply = make_pipeline("Ambient occlusion apply", "fs_ao_apply", format, samples,
-                              g_aoDebug ? kReplace : kMultiply);
+    g_aoApply = make_pipeline("Sun shadows apply", "fs_ao_apply", format, samples,
+                              g_aoDebug == 1 ? kReplace : kMultiply);
+    g_aoUpscale = make_ao_pipeline("Ambient occlusion apply", "fs_ao_upscale", format, samples,
+                                   g_aoDebug == 1 ? kReplace : kMultiply);
     g_aoSamples = samples;
   }
   if (!g_farComposite || samples != g_farSamples) {
     g_farComposite = make_far_pipeline(format, samples);
+    g_exposureDepth = make_cloud_pipeline(format, samples, true);
     g_farSamples = samples;
   }
   const wgpu::Extent3D size{std::max(1u, sceneSize.width / 4), std::max(1u, sceneSize.height / 4), 1};
@@ -1529,18 +1939,22 @@ void draw_depth(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::
 void draw_with_uniform(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::RenderPipeline& pipeline,
                        const wgpu::BindGroupLayout& layout, const void* uniform, size_t uniformSize,
                        const wgpu::TextureView& depthView, const wgpu::TextureView& target,
-                       const wgpu::TextureView& resolve);
+                       const wgpu::TextureView& resolve, const wgpu::TextureView* texture = nullptr,
+                       const wgpu::TextureView* scene = nullptr);
 
 void draw_with_view(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::RenderPipeline& pipeline,
                     const std::array<float, 20>& view, const wgpu::TextureView& depthView,
-                    const wgpu::TextureView& target, const wgpu::TextureView& resolve) {
-  draw_with_uniform(cmd, label, pipeline, g_cloudLayout, view.data(), sizeof(view), depthView, target, resolve);
+                    const wgpu::TextureView& target, const wgpu::TextureView& resolve,
+                    const wgpu::TextureView* texture = nullptr, const wgpu::TextureView* scene = nullptr) {
+  draw_with_uniform(cmd, label, pipeline, g_cloudLayout, view.data(), sizeof(view), depthView, target, resolve,
+                    texture, scene);
 }
 
 void draw_with_uniform(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::RenderPipeline& pipeline,
                        const wgpu::BindGroupLayout& layout, const void* uniform, size_t uniformSize,
                        const wgpu::TextureView& depthView, const wgpu::TextureView& target,
-                       const wgpu::TextureView& resolve) {
+                       const wgpu::TextureView& resolve, const wgpu::TextureView* texture,
+                       const wgpu::TextureView* scene) {
   // A small buffer for each frame, so a frame still in flight keeps its camera.
   const wgpu::BufferDescriptor bufferDescriptor{
       .label = "Post effects view",
@@ -1553,9 +1967,10 @@ void draw_with_uniform(const wgpu::CommandEncoder& cmd, const char* label, const
   buffer.Unmap();
   const std::array entries{
       wgpu::BindGroupEntry{.binding = 0, .sampler = g_sampler},
-      wgpu::BindGroupEntry{.binding = 1, .textureView = g_farView[0]},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = texture != nullptr ? *texture : g_farView[0]},
       wgpu::BindGroupEntry{.binding = 2, .textureView = depthView},
       wgpu::BindGroupEntry{.binding = 3, .buffer = buffer, .offset = 0, .size = uniformSize},
+      wgpu::BindGroupEntry{.binding = 4, .textureView = scene != nullptr ? *scene : g_farView[0]},
   };
   const wgpu::BindGroupDescriptor bindGroupDescriptor{
       .layout = layout,
@@ -1593,6 +2008,9 @@ void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const S
   uniform[68] = 1.f / static_cast<float>(g_sunMapSize);
   uniform[69] = static_cast<float>(sunMap.cascades);
   uniform[70] = sunMap.fade;
+  // The far plane's share of the depth (view_depth), 0 for one infinitely far.
+  const float nearPlane = camera.view[14];
+  uniform[71] = camera.farPlane > nearPlane ? nearPlane / (camera.farPlane - nearPlane) : 0.f;
   // The map's light (the moon at night) in the place of the sun.
   std::memcpy(uniform.data() + 17, sunMap.light.data(), sizeof(sunMap.light));
   for (uint32_t cascade = 0; cascade < kSunMapCascades; ++cascade) {
@@ -1661,9 +2079,17 @@ void initialize() {
   g_ao.store(ao != nullptr && ao[0] == '1', std::memory_order_relaxed);
   g_aoRadius = env_float("DOL_AURORA_AO_RADIUS", g_aoRadius, 0.1f, 1e6f);
   g_aoStrength = env_float("DOL_AURORA_AO_STRENGTH", g_aoStrength, 0.f, 1.f);
+  g_aoFadeStart = env_float("DOL_AURORA_AO_FADE_START", g_aoFadeStart, 1.f, 1e9f);
+  g_aoFadeEnd = env_float("DOL_AURORA_AO_FADE_END", g_aoFadeEnd, g_aoFadeStart + 1.f, 1e9f);
   g_cloudStrength = env_float("DOL_AURORA_CLOUD_SHADOWS_STRENGTH", g_cloudStrength, 0.f, 1.f);
   g_cloudScale = env_float("DOL_AURORA_CLOUD_SHADOWS_SCALE", g_cloudScale, 1.f, 1e7f);
   g_sunStrength = env_float("DOL_AURORA_SUN_SHADOWS_STRENGTH", g_sunStrength, 0.f, 1.f);
+  if (const char* colour = std::getenv("DOL_AURORA_SUN_SHADOWS_COLOUR")) {
+    float c[3];
+    if (std::sscanf(colour, "%f,%f,%f", &c[0], &c[1], &c[2]) == 3)
+      for (int i = 0; i < 3; ++i)
+        g_sunShadowColour[i] = std::clamp(c[i], 0.f, 1.f);
+  }
   g_sunReach = env_float("DOL_AURORA_SUN_SHADOWS_REACH", g_sunReach, 1.f, 1e6f);
   // The host decides through set_sun_shadow_map(); the variable overrides it only when it is set.
   if (const char* sunMap = std::getenv("DOL_AURORA_SUN_SHADOW_MAP"); sunMap != nullptr) {
@@ -1682,11 +2108,15 @@ void initialize() {
   g_sunMapDepth = env_float("DOL_AURORA_SUN_SHADOW_MAP_DEPTH", g_sunMapDepth, 1000.f, 1000000.f);
   g_sunMapBias = env_float("DOL_AURORA_SUN_SHADOW_MAP_BIAS", g_sunMapBias, 0.f, 1000.f);
   g_sunMapSlope = env_float("DOL_AURORA_SUN_SHADOW_MAP_SLOPE", g_sunMapSlope, 0.f, 32.f);
-  g_sunMapFadeLow = env_float("DOL_AURORA_SUN_SHADOW_MAP_FADE_LOW", g_sunMapFadeLow, 0.f, 0.9f);
+  g_sunMapFadeLow = env_float("DOL_AURORA_SUN_SHADOW_MAP_FADE_LOW", g_sunMapFadeLow, -0.5f, 0.9f);
   g_sunMapFadeHigh = env_float("DOL_AURORA_SUN_SHADOW_MAP_FADE_HIGH", g_sunMapFadeHigh, g_sunMapFadeLow + 0.001f, 1.f);
+  g_sunMapHold = env_float("DOL_AURORA_SUN_SHADOW_MAP_HOLD", g_sunMapHold, 0.f, 0.5f);
+  g_sunMapDim = env_float("DOL_AURORA_SUN_SHADOW_MAP_DIM", g_sunMapDim, 0.f, 1.f);
   g_moonStrength = env_float("DOL_AURORA_MOON_SHADOWS_STRENGTH", g_moonStrength, 0.f, 1.f);
   g_moonFadeLow = env_float("DOL_AURORA_MOON_SHADOWS_FADE_LOW", g_moonFadeLow, 0.f, 0.9f);
   g_moonFadeHigh = env_float("DOL_AURORA_MOON_SHADOWS_FADE_HIGH", g_moonFadeHigh, g_moonFadeLow + 0.001f, 1.f);
+  g_moonDawnLow = env_float("DOL_AURORA_MOON_SHADOWS_DAWN_LOW", g_moonDawnLow, 0.f, 0.9f);
+  g_moonDawnHigh = env_float("DOL_AURORA_MOON_SHADOWS_DAWN_HIGH", g_moonDawnHigh, g_moonDawnLow + 0.001f, 1.f);
   g_sunMapFarStart = env_float("DOL_AURORA_SUN_SHADOW_MAP_FAR_START", g_sunMapFarStart, 0.f, 100000.f);
   g_sunMapFarEnd = env_float("DOL_AURORA_SUN_SHADOW_MAP_FAR_END", g_sunMapFarEnd, g_sunMapFarStart + 1.f, 200000.f);
   g_sunMapNormalNear = env_float("DOL_AURORA_SUN_SHADOW_MAP_NORMAL_NEAR", g_sunMapNormalNear, 0.f, 16.f);
@@ -1699,6 +2129,9 @@ void initialize() {
   g_sunMapSteps = sunMapSteps != nullptr && sunMapSteps[0] == '1';
   g_sunMapSeaLow = env_float("DOL_AURORA_SUN_SHADOW_MAP_SEA_LOW", g_sunMapSeaLow, 0.f, 1000.f);
   g_sunMapSeaRise = env_float("DOL_AURORA_SUN_SHADOW_MAP_SEA_RISE", g_sunMapSeaRise, 0.f, 1000.f);
+  g_sunMapSeaBias = env_float("DOL_AURORA_SUN_SHADOW_MAP_SEA_BIAS", g_sunMapSeaBias, 0.f, 1.f);
+  g_sunMapSoft = env_float("DOL_AURORA_SUN_SHADOW_MAP_SOFT", g_sunMapSoft, 0.f, 1.f);
+  g_sunMapSoftMax = env_float("DOL_AURORA_SUN_SHADOW_MAP_SOFT_MAX", g_sunMapSoftMax, 0.f, 16.f);
   if (const char* sunMapSmooth = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_SMOOTH"); sunMapSmooth != nullptr)
     g_sunMapSmooth = sunMapSmooth[0] != '0';
   g_edgeStrength = env_float("DOL_AURORA_EDGE_LIGHT_STRENGTH", g_edgeStrength, 0.f, 4.f);
@@ -1707,7 +2140,7 @@ void initialize() {
   const char* cloudDebug = std::getenv("DOL_AURORA_CLOUD_SHADOWS_DEBUG");
   g_cloudDebug = cloudDebug != nullptr && cloudDebug[0] == '1';
   const char* aoDebug = std::getenv("DOL_AURORA_AO_DEBUG");
-  g_aoDebug = aoDebug != nullptr && aoDebug[0] == '1';
+  g_aoDebug = aoDebug != nullptr && (aoDebug[0] == '1' || aoDebug[0] == '2') ? aoDebug[0] - '0' : 0;
   const char* farDebug = std::getenv("DOL_AURORA_FAR_BLUR_DEBUG");
   g_farDebug = farDebug != nullptr && farDebug[0] == '1';
 
@@ -1786,14 +2219,28 @@ void initialize() {
   const wgpu::PipelineLayoutDescriptor depthPipelineLayoutDescriptor{.bindGroupLayoutCount = 1,
                                                                      .bindGroupLayouts = &g_depthLayout};
   g_depthPipelineLayout = g_device.CreatePipelineLayout(&depthPipelineLayoutDescriptor);
+  // Binding 1 is the exposure's sea mask (read with textureLoad);
+  // the cloud shadows, sun shadows and edge light leave it.
   const std::array cloudEntries{
       depthEntries[0],
-      depthEntries[1],
+      wgpu::BindGroupLayoutEntry{
+          .binding = 1,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .texture = {.sampleType = wgpu::TextureSampleType::UnfilterableFloat,
+                      .viewDimension = wgpu::TextureViewDimension::e2D},
+      },
       depthEntries[2],
       wgpu::BindGroupLayoutEntry{
           .binding = 3,
           .visibility = wgpu::ShaderStage::Fragment,
           .buffer = {.type = wgpu::BufferBindingType::Uniform, .minBindingSize = sizeof(g_camera)},
+      },
+      // The scene before the effects, for the exposure's highlights (read with textureLoad).
+      wgpu::BindGroupLayoutEntry{
+          .binding = 4,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .texture = {.sampleType = wgpu::TextureSampleType::UnfilterableFloat,
+                      .viewDimension = wgpu::TextureViewDimension::e2D},
       },
   };
   const wgpu::BindGroupLayoutDescriptor cloudLayoutDescriptor{
@@ -1861,7 +2308,8 @@ void initialize() {
 }
 
 void shutdown() {
-  g_bright = g_blurH = g_blurV = g_composite = g_down = g_farComposite = g_aoPass = g_aoApply = {};
+  g_bright = g_blurH = g_blurV = g_composite = g_down = g_farComposite = g_aoPass = g_aoApply = g_exposureDepth = {};
+  g_aoBlurH = g_aoBlurV = g_aoUpscale = {};
   g_aoTex = {};
   g_aoView = {};
   g_aoSamples = 0;
@@ -1891,6 +2339,13 @@ void shutdown() {
   g_cloudPipelineLayout = {};
   g_cloudLayout = {};
   g_cloudModule = {};
+  g_seaMaskView = {};
+  g_seaMask = {};
+  g_exposureSceneView = {};
+  g_exposureScene = {};
+  g_seaMaskDepthView = {};
+  g_seaMaskDepth = {};
+  g_seaMaskSize = {};
   g_tex = {};
   g_view = {};
   g_farTex = {};
@@ -1937,21 +2392,54 @@ void set_sun_shadow_quality(int level) noexcept {
     g_sunQualityPending.store(level, std::memory_order_relaxed);
 }
 
+void set_sun_shadow_strength(float strength) noexcept {
+  g_sunMapStrength.store(std::clamp(strength, 0.f, 1.f), std::memory_order_relaxed);
+}
+
 SunMap sun_map(const Camera& camera) noexcept {
   SunMap map;
   const float* v = camera.view.data();
-  // The sun, or below the horizon the moon: the game puts it opposite the sun
-  // (dScnKy_env_light_c's mMoonPos is the eye minus the sun's offset). Long
-  // shadows hold until the sun is a few degrees up, then fade; the moon's come
-  // in later, once the dusk has gone (from 12 degrees up, full at 27).
-  const bool moon = v[18] < 0.f;
-  const float sun[3] = {moon ? -v[17] : v[17], moon ? -v[18] : v[18], moon ? -v[19] : v[19]};
-  const float fade = moon ? smoothstep_f(g_moonFadeLow, g_moonFadeHigh, sun[1]) * g_moonStrength
-                          : smoothstep_f(g_sunMapFadeLow, g_sunMapFadeHigh, sun[1]);
-  if (!camera.valid || fade <= 0.f)
+  // The sun, or once it has gone the moon: the game puts it opposite the sun
+  // (dScnKy_env_light_c's mMoonPos is the eye minus the sun's offset). As in
+  // HD, the sun's shadows last while its disk is drawn, gone 8 degrees under
+  // the horizon, and are cast from the sun held at 24 degrees, thinning out
+  // from there; the moon is held at 2 degrees. HD's moon isn't the same both
+  // ways: its shadows come in once it is 25 degrees up, full at 30, but at
+  // dawn last until it is down to 8. The sun is in the
+  // west (-x) at dusk, so the moon is in the west at dawn.
+  const bool moon = v[18] < g_sunMapFadeLow;
+  float sun[3] = {moon ? -v[17] : v[17], moon ? -v[18] : v[18], moon ? -v[19] : v[19]};
+  const bool dawn = moon && sun[0] < 0.f;
+  const float thin = std::clamp((sun[1] - g_sunMapFadeLow) / std::max(g_sunMapHold - g_sunMapFadeLow, 1e-3f), 0.f, 1.f);
+  const float fade = !moon  ? smoothstep_f(g_sunMapFadeLow, g_sunMapFadeHigh, sun[1]) * (g_sunMapDim + (1.f - g_sunMapDim) * thin)
+                     : dawn ? smoothstep_f(g_moonDawnLow, g_moonDawnHigh, sun[1]) * g_moonStrength
+                            : smoothstep_f(g_moonFadeLow, g_moonFadeHigh, sun[1]) * g_moonStrength;
+  const float strength = g_sunMapStrength.load(std::memory_order_relaxed);
+  const float hold = moon ? kMoonHold : g_sunMapHold;
+  if (!moon && sun[1] < g_sunMapHold) {
+    // Below the hold the sun is cast from where its path crossed it, its
+    // direction fixed too, as in HD (shadows stood still from 17:20). With only
+    // its height held, its bearing kept turning, the map turned with it every
+    // frame and the shadows in the coarser cascades crawled. The path
+    // (dScnKy setSunpos): (sin a, -cos a, -0.6 cos a), so at height h,
+    // -cos a = h / sqrt(1 - 0.36 h^2) before normalising.
+    const float c = g_sunMapHold / std::sqrt(1.f - 0.36f * g_sunMapHold * g_sunMapHold);
+    const float x = std::copysign(std::sqrt(std::max(1.f - c * c, 0.f)), sun[0]);
+    const float length = std::sqrt(x * x + c * c * 1.36f);
+    sun[0] = x / length;
+    sun[1] = c / length;
+    sun[2] = 0.6f * c / length;
+  } else if (sun[1] < hold) {
+    const float across = std::sqrt(sun[0] * sun[0] + sun[2] * sun[2]);
+    const float scale = across > 1e-4f ? std::sqrt(1.f - hold * hold) / across : 0.f;
+    sun[0] *= scale;
+    sun[1] = hold;
+    sun[2] *= scale;
+  }
+  if (!camera.valid || fade * strength <= 0.f)
     return map;
   map.light = {sun[0], sun[1], sun[2]};
-  map.fade = fade;
+  map.fade = fade * strength;
   // Across the map: perpendicular to the sun, the first level.
   const float up[3] = {0.f, std::fabs(sun[1]) > 0.99f ? 0.f : 1.f, std::fabs(sun[1]) > 0.99f ? 1.f : 0.f};
   float x[3] = {up[1] * sun[2] - up[2] * sun[1], up[2] * sun[0] - up[0] * sun[2], up[0] * sun[1] - up[1] * sun[0]};
@@ -2046,6 +2534,44 @@ bool edge_light_enabled() noexcept { return g_edge.load(std::memory_order_relaxe
 
 void set_edge_light(bool enabled) noexcept { g_edge.store(enabled, std::memory_order_relaxed); }
 
+void set_exposure(float gain) noexcept {
+  std::lock_guard lock{g_cameraMutex};
+  g_exposureGain = gain > 0.f ? gain : 0.f;
+}
+
+bool exposure_active() noexcept {
+  std::lock_guard lock{g_cameraMutex};
+  return g_exposureGain > 1.f;
+}
+
+wgpu::TextureView sea_mask_target(const wgpu::Extent3D& sceneSize) {
+  if (!g_seaMask || g_seaMaskSize.width != sceneSize.width || g_seaMaskSize.height != sceneSize.height) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Sea mask",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+        .size = {sceneSize.width, sceneSize.height, 1},
+        .format = kSeaMaskFormat,
+    };
+    g_seaMask = g_device.CreateTexture(&descriptor);
+    g_seaMaskView = g_seaMask.CreateView();
+    const wgpu::TextureDescriptor depthDescriptor{
+        .label = "Sea mask depth",
+        .usage = wgpu::TextureUsage::RenderAttachment,
+        .size = {sceneSize.width, sceneSize.height, 1},
+        .format = kSeaMaskDepthFormat,
+    };
+    g_seaMaskDepth = g_device.CreateTexture(&depthDescriptor);
+    g_seaMaskDepthView = g_seaMaskDepth.CreateView();
+    g_seaMaskSize = sceneSize;
+  }
+  return g_seaMaskView;
+}
+
+wgpu::TextureView sea_mask_depth(const wgpu::Extent3D& sceneSize) {
+  sea_mask_target(sceneSize);
+  return g_seaMaskDepthView;
+}
+
 void set_sun_direction(float x, float y, float z) noexcept {
   const float length = std::sqrt(x * x + y * y + z * z);
   std::lock_guard lock{g_cameraMutex};
@@ -2070,10 +2596,17 @@ void set_world_view(const float invView[12], float tanHalfFovy, float aspect, fl
   g_cameraValid = nearPlane > 0.f && tanHalfFovy > 0.f && aspect > 0.f;
 }
 
+void set_world_view_far(float farPlane) noexcept {
+  std::lock_guard lock{g_cameraMutex};
+  g_cameraFar = farPlane > 0.f ? farPlane : 0.f;
+}
+
 Camera current_camera() noexcept {
   Camera camera;
   std::lock_guard lock{g_cameraMutex};
   camera.view = g_camera;
+  camera.farPlane = g_cameraFar;
+  camera.exposure = g_exposureGain;
   camera.valid = g_cameraValid;
   camera.lights = g_lights;
   camera.lightCount = g_lightCount;
@@ -2097,19 +2630,50 @@ bool any_enabled() noexcept {
          sun_shadows_enabled() || edge_light_enabled() || torch_light_enabled();
 }
 
+// The frame buffer's colours before the effects, for the exposure's
+// highlights: taken after the sun shadows, a shadow on ice was darker than the
+// lit ice beside it, took more of the gain and came out washed out. False
+// where the target isn't the frame buffer (the exposure then has no taper).
+bool copy_exposure_scene(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& size, const wgpu::TextureView& dst) {
+  const auto& frame = webgpu::g_frameBuffer;
+  if (!frame.texture || dst.Get() != frame.view.Get() || frame.texture.GetWidth() != size.width ||
+      frame.texture.GetHeight() != size.height)
+    return false;
+  if (!g_exposureScene || g_exposureScene.GetWidth() != size.width || g_exposureScene.GetHeight() != size.height ||
+      g_exposureScene.GetFormat() != frame.texture.GetFormat()) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Exposure scene",
+        .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding,
+        .size = {size.width, size.height, 1},
+        .format = frame.texture.GetFormat(),
+    };
+    g_exposureScene = g_device.CreateTexture(&descriptor);
+    g_exposureSceneView = g_exposureScene.CreateView();
+  }
+  const wgpu::TexelCopyTextureInfo from{.texture = frame.texture};
+  const wgpu::TexelCopyTextureInfo to{.texture = g_exposureScene};
+  const wgpu::Extent3D extent{size.width, size.height, 1};
+  cmd.CopyTextureToTexture(&from, &to, &extent);
+  return true;
+}
+
 void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
             const wgpu::Extent3D& size, wgpu::TextureFormat format, const wgpu::TextureView& dst,
             const wgpu::TextureView& resolve, uint32_t msaaSamples, const Camera& camera, const SunMap* sunMap) {
+  const bool exposureScene = camera.exposure > 1.f && g_module && msaaSamples == 1 && camera.valid &&
+                             size.width >= 4 && size.height >= 4 && copy_exposure_scene(cmd, size, dst);
   // Ambient occlusion and the far blur need single-sample depth (the depth
   // buffer is multisampled with MSAA).
   if (ambient_occlusion_enabled() && g_module && depthView && msaaSamples == 1 && size.width >= 4 && size.height >= 4) {
     const webgpu::gpu_prof::Zone zone{cmd, "Ambient occlusion"};
     ensure_targets(size, format, msaaSamples);
     draw_depth(cmd, "Ambient occlusion", g_aoPass, g_aoView[1], depthView, g_aoView[0], nullptr, false);
-    draw(cmd, "Ambient occlusion blur (horizontal)", g_blurH, g_aoView[0], g_aoView[1], false);
-    draw(cmd, "Ambient occlusion blur (vertical)", g_blurV, g_aoView[1], g_aoView[0], false);
-    // With DOL_AURORA_AO_DEBUG=1 the occlusion replaces the scene.
-    draw(cmd, "Ambient occlusion apply", g_aoApply, g_aoView[0], dst, true, resolve);
+    draw_depth(cmd, "Ambient occlusion blur (horizontal)", g_aoBlurH, g_aoView[0], depthView, g_aoView[1], nullptr,
+               false);
+    draw_depth(cmd, "Ambient occlusion blur (vertical)", g_aoBlurV, g_aoView[1], depthView, g_aoView[0], nullptr,
+               false);
+    // With DOL_AURORA_AO_DEBUG=1 the occlusion replaces the scene; with 2 it tints it.
+    draw_depth(cmd, "Ambient occlusion apply", g_aoUpscale, g_aoView[0], depthView, dst, resolve, true);
   }
   if (sun_shadows_enabled() && g_module && depthView && msaaSamples == 1) {
     if (camera.valid) {
@@ -2169,6 +2733,18 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
     }
     draw_depth(cmd, "Far blur composite", g_farComposite, g_farView[0], depthView, dst, resolve, true);
   }
+  if (camera.exposure > 1.f && g_module && size.width >= 4 && size.height >= 4) {
+    const webgpu::gpu_prof::Zone zone{cmd, "Exposure"};
+    ensure_targets(size, format, msaaSamples);
+    // The game's brightness rides in the seconds, which the pass doesn't use.
+    std::array<float, 20> view = camera.view;
+    view[16] = camera.exposure;
+    if (g_exposureDepth && depthView && msaaSamples == 1 && camera.valid && g_seaMaskView)
+    {
+      draw_with_view(cmd, "Exposure", g_exposureDepth, view, depthView, dst, resolve, &g_seaMaskView,
+                     exposureScene ? &g_exposureSceneView : &g_seaMaskView); // the mask: no taper where it is 0
+    }
+  }
   if (bloom_enabled())
     encode_bloom(cmd, scene, size, format, dst, resolve, msaaSamples);
 }
@@ -2203,13 +2779,19 @@ void aurora_set_world_view(const float inv_view[12], float tan_half_fovy, float 
   aurora::gfx::post_fx::set_world_view(inv_view, tan_half_fovy, aspect, near_plane, sea_level, seconds);
 }
 
+void aurora_set_world_view_far(float far_plane) { aurora::gfx::post_fx::set_world_view_far(far_plane); }
+
 void aurora_set_sun_shadows(bool enabled) { aurora::gfx::post_fx::set_sun_shadows(enabled); }
 
 void aurora_set_sun_direction(float x, float y, float z) { aurora::gfx::post_fx::set_sun_direction(x, y, z); }
 
+void aurora_set_exposure(float gain) { aurora::gfx::post_fx::set_exposure(gain); }
+
 void aurora_set_sun_shadow_map(bool enabled) { aurora::gfx::post_fx::set_sun_shadow_map(enabled); }
 
 void aurora_set_sun_shadow_quality(int quality) { aurora::gfx::post_fx::set_sun_shadow_quality(quality); }
+
+void aurora_set_sun_shadow_strength(float strength) { aurora::gfx::post_fx::set_sun_shadow_strength(strength); }
 
 void aurora_set_edge_light(bool enabled) { aurora::gfx::post_fx::set_edge_light(enabled); }
 
