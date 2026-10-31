@@ -123,6 +123,9 @@ struct DrawInput {
   float radius = 0.f;
   // A strip through an emitter's particles (trail_strip() in frame_interp.cpp).
   bool trail = false;
+  // A night star (camera_anchored() in frame_interp.cpp): its centre is kept
+  // from the camera's eye, and its in-between frames go with the camera.
+  bool cameraAnchored = false;
 };
 // `positionsWritten`: whether the game wrote an indexed draw's position array
 // this frame or the one before (gxcore_draw's positions_written()). Only such
