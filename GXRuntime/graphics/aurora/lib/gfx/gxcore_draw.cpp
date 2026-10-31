@@ -7,6 +7,7 @@
 #include "frame_interp.hpp"
 #include "pipeline_cache.hpp"
 #include "post_fx.hpp" // the sun shadow map
+#include "soft_effects.hpp"
 #include "thread_cpu.hpp"
 #include "texture.hpp"
 #include "tex_copy_conv.hpp" // EFB-copy format conversion (63/S16)
@@ -727,6 +728,7 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   // The ubershader draws without early-depth emulation (a frame or two).
   const bool emulateEarlyDepth = !uber && needs_early_depth_emulation(key);
   const bool depthCompare = key.depth_test != 0;
+  const bool softTarget = config.softTarget != 0u;
   const wgpu::DepthStencilState depthStencil{
       .format = g_graphicsConfig.depthFormat,
       .depthWriteEnabled =
@@ -775,12 +777,22 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
             dual_source),
     };
   }
+  if (softTarget) {
+    // The soft effects' buffer accumulates coverage (soft_effects.hpp).
+    blendState.alpha = {
+        .operation = wgpu::BlendOperation::Add,
+        .srcFactor = wgpu::BlendFactor::One,
+        .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha,
+    };
+  }
   auto writeMask = wgpu::ColorWriteMask::None;
-  if (key.color_update != 0) {
+  if (softTarget)
+    writeMask = wgpu::ColorWriteMask::All;
+  else if (key.color_update != 0) {
     writeMask |= wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green |
                  wgpu::ColorWriteMask::Blue;
   }
-  if (key.alpha_update != 0)
+  if (key.alpha_update != 0 && !softTarget)
     writeMask |= wgpu::ColorWriteMask::Alpha;
   const bool blending =
       key.blend_enable != 0 || key.blend_subtract != 0;
@@ -838,7 +850,7 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
               .frontFace = wgpu::FrontFace::CW,
               .cullMode = cullMode,
           },
-      .depthStencil = &depthStencil,
+      .depthStencil = softTarget ? nullptr : &depthStencil,
       .multisample =
           wgpu::MultisampleState{
               .count = config.msaaSamples,
@@ -868,6 +880,9 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
 // offset changed or the pipeline did (a tev pipeline's group 2 is another
 // layout than an untextured one's).
 namespace {
+// While a run is drawn into the soft effects' buffer (set_soft_target).
+static bool g_softTarget = false;
+
 struct PassState {
   WGPUBuffer vertexBuffer = nullptr; // bound whole, or a particle's range
   uint64_t vertexOffset = 0;
@@ -883,6 +898,10 @@ PassState g_pass;
 } // namespace
 
 void reset_pass_state() { g_pass = PassState{}; }
+
+static std::atomic_bool g_efficientEffects{false};
+bool efficient_effects() noexcept { return g_efficientEffects.load(std::memory_order_relaxed); }
+void set_soft_target(bool on) noexcept { g_softTarget = on; }
 
 // What a draw, or one of a batch's (submit_draw_plan) draws, is encoded with:
 // its constants and a particle's in-between vertices (empty: the frame's
@@ -970,7 +989,14 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   // recorded with its data (submit_draw_plan), without the depth prepass.
   static const bool uberForced = ubershader_mode() == 2;
   bool uberDraw = false;
-  if (uberForced && data.uberPipeline != 0) {
+  if (g_softTarget) {
+    // A run in the soft effects' buffer: their variant, checked ready before
+    // the run was given the buffer.
+    if (data.softPipeline == 0 || !bind(data.softPipeline)) {
+      note_draw_left_out(data.batchSize);
+      return;
+    }
+  } else if (uberForced && data.uberPipeline != 0) {
     if (!bind(data.uberPipeline)) {
       note_draw_left_out(data.batchSize);
       return;
@@ -2050,6 +2076,7 @@ uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool 
   // are those of this packet's job before (the helper's copy). The first job
   // of a packet carries its own.
   job.constantsCopied = !repeatsLastDraw || h->jobs == 0u;
+  frame_interp::note_job(job.constantsCopied);
   if (job.constantsCopied)
     std::memcpy(&job.constants, &plan.constants, sizeof(plan.constants));
   // pixelRepeats: the pixel constants are those last pushed in this frame
@@ -2777,6 +2804,16 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   }
   const bool ownVertices = plan.draw_tag != 0 || plan.draw_scope_part != 0 ||
                            (interpolating && frame_interp::blends_vertices(plan, positionsWritten));
+  // Efficient soft effects: its variant for the reduced-size buffer, looked up
+  // (and compiled) only while the setting is on.
+  const bool softEffect = efficient_effects() && soft_effects::qualifies_key(plan.pipeline);
+  PipelineRef softPipeline = 0;
+  if (softEffect) {
+    PipelineConfig softConfig = colorConfig;
+    softConfig.msaaSamples = 1;
+    softConfig.softTarget = 1;
+    softPipeline = pipeline_ref(softConfig);
+  }
 
   // The ubershader (gxcore_uber.cpp): a draw whose own pipeline is still
   // compiling is drawn with it, with the same result, rather than left out of
@@ -2963,11 +3000,18 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .sunCasterAlpha = plan.texmap_mask == 0u && textureBindGroup != 0 && sun_caster_alpha(plan.pipeline),
       .seaSurface = sea_mask_draw(plan),
       .depthWrite = plan.pipeline.depth_test != 0u && plan.pipeline.depth_update != 0u,
+      .softEffect = softEffect,
+      .softWritesAlpha = plan.pipeline.alpha_update != 0,
+      .softPipeline = softPipeline,
   });
   return true;
 }
 
 } // namespace aurora::gfx::gxcore
+
+void aurora_set_efficient_effects(bool on) {
+  aurora::gfx::gxcore::g_efficientEffects.store(on, std::memory_order_relaxed);
+}
 
 void aurora_set_forced_anisotropy(unsigned samples) {
   aurora::gfx::gxcore::g_forcedAnisotropy.store(

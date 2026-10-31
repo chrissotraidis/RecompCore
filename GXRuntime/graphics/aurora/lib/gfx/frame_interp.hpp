@@ -47,8 +47,40 @@ int frame_steps() noexcept;
 // Rendering fell behind (the GPU a game frame behind, the game waiting on the
 // render worker, a long wait for a drawable): the next game frames get fewer
 // in-between frames, or none (frame_skipped), until it has been calm a while.
-void note_overload(const char* why) noexcept;
+// `waitMs` is how long the wait that found it took.
+enum class OverloadCause : uint8_t {
+  RenderWorker, // the game waited for a frame slot (the render worker behind)
+  GpuStaging,   // the game waited for a staging buffer (the GPU behind)
+  GpuBehind,    // no in-between staging free: the GPU a game frame behind
+  LateDrawable, // the swapchain held back a drawable
+  Count,
+};
+void note_overload(OverloadCause cause, double waitMs) noexcept;
+const char* overload_reason(OverloadCause cause) noexcept;
 bool frame_skipped() noexcept;
+
+// Counts since the start, for attributing missing in-between frames
+// (DOL_AURORA_FRAME_INTERP_STATS=1 logs them each second as [interp-stats]).
+// Each presenting frame's verdict lands in exactly one of delivered, skipped
+// (pacing gave it none), cut (a state load or a scene cut), rejected (its
+// draws did not match the frame before) or idle (nothing to blend, or off),
+// or, never reaching the verdict, unstaged (note_unstaged).
+struct Stats {
+  uint64_t overloads[static_cast<size_t>(OverloadCause::Count)];
+  double waitMs[static_cast<size_t>(OverloadCause::Count)];
+  uint64_t delivered, skipped, cut, rejected, idle;
+  uint64_t unstaged; // presenting frames with no in-between staging (or it overflowed)
+  uint64_t drops, raises; // pacing budget changes
+  // Per-draw work: jobs queued to the helper, jobs that copied the whole
+  // constants block, blocks pooled for the next frame's matching, and draws
+  // that produced a blended block.
+  uint64_t jobs, copied, pooled, blended;
+};
+Stats stats() noexcept;
+void note_unstaged() noexcept;
+// Recording thread: a job queued for the helper, and whether it carried its own
+// copy of the constants block.
+void note_job(bool copiedConstants) noexcept;
 // A save state was loaded: the next game frame gets no in-between frames, as
 // the frame before it is not the one it follows.
 void request_cut() noexcept;
