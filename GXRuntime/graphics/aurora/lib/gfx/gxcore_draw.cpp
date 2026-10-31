@@ -29,6 +29,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace aurora::gfx::gxcore {
@@ -436,6 +437,113 @@ bool sun_caster_alpha(const gxc::PipelineKey& key) {
   return key.depth_test != 0u && key.depth_update != 0u && key.color_update != 0u && key.blend_enable == 0u &&
          key.blend_subtract == 0u && key.primitive_topology == 0u && key.shader.textured != 0u &&
          !alpha_test_always_passes(key.shader) && !alpha_test_always_fails(key.shader);
+}
+
+// The sea's surface, which the solid caster rule takes (it is opaque and
+// writes depth): strips the game lays around the player in world space, about
+// 51,000 units across, and flat quads out to 450,000 for the distance, flat
+// but for the waves. Nothing else is that wide and that flat. As in Wind Waker
+// HD it takes shadows but casts none: in the map a swell's crest shaded the
+// trough behind it, and a tower standing there lost the foot of its shadow.
+// DOL_AURORA_SUN_SHADOW_MAP_SEA_CASTS=1 puts it back in the map.
+bool sea_shape(const gxc::DrawPlan& plan) {
+  if (plan.constants.projection[3][3] == 1.f || plan.vertices.size() < 3)
+    return false;
+  float lo[3] = {plan.vertices[0], plan.vertices[1], plan.vertices[2]};
+  float hi[3] = {lo[0], lo[1], lo[2]};
+  for (size_t v = gxc::kVertexFloats; v + 2 < plan.vertices.size(); v += gxc::kVertexFloats)
+    for (int c = 0; c < 3; ++c) {
+      lo[c] = std::min(lo[c], plan.vertices[v + c]);
+      hi[c] = std::max(hi[c], plan.vertices[v + c]);
+    }
+  const float wide = std::max(hi[0] - lo[0], hi[2] - lo[2]);
+  return wide >= 20000.f && hi[1] - lo[1] <= 0.02f * wide;
+}
+
+bool sea_surface(const gxc::DrawPlan& plan) {
+  static const bool s_seaCasts = [] {
+    const char* value = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_SEA_CASTS");
+    return value != nullptr && value[0] == '1';
+  }();
+  return !s_seaCasts && sea_shape(plan);
+}
+
+// The sea's textures, by the texture packs' hash of their bytes (Dolphin's
+// tex1_WxH_hash_fmt): Always.arc's b_sea_tex0and2.bti, the open sea's water
+// and white foam lines (d_a_sea.cpp binds it to texmaps 0 and 2; models'
+// B_Sea share it); the island rooms' ring of sea, Txa_umi_kiwa_01 and
+// Txa_umi_kage_01; and their beaches' surf, Txa_nami_01, Txa_nami_02,
+// Txa_nami_ia and Txa_namisoko_ia (the wet band under it); and still and
+// running water, the Private Oasis's pool (Txa_dummy_umi) and the rivers' and
+// falls' edge, flow and spray (Txa_test_kiwa_a, _nagare_j, _sibuki_a: the
+// oasis, Hyrule, the Forest Haven), which came out pale cyan brightened. Kept
+// per guest address, checked again when the bytes there change.
+bool sea_texture(uint32_t address, uint32_t format, uint32_t width, uint32_t height, const void* data,
+                 uint32_t available) {
+  struct SeaTexture {
+    uint32_t format, width, height;
+    uint64_t hash;
+  };
+  static constexpr SeaTexture kSea[] = {
+      {0, 256, 256, 0x35b39510e63e0eddull}, // b_sea_tex0and2, B_Sea (I4)
+      {0, 128, 64, 0xae4b9cf3ade885aeull},  // Txa_umi_kiwa_01
+      {0, 128, 64, 0xa75016cd8d47c1f9ull},  // Txa_umi_kage_01
+      {0, 128, 128, 0xcb795d7577fa2a1eull}, // Txa_nami_01
+      {0, 128, 128, 0x6c7d2c9e6e7e34adull}, // Txa_nami_02
+      {2, 128, 128, 0x8d4cd80958bc6cd6ull}, // Txa_nami_ia (IA4)
+      {2, 128, 128, 0xb485ef6b2fed6f20ull}, // Txa_namisoko_ia
+      {14, 128, 128, 0xb8e02ad23e1b98b9ull}, // Txa_dummy_umi (CMPR)
+      {0, 128, 128, 0xb26b325c4b3c1a25ull}, // Txa_test_kiwa_a
+      {0, 128, 128, 0x6d34c29c2f22bc6dull}, // Txa_test_nagare_j
+      {0, 128, 128, 0xa1248d29670925e0ull}, // Txa_test_sibuki_a
+  };
+  bool shape = false;
+  for (const SeaTexture& sea : kSea)
+    shape = shape || (sea.format == format && sea.width == width && sea.height == height);
+  // I4 and CMPR are 4 bits a texel, IA4 8 (these sizes fill whole tiles).
+  const uint32_t bytes = format == 2u ? width * height : width * height / 2;
+  if (!shape || data == nullptr || available < bytes)
+    return false;
+  struct Seen {
+    uint64_t head = 0;
+    bool sea = false;
+  };
+  static std::unordered_map<uint32_t, Seen> s_seen;
+  const uint64_t head = XXH3_64bits(data, 64);
+  auto [it, fresh] = s_seen.try_emplace(address);
+  if (fresh || it->second.head != head) {
+    const uint64_t hash = XXH64(data, bytes, 0);
+    bool sea = false;
+    for (const SeaTexture& texture : kSea)
+      sea = sea || (texture.format == format && texture.width == width && texture.height == height &&
+                    texture.hash == hash);
+    it->second = Seen{head, sea};
+  }
+  return it->second.sea;
+}
+
+// A sea draw for the sea mask (post_fx.hpp), while the scene is brightened:
+// one that samples the sea's textures, or the sea rooms' own sea, an
+// untextured solid square of the environment's sea colour under d_a_sea's
+// grid (100,000 units across, at the sea's height), seen past the grid's edge.
+bool sea_mask_draw(const gxc::DrawPlan& plan) {
+  if (!post_fx::exposure_active() || plan.constants.projection[3][3] == 1.f)
+    return false;
+  bool sea = false;
+  if (plan.texmap_mask > 1u && (plan.texmap_mask & (plan.texmap_mask - 1u)) != 0u) {
+    for (uint32_t t = 0; t < 8 && !sea; ++t) {
+      const auto& texture = plan.textures[t];
+      sea = (plan.texmap_mask >> t & 1u) != 0u && texture.valid &&
+            sea_texture(texture.address, texture.format, texture.width, texture.height, texture.data,
+                        texture.available);
+    }
+  } else if (plan.has_texture) {
+    sea = sea_texture(plan.tex_address, plan.tex_format, plan.tex_width, plan.tex_height, plan.tex_data,
+                      plan.tex_available);
+  } else {
+    sea = plan.pipeline.depth_update != 0u && plan.pipeline.blend_enable == 0u && sea_shape(plan);
+  }
+  return sea;
 }
 } // namespace
 
@@ -1164,23 +1272,10 @@ void begin_sun_casters(const wgpu::RenderPassEncoder& pass, const float rows[12]
   g_sunCasterState = SunCasterState{};
 }
 
-void render_sun_caster(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
-  const bool alpha = data.sunCasterAlpha && data.textureBindGroup != 0;
-  if (!data.sunCaster && !alpha)
-    return;
-  SunCasterState& state = g_sunCasterState;
-  const int pipeline = (alpha ? 2 : 0) + (data.posMtxIdx ? 1 : 0);
-  if (state.pipeline != pipeline) {
-    pass.SetPipeline(g_sunCasterPipelines[pipeline]);
-    state.pipeline = pipeline;
-  }
-  if (alpha) {
-    const auto& group = find_bind_group(data.textureBindGroup);
-    if (group.Get() != state.group2) {
-      pass.SetBindGroup(2, group);
-      state.group2 = group.Get();
-    }
-  }
+namespace {
+// A draw's parts, as render() draws them: its own vertices and constants, or
+// in an in-between frame the blended ones (the sun map's casters, the sea mask).
+void draw_parts(const DrawData& data, const wgpu::RenderPassEncoder& pass, SunCasterState& state) {
   static std::vector<DrawPart> parts;
   collect_parts(data, parts);
   for (const DrawPart& part : parts) {
@@ -1217,6 +1312,212 @@ void render_sun_caster(const DrawData& data, const wgpu::RenderPassEncoder& pass
     }
     pass.DrawIndexed(part.indexCount, 1, part.firstIndex, baseVertex);
   }
+}
+
+} // namespace
+
+void render_sun_caster(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+  const bool alpha = data.sunCasterAlpha && data.textureBindGroup != 0;
+  if (!data.sunCaster && !alpha)
+    return;
+  SunCasterState& state = g_sunCasterState;
+  const int pipeline = (alpha ? 2 : 0) + (data.posMtxIdx ? 1 : 0);
+  if (state.pipeline != pipeline) {
+    pass.SetPipeline(g_sunCasterPipelines[pipeline]);
+    state.pipeline = pipeline;
+  }
+  if (alpha) {
+    const auto& group = find_bind_group(data.textureBindGroup);
+    if (group.Get() != state.group2) {
+      pass.SetBindGroup(2, group);
+      state.group2 = group.Get();
+    }
+  }
+  draw_parts(data, pass, state);
+}
+
+namespace {
+constexpr const char* kSeaMaskShader = R"""(
+struct VertexShaderConstants {
+    posnormalmatrix: array<vec4f, 6>,
+    projection: array<vec4f, 4>,
+    texmatrices: array<vec4f, 24>,
+    transformmatrices: array<vec4f, 64>,
+};
+@group(1) @binding(0) var<uniform> vsc: VertexShaderConstants;
+struct VertexIn {
+    @location(0) rawpos: vec3f,
+    @location(1) posmtx: u32,
+};
+// As the game's own vertex shader (gxcore_shader.cpp vs_main).
+fn to_clip(p0: vec4f, p1: vec4f, p2: vec4f, raw: vec3f) -> vec4f {
+    let pos4 = vec4f(raw, 1.0);
+    let viewpos = vec4f(dot(p0, pos4), dot(p1, pos4), dot(p2, pos4), 1.0);
+    var clip = vec4f(dot(vsc.projection[0], viewpos), dot(vsc.projection[1], viewpos),
+                     dot(vsc.projection[2], viewpos), dot(vsc.projection[3], viewpos));
+    clip.z = -clip.z;
+    return clip;
+}
+@vertex
+fn vs_current(in: VertexIn) -> @builtin(position) vec4f {
+    return to_clip(vsc.posnormalmatrix[0], vsc.posnormalmatrix[1], vsc.posnormalmatrix[2], in.rawpos);
+}
+@vertex
+fn vs_indexed(in: VertexIn) -> @builtin(position) vec4f {
+    let i = i32(in.posmtx);
+    return to_clip(vsc.transformmatrices[i], vsc.transformmatrices[i + 1], vsc.transformmatrices[i + 2], in.rawpos);
+}
+@fragment
+fn fs_land() -> @location(0) vec4f {
+    return vec4f(0.0);
+}
+@fragment
+fn fs_sea() -> @location(0) vec4f {
+    return vec4f(1.0, 0.0, 0.0, 0.0);
+}
+// What is not the sea and alpha-tested (a wave's crest, leaves): it covers the
+// sea only where its texture is solid, as the sun map's cutout casters do.
+struct VertexInUv {
+    @location(0) rawpos: vec3f,
+    @location(1) posmtx: u32,
+    @location(2) uv0: vec2f,
+};
+struct VertexOutUv {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+@vertex
+fn vs_current_uv(in: VertexInUv) -> VertexOutUv {
+    var out: VertexOutUv;
+    out.pos = to_clip(vsc.posnormalmatrix[0], vsc.posnormalmatrix[1], vsc.posnormalmatrix[2], in.rawpos);
+    out.uv = in.uv0;
+    return out;
+}
+@vertex
+fn vs_indexed_uv(in: VertexInUv) -> VertexOutUv {
+    let i = i32(in.posmtx);
+    var out: VertexOutUv;
+    out.pos = to_clip(vsc.transformmatrices[i], vsc.transformmatrices[i + 1], vsc.transformmatrices[i + 2], in.rawpos);
+    out.uv = in.uv0;
+    return out;
+}
+@group(2) @binding(0) var tex: texture_2d<f32>;
+@group(2) @binding(1) var samp: sampler;
+@fragment
+fn fs_land_alpha(in: VertexOutUv) -> @location(0) vec4f {
+    if (textureSample(tex, samp, in.uv).a < 0.5) {
+        discard;
+    }
+    return vec4f(0.0);
+}
+)""";
+
+wgpu::BindGroupLayout g_seaMaskLayout; // empty: the draws' constants are group 1, as render() has them
+wgpu::BindGroup g_seaMaskGroup;
+// [kind * 2 + indexed]: kind 0 what is not the sea, 1 the sea, 2 a sea draw that writes no depth, 3 what is
+// not the sea with its texture's cutout.
+std::array<wgpu::RenderPipeline, 8> g_seaMaskPipelines;
+SunCasterState g_seaMaskState;
+int g_seaMaskPipeline = -1;
+
+void make_sea_mask_pipelines() {
+  wgpu::ShaderSourceWGSL source{};
+  source.code = kSeaMaskShader;
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &source, .label = "Sea mask"};
+  const auto module = g_device.CreateShaderModule(&moduleDescriptor);
+  const wgpu::BindGroupLayoutDescriptor layoutDescriptor{.label = "Sea mask", .entryCount = 0, .entries = nullptr};
+  g_seaMaskLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
+  const wgpu::BindGroupDescriptor groupDescriptor{.layout = g_seaMaskLayout, .entryCount = 0, .entries = nullptr};
+  g_seaMaskGroup = g_device.CreateBindGroup(&groupDescriptor);
+  const std::array layouts{g_seaMaskLayout, g_uniformBindGroupLayout};
+  const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{
+      .label = "Sea mask", .bindGroupLayoutCount = layouts.size(), .bindGroupLayouts = layouts.data()};
+  const auto pipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
+  const std::array alphaLayouts{g_seaMaskLayout, g_uniformBindGroupLayout, texture_bind_group_layout(1u)};
+  const wgpu::PipelineLayoutDescriptor alphaLayoutDescriptor{
+      .label = "Sea mask (alpha)", .bindGroupLayoutCount = alphaLayouts.size(), .bindGroupLayouts = alphaLayouts.data()};
+  const auto alphaPipelineLayout = g_device.CreatePipelineLayout(&alphaLayoutDescriptor);
+  const std::array attributes{
+      wgpu::VertexAttribute{.format = wgpu::VertexFormat::Float32x3, .offset = gxc::kVertexPosOffset, .shaderLocation = 0},
+      wgpu::VertexAttribute{.format = wgpu::VertexFormat::Uint32, .offset = gxc::kVertexPosMtxOffset, .shaderLocation = 1},
+      wgpu::VertexAttribute{.format = wgpu::VertexFormat::Float32x2, .offset = gxc::kVertexUvOffset, .shaderLocation = 2},
+  };
+  const wgpu::VertexBufferLayout vertexLayout{
+      .arrayStride = gxc::kVertexStrideBytes,
+      .stepMode = wgpu::VertexStepMode::Vertex,
+      .attributeCount = 2,
+      .attributes = attributes.data(),
+  };
+  const wgpu::VertexBufferLayout alphaVertexLayout{
+      .arrayStride = gxc::kVertexStrideBytes,
+      .stepMode = wgpu::VertexStepMode::Vertex,
+      .attributeCount = attributes.size(),
+      .attributes = attributes.data(),
+  };
+  const wgpu::ColorTargetState target{.format = post_fx::kSeaMaskFormat, .writeMask = wgpu::ColorWriteMask::Red};
+  for (int kind = 0; kind < 4; ++kind) {
+    // Reversed Z: nearer is more; level surfaces drawn later win, as with the game's less-or-equal.
+    const wgpu::DepthStencilState depth{
+        .format = post_fx::kSeaMaskDepthFormat,
+        .depthWriteEnabled = kind != 2,
+        .depthCompare = wgpu::CompareFunction::GreaterEqual,
+    };
+    const bool alpha = kind == 3;
+    const wgpu::FragmentState fragment{.module = module,
+                                       .entryPoint = alpha ? "fs_land_alpha" : kind == 0 ? "fs_land" : "fs_sea",
+                                       .targetCount = 1,
+                                       .targets = &target};
+    for (int indexed = 0; indexed < 2; ++indexed) {
+      const wgpu::RenderPipelineDescriptor descriptor{
+          .label = "Sea mask",
+          .layout = alpha ? alphaPipelineLayout : pipelineLayout,
+          .vertex = {.module = module,
+                     .entryPoint = alpha ? (indexed != 0 ? "vs_indexed_uv" : "vs_current_uv")
+                                         : (indexed != 0 ? "vs_indexed" : "vs_current"),
+                     .bufferCount = 1,
+                     .buffers = alpha ? &alphaVertexLayout : &vertexLayout},
+          .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList, .cullMode = wgpu::CullMode::None},
+          .depthStencil = &depth,
+          .multisample = {.count = 1, .mask = UINT32_MAX},
+          .fragment = &fragment,
+      };
+      g_seaMaskPipelines[kind * 2 + indexed] = g_device.CreateRenderPipeline(&descriptor);
+    }
+  }
+}
+
+} // namespace
+
+void begin_sea_mask(const wgpu::RenderPassEncoder& pass) {
+  if (!g_seaMaskPipelines[0])
+    make_sea_mask_pipelines();
+  pass.SetBindGroup(0, g_seaMaskGroup);
+  pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16);
+  g_seaMaskState = SunCasterState{};
+  g_seaMaskPipeline = -1;
+}
+
+void render_sea_mask(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+  // What covers the sea is what the sun map takes as solid: a blended draw
+  // doesn't, and an alpha-tested one only where its texture is solid (a wave's
+  // crest whole covered a box of sea, which was then brightened).
+  const bool cutout = !data.seaSurface && !data.sunCaster && data.sunCasterAlpha && data.textureBindGroup != 0;
+  if (!data.seaSurface && !data.sunCaster && !cutout)
+    return;
+  const int kind = data.seaSurface ? (data.depthWrite ? 1 : 2) : cutout ? 3 : 0;
+  const int pipeline = kind * 2 + (data.posMtxIdx ? 1 : 0);
+  if (g_seaMaskPipeline != pipeline) {
+    pass.SetPipeline(g_seaMaskPipelines[pipeline]);
+    g_seaMaskPipeline = pipeline;
+  }
+  if (cutout) {
+    const auto& group = find_bind_group(data.textureBindGroup);
+    if (group.Get() != g_seaMaskState.group2) {
+      pass.SetBindGroup(2, group);
+      g_seaMaskState.group2 = group.Get();
+    }
+  }
+  draw_parts(data, pass, g_seaMaskState);
 }
 
 void note_frame_presented() {
@@ -1259,6 +1560,9 @@ void shutdown() {
   reset_texture_cache();
   g_sunCasterPipelines = {};
   g_sunCasterLayout = {};
+  g_seaMaskPipelines = {};
+  g_seaMaskGroup = {};
+  g_seaMaskLayout = {};
 }
 
 void set_texture_dirty_epoch_observer(TextureDirtyEpochObserver observer) {
@@ -1971,6 +2275,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // Resolve one texmap's texture to a GPU handle: EFB-copy shadow first, else the
   // guest-identity + content-hash decode cache. Shared by the single-texmap fast
   // path and the multi-texmap path (63/Mfin, e.g. THP YUV Y/U/V on texmap 0/1/2).
+  // A texture that is a copy of the EFB marks a flat draw as the frame laid back
+  // over itself (post_fx goes in before it: common.cpp).
+  bool samplesCopy = false;
   auto resolve_texture_handle =
       [&](uint32_t address, uint32_t tsize, uint32_t format, uint32_t width,
           uint32_t height, const void* data, uint32_t available, bool has_tlut,
@@ -1998,6 +2305,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
            memoryEpoch == efbIt->second.memory_epoch);
       if (memoryUnchanged) {
         ++g_textureCacheStats.hits;
+        samplesCopy = true;
         return efbIt->second.handle;
       }
       g_efbCopyTextures.erase(efbIt);
@@ -2443,14 +2751,26 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         sizeof(plan.pixel_constants));
     pixelRepeats = g_pixelUniformCache.hits != hits;
   }
+  // A lightning strike (dThunder_c) draws, with its bolt, an invisible model
+  // that writes depth only, about 100,000 units out: a strip from the sea to
+  // the clouds. The HD look's effects read the depth, so the far blur and the
+  // cloud shadows took that strip of sky for something solid and drew it as a
+  // grey column. A depth-only draw that far out writes none while they are on.
+  gxc::PipelineKey key = plan.pipeline;
+  if (key.depth_update != 0u && key.color_update == 0u && key.alpha_update == 0u && post_fx::any_enabled() &&
+      plan.constants.projection[3][3] != 1.f) {
+    const auto& m = plan.constants.posnormalmatrix;
+    if (m[0][3] * m[0][3] + m[1][3] * m[1][3] + m[2][3] * m[2][3] > 50000.f * 50000.f)
+      key.depth_update = 0u;
+  }
   const PipelineConfig colorConfig{
       .version = GXCorePipelineConfigVersion,
-      .key = plan.pipeline,
+      .key = key,
       .msaaSamples = get_sample_count(),
   };
   const PipelineRef pipeline = pipeline_ref(colorConfig);
   PipelineRef depthPipeline = 0;
-  if (needs_early_depth_emulation(plan.pipeline)) {
+  if (needs_early_depth_emulation(key)) {
     PipelineConfig depthConfig = colorConfig;
     depthConfig.depthOnly = 1u;
     depthPipeline = pipeline_ref(depthConfig);
@@ -2614,6 +2934,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     return true;
   }
   set_next_draw_flat(plan.constants.projection[3][3] == 1.f);
+  set_next_draw_composite(plan.constants.projection[3][3] == 1.f && samplesCopy);
   push_draw_command(DrawData{
       .pipeline = pipeline,
       .depthPipeline = depthPipeline,
@@ -2631,7 +2952,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .uberPipeline = uberPipeline,
       .uberPixelRange = uberPixelRange,
       .uberTextureBindGroup = uberTextureBindGroup,
-      .sunCaster = sun_caster(plan.pipeline) || clothCaster || blendedCaster,
+      .sunCaster = (sun_caster(plan.pipeline) || clothCaster || blendedCaster) &&
+                   !(sun_caster(plan.pipeline) && post_fx::sun_shadow_map_enabled() && sea_surface(plan)),
       .posMtxIdx = plan.pipeline.shader.has_pos_mtx_idx != 0,
       // DOL_AURORA_SUN_CASTER_LOG=1: why a cloth's or wake's draw (a scope)
       // does or does not cast, once per distinct state (local debug).
@@ -2639,6 +2961,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       // The cutout pipeline binds one texture and sampler at group 2, the
       // single-texmap layout: a multi-texmap material keeps the screen's steps.
       .sunCasterAlpha = plan.texmap_mask == 0u && textureBindGroup != 0 && sun_caster_alpha(plan.pipeline),
+      .seaSurface = sea_mask_draw(plan),
+      .depthWrite = plan.pipeline.depth_test != 0u && plan.pipeline.depth_update != 0u,
   });
   return true;
 }

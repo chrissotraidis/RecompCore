@@ -1336,6 +1336,20 @@ static bool trail_strip(const gxc::DrawPlan& plan) noexcept {
          plan.match_primitive == 0x98 && plan.vertex_count >= kTrailVertices && !screen_space_sprite(plan);
 }
 
+// A night star (dKyr_drawStar): a quad of three vertices, drawn with the view
+// matrix at the camera's eye plus its place on a dome 300 units around it, so
+// the stars go with the camera as it sails. Paired by their centres in the
+// world, a star the camera carried more than a few units found none or its
+// neighbour, and the in-between frames drew the stars jumping with the camera
+// or half way to another star. Nothing else draws a quad of three vertices.
+static bool camera_anchored(const gxc::DrawPlan& plan) noexcept {
+  return plan.match_direct_position && plan.draw_tag == 0 && plan.match_primitive == 0x80 &&
+         plan.vertex_count == 3 && !screen_space_sprite(plan);
+}
+
+// The camera's eye, from a view matrix (its inverse's translation).
+static bool view_eye(const float view[][4], double eye[3]) noexcept;
+
 static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
   if (plan.match_payload == nullptr || plan.match_payload_size == 0)
     return 0;
@@ -1440,6 +1454,15 @@ bool blends_vertices(const gxc::DrawPlan& plan, bool positionsWritten) noexcept 
          (plan.match_direct_position || positionsWritten || plan.match_direct_texcoord_mask != 0);
 }
 
+static bool view_eye(const float view[][4], double eye[3]) noexcept {
+  double back[3][4];
+  if (!affine_inverse(view, back))
+    return false;
+  for (int r = 0; r < 3; ++r)
+    eye[r] = back[r][3];
+  return std::isfinite(eye[0]) && std::isfinite(eye[1]) && std::isfinite(eye[2]);
+}
+
 void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritten) noexcept {
   out.key = draw_key_of(plan);
   out.usedMatrixRows = used_matrix_rows(plan);
@@ -1456,6 +1479,7 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritt
   out.centre = {};
   out.radius = 0.f;
   out.trail = false;
+  out.cameraAnchored = false;
   if (out.key == 0)
     return;
   // Screen sprites and particles the host tagged: an untagged world draw of one
@@ -1525,6 +1549,12 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritt
       }
       out.radius = static_cast<float>(radius / double(decoded));
       out.haveCentre = out.haveCentre && std::isfinite(out.radius);
+      double eye[3];
+      if (out.haveCentre && camera_anchored(plan) && view_eye(plan.constants.posnormalmatrix, eye)) {
+        out.cameraAnchored = true;
+        for (unsigned r = 0; r < 3; ++r)
+          out.centre[r] = static_cast<float>(out.centre[r] - eye[r]);
+      }
       out.trail = out.haveCentre && trail_strip(plan);
       if (out.haveCentre && centred_vertices(plan)) {
         out.positions.resize(decoded * 3u);
@@ -2168,6 +2198,31 @@ const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::
     record.texcoords = static_cast<uint32_t>(frame.texcoords.size());
     record.texcoordMask = input.texcoordMask;
     frame.texcoords.insert(frame.texcoords.end(), input.texcoords.begin(), input.texcoords.end());
+  }
+  if (input.cameraAnchored) {
+    // A star: where it is now, moved as far as each in-between camera's eye
+    // is from this frame's (camera_anchored()).
+    double eyeNow[3];
+    if (result == nullptr || !view_eye(current.posnormalmatrix, eyeNow))
+      return result;
+    const float* now = input.positions.data();
+    bool moves = false;
+    for (int step = 0; step < g_frameSteps; ++step) {
+      double eye[3];
+      if (!view_eye(g_blended[step].posnormalmatrix, eye))
+        return result;
+      g_blendedPositions[step].resize(static_cast<size_t>(count) * 3u);
+      for (uint32_t i = 0; i < count; ++i)
+        for (unsigned r = 0; r < 3; ++r) {
+          const double shift = eye[r] - eyeNow[r];
+          g_blendedPositions[step][i * 3u + r] = static_cast<float>(now[i * 3u + r] + shift);
+          moves = moves || std::fabs(shift) > 1e-3;
+        }
+    }
+    g_haveBlendedPositions = moves;
+    if (moves)
+      ++g_frameCounts.positions;
+    return result;
   }
   const Record* before = g_match.record;
   if (before == nullptr || g_match.block == nullptr || before->positions == kNoSamples ||

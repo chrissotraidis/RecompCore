@@ -378,6 +378,8 @@ const State& get_state();
 // Whether the next draw has an orthographic projection (the HUD, menus), for
 // a draw whose projection is not in the legacy GX state (post_fx).
 void set_next_draw_flat(bool flat) noexcept;
+// Whether the next draw lays a copy of the frame back over it (gxcore_draw).
+void set_next_draw_composite(bool composite) noexcept;
 
 template <typename DrawData>
 void push_draw_command(DrawData data);

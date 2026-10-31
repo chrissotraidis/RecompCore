@@ -72,6 +72,12 @@ struct DrawData {
   // Alpha-tested solid scenery (a roof, an awning, leaves, a fence): drawn
   // into the map with its texture's cutout (sun_caster_alpha()).
   bool sunCasterAlpha = false;
+  // A draw of the sea's texture (the sea's surface): the HD look's brightness
+  // leaves it out, by a mask of where it is on screen (render_sea_mask()).
+  bool seaSurface = false;
+  // It tests and writes depth (the sea mask's own depth: what stands in front
+  // of the sea there covers it).
+  bool depthWrite = false;
 };
 
 // Recording: the pass's last command, when it is a GXCore draw a following
@@ -118,6 +124,14 @@ void reset_pass_state();
 // in an in-between frame, the blended ones render() would use).
 void begin_sun_casters(const wgpu::RenderPassEncoder& pass, const float rows[12]);
 void render_sun_caster(const DrawData& data, const wgpu::RenderPassEncoder& pass);
+// The sea's mask for the HD look's brightness (post_fx.hpp): the frame's
+// solid draws again, with their own cameras, into the mask and a depth of its
+// own: the sea 1, what the sun map takes as solid 0 (an alpha-tested draw
+// with its texture's cutout), so the sea is marked where it is the nearest.
+// A sea draw that writes no depth tests it without writing it.
+// begin_sea_mask() sets up a pass; render_sea_mask() draws one draw.
+void begin_sea_mask(const wgpu::RenderPassEncoder& pass);
+void render_sea_mask(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 
 // Perform one EFB copy-to-texture (63/S16): resolve the current EFB region into
 // a texture keyed by the copy destination address, so a later draw binding that

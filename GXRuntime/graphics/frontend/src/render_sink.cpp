@@ -553,8 +553,10 @@ std::uint32_t build_topology_indices(GxPrimitive primitive,
   };
   switch (primitive) {
   case GxPrimitive::Quads:
-    // Each quad -> two triangles {0,1,2} {2,3,0}. Trailing verts (< 4) ignored,
-    // matching Aurora's v += 4 loop.
+    // Each quad -> two triangles {0,1,2} {2,3,0}. Three vertices left over
+    // draw a triangle, as on the hardware: Wind Waker draws each of its night
+    // stars as a quad of three vertices (dKyr_drawStar), and without it the
+    // sky had none. One or two left over draw nothing.
     for (std::uint16_t v = 0; v + 4u <= vtx_count; v += 4u) {
       const std::uint16_t i0 = static_cast<std::uint16_t>(vtx_start + v);
       const std::uint16_t i1 = static_cast<std::uint16_t>(vtx_start + v + 1);
@@ -566,6 +568,12 @@ std::uint32_t build_topology_indices(GxPrimitive primitive,
       push(i2);
       push(i3);
       push(i0);
+    }
+    if (vtx_count % 4u == 3u) {
+      const std::uint16_t v = static_cast<std::uint16_t>(vtx_start + vtx_count - 3u);
+      push(v);
+      push(static_cast<std::uint16_t>(v + 1));
+      push(static_cast<std::uint16_t>(v + 2));
     }
     break;
   case GxPrimitive::Triangles:

@@ -179,6 +179,10 @@ void aurora_set_ambient_occlusion(bool enabled);
    passed to aurora_set_world_view. Takes effect at the next frame. */
 void aurora_set_sun_shadows(bool enabled);
 void aurora_set_sun_direction(float x, float y, float z);
+/* The scene's brightness, from the game (Wind Waker HD's factor for the hour):
+   what is lit and stands above the sea is multiplied by it, before bloom. 0
+   (or 1) leaves the scene as it is. */
+void aurora_set_exposure(float gain);
 /* Sun shadows from a shadow map: with sun shadows on, the scene's solid draws
    are drawn again from the sun, so what is off screen still casts. Takes
    effect at the next frame. DOL_AURORA_SUN_SHADOW_MAP=1 sets the starting
@@ -188,6 +192,10 @@ void aurora_set_sun_shadow_map(bool enabled);
    DOL_AURORA_SUN_SHADOW_QUALITY, which sets the starting one). The map is made
    again at its size before the next frame, a one-frame hitch. */
 void aurora_set_sun_shadow_quality(int quality);
+/* How dark the sun shadow map's shadows are, 0 to 1 (1, the default, is Wind
+   Waker HD's): the full shadow's colour is blended in by this much, the
+   moon's shadows too. Takes effect at the next frame. */
+void aurora_set_sun_shadow_strength(float strength);
 /* Edge light: a warm rim on the sunlit outline of what is near the camera,
    from the same sun and camera. Takes effect at the next frame. */
 void aurora_set_edge_light(bool enabled);
@@ -207,6 +215,11 @@ void aurora_set_cloud_shadows(bool enabled);
    world's sea; seconds, the game's time. */
 void aurora_set_world_view(const float inv_view[12], float tan_half_fovy, float aspect, float near_plane,
                            float sea_level, float seconds);
+/* The same camera's far distance, for reading distances from the scene's
+   depth exactly (0, the default, takes the far plane as infinitely far: at a
+   tenth of the far distance that read them a tenth too far, and distant
+   surfaces shaded themselves in the sun shadow map). */
+void aurora_set_world_view_far(float far_plane);
 /* A frames-a-second counter at the top of the window (with the game's own
    rate beside it when in-between frames are on). DOL_AURORA_SHOW_FPS=1 sets
    the starting value. */
