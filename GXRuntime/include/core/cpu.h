@@ -116,6 +116,10 @@ bool ppc_guest_alias_remove(u32 linked_start, u32 size);
 void ppc_guest_alias_clear(void);
 bool ppc_guest_alias_resolve(u32 address, u32 size, u8** pointer,
                              u32* journal_offset);
+// Reports whether any registered alias intersects the half-open guest range.
+// This does not apply the 0x40000000 mirror; callers that accept mirrored
+// addresses must query the original and canonical ranges as appropriate.
+bool ppc_guest_alias_range_overlaps(u32 address, u32 size);
 extern bool g_ppc_guest_aliases_overlap_mem1;
 // Moves whenever the alias set is touched; see the definition.
 extern u32 g_ppc_guest_alias_generation;

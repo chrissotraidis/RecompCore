@@ -115,7 +115,6 @@ u32 g_ppc_guest_alias_generation;
 
 static void ppc_guest_alias_set_overlap_mem1(bool overlaps) {
     g_ppc_guest_aliases_overlap_mem1 = overlaps;
-    g_ppc_guest_alias_generation++;
 }
 // Cost census for the alias path (docs/status/REORGANIZATION_2026-09-17.md, W4).
 // get_ram_ptr sends every untagged MEM1 access through ppc_guest_alias_resolve
@@ -183,6 +182,7 @@ GXRUNTIME_EXPORT void ppc_guest_alias_clear(void) {
     g_guest_alias_max_end = 0u;
     g_guest_alias_overlapping = false;
     ppc_guest_alias_set_overlap_mem1(false);
+    g_ppc_guest_alias_generation++;
 }
 
 static bool ppc_guest_alias_add_storage(u32 linked_start, u32 size,
@@ -205,6 +205,7 @@ static bool ppc_guest_alias_add_storage(u32 linked_start, u32 size,
     if (alias->linked_start < GC_MEM1_ADDRESS_END &&
         alias_end > GC_RAM_BASE)
         ppc_guest_alias_set_overlap_mem1(true);
+    g_ppc_guest_alias_generation++;
     if (getenv("BLUEWAKE_TRACE_GUEST_ALIASES") != NULL &&
         alias->linked_start < 0x81516E20u &&
         (u64)alias->linked_start + alias->size > 0x81512AC0u) {
@@ -265,6 +266,7 @@ GXRUNTIME_EXPORT bool ppc_guest_alias_remove(u32 linked_start, u32 size) {
         g_guest_aliases[g_guest_alias_count] = (PPCGuestAlias){0};
         ppc_guest_alias_index_rebuild();
         ppc_guest_alias_recompute_bounds();
+        g_ppc_guest_alias_generation++;
         return true;
     }
     return false;
@@ -321,6 +323,44 @@ GXRUNTIME_EXPORT bool ppc_guest_alias_resolve(u32 address, u32 size,
         if (journal_offset != NULL)
             *journal_offset = address - GC_RAM_BASE;
         return true;
+    }
+    return false;
+}
+
+GXRUNTIME_EXPORT bool ppc_guest_alias_range_overlaps(u32 address, u32 size) {
+    if (size == 0u)
+        return false;
+
+    const u64 range_start = address;
+    const u64 range_end = range_start + size;
+    if (range_end <= g_guest_alias_min_start ||
+        range_start >= g_guest_alias_max_end)
+        return false;
+
+    if (!g_guest_alias_overlapping) {
+        u32 lo = 0u, hi = g_guest_alias_count;
+        while (lo < hi) { // first alias whose start is at or after range_end
+            const u32 mid = lo + (hi - lo) / 2u;
+            if (g_guest_aliases[g_guest_alias_sorted[mid]].linked_start < range_end)
+                lo = mid + 1u;
+            else
+                hi = mid;
+        }
+        if (lo == 0u)
+            return false;
+        const PPCGuestAlias* alias =
+            &g_guest_aliases[g_guest_alias_sorted[lo - 1u]];
+        return (u64)alias->linked_start + alias->size > range_start;
+    }
+
+    // Overlapping aliases preserve registration-order resolution semantics,
+    // so the sorted predecessor alone cannot prove that no earlier, larger
+    // alias intersects the range.
+    for (u32 i = 0u; i < g_guest_alias_count; ++i) {
+        const PPCGuestAlias* alias = &g_guest_aliases[i];
+        if ((u64)alias->linked_start < range_end &&
+            (u64)alias->linked_start + alias->size > range_start)
+            return true;
     }
     return false;
 }
