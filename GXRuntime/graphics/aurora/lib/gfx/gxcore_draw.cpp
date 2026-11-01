@@ -582,11 +582,8 @@ bool effect_draw(const gxc::DrawPlan& plan) {
 }
 } // namespace
 
-// Toon-shaded (a texgen from a lit colour, GX_TG_SRTG: Wind Waker's characters' ramp, Link's hair included,
-// which is rigid on his head) or skinned: a character for the sea mask.
-static bool character_draw(const gxc::PipelineKey& key) {
-  if (key.shader.has_pos_mtx_idx != 0u)
-    return true;
+// Toon-shaded: a texgen from a lit colour (GX_TG_SRTG: Wind Waker's characters' ramp, Link's hair included).
+static bool toon_draw(const gxc::PipelineKey& key) {
   for (uint32_t i = 0; i < key.shader.num_tex_gens && i < gxc::kMaxTexGens; ++i) {
     const auto& tg = key.shader.tex_gens[i];
     if (tg.enabled != 0u && (tg.texgentype == static_cast<uint8_t>(gxc::TexGenType::Color0) ||
@@ -595,6 +592,10 @@ static bool character_draw(const gxc::PipelineKey& key) {
   }
   return false;
 }
+
+// Toon-shaded (toon_draw(): Link's hair included, which is rigid on his head) or skinned: a character for the sea
+// mask.
+static bool character_draw(const gxc::PipelineKey& key) { return key.shader.has_pos_mtx_idx != 0u || toon_draw(key); }
 
 // DOL_AURORA_TERRAIN_NORMAL_LOG=1 (local debug): whether the scenery the sun shadows' facing term shades
 // carries vertex normals and lights with them, a line per distinct vertex format, lighting and texture.
@@ -1269,7 +1270,9 @@ fn fs_alpha(in: VertexOutUv) {
 )""";
 constexpr uint64_t kSunCasterUniformSize = 12 * sizeof(float);
 wgpu::BindGroupLayout g_sunCasterLayout;
-std::array<wgpu::RenderPipeline, 4> g_sunCasterPipelines; // current, indexed, then the same with the alpha cutout
+// [character * 4 + alpha * 2 + indexed]: current, indexed, then the same with the alpha cutout; then the same for
+// characters (BlueWake's own depth bias, see make_sun_caster_pipelines()).
+std::array<wgpu::RenderPipeline, 8> g_sunCasterPipelines;
 struct SunCasterState {
   int pipeline = -1;
   WGPUBindGroup group1 = nullptr;
@@ -1323,8 +1326,12 @@ void make_sun_caster_pipelines() {
   // surface steep to the sun from shadowing itself (post_fx adds a constant one);
   // at 2 texels it lifted the shadow off a thin caster's base, Link's shoes.
   // DOL_AURORA_SUN_SHADOW_MAP_CASTER_BIAS=constant,slope (local test; 0,1 by default): the casters' depth
-  // biased as they are drawn, as Wind Waker HD draws its map (constant 3, slope 80), for HD's own bias
-  // (post_fx DOL_AURORA_SUN_SHADOW_MAP_HD_BIAS).
+  // biased as they are drawn, as Wind Waker HD draws its map (constant 80, slope 3, back faces culled: read from a
+  // RenderDoc capture of Cemu; its map is 16-bit, so its constant is about 1 world unit in the first cascade), for
+  // HD's own bias (post_fx DOL_AURORA_SUN_SHADOW_MAP_HD_BIAS).
+  // Characters keep BlueWake's own (0, 1): with the two swapped (slope 80), Link's shadow came off his feet and his
+  // arms thinned, and an island's cliff left a lit band on the water at its foot (Oct 31, Outset's bridge at 10:00).
+  // DOL_AURORA_SUN_SHADOW_MAP_CASTER_BIAS_CHARACTERS=1 gives them HD's too (local test).
   int32_t casterBias = 0;
   float casterSlope = 1.f;
   if (const char* bias = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_CASTER_BIAS")) {
@@ -1332,12 +1339,22 @@ void make_sun_caster_pipelines() {
     if (const char* comma = std::strchr(bias, ','))
       casterSlope = static_cast<float>(std::atof(comma + 1));
   }
+  const char* characterBias = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_CASTER_BIAS_CHARACTERS");
+  const bool characterHdBias = characterBias != nullptr && characterBias[0] == '1';
   const wgpu::DepthStencilState depthStencil{
       .format = post_fx::kSunMapFormat,
       .depthWriteEnabled = true,
       .depthCompare = wgpu::CompareFunction::Less,
       .depthBias = casterBias,
       .depthBiasSlopeScale = casterSlope,
+      .depthBiasClamp = 0.f,
+  };
+  const wgpu::DepthStencilState characterDepthStencil{
+      .format = post_fx::kSunMapFormat,
+      .depthWriteEnabled = true,
+      .depthCompare = wgpu::CompareFunction::Less,
+      .depthBias = characterHdBias ? casterBias : 0,
+      .depthBiasSlopeScale = characterHdBias ? casterSlope : 1.f,
       .depthBiasClamp = 0.f,
   };
   const wgpu::FragmentState alphaFragment{.module = module, .entryPoint = "fs_alpha", .targetCount = 0};
@@ -1348,6 +1365,7 @@ void make_sun_caster_pipelines() {
   auto characterCull = wgpu::CullMode::None;
   if (const char* cull = std::getenv("DOL_AURORA_SUN_SHADOW_CHARACTER_CULL"))
     characterCull = cull[0] == 'f' ? wgpu::CullMode::Front : cull[0] == 'b' ? wgpu::CullMode::Back : wgpu::CullMode::None;
+  for (int character = 0; character < 2; ++character) {
   for (int alpha = 0; alpha < 2; ++alpha) {
     for (int indexed = 0; indexed < 2; ++indexed) {
       const wgpu::RenderPipelineDescriptor descriptor{
@@ -1362,12 +1380,13 @@ void make_sun_caster_pipelines() {
                      .buffers = alpha != 0 ? &alphaVertexLayout : &vertexLayout},
           .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList,
                         .cullMode = indexed != 0 ? characterCull : wgpu::CullMode::None},
-          .depthStencil = &depthStencil,
+          .depthStencil = character != 0 ? &characterDepthStencil : &depthStencil,
           .multisample = {.count = 1, .mask = UINT32_MAX},
           .fragment = alpha != 0 ? &alphaFragment : nullptr,
       };
-      g_sunCasterPipelines[alpha * 2 + indexed] = g_device.CreateRenderPipeline(&descriptor);
+      g_sunCasterPipelines[character * 4 + alpha * 2 + indexed] = g_device.CreateRenderPipeline(&descriptor);
     }
+  }
   }
 }
 } // namespace
@@ -1441,7 +1460,7 @@ void render_sun_caster(const DrawData& data, const wgpu::RenderPassEncoder& pass
   if (!data.sunCaster && !alpha)
     return;
   SunCasterState& state = g_sunCasterState;
-  const int pipeline = (alpha ? 2 : 0) + (data.posMtxIdx ? 1 : 0);
+  const int pipeline = (data.character ? 4 : 0) + (alpha ? 2 : 0) + (data.posMtxIdx ? 1 : 0);
   if (state.pipeline != pipeline) {
     pass.SetPipeline(g_sunCasterPipelines[pipeline]);
     state.pipeline = pipeline;
@@ -1465,6 +1484,12 @@ struct VertexShaderConstants {
     transformmatrices: array<vec4f, 64>,
 };
 @group(1) @binding(0) var<uniform> vsc: VertexShaderConstants;
+// Wind Waker HD's bloom mask (post_fx::bloom_mask_wanted()): blue 0.5 where what is drawn may glow (HD's
+// offset 0), 0 elsewhere (-1); the pass clears it to 0.5, so what nothing covers (the sky) may glow.
+override bloom_b: f32 = 0.0;
+// A character's green: 1 toon-shaded (Link, the islanders: Wind Waker HD's rim light takes those), 0.6 skinned
+// only (a palm's swaying leaves); both are characters to the sun shadows.
+override actor_g: f32 = 1.0;
 struct VertexIn {
     @location(0) rawpos: vec3f,
     @location(1) posmtx: u32,
@@ -1489,7 +1514,7 @@ fn vs_indexed(in: VertexIn) -> @builtin(position) vec4f {
 }
 @fragment
 fn fs_land() -> @location(0) vec4f {
-    return vec4f(0.0);
+    return vec4f(0.0, 0.0, bloom_b, 0.0);
 }
 @fragment
 fn fs_sea() -> @location(0) vec4f {
@@ -1498,7 +1523,7 @@ fn fs_sea() -> @location(0) vec4f {
 // A character (a solid skinned draw), for the sun shadows' facing term.
 @fragment
 fn fs_actor() -> @location(0) vec4f {
-    return vec4f(0.0, 1.0, 0.0, 0.0);
+    return vec4f(0.0, actor_g, 0.0, 0.0);
 }
 // What is not the sea and alpha-tested (a wave's crest, leaves): it covers the
 // sea only where its texture is solid, as the sun map's cutout casters do.
@@ -1533,7 +1558,7 @@ fn fs_land_alpha(in: VertexOutUv) -> @location(0) vec4f {
     if (textureSample(tex, samp, in.uv).a < 0.5) {
         discard;
     }
-    return vec4f(0.0);
+    return vec4f(0.0, 0.0, bloom_b, 0.0);
 }
 // A character's alpha-tested part (Link's hair), where its texture is solid.
 @fragment
@@ -1541,7 +1566,7 @@ fn fs_actor_alpha(in: VertexOutUv) -> @location(0) vec4f {
     if (textureSample(tex, samp, in.uv).a < 0.5) {
         discard;
     }
-    return vec4f(0.0, 1.0, 0.0, 0.0);
+    return vec4f(0.0, actor_g, 0.0, 0.0);
 }
 
 // With the scenery's smooth normals (the sun shadows' facing term): the same, and a second target, the
@@ -1555,7 +1580,7 @@ fn mask_only(mask: vec4f) -> MaskOut {
 }
 @fragment
 fn fs_land_n() -> MaskOut {
-    return mask_only(vec4f(0.0));
+    return mask_only(vec4f(0.0, 0.0, bloom_b, 0.0));
 }
 @fragment
 fn fs_sea_n() -> MaskOut {
@@ -1563,21 +1588,21 @@ fn fs_sea_n() -> MaskOut {
 }
 @fragment
 fn fs_actor_n() -> MaskOut {
-    return mask_only(vec4f(0.0, 1.0, 0.0, 0.0));
+    return mask_only(vec4f(0.0, actor_g, 0.0, 0.0));
 }
 @fragment
 fn fs_land_alpha_n(in: VertexOutUv) -> MaskOut {
     if (textureSample(tex, samp, in.uv).a < 0.5) {
         discard;
     }
-    return mask_only(vec4f(0.0));
+    return mask_only(vec4f(0.0, 0.0, bloom_b, 0.0));
 }
 @fragment
 fn fs_actor_alpha_n(in: VertexOutUv) -> MaskOut {
     if (textureSample(tex, samp, in.uv).a < 0.5) {
         discard;
     }
-    return mask_only(vec4f(0.0, 1.0, 0.0, 0.0));
+    return mask_only(vec4f(0.0, actor_g, 0.0, 0.0));
 }
 // Scenery with smooth normals in its vertices' normal slot (made on the CPU, submit_draw_plan()): the normal
 // turned into view space by the position matrix (the scenery's is a rotation, scale and move), blended across
@@ -1609,9 +1634,9 @@ fn vs_indexed_n(in: VertexInN) -> VertexOutN {
     let i = i32(in.posmtx);
     return smooth_out(vsc.transformmatrices[i], vsc.transformmatrices[i + 1], vsc.transformmatrices[i + 2], in);
 }
-@fragment
-fn fs_land_smooth_n(in: VertexOutN) -> MaskOut {
-    // Turned to the side the camera sees, by the triangle's own facing (a model's winding isn't known here).
+// The normal turned to the side the camera sees, by the triangle's own facing (a model's winding isn't known
+// here); alpha 0 where the draw gives none.
+fn seen_normal(in: VertexOutN) -> vec4f {
     var face = cross(dpdx(in.viewpos), dpdy(in.viewpos));
     if (dot(face, -in.viewpos) < 0.0) {
         face = -face;
@@ -1619,33 +1644,49 @@ fn fs_land_smooth_n(in: VertexOutN) -> MaskOut {
     var n = in.normal;
     let len = length(n);
     if (len < 1e-6) {
-        return mask_only(vec4f(0.0));
+        return vec4f(0.0);
     }
     n = n / len;
     if (dot(n, face) < 0.0) {
         n = -n;
     }
-    return MaskOut(vec4f(0.0), vec4f(n * 0.5 + 0.5, 1.0));
+    return vec4f(n * 0.5 + 0.5, 1.0);
+}
+@fragment
+fn fs_land_smooth_n(in: VertexOutN) -> MaskOut {
+    return MaskOut(vec4f(0.0, 0.0, bloom_b, 0.0), seen_normal(in));
+}
+// A character with its own normals (Wind Waker HD's rim light): green in the mask, its normal beside it. Its
+// position matrix turns the normal (a skinned part's is a rotation, as the scenery's is).
+@fragment
+fn fs_actor_smooth_n(in: VertexOutN) -> MaskOut {
+    return MaskOut(vec4f(0.0, actor_g, 0.0, 0.0), seen_normal(in));
 }
 )""";
 
 wgpu::BindGroupLayout g_seaMaskLayout; // empty: the draws' constants are group 1, as render() has them
 wgpu::BindGroup g_seaMaskGroup;
-// [normals * 14 + kind * 2 + indexed]: kind 0 what is not the sea, 1 the sea, 2 a sea draw that writes no
-// depth, 3 what is not the sea with its texture's cutout, 4 a character (skinned: green in the mask), 5 a
-// character's part with its texture's cutout, 6 scenery with smooth normals (as 0 without the normals'
-// target); normals 1: the pass has the smooth normals' second target.
-constexpr int kSeaMaskKinds = 7;
-std::array<wgpu::RenderPipeline, 2 * kSeaMaskKinds * 2> g_seaMaskPipelines;
+// Made when first used (sea_mask_pipeline()), [((normals * 2 + bloom) * kinds + kind) * 2 + indexed]: kind 0 what
+// is not the sea, 1 the sea, 2 a sea draw that writes no depth, 3 what is not the sea with its texture's cutout, 4 a
+// character (skinned: green in the mask), 5 a character's part with its texture's cutout, 6 scenery with smooth
+// normals (as 0 without the normals' target), 7 what is solid but writes no depth (the sky, for HD's bloom mask),
+// 8 a character with its own normals (as 4 without the normals' target); normals 1: the pass has the normals'
+// second target; variant 1: blue 0.5 (HD's bloom mask: it may glow), or for a character green 0.6 (skinned, not
+// toon-shaded).
+constexpr int kSeaMaskKinds = 9;
+std::array<wgpu::RenderPipeline, 2 * 2 * kSeaMaskKinds * 2> g_seaMaskPipelines;
+wgpu::ShaderModule g_seaMaskModule;
+wgpu::PipelineLayout g_seaMaskPipelineLayout;
+wgpu::PipelineLayout g_seaMaskAlphaPipelineLayout;
 SunCasterState g_seaMaskState;
 int g_seaMaskPipeline = -1;
 bool g_seaMaskNormals = false;
 
-void make_sea_mask_pipelines() {
+void make_sea_mask_layouts() {
   wgpu::ShaderSourceWGSL source{};
   source.code = kSeaMaskShader;
   const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &source, .label = "Sea mask"};
-  const auto module = g_device.CreateShaderModule(&moduleDescriptor);
+  g_seaMaskModule = g_device.CreateShaderModule(&moduleDescriptor);
   const wgpu::BindGroupLayoutDescriptor layoutDescriptor{.label = "Sea mask", .entryCount = 0, .entries = nullptr};
   g_seaMaskLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
   const wgpu::BindGroupDescriptor groupDescriptor{.layout = g_seaMaskLayout, .entryCount = 0, .entries = nullptr};
@@ -1653,11 +1694,19 @@ void make_sea_mask_pipelines() {
   const std::array layouts{g_seaMaskLayout, g_uniformBindGroupLayout};
   const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{
       .label = "Sea mask", .bindGroupLayoutCount = layouts.size(), .bindGroupLayouts = layouts.data()};
-  const auto pipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
+  g_seaMaskPipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
   const std::array alphaLayouts{g_seaMaskLayout, g_uniformBindGroupLayout, texture_bind_group_layout(1u)};
   const wgpu::PipelineLayoutDescriptor alphaLayoutDescriptor{
       .label = "Sea mask (alpha)", .bindGroupLayoutCount = alphaLayouts.size(), .bindGroupLayouts = alphaLayouts.data()};
-  const auto alphaPipelineLayout = g_device.CreatePipelineLayout(&alphaLayoutDescriptor);
+  g_seaMaskAlphaPipelineLayout = g_device.CreatePipelineLayout(&alphaLayoutDescriptor);
+}
+
+const wgpu::RenderPipeline& sea_mask_pipeline(int normals, int bloom, int kind, int indexed) {
+  auto& pipeline = g_seaMaskPipelines[((normals * 2 + bloom) * kSeaMaskKinds + kind) * 2 + indexed];
+  if (pipeline)
+    return pipeline;
+  if (!g_seaMaskModule)
+    make_sea_mask_layouts();
   const std::array attributes{
       wgpu::VertexAttribute{.format = wgpu::VertexFormat::Float32x3, .offset = gxc::kVertexPosOffset, .shaderLocation = 0},
       wgpu::VertexAttribute{.format = wgpu::VertexFormat::Uint32, .offset = gxc::kVertexPosMtxOffset, .shaderLocation = 1},
@@ -1688,56 +1737,56 @@ void make_sea_mask_pipelines() {
   };
   const std::array targets{
       wgpu::ColorTargetState{.format = post_fx::kSeaMaskFormat,
-                             .writeMask = wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green},
+                             .writeMask = wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green |
+                                          wgpu::ColorWriteMask::Blue},
       wgpu::ColorTargetState{.format = post_fx::kSunNormalFormat},
   };
-  for (int normals = 0; normals < 2; ++normals) {
-    for (int kind = 0; kind < kSeaMaskKinds; ++kind) {
-      // Reversed Z: nearer is more; level surfaces drawn later win, as with the game's less-or-equal.
-      const wgpu::DepthStencilState depth{
-          .format = post_fx::kSeaMaskDepthFormat,
-          .depthWriteEnabled = kind != 2,
-          .depthCompare = wgpu::CompareFunction::GreaterEqual,
-      };
-      const bool alpha = kind == 3 || kind == 5;
-      const bool smooth = kind == 6 && normals != 0;
-      const char* entry = kind == 5             ? "fs_actor_alpha"
-                          : alpha               ? "fs_land_alpha"
-                          : kind == 0 || kind == 6 ? "fs_land"
-                          : kind == 4           ? "fs_actor"
-                                                : "fs_sea";
-      std::string entryN = smooth ? "fs_land_smooth_n" : std::string(entry) + "_n";
-      const wgpu::FragmentState fragment{.module = module,
-                                         .entryPoint = normals != 0 ? entryN.c_str() : entry,
-                                         .targetCount = normals != 0 ? 2u : 1u,
-                                         .targets = targets.data()};
-      for (int indexed = 0; indexed < 2; ++indexed) {
-        const wgpu::RenderPipelineDescriptor descriptor{
-            .label = "Sea mask",
-            .layout = alpha ? alphaPipelineLayout : pipelineLayout,
-            .vertex = {.module = module,
-                       .entryPoint = smooth  ? (indexed != 0 ? "vs_indexed_n" : "vs_current_n")
-                                     : alpha ? (indexed != 0 ? "vs_indexed_uv" : "vs_current_uv")
-                                             : (indexed != 0 ? "vs_indexed" : "vs_current"),
-                       .bufferCount = 1,
-                       .buffers = smooth ? &normalVertexLayout : alpha ? &alphaVertexLayout : &vertexLayout},
-            .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList, .cullMode = wgpu::CullMode::None},
-            .depthStencil = &depth,
-            .multisample = {.count = 1, .mask = UINT32_MAX},
-            .fragment = &fragment,
-        };
-        g_seaMaskPipelines[normals * kSeaMaskKinds * 2 + kind * 2 + indexed] =
-            g_device.CreateRenderPipeline(&descriptor);
-      }
-    }
-  }
+  // Reversed Z: nearer is more; level surfaces drawn later win, as with the game's less-or-equal.
+  const wgpu::DepthStencilState depth{
+      .format = post_fx::kSeaMaskDepthFormat,
+      .depthWriteEnabled = kind != 2 && kind != 7,
+      .depthCompare = wgpu::CompareFunction::GreaterEqual,
+  };
+  const bool alpha = kind == 3 || kind == 5;
+  const bool smooth = (kind == 6 || kind == 8) && normals != 0;
+  const char* entry = kind == 5                             ? "fs_actor_alpha"
+                      : alpha                               ? "fs_land_alpha"
+                      : kind == 0 || kind == 6 || kind == 7 ? "fs_land"
+                      : kind == 4 || kind == 8              ? "fs_actor"
+                                                            : "fs_sea";
+  const std::string entryN =
+      smooth ? (kind == 8 ? "fs_actor_smooth_n" : "fs_land_smooth_n") : std::string(entry) + "_n";
+  const std::array constants{wgpu::ConstantEntry{.key = "bloom_b", .value = bloom != 0 ? 0.5 : 0.0},
+                             wgpu::ConstantEntry{.key = "actor_g", .value = bloom != 0 ? 0.6 : 1.0}};
+  const wgpu::FragmentState fragment{.module = g_seaMaskModule,
+                                     .entryPoint = normals != 0 ? entryN.c_str() : entry,
+                                     .constantCount = constants.size(),
+                                     .constants = constants.data(),
+                                     .targetCount = normals != 0 ? 2u : 1u,
+                                     .targets = targets.data()};
+  const wgpu::RenderPipelineDescriptor descriptor{
+      .label = "Sea mask",
+      .layout = alpha ? g_seaMaskAlphaPipelineLayout : g_seaMaskPipelineLayout,
+      .vertex = {.module = g_seaMaskModule,
+                 .entryPoint = smooth  ? (indexed != 0 ? "vs_indexed_n" : "vs_current_n")
+                               : alpha ? (indexed != 0 ? "vs_indexed_uv" : "vs_current_uv")
+                                       : (indexed != 0 ? "vs_indexed" : "vs_current"),
+                 .bufferCount = 1,
+                 .buffers = smooth ? &normalVertexLayout : alpha ? &alphaVertexLayout : &vertexLayout},
+      .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList, .cullMode = wgpu::CullMode::None},
+      .depthStencil = &depth,
+      .multisample = {.count = 1, .mask = UINT32_MAX},
+      .fragment = &fragment,
+  };
+  pipeline = g_device.CreateRenderPipeline(&descriptor);
+  return pipeline;
 }
 
 } // namespace
 
 void begin_sea_mask(const wgpu::RenderPassEncoder& pass, bool normals) {
-  if (!g_seaMaskPipelines[0])
-    make_sea_mask_pipelines();
+  if (!g_seaMaskModule)
+    make_sea_mask_layouts();
   pass.SetBindGroup(0, g_seaMaskGroup);
   pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16);
   g_seaMaskState = SunCasterState{};
@@ -1753,16 +1802,25 @@ void render_sea_mask(const DrawData& data, const wgpu::RenderPassEncoder& pass) 
   // A skinned draw that writes depth is a character (Link, the islanders), whether or not it casts in the sun
   // map (Link's own draws don't all): the sun shadows' facing term leaves it out.
   const bool character = !data.seaSurface && data.character && data.depthWrite;
-  if (!data.seaSurface && !data.sunCaster && !cutout && !character)
+  // With Wind Waker HD's bloom mask, what is solid but writes no depth (the sky's layers) is drawn too. The pass
+  // clears the mask's blue to 0.5 (may glow); what writes no depth keeps it and every other draw here covers it with
+  // 0, so the sky glows and nothing else does, as Cemu showed at Outset. (Whether a draw is lit says nothing here:
+  // the GameCube lights its sky's layers and draws its islands' terrain unlit, its light baked in the vertices.)
+  const bool bloomMask = post_fx::bloom_mask_wanted();
+  const bool cover = bloomMask && !data.seaSurface && data.maskCover;
+  if (!data.seaSurface && !data.sunCaster && !cutout && !character && !cover)
     return;
   const int kind = data.seaSurface ? (data.depthWrite ? 1 : 2)
-                   : character     ? (cutout ? 5 : 4)
+                   : character     ? (cutout ? 5 : data.hasNormal && g_seaMaskNormals ? 8 : 4)
                    : cutout        ? 3
+                   : cover         ? 7
                    : data.smoothNormal && g_seaMaskNormals ? 6
                                                            : 0;
-  const int pipeline = (g_seaMaskNormals ? kSeaMaskKinds * 2 : 0) + kind * 2 + (data.posMtxIdx ? 1 : 0);
+  const int bloom = character ? (data.toon ? 0 : 1) : kind == 7 ? 1 : 0;
+  const int indexed = data.posMtxIdx ? 1 : 0;
+  const int pipeline = (((g_seaMaskNormals ? 2 : 0) + bloom) * kSeaMaskKinds + kind) * 2 + indexed;
   if (g_seaMaskPipeline != pipeline) {
-    pass.SetPipeline(g_seaMaskPipelines[pipeline]);
+    pass.SetPipeline(sea_mask_pipeline(g_seaMaskNormals ? 1 : 0, bloom, kind, indexed));
     g_seaMaskPipeline = pipeline;
   }
   if (cutout) {
@@ -1816,6 +1874,9 @@ void shutdown() {
   g_sunCasterPipelines = {};
   g_sunCasterLayout = {};
   g_seaMaskPipelines = {};
+  g_seaMaskPipelineLayout = {};
+  g_seaMaskAlphaPipelineLayout = {};
+  g_seaMaskModule = {};
   g_seaMaskGroup = {};
   g_seaMaskLayout = {};
 }
@@ -3436,6 +3497,11 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .effect = effect_draw(plan),
       .character = character_draw(plan.pipeline),
       .smoothNormal = smoothNormal,
+      .maskCover = plan.pipeline.depth_update == 0u && plan.pipeline.color_update != 0u &&
+                   plan.pipeline.blend_enable == 0u && plan.pipeline.blend_subtract == 0u &&
+                   plan.pipeline.primitive_topology == 0u,
+      .hasNormal = plan.pipeline.shader.has_vertex_normal != 0u && plan.pipeline.shader.raw_tex_hi_in_nbt == 0u,
+      .toon = toon_draw(plan.pipeline),
   });
   return true;
 }

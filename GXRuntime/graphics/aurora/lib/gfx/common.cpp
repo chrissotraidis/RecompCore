@@ -2261,21 +2261,24 @@ static void encode_sea_mask(const wgpu::CommandEncoder& cmd, const RenderPass& p
       continue;
     seaDraws += command.data.draw.gxcore.seaSurface;
     // A character's draws (skinned, writing depth) mark the mask too (render_sea_mask), casters or not.
+    // With Wind Waker HD's bloom mask, what is solid but writes no depth (the sky) too.
     solidDraws += command.data.draw.gxcore.sunCaster || command.data.draw.gxcore.sunCasterAlpha ||
-                  (command.data.draw.gxcore.character && command.data.draw.gxcore.depthWrite);
+                  (command.data.draw.gxcore.character && command.data.draw.gxcore.depthWrite) ||
+                  (command.data.draw.gxcore.maskCover && post_fx::bloom_mask_wanted());
   }
   if (seaDraws == 0 && solidDraws == 0 && !clear)
     return;
   clearedFrame = frameKey;
   const webgpu::gpu_prof::Zone zone{cmd, "Sea mask"};
   // With the sun shadows' facing term, the scenery's smooth normals beside the mask (post_fx::sun_normal_target()).
-  const bool normals = post_fx::sun_normals_wanted();
+  const bool normals = post_fx::mask_normals_wanted();
   const std::array attachments{
       wgpu::RenderPassColorAttachment{
           .view = post_fx::sea_mask_target(passInfo.targetSize),
           .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
           .storeOp = wgpu::StoreOp::Store,
-          .clearValue = {0.0, 0.0, 0.0, 0.0},
+          // Blue 0.5: Wind Waker HD's bloom may start where no draw covers it (the sky; render_sea_mask()).
+          .clearValue = {0.0, 0.0, 0.5, 0.0},
       },
       wgpu::RenderPassColorAttachment{
           .view = normals ? post_fx::sun_normal_target(passInfo.targetSize) : nullptr,
