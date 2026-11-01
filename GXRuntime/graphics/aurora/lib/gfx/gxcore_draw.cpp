@@ -1322,12 +1322,22 @@ void make_sun_caster_pipelines() {
   // Nearer the sun is less (the map is cleared to 1). The slope bias keeps a
   // surface steep to the sun from shadowing itself (post_fx adds a constant one);
   // at 2 texels it lifted the shadow off a thin caster's base, Link's shoes.
+  // DOL_AURORA_SUN_SHADOW_MAP_CASTER_BIAS=constant,slope (local test; 0,1 by default): the casters' depth
+  // biased as they are drawn, as Wind Waker HD draws its map (constant 3, slope 80), for HD's own bias
+  // (post_fx DOL_AURORA_SUN_SHADOW_MAP_HD_BIAS).
+  int32_t casterBias = 0;
+  float casterSlope = 1.f;
+  if (const char* bias = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_CASTER_BIAS")) {
+    casterBias = std::atoi(bias);
+    if (const char* comma = std::strchr(bias, ','))
+      casterSlope = static_cast<float>(std::atof(comma + 1));
+  }
   const wgpu::DepthStencilState depthStencil{
       .format = post_fx::kSunMapFormat,
       .depthWriteEnabled = true,
       .depthCompare = wgpu::CompareFunction::Less,
-      .depthBias = 0,
-      .depthBiasSlopeScale = 1.f,
+      .depthBias = casterBias,
+      .depthBiasSlopeScale = casterSlope,
       .depthBiasClamp = 0.f,
   };
   const wgpu::FragmentState alphaFragment{.module = module, .entryPoint = "fs_alpha", .targetCount = 0};
@@ -2468,20 +2478,18 @@ static float smooth_crease_cos() {
   return value;
 }
 
-// Wind Waker HD's own normals for the scenery, by the GameCube's exact vertex position (local test:
-// DOL_AURORA_SUN_SHADOW_FACING_HD_NORMALS=<table>, b'BWHN', u32 version 1, u32 count, then count x f32 x, y,
-// z, nx, ny, nz; a position at one of HD's hard edges is listed once per normal). HD remade its models with
-// the GameCube's positions and normals of its own, which its per-vertex light follows.
+// Wind Waker HD's own normals for the scenery, by the GameCube's exact vertex position: a stage's table from the
+// HD pack, given by the host as the stage changes (aurora_set_hd_normals), or one fixed table for tests
+// (DOL_AURORA_SUN_SHADOW_FACING_HD_NORMALS). Format: b'BWHN', u32 version 1, u32 count, then count x f32 x, y,
+// z, nx, ny, nz; a position at one of HD's hard edges is listed once per normal. HD remade its models with the
+// GameCube's positions and normals of its own, which its per-vertex light follows.
 struct HdNormals {
   absl::flat_hash_map<std::array<uint32_t, 3>, std::pair<uint32_t, uint32_t>> at; // first, count in `normals`
   std::vector<std::array<float, 3>> normals;
 };
 
-static const HdNormals* hd_normals() {
-  static const std::unique_ptr<HdNormals> table = []() -> std::unique_ptr<HdNormals> {
-    const char* path = std::getenv("DOL_AURORA_SUN_SHADOW_FACING_HD_NORMALS");
-    if (path == nullptr || path[0] == '\0')
-      return nullptr;
+static std::shared_ptr<const HdNormals> load_hd_normals(const char* path) {
+  {
     FILE* f = std::fopen(path, "rb");
     if (f == nullptr)
       return nullptr;
@@ -2494,7 +2502,7 @@ static const HdNormals* hd_normals() {
     std::fclose(f);
     if (!ok)
       return nullptr;
-    auto table = std::make_unique<HdNormals>();
+    auto table = std::make_shared<HdNormals>();
     table->normals.reserve(rows.size());
     for (const auto& r : rows) {
       std::array<uint32_t, 3> key{};
@@ -2507,8 +2515,22 @@ static const HdNormals* hd_normals() {
     }
     std::fprintf(stderr, "[sun-facing] HD normals: %zu positions from %s\n", table->at.size(), path);
     return table;
+  }
+}
+
+std::mutex g_hdNormalsMutex;
+std::shared_ptr<const HdNormals> g_hdNormals;  // the stage's (aurora_set_hd_normals)
+
+// The table in use: the test's fixed one, else the stage's.
+static std::shared_ptr<const HdNormals> hd_normals() {
+  static const std::shared_ptr<const HdNormals> fixed = []() -> std::shared_ptr<const HdNormals> {
+    const char* path = std::getenv("DOL_AURORA_SUN_SHADOW_FACING_HD_NORMALS");
+    return path != nullptr && path[0] != '\0' ? load_hd_normals(path) : nullptr;
   }();
-  return table.get();
+  if (fixed)
+    return fixed;
+  std::lock_guard lock{g_hdNormalsMutex};
+  return g_hdNormals;
 }
 
 static const std::vector<float>& with_smooth_normals(const gxc::DrawPlan& plan) {
@@ -2574,7 +2596,8 @@ static const std::vector<float>& with_smooth_normals(const gxc::DrawPlan& plan) 
   // A vertex's normal: HD's at its position when the table has it (the one nearest its own faces' at one of
   // HD's hard edges), else the faces at its position that turn within the crease of its own faces.
   const float crease = smooth_crease_cos();
-  const HdNormals* hd = hd_normals();
+  const std::shared_ptr<const HdNormals> hdTable = hd_normals();
+  const HdNormals* hd = hdTable.get();
   // DOL_AURORA_SUN_SHADOW_FACING_LOG=1 (local debug): how many scenery vertices found HD's normal.
   static const bool log = std::getenv("DOL_AURORA_SUN_SHADOW_FACING_LOG") != nullptr;
   static thread_local uint64_t s_hdHits = 0, s_vertices = 0, s_calls = 0;
@@ -3421,6 +3444,13 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
 
 void aurora_set_efficient_effects(bool on) {
   aurora::gfx::gxcore::g_efficientEffects.store(on, std::memory_order_relaxed);
+}
+
+void aurora_set_hd_normals(const char* path) {
+  using namespace aurora::gfx::gxcore;
+  std::shared_ptr<const HdNormals> table = path != nullptr && path[0] != '\0' ? load_hd_normals(path) : nullptr;
+  std::lock_guard lock{g_hdNormalsMutex};
+  g_hdNormals = std::move(table);
 }
 
 void aurora_set_forced_anisotropy(unsigned samples) {
