@@ -2243,10 +2243,10 @@ std::vector<soft_effects::Run> soft_runs(const RenderPass& passInfo, std::vector
 // a scene pass's draws up to `end` again, with their own cameras and a depth
 // buffer of the mask's own, the sea's marking the mask and the rest that
 // write depth covering it, so the mask is the sea where it is seen. The
-// frame's first scene pass clears it, while the scene is brightened.
+// frame's first scene pass clears it, while it is wanted (post_fx::sea_mask_wanted()).
 static void encode_sea_mask(const wgpu::CommandEncoder& cmd, const RenderPass& passInfo, size_t end,
                             uint64_t frameKey) {
-  if (!post_fx::exposure_active() || passInfo.msaaSamples != 1)
+  if (!post_fx::sea_mask_wanted() || passInfo.msaaSamples != 1)
     return;
   // Only the scene's passes, at the frame buffer's size (a pass of another size would make the mask anew).
   if (passInfo.targetSize.width != webgpu::g_frameBuffer.texture.GetWidth() ||
@@ -2260,18 +2260,30 @@ static void encode_sea_mask(const wgpu::CommandEncoder& cmd, const RenderPass& p
     if (command.type != CommandType::Draw || command.data.draw.type != ShaderType::GXCore || command.flat)
       continue;
     seaDraws += command.data.draw.gxcore.seaSurface;
-    solidDraws += command.data.draw.gxcore.sunCaster || command.data.draw.gxcore.sunCasterAlpha;
+    // A character's draws (skinned, writing depth) mark the mask too (render_sea_mask), casters or not.
+    solidDraws += command.data.draw.gxcore.sunCaster || command.data.draw.gxcore.sunCasterAlpha ||
+                  (command.data.draw.gxcore.character && command.data.draw.gxcore.depthWrite);
   }
   if (seaDraws == 0 && solidDraws == 0 && !clear)
     return;
   clearedFrame = frameKey;
   const webgpu::gpu_prof::Zone zone{cmd, "Sea mask"};
-  const std::array attachments{wgpu::RenderPassColorAttachment{
-      .view = post_fx::sea_mask_target(passInfo.targetSize),
-      .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
-      .storeOp = wgpu::StoreOp::Store,
-      .clearValue = {0.0, 0.0, 0.0, 0.0},
-  }};
+  // With the sun shadows' facing term, the scenery's smooth normals beside the mask (post_fx::sun_normal_target()).
+  const bool normals = post_fx::sun_normals_wanted();
+  const std::array attachments{
+      wgpu::RenderPassColorAttachment{
+          .view = post_fx::sea_mask_target(passInfo.targetSize),
+          .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+          .storeOp = wgpu::StoreOp::Store,
+          .clearValue = {0.0, 0.0, 0.0, 0.0},
+      },
+      wgpu::RenderPassColorAttachment{
+          .view = normals ? post_fx::sun_normal_target(passInfo.targetSize) : nullptr,
+          .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+          .storeOp = wgpu::StoreOp::Store,
+          .clearValue = {0.0, 0.0, 0.0, 0.0},
+      },
+  };
   const wgpu::RenderPassDepthStencilAttachment depth{
       .view = post_fx::sea_mask_depth(passInfo.targetSize),
       .depthLoadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
@@ -2280,13 +2292,13 @@ static void encode_sea_mask(const wgpu::CommandEncoder& cmd, const RenderPass& p
   };
   const wgpu::RenderPassDescriptor descriptor{
       .label = "Sea mask",
-      .colorAttachmentCount = attachments.size(),
+      .colorAttachmentCount = normals ? 2u : 1u,
       .colorAttachments = attachments.data(),
       .depthStencilAttachment = &depth,
   };
   auto pass = cmd.BeginRenderPass(&descriptor);
   if (seaDraws != 0 || solidDraws != 0) {
-    gxcore::begin_sea_mask(pass);
+    gxcore::begin_sea_mask(pass, normals);
     // The pass's viewports (with the game's depth range) and scissors as render_pass() sets them, so each sea
     // draw lands on the pixels and depths it drew.
     for (size_t i = 0; i < end && i < passInfo.commands.size(); ++i) {

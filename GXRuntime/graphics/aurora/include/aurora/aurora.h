@@ -201,6 +201,12 @@ void aurora_set_sun_shadow_quality(int quality);
    Waker HD's): the full shadow's colour is blended in by this much, the
    moon's shadows too. Takes effect at the next frame. */
 void aurora_set_sun_shadow_strength(float strength);
+/* Wind Waker HD's light for the sun shadow map's shade, the hour's (linear RGB): `sky`, the light from the sky
+   its shade takes from above (its palette's shadow colour), `ground`, the ambient it takes from the side (the
+   scenery's C0 times its factor), and `lit`, the sun's light (the scenery's K0 times its factor). A shaded pixel
+   is multiplied by (their ambient over `lit`) in the scene's gamma. `on` 0 goes back to the fixed shadow colour.
+   Takes effect at the next frame. */
+void aurora_set_sun_palette(int on, const float sky[3], const float ground[3], const float lit[3]);
 /* Edge light: a warm rim on the sunlit outline of what is near the camera,
    from the same sun and camera. Takes effect at the next frame. */
 void aurora_set_edge_light(bool enabled);

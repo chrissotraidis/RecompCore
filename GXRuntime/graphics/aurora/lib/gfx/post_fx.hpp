@@ -68,17 +68,24 @@ void set_sun_shadow_map(bool enabled) noexcept;
 // levels); applied by the render thread before its next frame.
 void set_sun_shadow_quality(int level) noexcept;
 void set_sun_shadow_strength(float strength) noexcept;
+void set_sun_palette(bool on, const float sky[3], const float ground[3], const float lit[3]) noexcept;
 void set_sun_direction(float x, float y, float z) noexcept;
 void set_exposure(float gain) noexcept;
 // The scene is brightened this frame (the game's gain over 1): the sea's draws
 // are then marked for the sea mask (gxcore_draw.hpp render_sea_mask()).
 bool exposure_active() noexcept;
-// The sea mask the brightness leaves the sea out by: 1 where the sea is the
-// nearest surface, from the frame's solid draws and the sea drawn again into
-// it and a depth of its own (gxcore_draw.hpp render_sea_mask()), the scene's
-// size and single-sampled. common.cpp clears both at a frame's first scene
-// pass and adds each scene pass, before encode().
-constexpr wgpu::TextureFormat kSeaMaskFormat = wgpu::TextureFormat::R8Unorm;
+// The sea mask (below) is wanted this frame: the scene is brightened, or the sun shadow map's facing term
+// needs it to leave characters and the sea out (it's on with no brightening too: at 10:00 on Outset the
+// game's gain isn't over 1).
+bool sea_mask_wanted() noexcept;
+// The sea mask the brightness leaves the sea out by: red 1 where the sea is the
+// nearest surface, green 1 where a character is (a solid skinned draw: the sun
+// shadows' facing term leaves characters to their own shading), from the
+// frame's solid draws and the sea drawn again into it and a depth of its own
+// (gxcore_draw.hpp render_sea_mask()), the scene's size and single-sampled.
+// common.cpp clears both at a frame's first scene pass and adds each scene
+// pass, before encode().
+constexpr wgpu::TextureFormat kSeaMaskFormat = wgpu::TextureFormat::RG8Unorm;
 constexpr wgpu::TextureFormat kSeaMaskDepthFormat = wgpu::TextureFormat::Depth32Float;
 wgpu::TextureView sea_mask_target(const wgpu::Extent3D& sceneSize);
 wgpu::TextureView sea_mask_depth(const wgpu::Extent3D& sceneSize);
@@ -91,6 +98,14 @@ wgpu::TextureView effect_mask_target(const wgpu::Extent3D& sceneSize, wgpu::Text
 // How far back the effects are drawn into it, a share of their distance
 // (DOL_AURORA_EFFECT_MASK_PUSH, 0.05): what lies on a surface is left out.
 float effect_mask_push() noexcept;
+// The sun shadows' facing term is on: the scenery's smooth normals are wanted (made on the CPU for a draw
+// without normals of its own, gxcore_draw.cpp, and drawn by the sea mask's pass into sun_normal_target()).
+// Off, none of that work is done.
+bool sun_normals_wanted() noexcept;
+// The scenery's smooth normals beside the sea mask, the same size: the view-space normal x 0.5 + 0.5, alpha 1
+// where a draw gave one; the facing term reads the depth's normal elsewhere.
+constexpr wgpu::TextureFormat kSunNormalFormat = wgpu::TextureFormat::RGBA8Unorm;
+wgpu::TextureView sun_normal_target(const wgpu::Extent3D& sceneSize);
 bool cloud_shadows_enabled() noexcept;
 void set_cloud_shadows(bool enabled) noexcept;
 void set_world_view(const float invView[12], float tanHalfFovy, float aspect, float nearPlane, float seaLevel,
