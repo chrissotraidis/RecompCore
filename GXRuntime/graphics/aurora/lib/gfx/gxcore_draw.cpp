@@ -2502,6 +2502,49 @@ static float smooth_crease_cos() {
   return value;
 }
 
+// Wind Waker HD's own normals for the scenery, by the GameCube's exact vertex position (local test:
+// DOL_AURORA_SUN_SHADOW_FACING_HD_NORMALS=<table>, b'BWHN', u32 version 1, u32 count, then count x f32 x, y,
+// z, nx, ny, nz; a position at one of HD's hard edges is listed once per normal). HD remade its models with
+// the GameCube's positions and normals of its own, which its per-vertex light follows.
+struct HdNormals {
+  absl::flat_hash_map<std::array<uint32_t, 3>, std::pair<uint32_t, uint32_t>> at; // first, count in `normals`
+  std::vector<std::array<float, 3>> normals;
+};
+
+static const HdNormals* hd_normals() {
+  static const std::unique_ptr<HdNormals> table = []() -> std::unique_ptr<HdNormals> {
+    const char* path = std::getenv("DOL_AURORA_SUN_SHADOW_FACING_HD_NORMALS");
+    if (path == nullptr || path[0] == '\0')
+      return nullptr;
+    FILE* f = std::fopen(path, "rb");
+    if (f == nullptr)
+      return nullptr;
+    char magic[4]{};
+    uint32_t version = 0, count = 0;
+    bool ok = std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "BWHN", 4) == 0 &&
+              std::fread(&version, 4, 1, f) == 1 && version == 1 && std::fread(&count, 4, 1, f) == 1;
+    std::vector<std::array<float, 6>> rows(ok ? count : 0);
+    ok = ok && std::fread(rows.data(), sizeof(rows[0]), rows.size(), f) == rows.size();
+    std::fclose(f);
+    if (!ok)
+      return nullptr;
+    auto table = std::make_unique<HdNormals>();
+    table->normals.reserve(rows.size());
+    for (const auto& r : rows) {
+      std::array<uint32_t, 3> key{};
+      std::memcpy(key.data(), r.data(), sizeof(key));
+      auto [it, added] = table->at.try_emplace(key, static_cast<uint32_t>(table->normals.size()), 0u);
+      if (!added && it->second.first + it->second.second != table->normals.size())
+        continue; // a position listed apart: keep its first run
+      table->normals.push_back({r[3], r[4], r[5]});
+      ++it->second.second;
+    }
+    std::fprintf(stderr, "[sun-facing] HD normals: %zu positions from %s\n", table->at.size(), path);
+    return table;
+  }();
+  return table.get();
+}
+
 static const std::vector<float>& with_smooth_normals(const gxc::DrawPlan& plan) {
   using Vec = std::array<float, 3>;
   static thread_local std::vector<float> vertices;
@@ -2562,12 +2605,42 @@ static const std::vector<float>& with_smooth_normals(const gxc::DrawPlan& plan) 
     if (valid(i))
       for (int corner = 0; corner < 3; ++corner)
         groupFaces[groupFill[group[plan.indices[i + corner]]]++] = static_cast<uint32_t>(f);
-  // A vertex's normal: the faces at its position that turn within the crease of its own faces.
+  // A vertex's normal: HD's at its position when the table has it (the one nearest its own faces' at one of
+  // HD's hard edges), else the faces at its position that turn within the crease of its own faces.
   const float crease = smooth_crease_cos();
+  const HdNormals* hd = hd_normals();
+  // DOL_AURORA_SUN_SHADOW_FACING_LOG=1 (local debug): how many scenery vertices found HD's normal.
+  static const bool log = std::getenv("DOL_AURORA_SUN_SHADOW_FACING_LOG") != nullptr;
+  static thread_local uint64_t s_hdHits = 0, s_vertices = 0, s_calls = 0;
+  s_vertices += count;
+  if (log && hd != nullptr && ++s_calls % 4000 == 0)
+    std::fprintf(stderr, "[sun-facing] HD normals for %llu of %llu scenery vertices\n",
+                 static_cast<unsigned long long>(s_hdHits), static_cast<unsigned long long>(s_vertices));
   for (size_t v = 0; v < count; ++v) {
     float* out = &vertices[v * gxc::kVertexFloats + gxc::kVertexNormalOffset / sizeof(float)];
     const Vec& ref = own[v];
     const float refLength = std::sqrt(ref[0] * ref[0] + ref[1] * ref[1] + ref[2] * ref[2]);
+    if (hd != nullptr) {
+      std::array<uint32_t, 3> key{};
+      std::memcpy(key.data(), &vertices[v * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float)], sizeof(key));
+      if (const auto it = hd->at.find(key); it != hd->at.end()) {
+        const Vec* best = &hd->normals[it->second.first];
+        float bestDot = -2.f;
+        for (uint32_t j = 0; j < it->second.second; ++j) {
+          const Vec& c = hd->normals[it->second.first + j];
+          // The model's winding isn't known: the mask's pass turns the normal to the side seen.
+          const float d = std::abs(c[0] * ref[0] + c[1] * ref[1] + c[2] * ref[2]);
+          if (d > bestDot) {
+            bestDot = d;
+            best = &c;
+          }
+        }
+        for (int k = 0; k < 3; ++k)
+          out[k] = (*best)[k];
+        ++s_hdHits;
+        continue;
+      }
+    }
     Vec n{0.f, 0.f, 0.f};
     if (refLength > 0.f) {
       for (uint32_t j = groupStart[group[v]]; j < groupStart[group[v] + 1]; ++j) {
