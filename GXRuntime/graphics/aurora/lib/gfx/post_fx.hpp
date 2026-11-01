@@ -68,6 +68,7 @@ void set_sun_shadow_map(bool enabled) noexcept;
 // (DOL_AURORA_SUN_SHADOW_QUALITY's levels, "hd" for 3); applied by the render thread before its next frame.
 void set_sun_shadow_quality(int level) noexcept;
 void set_sun_shadow_strength(float strength) noexcept;
+void set_sun_cascade_splits(float middle, float far) noexcept;
 void set_sun_palette(bool on, const float sky[3], const float ground[3], const float lit[3]) noexcept;
 // Wind Waker HD's cloud shadow texture (aurora_set_hd_cloud_texture): a BC4 DDS, loaded by the render thread; null
 // or empty: none (BlueWake's noise).

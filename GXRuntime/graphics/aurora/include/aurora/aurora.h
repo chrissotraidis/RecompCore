@@ -201,6 +201,11 @@ void aurora_set_sun_shadow_quality(int quality);
    Waker HD's): the full shadow's colour is blended in by this much, the
    moon's shadows too. Takes effect at the next frame. */
 void aurora_set_sun_shadow_strength(float strength);
+/* Wind Waker HD's shadow cascade splits for this frame, from the game's camera (HD sets them each frame from the
+   camera's distance to what it looks at and its field of view): the distances from the camera where the "HD" shadow
+   quality moves to its second and third cascade, whose first two cascades are sized with them. 0 goes back to the
+   fixed ones (420 and 1395, HD's at Outset's bridge). Takes effect at the next frame. */
+void aurora_set_sun_cascade_splits(float middle, float far);
 /* Wind Waker HD's light for the sun shadow map's shade, the hour's (linear RGB): `sky`, the light from the sky
    its shade takes from above (its palette's shadow colour), `ground`, the ambient it takes from the side (the
    scenery's C0 times its factor), and `lit`, the sun's light (the scenery's K0 times its factor). A shaded pixel
