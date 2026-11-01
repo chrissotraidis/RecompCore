@@ -69,6 +69,8 @@ void set_sun_shadow_map(bool enabled) noexcept;
 void set_sun_shadow_quality(int level) noexcept;
 void set_sun_shadow_strength(float strength) noexcept;
 void set_sun_palette(bool on, const float sky[3], const float ground[3], const float lit[3]) noexcept;
+// Wind Waker HD's light rule (aurora_set_sun_hd_light).
+void set_sun_hd_light(bool on, bool night, float fade) noexcept;
 void set_sun_direction(float x, float y, float z) noexcept;
 void set_exposure(float gain) noexcept;
 // The scene is brightened this frame (the game's gain over 1): the sea's draws

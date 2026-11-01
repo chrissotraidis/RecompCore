@@ -207,6 +207,15 @@ void aurora_set_sun_shadow_strength(float strength);
    is multiplied by (their ambient over `lit`) in the scene's gamma. `on` 0 goes back to the fixed shadow colour.
    Takes effect at the next frame. */
 void aurora_set_sun_palette(int on, const float sky[3], const float ground[3], const float lit[3]);
+/* Wind Waker HD's light rule for the sun shadow map (its setLightPosHD): with `on`, the direction given by
+   aurora_set_sun_direction is HD's light already (the sun by day, the moon's side by night, its height held as
+   HD holds it), `night` says which, and `fade` (0 to 1) is HD's day/night switch fade, which takes the lit side
+   down to the shade before the light changes sides. `on` 0 goes back to BlueWake's own rule. */
+void aurora_set_sun_hd_light(int on, int night, float fade);
+/* Wind Waker HD's own normals for the stage in play (the HD pack's optional/hd-normals/<stage>.bin, made by the
+   importer from the player's HD dump), for the sun shadows' facing term; NULL or a missing file: none, and
+   the facing term makes its own. Loaded at once; call it as the stage changes. */
+void aurora_set_hd_normals(const char* path);
 /* Edge light: a warm rim on the sunlit outline of what is near the camera,
    from the same sun and camera. Takes effect at the next frame. */
 void aurora_set_edge_light(bool enabled);
