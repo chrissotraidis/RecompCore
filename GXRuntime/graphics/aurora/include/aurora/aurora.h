@@ -216,6 +216,10 @@ void aurora_set_sun_hd_light(int on, int night, float fade);
    importer from the player's HD dump), for the sun shadows' facing term; NULL or a missing file: none, and
    the facing term makes its own. Loaded at once; call it as the stage changes. */
 void aurora_set_hd_normals(const char* path);
+/* Wind Waker HD's cloud shadow texture for the cloud shadows on HD's rule (the HD pack's
+   optional/hd-cloud-shadow/ww_shadow_clouds.dds, made by the importer from the player's HD dump); NULL or a
+   missing file: none, and BlueWake's own noise. Loaded by the render thread at its next frame. */
+void aurora_set_hd_cloud_texture(const char* path);
 /* Edge light: a warm rim on the sunlit outline of what is near the camera,
    from the same sun and camera. Takes effect at the next frame. */
 void aurora_set_edge_light(bool enabled);
