@@ -100,6 +100,14 @@ struct DrawData {
   // Scenery with no normals of its own, given smooth ones in its vertices' normal slot (made on the CPU while
   // the sun shadows' facing term is on, post_fx::sun_normals_wanted()): the sea mask's pass draws them.
   bool smoothNormal = false;
+  // Solid and not blended but writing no depth (the sky's layers): with Wind Waker HD's bloom mask
+  // (post_fx::bloom_mask_wanted()) drawn into the sea mask, where it may glow.
+  bool maskCover = false;
+  // Its vertices carry their own normals (the rim light takes a character's from the sea mask's pass).
+  bool hasNormal = false;
+  // Toon-shaded (a texgen from a lit colour): Wind Waker HD's rim light takes these characters, not a skinned
+  // palm's leaves.
+  bool toon = false;
 };
 
 // Recording: the pass's last command, when it is a GXCore draw a following
@@ -162,7 +170,8 @@ void render_sun_caster(const DrawData& data, const wgpu::RenderPassEncoder& pass
 // with its texture's cutout), so the sea is marked where it is the nearest.
 // A sea draw that writes no depth tests it without writing it.
 // begin_sea_mask() sets up a pass; render_sea_mask() draws one draw. With `normals` the pass has a second
-// target, the scenery's smooth normals (post_fx::sun_normal_target()), and smooth-normal draws fill it.
+// target, the scenery's smooth normals (post_fx::sun_normal_target()), and smooth-normal draws fill it (and, for
+// Wind Waker HD's rim light, the characters' own normals). With HD's bloom mask the mask's blue marks what may glow.
 void begin_sea_mask(const wgpu::RenderPassEncoder& pass, bool normals);
 void render_sea_mask(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 

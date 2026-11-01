@@ -14,6 +14,8 @@
 #include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_render.h>
 #include <SDL3/SDL_surface.h>
+
+#include <cstdlib>
 #include <SDL3/SDL_video.h>
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_hints.h>
@@ -419,9 +421,13 @@ bool initialize() {
   // SDL 3 does not activate the application when a window is shown or raised
   // unless these hints ask for it. A game launched from a shell therefore gets a
   // visible window that is never the key window, and no key press ever arrives.
-  TRY(SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "1"), "Error setting {}: {}",
+  // DOL_AURORA_WINDOW_NO_ACTIVATE=1 (local test runs): the window opens without taking the focus from whatever the
+  // person at the machine is using; a scripted run needs no keyboard.
+  const char* noActivate = std::getenv("DOL_AURORA_WINDOW_NO_ACTIVATE");
+  const char* activate = noActivate != nullptr && noActivate[0] == '1' ? "0" : "1";
+  TRY(SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, activate), "Error setting {}: {}",
       SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, SDL_GetError());
-  TRY(SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, "1"), "Error setting {}: {}",
+  TRY(SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, activate), "Error setting {}: {}",
       SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, SDL_GetError());
 
   return true;

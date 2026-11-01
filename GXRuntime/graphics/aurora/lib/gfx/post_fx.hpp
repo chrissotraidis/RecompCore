@@ -64,11 +64,14 @@ void set_sun_shadows(bool enabled) noexcept;
 // Sun shadows on, and drawn from the shadow map.
 bool sun_shadow_map_enabled() noexcept;
 void set_sun_shadow_map(bool enabled) noexcept;
-// The shadow quality, 0 low, 1 medium, 2 high (DOL_AURORA_SUN_SHADOW_QUALITY's
-// levels); applied by the render thread before its next frame.
+// The shadow quality, 0 low, 1 medium, 2 high, 3 Wind Waker HD's own shadow pass
+// (DOL_AURORA_SUN_SHADOW_QUALITY's levels, "hd" for 3); applied by the render thread before its next frame.
 void set_sun_shadow_quality(int level) noexcept;
 void set_sun_shadow_strength(float strength) noexcept;
 void set_sun_palette(bool on, const float sky[3], const float ground[3], const float lit[3]) noexcept;
+// Wind Waker HD's cloud shadow texture (aurora_set_hd_cloud_texture): a BC4 DDS, loaded by the render thread; null
+// or empty: none (BlueWake's noise).
+void set_hd_cloud_texture(const char* path) noexcept;
 // Wind Waker HD's light rule (aurora_set_sun_hd_light).
 void set_sun_hd_light(bool on, bool night, float fade) noexcept;
 void set_sun_direction(float x, float y, float z) noexcept;
@@ -80,6 +83,15 @@ bool exposure_active() noexcept;
 // needs it to leave characters and the sea out (it's on with no brightening too: at 10:00 on Outset the
 // game's gain isn't over 1).
 bool sea_mask_wanted() noexcept;
+// Wind Waker HD's bloom mask is wanted (DOL_AURORA_BLOOM_HD_MASK, with bloom on): the sea mask's pass also draws
+// what writes no depth (the sky) and marks in blue what may glow (gxcore_draw.hpp render_sea_mask()).
+bool bloom_mask_wanted() noexcept;
+// Wind Waker HD's rim light on characters is on (DOL_AURORA_RIM_HD): the sea mask's pass draws the characters'
+// own normals into sun_normal_target() (mask_normals_wanted()).
+bool rim_hd_active() noexcept;
+// The sea mask's pass draws normals beside it: the scenery's smooth ones for the facing term
+// (sun_normals_wanted()), or the characters' for the rim light.
+bool mask_normals_wanted() noexcept;
 // The sea mask the brightness leaves the sea out by: red 1 where the sea is the
 // nearest surface, green 1 where a character is (a solid skinned draw: the sun
 // shadows' facing term leaves characters to their own shading), from the
@@ -87,7 +99,8 @@ bool sea_mask_wanted() noexcept;
 // (gxcore_draw.hpp render_sea_mask()), the scene's size and single-sampled.
 // common.cpp clears both at a frame's first scene pass and adds each scene
 // pass, before encode().
-constexpr wgpu::TextureFormat kSeaMaskFormat = wgpu::TextureFormat::RG8Unorm;
+// Blue: 0.5 where Wind Waker HD's bloom may start (bloom_mask_wanted()), 0 elsewhere.
+constexpr wgpu::TextureFormat kSeaMaskFormat = wgpu::TextureFormat::RGBA8Unorm;
 constexpr wgpu::TextureFormat kSeaMaskDepthFormat = wgpu::TextureFormat::Depth32Float;
 wgpu::TextureView sea_mask_target(const wgpu::Extent3D& sceneSize);
 wgpu::TextureView sea_mask_depth(const wgpu::Extent3D& sceneSize);
