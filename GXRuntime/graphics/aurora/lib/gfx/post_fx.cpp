@@ -137,6 +137,11 @@ float g_sunMapDim = 0.5f;         // DOL_AURORA_SUN_SHADOW_MAP_DIM: how strong t
 // far fade (12000 to 14000).
 bool g_sunFacing = false;
 float g_sunFacingMul = 10.f;         // DOL_AURORA_SUN_SHADOW_FACING_MUL: fully lit from N.L = 1 / mul (HD: 10)
+// With the scenery's smooth normals: the shape's own facing as well, from the depth's normal, as HD's shadow
+// pre-pass folds into its shadow term (normal2ShadowMul 10) on top of its models' per-vertex light; 0 off
+// (DOL_AURORA_SUN_SHADOW_FACING_DEPTH_MUL, local test).
+float g_sunFacingDepthMul = 0.f;
+float g_sunFacingDepthBlur = 8.f; // DOL_AURORA_SUN_SHADOW_FACING_DEPTH_BLUR: its blur, pixels at 1080 lines (0 none)
 float g_sunFacingFarStart = 12000.f; // DOL_AURORA_SUN_SHADOW_FACING_FAR_START / _END: where it fades out
 float g_sunFacingFarEnd = 14000.f;
 // With the facing term, HD's terrain curve for its shadow (its terrain shaders' 0.5 x pow(2 x shadow, e), e
@@ -928,6 +933,8 @@ override sea_bias: f32 = 0.0;
 override soft: f32 = 0.01;
 override facing_on: f32 = 0.0;
 override facing_mul: f32 = 10.0;
+override facing_depth_mul: f32 = 0.0;
+override facing_depth_blur: f32 = 8.0;
 override facing_far_start: f32 = 12000.0;
 override facing_far_end: f32 = 14000.0;
 override shape_on: f32 = 1.0;
@@ -1196,6 +1203,31 @@ fn depth_normal(uv: vec2<f32>, p: vec3<f32>, tx: f32, ty: f32) -> vec3<f32> {
     return select(n, -n, dot(n, -p) < 0.0);
 }
 
+// The shape's own facing (the depth's normal, x facing_depth_mul), blurred as HD's shadow pre-pass blurs it:
+// 3 x 3 points facing_depth_blur pixels apart (at 1080 lines, wider with distance), leaving out points whose
+// depth jumps (another object, or the sky past an edge), so the shade doesn't cross a silhouette.
+fn depth_facing_blurred(uv: vec2<f32>, z: f32, tx: f32, ty: f32, sun: vec3<f32>) -> f32 {
+    let size = vec2<f32>(textureDimensions(depth));
+    let stride = facing_depth_blur * (size.y / 1080.0) * mix(1.0, 3.0, smoothstep(1000.0, 8000.0, z)) / size;
+    var sum = 0.0;
+    var weight = 0.0;
+    for (var j = -1; j <= 1; j++) {
+        for (var i = -1; i <= 1; i++) {
+            let q = uv + vec2<f32>(f32(i), f32(j)) * stride;
+            let pq = view_pos(q, tx, ty);
+            if (abs(-pq.z - z) > 0.1 * z) {
+                continue;
+            }
+            let nq = depth_normal(q, pq, tx, ty);
+            let nw = vec3(dot(view.rows[0].xyz, nq), dot(view.rows[1].xyz, nq), dot(view.rows[2].xyz, nq));
+            let w = (2.0 - abs(f32(i))) * (2.0 - abs(f32(j)));
+            sum += w * clamp(dot(nw, sun) * facing_depth_mul, 0.0, 1.0);
+            weight += w;
+        }
+    }
+    return select(1.0, sum / weight, weight > 0.0);
+}
+
 @fragment
 fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
     let z = view_depth(in.uv);
@@ -1375,16 +1407,29 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
         if (terrain) {
             // The scenery's smooth normal where its draw gave one (blended across each triangle, as HD's
             // models' per-vertex light is), else the depth's (one per triangle).
-            var nv = depth_normal(in.uv, p, tx, ty);
+            let nd = depth_normal(in.uv, p, tx, ty);
+            var nv = nd;
+            var smoothed = false;
             if (view.facing.z > 0.5) {
                 let sn = textureLoad(normals, mp, 0);
                 if (sn.a > 0.5) {
                     nv = normalize(sn.xyz * 2.0 - 1.0);
+                    smoothed = true;
                 }
             }
             let nw = vec3(dot(view.rows[0].xyz, nv), dot(view.rows[1].xyz, nv), dot(view.rows[2].xyz, nv));
             let away = 1.0 - smoothstep(facing_far_start, facing_far_end, z);
-            facing = mix(1.0, clamp(dot(nw, sun) * facing_mul, 0.0, 1.0), away);
+            var turned = clamp(dot(nw, sun) * facing_mul, 0.0, 1.0);
+            // The shape's own facing too where the light came from smooth normals (HD's shadow pre-pass).
+            if (smoothed && facing_depth_mul > 0.0) {
+                if (facing_depth_blur > 0.0) {
+                    turned = min(turned, depth_facing_blurred(in.uv, z, tx, ty, sun));
+                } else {
+                    let ndw = vec3(dot(view.rows[0].xyz, nd), dot(view.rows[1].xyz, nd), dot(view.rows[2].xyz, nd));
+                    turned = min(turned, clamp(dot(ndw, sun) * facing_depth_mul, 0.0, 1.0));
+                }
+            }
+            facing = mix(1.0, turned, away);
             lit = min(lit, facing);
             if (shape_on > 0.5) {
                 let e = mix(4.0, 2.0, smoothstep(shape_near, shape_far, z));
@@ -1857,6 +1902,8 @@ wgpu::RenderPipeline make_sun_map_pipeline(wgpu::TextureFormat format, bool dire
       wgpu::ConstantEntry{.key = "effect_debug", .value = g_effectDebug ? 1.0 : 0.0},
       wgpu::ConstantEntry{.key = "facing_on", .value = g_sunFacing ? 1.0 : 0.0},
       wgpu::ConstantEntry{.key = "facing_mul", .value = g_sunFacingMul},
+      wgpu::ConstantEntry{.key = "facing_depth_mul", .value = g_sunFacingDepthMul},
+      wgpu::ConstantEntry{.key = "facing_depth_blur", .value = g_sunFacingDepthBlur},
       wgpu::ConstantEntry{.key = "facing_far_start", .value = g_sunFacingFarStart},
       wgpu::ConstantEntry{.key = "facing_far_end", .value = g_sunFacingFarEnd},
       wgpu::ConstantEntry{.key = "shape_on", .value = g_sunShape ? 1.0 : 0.0},
@@ -2374,6 +2421,8 @@ void initialize() {
   if (const char* facing = std::getenv("DOL_AURORA_SUN_SHADOW_FACING"))
     g_sunFacing = facing[0] == '1';
   g_sunFacingMul = env_float("DOL_AURORA_SUN_SHADOW_FACING_MUL", g_sunFacingMul, 0.5f, 1000.f);
+  g_sunFacingDepthMul = env_float("DOL_AURORA_SUN_SHADOW_FACING_DEPTH_MUL", g_sunFacingDepthMul, 0.f, 1000.f);
+  g_sunFacingDepthBlur = env_float("DOL_AURORA_SUN_SHADOW_FACING_DEPTH_BLUR", g_sunFacingDepthBlur, 0.f, 200.f);
   g_sunFacingFarStart = env_float("DOL_AURORA_SUN_SHADOW_FACING_FAR_START", g_sunFacingFarStart, 0.f, 1e7f);
   g_sunFacingFarEnd = env_float("DOL_AURORA_SUN_SHADOW_FACING_FAR_END", g_sunFacingFarEnd, g_sunFacingFarStart + 1.f, 1e7f);
   if (const char* shape = std::getenv("DOL_AURORA_SUN_SHADOW_SHAPE"))
