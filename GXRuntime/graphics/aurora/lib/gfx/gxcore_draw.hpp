@@ -94,6 +94,12 @@ struct DrawData {
   // Drawn at its own depth into the effects' mask: an effect that writes depth, or a particle's colour draw over
   // its own depth draw.
   bool effectOwnDepth = false;
+  // A character's draw (the sea mask's green; the sun shadows' facing term leaves it out): toon-shaded, a
+  // texgen that reads a lit colour (GX_TG_SRTG, Wind Waker's characters' ramp), or skinned (per-vertex matrices).
+  bool character = false;
+  // Scenery with no normals of its own, given smooth ones in its vertices' normal slot (made on the CPU while
+  // the sun shadows' facing term is on, post_fx::sun_normals_wanted()): the sea mask's pass draws them.
+  bool smoothNormal = false;
 };
 
 // Recording: the pass's last command, when it is a GXCore draw a following
@@ -155,8 +161,9 @@ void render_sun_caster(const DrawData& data, const wgpu::RenderPassEncoder& pass
 // own: the sea 1, what the sun map takes as solid 0 (an alpha-tested draw
 // with its texture's cutout), so the sea is marked where it is the nearest.
 // A sea draw that writes no depth tests it without writing it.
-// begin_sea_mask() sets up a pass; render_sea_mask() draws one draw.
-void begin_sea_mask(const wgpu::RenderPassEncoder& pass);
+// begin_sea_mask() sets up a pass; render_sea_mask() draws one draw. With `normals` the pass has a second
+// target, the scenery's smooth normals (post_fx::sun_normal_target()), and smooth-normal draws fill it.
+void begin_sea_mask(const wgpu::RenderPassEncoder& pass, bool normals);
 void render_sea_mask(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 
 // Perform one EFB copy-to-texture (63/S16): resolve the current EFB region into
