@@ -221,6 +221,15 @@ void aurora_set_sun_hd_light(int on, int night, float fade);
    importer from the player's HD dump), for the sun shadows' facing term; NULL or a missing file: none, and
    the facing term makes its own. Loaded at once; call it as the stage changes. */
 void aurora_set_hd_normals(const char* path);
+/* Wind Waker HD's own vertex colours for the stage in play's rooms (the HD pack's optional/hd-colours/<stage>.bin,
+   made by the importer): HD remade its rooms' colours, so the draws with HD's light take HD's (in the game's gamma)
+   where a position has one, before the objects' table. NULL or a missing file: none. Call it as the stage changes. */
+void aurora_set_hd_stage_colours(const char* path);
+/* Wind Waker HD's normals and vertex colours for the game's object models (the HD pack's
+   optional/hd-normals/objects.bin and optional/hd-colours/objects.bin, made by the importer from the player's HD
+   dump): the normals are looked up after the stage's, the colours light draws as HD lights its palms. NULL or a
+   missing file: none. Loaded at once; call it once. */
+void aurora_set_hd_object_tables(const char* normals_path, const char* colours_path);
 /* Wind Waker HD's cloud shadow texture for the cloud shadows on HD's rule (the HD pack's
    optional/hd-cloud-shadow/ww_shadow_clouds.dds, made by the importer from the player's HD dump); NULL or a
    missing file: none, and BlueWake's own noise. Loaded by the render thread at its next frame. */
