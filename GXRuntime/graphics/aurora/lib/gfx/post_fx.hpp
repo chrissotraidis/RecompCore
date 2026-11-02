@@ -70,6 +70,28 @@ void set_sun_shadow_quality(int level) noexcept;
 void set_sun_shadow_strength(float strength) noexcept;
 void set_sun_cascade_splits(float middle, float far) noexcept;
 void set_sun_palette(bool on, const float sky[3], const float ground[3], const float lit[3]) noexcept;
+// Wind Waker HD's character light (gxcore_shader.cpp, ShaderKey::hd_actor_light): DOL_AURORA_ACTOR_LIGHT_HD=1 (read
+// once) lets the toon characters' draws take it; the host gives the hour's colours (aurora_set_actor_light_hd,
+// linear). actor_light_palette(): the colours, false while none are given (the GameCube shading).
+bool actor_light_hd_switch() noexcept;
+void set_actor_light_hd(bool on, const float c0[3], const float shadow[3], const float k[3]) noexcept;
+bool actor_light_palette(float c0[3], float shadow[3], float k[3]) noexcept;
+// The switch is on and the host has given colours: the characters may take HD's light this frame.
+bool actor_light_wanted() noexcept;
+// The shadow the characters' light reads: the last post pass's blurred shadow pre-pass (HD's terrain mix or its
+// shadow pass, made after the scene, so last frame's), and its LOD to read (HD's mip 1 with its shadow pass). False
+// when the last post pass made none.
+// With the characters' own pre-pass made for this pass (draw_actor_shadow()), that one (this frame's, mip 1) and
+// `sameFrame` true.
+bool actor_shadow_source(wgpu::TextureView& view, float& lod, bool& sameFrame) noexcept;
+// DOL_AURORA_ACTOR_LIGHT_SAME_FRAME (read once; on unless 0): the characters' shadow from this frame, from a
+// pre-pass of their own (draw_actor_shadow()); 0 takes last frame's pre-pass alone (for A/B).
+bool actor_light_same_frame() noexcept;
+// This frame's scene pass drew the characters with HD's light (gxcore_draw.cpp, begin_actor_light_pass()): the
+// effects after it leave the toon-shaded pixels (the sea mask's green over 0.8) to it (the sun shadows' shade,
+// HD's rim light, the brightness), since HD's light already has them.
+void set_actor_light_applied(bool applied) noexcept;
+bool actor_light_applied() noexcept;
 // Wind Waker HD's cloud shadow texture (aurora_set_hd_cloud_texture): a BC4 DDS, loaded by the render thread; null
 // or empty: none (BlueWake's noise).
 void set_hd_cloud_texture(const char* path) noexcept;
@@ -170,6 +192,14 @@ struct SunMap {
   bool valid = false;
 };
 SunMap sun_map(const Camera& camera) noexcept;
+// The characters' shadow pre-pass for the scene pass about to be encoded (common.cpp render(), after the sea mask
+// is drawn for it, before the pass): Wind Waker HD's shadow pre-pass from the sea mask's depth, the map's shadow at
+// half the size blurred (mip 0), and mip 1 (a blurred eighth-size copy brought back up), with no blend with the
+// last frames'. False when it can't be made (the camera or the map not valid, the mask of another size): the flagged
+// draws then take last frame's (actor_shadow_source()). end_actor_shadow() after the pass.
+bool draw_actor_shadow(const wgpu::CommandEncoder& cmd, const Camera& camera, const SunMap& sunMap,
+                       const wgpu::Extent3D& size, wgpu::TextureFormat format);
+void end_actor_shadow() noexcept;
 // The map's depth texture (one layer a cascade), made at its size on first
 // use: all of it, for the lookups.
 const wgpu::TextureView& sun_map_view();

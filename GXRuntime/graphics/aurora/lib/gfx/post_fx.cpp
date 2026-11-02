@@ -94,6 +94,18 @@ struct SunHdLight {
   float fade = 0.f;
 };
 SunHdLight g_sunHdLight;
+// Wind Waker HD's character light's colours for the hour (aurora_set_actor_light_hd, linear), under g_cameraMutex.
+struct ActorLightPalette {
+  bool on = false;
+  float c0[3]{}, shadow[3]{}, k[3]{};
+};
+ActorLightPalette g_actorLight;
+// The scene pass drew the characters with it this frame (set_actor_light_applied), render thread.
+std::atomic_bool g_actorLightApplied{false};
+// Post passes encoded so far, and the one that last made the shadow pre-pass (g_sunLow), render thread: the
+// characters read it only when the latest one did (actor_shadow_source()).
+uint64_t g_postEncodes = 0;
+uint64_t g_sunLowEncode = 0;
 float g_sunReach = 1500.f;    // how far toward the sun a shadow is looked for, in world units
 std::atomic_bool g_sunMapOn{false};
 uint32_t g_sunMapSize = 4096;    // the shadow map's texels a side (4096 high, 2048 medium, 1024 low)
@@ -284,6 +296,17 @@ wgpu::ShaderModule g_sunBlurModule;
 wgpu::BindGroupLayout g_sunBlurLayout;
 wgpu::PipelineLayout g_sunBlurPipelineLayout;
 wgpu::RenderPipeline g_sunBlurX, g_sunBlurY;
+wgpu::RenderPipeline g_sunCopy; // one bilinear tap (make_sun_blur_pipelines)
+// The characters' shadow from this frame (draw_actor_shadow()): HD's pre-pass at half the scene's size (mip 0) and
+// its mip 1, a blurred copy at an eighth brought back up; a half-size scratch for the blur, two eighth-size ones.
+// g_actorLowReady: made for the pass being encoded (actor_shadow_source()).
+wgpu::Texture g_actorLow;
+wgpu::TextureView g_actorLowView;     // both mips, to read
+wgpu::TextureView g_actorLowMip[2];   // one mip each, to draw into
+wgpu::Texture g_actorTmp[3];          // half, eighth, eighth
+wgpu::TextureView g_actorTmpView[3];
+wgpu::Extent3D g_actorLowSize{};
+bool g_actorLowReady = false;
 float g_sunMapSlope = 20.f;       // DOL_AURORA_SUN_SHADOW_MAP_SLOPE: texels of the surface's own depth slope added to the bias
                                   // far off (10 left acne in stripes on Ice Ring Isle's walls edge-on to the sun)
 float g_sunMapNormalOffset = 2.f; // DOL_AURORA_SUN_SHADOW_MAP_NORMAL_OFFSET: a lookup moved out along the surface's normal, in its cascade's texels      // DOL_AURORA_SUN_SHADOW_MAP_STEPS=1: the screen's steps too, for what the map leaves out
@@ -1058,6 +1081,11 @@ fn fs_exposure(in: VertexOutput) -> @location(0) vec4<f32> {
         // one more than this; the target clamps what is below zero).
         return vec4(select(vec3(0.0), vec3(1.0), land < 0.5), 0.0);
     }
+    // Wind Waker HD's character light (time.y 1 in this pass) has the brightness in it: the characters drawn with it
+    // (the mask's alpha 1) are left as drawn.
+    if (view.time.y > 0.5 && textureLoad(mask, p, 0).a > 0.5) {
+        return vec4(0.0);
+    }
     let near = 1.0 - smoothstep(far_start, far_end, view.lens.z / d);
     var gain = (view.time.x - 1.0) * land * near;
     let c = textureLoad(scene, p, 0).rgb;
@@ -1256,7 +1284,8 @@ struct View {
                                 // shadows' floor (HD's cCloudShadowPower)
     lit: vec4<f32>,             // with HD's palette: its sunlight (linear); w: 1 with HD's cloud texture bound
     hd: vec4<f32>,              // HD's pass: x, y the distances from the camera where it moves to the second and third
-                                // cascade (HD's 420 and 1395, times the camera's zoom)
+                                // cascade (HD's 420 and 1395, times the camera's zoom); z: 1 when the characters took
+                                // Wind Waker HD's light in their own draws (post_fx::actor_light_applied())
 };
 
 @group(0) @binding(0) var samp: sampler;
@@ -1992,6 +2021,15 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
     if (ao_debug > 0.5) {
         return vec4(vec3(ao_term), 1.0);
     }
+    // Wind Waker HD's character light (view.hd.z) has the shadow in the characters' own draws: those drawn with it
+    // (the mask's alpha 1) are left as drawn.
+    if (view.hd.z > 0.5 && view.facing.x > 0.5) {
+        let tsize = vec2<f32>(textureDimensions(mask));
+        let tp = clamp(vec2<i32>(in.uv * tsize), vec2<i32>(0), vec2<i32>(tsize) - vec2<i32>(1));
+        if (textureLoad(mask, tp, 0).a > 0.5) {
+            return vec4(1.0);
+        }
+    }
     // An effect drawn over the pixel (the spin attack's rings, a glow) isn't in
     // the shade of the scenery behind it, whose depth this is: Link's shadow
     // was drawn across the rings. As much of the pixel as they make up is left.
@@ -2215,7 +2253,7 @@ struct View {
     lens: vec4<f32>,            // tan(fovy / 2), aspect, near, the sea's height
     time: vec4<f32>,            // seconds, then the direction to the sun (world)
     sky: vec4<f32>,             // HD's palette (linear): its light from above; w: 1 with the palette
-    ground: vec4<f32>,          // from the side
+    ground: vec4<f32>,          // from the side; w: 1 when the characters took Wind Waker HD's light (actor_light_applied())
     lit: vec4<f32>,             // its sunlight
 };
 
@@ -2252,8 +2290,10 @@ fn fs_rim(in: VertexOutput) -> @location(0) vec4<f32> {
     var nd = cross(dpdx(v), dpdy(v));
     nd = select(vec3(0.0, 0.0, 1.0), normalize(nd), length(nd) > 1e-12);
     nd = select(nd, -nd, dot(nd, -v) < 0.0);
-    // Toon-shaded characters only (green 1; a skinned palm's leaves are 0.6).
-    if (d <= 0.0 || textureLoad(mask, p, 0).g < 0.8) {
+    // Toon-shaded characters only (green 1; a skinned palm's leaves are 0.6), and not those drawn with Wind Waker
+    // HD's light (the mask's alpha 1, while ground.w says it was applied), which has the rim in it.
+    let mk = textureLoad(mask, p, 0);
+    if (d <= 0.0 || mk.g < 0.8 || (view.ground.w > 0.5 && mk.a > 0.5)) {
         return vec4(0.0);
     }
     let nt = textureLoad(normals, p, 0);
@@ -2996,6 +3036,11 @@ fn fs_blur(in: VertexOutput) -> @location(0) vec4<f32> {
     return 0.29411765 * textureSampleLevel(src, samp, in.uv, 0.0) +
            0.35294118 * (textureSampleLevel(src, samp, in.uv - o, 0.0) + textureSampleLevel(src, samp, in.uv + o, 0.0));
 }
+// One bilinear tap: a smaller or larger copy (the characters' shadow pre-pass's mip 1, as HD makes it).
+@fragment
+fn fs_copy(in: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSampleLevel(src, samp, in.uv, 0.0);
+}
 )""";
 
 void make_sun_blur_pipelines() {
@@ -3035,6 +3080,18 @@ void make_sun_blur_pipelines() {
     };
     (axis == 0 ? g_sunBlurX : g_sunBlurY) = g_device.CreateRenderPipeline(&descriptor);
   }
+  const wgpu::ColorTargetState target{.format = kSunLowFormat, .writeMask = wgpu::ColorWriteMask::All};
+  const wgpu::FragmentState fragment{
+      .module = g_sunBlurModule, .entryPoint = "fs_copy", .targetCount = 1, .targets = &target};
+  const wgpu::RenderPipelineDescriptor descriptor{
+      .label = "Sun shadows' copy",
+      .layout = g_sunBlurPipelineLayout,
+      .vertex = {.module = g_sunBlurModule, .entryPoint = "vs_main"},
+      .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+      .multisample = {.count = 1, .mask = UINT32_MAX},
+      .fragment = &fragment,
+  };
+  g_sunCopy = g_device.CreateRenderPipeline(&descriptor);
 }
 
 // The pre-pass blended with the last frame's (g_sunTemporal): each place in the world takes back what it had last
@@ -3224,6 +3281,21 @@ bool ao_hd_on() noexcept { return g_aoHd && hd_mix_on() && ambient_occlusion_ena
 // The cloud shadows on HD's rule run this frame, in the sun shadows' pass in place of their own.
 bool clouds_hd_on() noexcept { return g_cloudHd && cloud_shadows_enabled() && sun_shadow_map_enabled(); }
 
+// A black texel in the effects' mask's place (no effects), made on first use.
+const wgpu::TextureView& effect_none_view() {
+  if (!g_effectNone) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "No effects",
+        .usage = wgpu::TextureUsage::TextureBinding,
+        .size = {1, 1, 1},
+        .format = wgpu::TextureFormat::RGBA8Unorm,
+    };
+    g_effectNone = g_device.CreateTexture(&descriptor);
+    g_effectNoneView = g_effectNone.CreateView();
+  }
+  return g_effectNoneView;
+}
+
 // The quarter-size targets of HD's terrain mix, for a scene of `size` (half the size in HD's pass, as its pre-pass).
 void ensure_sun_low(const wgpu::Extent3D& size) {
   const uint32_t div = g_sunHdPrepass ? 2u : 4u;
@@ -3272,11 +3344,16 @@ void draw_into(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::R
   pass.End();
 }
 
-// effects: the effects' mask (effect_mask_target()), whose effects it leaves.
-void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const SunMap& sunMap,
-                  const wgpu::TextureView& depthView, const wgpu::TextureView& effects,
-                  const wgpu::TextureView& target, bool direct, const wgpu::Extent3D& size,
-                  const wgpu::TextureView& resolve = nullptr) {
+// The sun shadow map pass's uniform and what its bind group takes (draw_sun_map(), and the characters' own
+// shadow pre-pass, draw_actor_shadow(): `actor` leaves HD's SSAO out of its low pass, which they don't read).
+struct SunMapInputs {
+  wgpu::Buffer buffer;
+  bool mask = false;
+  bool normals = false;
+  float farTerm = 0.f; // near / (far - near)
+};
+
+SunMapInputs sun_map_inputs(const Camera& camera, const SunMap& sunMap, bool actor) {
   std::array<float, kSunMapUniformFloats> uniform{};
   std::memcpy(uniform.data(), camera.view.data(), sizeof(camera.view));
   for (uint32_t cascade = 0; cascade < kSunMapCascades; ++cascade)
@@ -3337,6 +3414,8 @@ void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const S
   // The scenery's smooth normals (sun_normal_target()), drawn with the mask while the facing term is on.
   const bool normals = mask && g_sunNormalView && sun_normals_wanted();
   uniform[78] = normals ? 1.f : 0.f;
+  // Wind Waker HD's character light took the toon characters' shade in their draws: their pixels are left as drawn.
+  uniform[94] = actor_light_applied() ? 1.f : 0.f;
   // The full shadow's colour, or Wind Waker HD's light for the hour when the host gives it.
   {
     std::lock_guard lock{g_cameraMutex};
@@ -3353,29 +3432,47 @@ void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const S
       .size = sizeof(uniform),
       .mappedAtCreation = true,
   };
+  if (actor)
+    uniform[79] = 0.f;
   const auto buffer = g_device.CreateBuffer(&bufferDescriptor);
   std::memcpy(buffer.GetMappedRange(0, sizeof(uniform)), uniform.data(), sizeof(uniform));
   buffer.Unmap();
+  return {.buffer = buffer, .mask = mask, .normals = normals, .farTerm = uniform[71]};
+}
+
+// effects: the effects' mask (effect_mask_target()), whose effects the shade leaves.
+wgpu::BindGroup sun_map_group(const SunMapInputs& in, const wgpu::TextureView& depthView,
+                              const wgpu::TextureView& blurred, const wgpu::TextureView& effects) {
+  const std::array entries{
+      wgpu::BindGroupEntry{.binding = 0, .sampler = g_sampler},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = in.mask ? g_seaMaskView : g_farView[0]},
+      wgpu::BindGroupEntry{.binding = 2, .textureView = depthView},
+      wgpu::BindGroupEntry{.binding = 3, .buffer = in.buffer, .offset = 0,
+                           .size = kSunMapUniformFloats * sizeof(float)},
+      wgpu::BindGroupEntry{.binding = 4, .textureView = g_sunMapView},
+      wgpu::BindGroupEntry{.binding = 5, .sampler = g_sunMapCompare},
+      wgpu::BindGroupEntry{.binding = 6, .textureView = in.normals ? g_sunNormalView : g_farView[0]},
+      wgpu::BindGroupEntry{.binding = 7, .textureView = blurred},
+      wgpu::BindGroupEntry{.binding = 8, .textureView = g_cloudTexView ? g_cloudTexView : g_farView[0]},
+      wgpu::BindGroupEntry{.binding = 9, .sampler = g_cloudSampler},
+      wgpu::BindGroupEntry{.binding = 10, .textureView = effects},
+  };
+  const wgpu::BindGroupDescriptor bindGroupDescriptor{
+      .layout = g_sunMapLayout,
+      .entryCount = entries.size(),
+      .entries = entries.data(),
+  };
+  return g_device.CreateBindGroup(&bindGroupDescriptor);
+}
+
+// effects: the effects' mask (effect_mask_target()), whose effects it leaves.
+void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const SunMap& sunMap,
+                  const wgpu::TextureView& depthView, const wgpu::TextureView& effects,
+                  const wgpu::TextureView& target, bool direct, const wgpu::Extent3D& size,
+                  const wgpu::TextureView& resolve = nullptr) {
+  const SunMapInputs inputs = sun_map_inputs(camera, sunMap, false);
   const auto sun_group = [&](const wgpu::TextureView& blurred) {
-    const std::array entries{
-        wgpu::BindGroupEntry{.binding = 0, .sampler = g_sampler},
-        wgpu::BindGroupEntry{.binding = 1, .textureView = mask ? g_seaMaskView : g_farView[0]},
-        wgpu::BindGroupEntry{.binding = 2, .textureView = depthView},
-        wgpu::BindGroupEntry{.binding = 3, .buffer = buffer, .offset = 0, .size = sizeof(uniform)},
-        wgpu::BindGroupEntry{.binding = 4, .textureView = g_sunMapView},
-        wgpu::BindGroupEntry{.binding = 5, .sampler = g_sunMapCompare},
-        wgpu::BindGroupEntry{.binding = 6, .textureView = normals ? g_sunNormalView : g_farView[0]},
-        wgpu::BindGroupEntry{.binding = 7, .textureView = blurred},
-        wgpu::BindGroupEntry{.binding = 8, .textureView = g_cloudTexView ? g_cloudTexView : g_farView[0]},
-        wgpu::BindGroupEntry{.binding = 9, .sampler = g_cloudSampler},
-        wgpu::BindGroupEntry{.binding = 10, .textureView = effects},
-    };
-    const wgpu::BindGroupDescriptor bindGroupDescriptor{
-        .layout = g_sunMapLayout,
-        .entryCount = entries.size(),
-        .entries = entries.data(),
-    };
-    return g_device.CreateBindGroup(&bindGroupDescriptor);
+    return sun_map_group(inputs, depthView, blurred, effects);
   };
   // HD's terrain mix: the map's shadow and the grazing term at a quarter of the size, blurred (X then Y,
   // g_sunHdMixBlurs times), for the main pass to take by distance and grazing.
@@ -3390,7 +3487,7 @@ void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const S
     draw_into(cmd, "Sun shadows (quarter size)", g_sunMapLow, sun_group(g_farView[0]),
               g_sunLowMipView[g_sunTemporal ? 1 : 0][0]);
     if (g_sunTemporal)
-      draw_sun_temporal(cmd, camera, depthView, uniform[71]);
+      draw_sun_temporal(cmd, camera, depthView, inputs.farTerm);
     else
       g_sunHistValid = false;
     const auto blur_group = [&](const wgpu::TextureView& view) {
@@ -3410,6 +3507,7 @@ void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const S
       draw_into(cmd, "Sun shadows' mip 1 (Y)", g_sunBlurY, blur_group(g_sunLowMipView[1][1]), g_sunLowMipView[0][1]);
     }
     blurred = g_sunLowView[0];
+    g_sunLowEncode = g_postEncodes;
   }
   const auto bindGroup = sun_group(blurred);
   const std::array attachments{wgpu::RenderPassColorAttachment{
@@ -3430,6 +3528,70 @@ void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const S
   pass.SetBindGroup(0, bindGroup, 0, nullptr);
   pass.Draw(3);
   pass.End();
+}
+
+void ensure_actor_low(const wgpu::Extent3D& size) {
+  const wgpu::Extent3D half{std::max(1u, size.width / 2), std::max(1u, size.height / 2), 1};
+  if (g_actorLow && g_actorLowSize.width == half.width && g_actorLowSize.height == half.height)
+    return;
+  const wgpu::TextureUsage usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding;
+  const wgpu::TextureDescriptor descriptor{
+      .label = "Characters' shadow (half size)", .usage = usage, .size = half, .format = kSunLowFormat, .mipLevelCount = 2};
+  g_actorLow = g_device.CreateTexture(&descriptor);
+  g_actorLowView = g_actorLow.CreateView();
+  for (uint32_t mip = 0; mip < 2; ++mip) {
+    const wgpu::TextureViewDescriptor one{.baseMipLevel = mip, .mipLevelCount = 1};
+    g_actorLowMip[mip] = g_actorLow.CreateView(&one);
+  }
+  const wgpu::Extent3D eighth{std::max(1u, size.width / 8), std::max(1u, size.height / 8), 1};
+  for (int i = 0; i < 3; ++i) {
+    const wgpu::TextureDescriptor tmp{
+        .label = "Characters' shadow (blur)", .usage = usage, .size = i == 0 ? half : eighth, .format = kSunLowFormat};
+    g_actorTmp[i] = g_device.CreateTexture(&tmp);
+    g_actorTmpView[i] = g_actorTmp[i].CreateView();
+  }
+  g_actorLowSize = half;
+}
+
+bool draw_actor_shadow_now(const wgpu::CommandEncoder& cmd, const Camera& camera, const SunMap& sunMap,
+                           const wgpu::Extent3D& size, wgpu::TextureFormat format) {
+  g_actorLowReady = false;
+  if (!g_module || !camera.valid || !sunMap.valid || !sun_shadows_enabled() || !g_seaMaskDepthView ||
+      g_seaMaskSize.width != size.width || g_seaMaskSize.height != size.height || size.width < 16 ||
+      size.height < 16)
+    return false;
+  ensure_targets(size, format, 1);
+  if (!g_sunMapView)
+    return false;
+  const webgpu::gpu_prof::Zone zone{cmd, "Characters' shadow"};
+  ensure_actor_low(size);
+  if (!g_sunBlurX)
+    make_sun_blur_pipelines();
+  if (!g_sunMapLow)
+    g_sunMapLow = make_sun_map_pipeline(kSunLowFormat, false, true);
+  // HD's pre-pass from this frame's depth (the sea mask's, drawn before the scene for this): the map's shadow at
+  // half the size, no blend with the last frames'.
+  const SunMapInputs inputs = sun_map_inputs(camera, sunMap, true);
+  draw_into(cmd, "Characters' shadow (half size)", g_sunMapLow,
+            sun_map_group(inputs, g_seaMaskDepthView, g_farView[0], effect_none_view()),
+            g_actorLowMip[0]);
+  const auto blur_group = [&](const wgpu::TextureView& view) {
+    const std::array entries{wgpu::BindGroupEntry{.binding = 0, .sampler = g_sampler},
+                             wgpu::BindGroupEntry{.binding = 1, .textureView = view}};
+    const wgpu::BindGroupDescriptor descriptor{
+        .layout = g_sunBlurLayout, .entryCount = entries.size(), .entries = entries.data()};
+    return g_device.CreateBindGroup(&descriptor);
+  };
+  // Mip 0: HD's 3-tap blur (0 and +-1.3636 texels, 0.294 and 0.353), across then down.
+  draw_into(cmd, "Characters' shadow blur (X)", g_sunBlurX, blur_group(g_actorLowMip[0]), g_actorTmpView[0]);
+  draw_into(cmd, "Characters' shadow blur (Y)", g_sunBlurY, blur_group(g_actorTmpView[0]), g_actorLowMip[0]);
+  // Mip 1: one bilinear tap of mip 0 at an eighth of the scene, the same blur there, and bilinear back up.
+  draw_into(cmd, "Characters' shadow mip 1 (down)", g_sunCopy, blur_group(g_actorLowMip[0]), g_actorTmpView[1]);
+  draw_into(cmd, "Characters' shadow mip 1 (X)", g_sunBlurX, blur_group(g_actorTmpView[1]), g_actorTmpView[2]);
+  draw_into(cmd, "Characters' shadow mip 1 (Y)", g_sunBlurY, blur_group(g_actorTmpView[2]), g_actorTmpView[1]);
+  draw_into(cmd, "Characters' shadow mip 1 (up)", g_sunCopy, blur_group(g_actorTmpView[1]), g_actorLowMip[1]);
+  g_actorLowReady = true;
+  return true;
 }
 
 // One pipeline of HD's bloom chain into `format`. compose: screened (or, with debug view 1, replacing) with the
@@ -3649,6 +3811,13 @@ void load_cloud_texture(const char* path) {
   std::fprintf(stderr, "[cloud-shadows] HD's cloud texture %ux%u, %u mips, from %s\n", width, height, mips, path);
 }
 } // namespace
+
+bool draw_actor_shadow(const wgpu::CommandEncoder& cmd, const Camera& camera, const SunMap& sunMap,
+                       const wgpu::Extent3D& size, wgpu::TextureFormat format) {
+  return draw_actor_shadow_now(cmd, camera, sunMap, size, format);
+}
+
+void end_actor_shadow() noexcept { g_actorLowReady = false; }
 
 void initialize() {
   const char* bloom = std::getenv("DOL_AURORA_BLOOM");
@@ -4050,12 +4219,22 @@ void shutdown() {
   g_sunMapPass = {};
   g_sunMapDirect = {};
   g_sunMapLow = {};
+  g_sunCopy = {};
+  g_actorLowView = {};
+  g_actorLow = {};
+  for (int i = 0; i < 3; ++i) {
+    g_actorTmpView[i] = {};
+    g_actorTmp[i] = {};
+  }
+  g_actorLowSize = {};
+  g_actorLowReady = false;
   g_sunBlurX = g_sunBlurY = {};
   g_sunBlurPipelineLayout = {};
   g_sunBlurLayout = {};
   g_sunBlurModule = {};
   for (int i = 0; i < 2; ++i) {
     g_sunLowView[i] = {};
+    g_actorLowMip[i] = {};
     g_sunLowMipView[i][0] = g_sunLowMipView[i][1] = {};
     g_sunLow[i] = {};
   }
@@ -4179,6 +4358,68 @@ void set_sun_palette(bool on, const float sky[3], const float ground[3], const f
     g_sunPalette.lit[i] = std::max(lit[i], 0.f);
   }
 }
+
+bool actor_light_hd_switch() noexcept {
+  static const bool on = [] {
+    const char* env = std::getenv("DOL_AURORA_ACTOR_LIGHT_HD");
+    return env != nullptr && env[0] == '1';
+  }();
+  return on;
+}
+
+void set_actor_light_hd(bool on, const float c0[3], const float shadow[3], const float k[3]) noexcept {
+  std::lock_guard lock{g_cameraMutex};
+  g_actorLight.on = on && c0 != nullptr && shadow != nullptr && k != nullptr;
+  for (int i = 0; g_actorLight.on && i < 3; ++i) {
+    g_actorLight.c0[i] = std::max(c0[i], 0.f);
+    g_actorLight.shadow[i] = std::max(shadow[i], 0.f);
+    g_actorLight.k[i] = std::max(k[i], 0.f);
+  }
+}
+
+bool actor_light_palette(float c0[3], float shadow[3], float k[3]) noexcept {
+  std::lock_guard lock{g_cameraMutex};
+  for (int i = 0; i < 3; ++i) {
+    c0[i] = g_actorLight.c0[i];
+    shadow[i] = g_actorLight.shadow[i];
+    k[i] = g_actorLight.k[i];
+  }
+  return g_actorLight.on;
+}
+
+bool actor_light_wanted() noexcept {
+  if (!actor_light_hd_switch())
+    return false;
+  std::lock_guard lock{g_cameraMutex};
+  return g_actorLight.on;
+}
+
+bool actor_light_same_frame() noexcept {
+  static const bool on = [] {
+    const char* env = std::getenv("DOL_AURORA_ACTOR_LIGHT_SAME_FRAME");
+    return env == nullptr || env[0] != '0';
+  }();
+  return on;
+}
+
+bool actor_shadow_source(wgpu::TextureView& view, float& lod, bool& sameFrame) noexcept {
+  sameFrame = false;
+  if (g_actorLowReady && g_actorLowView) {
+    view = g_actorLowView;
+    lod = 1.f; // HD's mip 1
+    sameFrame = true;
+    return true;
+  }
+  if (!g_sunLow[0] || g_postEncodes == 0 || g_sunLowEncode != g_postEncodes)
+    return false;
+  view = g_sunLowView[0];
+  lod = g_sunHdPrepass ? 1.f : 0.f;
+  return true;
+}
+
+void set_actor_light_applied(bool applied) noexcept { g_actorLightApplied.store(applied, std::memory_order_relaxed); }
+
+bool actor_light_applied() noexcept { return g_actorLightApplied.load(std::memory_order_relaxed); }
 
 SunMap sun_map(const Camera& camera) noexcept {
   SunMap map;
@@ -4344,7 +4585,7 @@ bool exposure_active() noexcept {
 
 bool sea_mask_wanted() noexcept {
   return exposure_active() || ((g_sunFacing || g_sunHdPrepass) && sun_shadow_map_enabled()) || bloom_mask_wanted() ||
-         rim_hd_active();
+         rim_hd_active() || actor_light_wanted();
 }
 
 bool bloom_mask_wanted() noexcept { return g_bloomHd && g_bloomHdMask && bloom_enabled(); }
@@ -4361,7 +4602,8 @@ wgpu::TextureView sea_mask_target(const wgpu::Extent3D& sceneSize) {
     g_seaMaskView = g_seaMask.CreateView();
     const wgpu::TextureDescriptor depthDescriptor{
         .label = "Sea mask depth",
-        .usage = wgpu::TextureUsage::RenderAttachment,
+        // Read by the characters' shadow pre-pass (draw_actor_shadow()).
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
         .size = {sceneSize.width, sceneSize.height, 1},
         .format = kSeaMaskDepthFormat,
     };
@@ -4504,20 +4746,12 @@ bool copy_exposure_scene(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& 
 void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
             const wgpu::Extent3D& size, wgpu::TextureFormat format, const wgpu::TextureView& dst,
             const wgpu::TextureView& resolve, uint32_t msaaSamples, const Camera& camera, const SunMap* sunMap) {
+  ++g_postEncodes;
   const bool exposureScene = camera.exposure > 1.f && g_module && msaaSamples == 1 && camera.valid &&
                              size.width >= 4 && size.height >= 4 && copy_exposure_scene(cmd, size, dst);
   // The effects drawn over the scene, which the shading below leaves (common.cpp
   // encode_effect_mask()), or a black texel: no effects this frame.
-  if (!g_effectNone && g_module) {
-    const wgpu::TextureDescriptor descriptor{
-        .label = "No effects",
-        .usage = wgpu::TextureUsage::TextureBinding,
-        .size = {1, 1, 1},
-        .format = wgpu::TextureFormat::RGBA8Unorm,
-    };
-    g_effectNone = g_device.CreateTexture(&descriptor);
-    g_effectNoneView = g_effectNone.CreateView();
-  }
+  effect_none_view();
   const bool effects = g_effectMaskDrawn && g_effectMask && g_effectMask.GetWidth() == size.width &&
                        g_effectMask.GetHeight() == size.height;
   g_effectMaskDrawn = false;
@@ -4586,6 +4820,8 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
       }
       uniform[23] = g_sunPalette.on ? 1.f : 0.f;
     }
+    // The characters drawn with Wind Waker HD's light (the mask's alpha) have the rim in their draws: left out.
+    uniform[27] = actor_light_applied() ? 1.f : 0.f;
     draw_with_uniform(cmd, "Rim light (HD)", g_rimPass, g_cloudLayout, uniform.data(), sizeof(uniform), depthView,
                       dst, resolve, &g_seaMaskView, &g_sunNormalView);
   } else if (edge_light_enabled() && !rim_hd_active() && g_module && depthView && msaaSamples == 1) {
@@ -4630,6 +4866,8 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
     // The game's brightness rides in the seconds, which the pass doesn't use.
     std::array<float, 20> view = camera.view;
     view[16] = camera.exposure;
+    // And, in place of the sun's x (unused here), whether the characters took Wind Waker HD's light (fs_exposure).
+    view[17] = actor_light_applied() ? 1.f : 0.f;
     if (g_exposureDepth && depthView && msaaSamples == 1 && camera.valid && g_seaMaskView)
     {
       draw_with_view(cmd, "Exposure", g_exposureDepth, view, depthView, dst, resolve, &g_seaMaskView,
@@ -4692,6 +4930,10 @@ void aurora_set_sun_cascade_splits(float middle, float far) {
 }
 void aurora_set_sun_palette(int on, const float sky[3], const float ground[3], const float lit[3]) {
   aurora::gfx::post_fx::set_sun_palette(on != 0, sky, ground, lit);
+}
+
+void aurora_set_actor_light_hd(int on, const float c0[3], const float shadow[3], const float k[3]) {
+  aurora::gfx::post_fx::set_actor_light_hd(on != 0, c0, shadow, k);
 }
 
 void aurora_set_hd_cloud_texture(const char* path) {
