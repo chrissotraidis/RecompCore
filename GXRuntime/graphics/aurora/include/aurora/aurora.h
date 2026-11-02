@@ -212,6 +212,12 @@ void aurora_set_sun_cascade_splits(float middle, float far);
    is multiplied by (their ambient over `lit`) in the scene's gamma. `on` 0 goes back to the fixed shadow colour.
    Takes effect at the next frame. */
 void aurora_set_sun_palette(int on, const float sky[3], const float ground[3], const float lit[3]);
+/* Wind Waker HD's character light for the hour (linear RGB): `c0`, the hemisphere's lower colour (actor_c0 times
+   its factor), `shadow`, its upper colour (the palette's shadow colour), and `k`, the lit colour (actor_k0 times its
+   factor: 2.75 at noon). Toon-shaded characters then take HD's light in place of the GameCube's ramp, when the
+   renderer's switch DOL_AURORA_ACTOR_LIGHT_HD=1 is on (read at startup). `on` 0 goes back to the GameCube shading.
+   Takes effect at the next frame. */
+void aurora_set_actor_light_hd(int on, const float c0[3], const float shadow[3], const float k[3]);
 /* Wind Waker HD's light rule for the sun shadow map (its setLightPosHD): with `on`, the direction given by
    aurora_set_sun_direction is HD's light already (the sun by day, the moon's side by night, its height held as
    HD holds it), `night` says which, and `fade` (0 to 1) is HD's day/night switch fade, which takes the lit side

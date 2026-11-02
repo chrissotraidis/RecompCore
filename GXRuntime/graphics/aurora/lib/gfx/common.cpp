@@ -2611,6 +2611,39 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
   const post_fx::SunMap* frameSunMap = sunMapFrame == frameKey && sunMap.valid ? &sunMap : nullptr;
 
 #ifdef AURORA_ENABLE_GXCORE
+  // Wind Waker HD's character light (gxcore_draw.hpp begin_actor_light_pass()): in the scene's own passes,
+  // single-sampled and at the frame buffer's size (the sea mask's passes, which the effects after it read to leave
+  // the characters to it); any other pass keeps the GameCube shading.
+  // Its shadow from this frame (post_fx::actor_light_same_frame(), on by default): for a scene pass that holds such
+  // draws, the sea mask is drawn first (it doesn't read the EFB; the effects after the scene read it as before), and
+  // the characters' shadow pre-pass made from its depth (post_fx::draw_actor_shadow()); else, or when that can't
+  // be made, last frame's pre-pass. Each such pass makes its own (a mid-frame EFB pass, and every in-between frame).
+  const size_t maskEnd = split == SIZE_MAX ? passInfo.commands.size() : split;
+  bool maskDrawn = false;
+  if (post_fx::actor_light_hd_switch()) {
+    const bool scenePass = efbPass && passInfo.msaaSamples == 1 &&
+                           passInfo.targetSize.width == webgpu::g_frameBuffer.texture.GetWidth() &&
+                           passInfo.targetSize.height == webgpu::g_frameBuffer.texture.GetHeight();
+    if (scenePass && frameSunMap != nullptr && post_fx::actor_light_same_frame() && post_fx::actor_light_wanted()) {
+      bool flagged = false;
+      for (size_t i = 0; i < maskEnd && !flagged; ++i) {
+        const auto& command = passInfo.commands[i];
+        flagged = command.type == CommandType::Draw && command.data.draw.type == ShaderType::GXCore &&
+                  !command.flat && command.data.draw.gxcore.actorLight;
+      }
+      if (flagged) {
+        encode_sea_mask(cmd, passInfo, maskEnd, frameKey);
+        maskDrawn = true;
+        post_fx::draw_actor_shadow(cmd, frame_camera(frame, frameKey), *frameSunMap, passInfo.targetSize,
+                                   webgpu::g_frameBuffer.texture.GetFormat());
+      }
+    }
+    post_fx::set_actor_light_applied(gxcore::begin_actor_light_pass(
+        scenePass ? &frame_camera(frame, frameKey) : nullptr, frameSunMap, passInfo.targetSize));
+  }
+#endif
+
+#ifdef AURORA_ENABLE_GXCORE
   // DOL_AURORA_DRAW_LOG=PASS:FIRST-LAST: the draws of that range, once, in the
   // 300th real frame: each one's pipeline state, indices, vertex bytes and
   // textures (a texture bind group is the same textures where it repeats).
@@ -2786,10 +2819,11 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
     pass.End();
   }
 #ifdef AURORA_ENABLE_GXCORE
-  if (efbPass) {
-    encode_sea_mask(cmd, passInfo, split == SIZE_MAX ? passInfo.commands.size() : split, frameKey);
-    encode_effect_mask(cmd, frame, passInfo, split == SIZE_MAX ? passInfo.commands.size() : split, frameKey);
-  }
+  if (efbPass && !maskDrawn)
+    encode_sea_mask(cmd, passInfo, maskEnd, frameKey);
+  // The effects' mask needs the scene's finished depth: always after the pass.
+  if (efbPass)
+    encode_effect_mask(cmd, frame, passInfo, maskEnd, frameKey);
 #endif
 
   if (bloomBeforeCopy) {
@@ -2826,6 +2860,10 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
       after.End();
     }
   }
+#ifdef AURORA_ENABLE_GXCORE
+  gxcore::end_actor_light_pass();
+  post_fx::end_actor_shadow();
+#endif
 
   if (passInfo.captureDepthSnapshot && !frame_interp::encoding_interpolated()) {
     depth_peek::encode_frame_snapshot(cmd, passInfo.copySourceDepthView, passInfo.targetSize, passInfo.msaaSamples);
