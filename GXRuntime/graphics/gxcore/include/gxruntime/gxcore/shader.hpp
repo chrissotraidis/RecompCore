@@ -265,6 +265,12 @@ struct ShaderKey {
   // them and no normal (kMaxRawTexCoords). Also keeps the scalar block a
   // multiple of 4, so ShaderKey stays a unique-object-representation type.
   std::uint8_t raw_tex_hi_in_nbt = 0;
+  // Wind Waker HD's character light (toon_light_stage() matched and the host's
+  // switch on): generate_wgsl adds HD's light beside the GX result, picked by
+  // HdActorLightConstants::params.x (group 0). Three pad bytes keep the scalar
+  // block a multiple of 4.
+  std::uint8_t hd_actor_light = 0;
+  std::uint8_t pad_hd[3]{};
   LightChanKey litchan[4]{}; // color0, color1, alpha0, alpha1
   TexGenKey tex_gens[kMaxTexGens]{};
   IndirectStageKey ind_stages[kMaxIndirectStages]{};
@@ -628,6 +634,67 @@ struct EfbCopyCommand {
 // group(1)=dynamic uniform, group(2)=texture+sampler.
 std::string generate_wgsl(const ShaderKey& key);
 bool channel_lit_path(const ShaderKey& k, unsigned j);
+
+// --- Wind Waker HD's character light ------------------------------------------
+//
+// Wind Waker's toon characters shade by a ramp: stage 0 mixes C0 and a konst
+// colour by a ramp texture looked up at the lit colour channel (an SRTG
+// texgen, GX_TG_SRTG), stage 1 multiplies that by the albedo texture, and an
+// optional stage 2 adds a konst colour times a second ramp lookup (a
+// highlight). toon_light_stage() finds that pattern (TEV args: 2 C0, 8 TEXC,
+// 14 KONST, 15 ZERO, 0 PREV):
+//   stage 0: a=C0 b=KONST c=TEXC d=ZERO, bias 0, add, scale 1, out PREV,
+//            its texture read through a Color0/Color1 texgen of a lit channel;
+//   stage 1: a=ZERO b=TEXC c=PREV d=ZERO, bias 0, add, scale 1, out PREV,
+//            a texture (the albedo) read through a regular texgen;
+//   stage 2 (optional): a=ZERO b=KONST c=TEXC d=PREV, bias 0, add, scale 1,
+//            out PREV, read through a Color0/Color1 texgen.
+// Anything else (another stage order, C1 in place of C0, ONE/ONE, an eye or
+// emissive stage first) is no match, and keeps the GameCube shading.
+struct ToonLightMatch {
+  bool matched = false;
+  std::uint8_t ramp_stage = 0;
+  std::uint8_t albedo_stage = 0;
+  std::uint8_t highlight_stage = 0xFF; // 0xFF: none
+  std::uint8_t ramp_texcoord = 0;      // the ramp stage's texgen (Color0/Color1)
+  std::uint8_t ramp_channel = 0;       // 0 color0, 1 color1: the lit channel it reads
+};
+ToonLightMatch toon_light_stage(const ShaderKey& key);
+
+// The uniform a ShaderKey::hd_actor_light shader reads at group(0) binding(2)
+// (binding 0 and 1 are the pass's static storage buffers; binding 3 the shadow
+// texture, 4 its sampler). All colours linear. vec4-aligned.
+struct HdActorLightConstants {
+  // x: 1 = HD's light, 0 = the GameCube result unchanged; y: debug view
+  // (DOL_AURORA_ACTOR_LIGHT_DEBUG: 1 s, 2 shadow, 3 ramp, 4 hemi, 5 rim);
+  // z: the shadow texture's LOD; w: how strongly the shadow shows (0 to 1).
+  float params[4]{};
+  float c0[4]{};     // the hemisphere's lower colour (actor_c0); w: 1 when a shadow texture is bound
+  float shadow[4]{}; // the hemisphere's upper colour (the hour's shadow colour)
+  float k[4]{};      // the lit colour (actor_k0 x its factor, 2.75 at noon)
+  float light[4]{};  // the direction to the light (the shadow map's sun or moon), view space
+  float rows[3][4]{}; // the inverse view matrix (view to world), by rows
+  float rim[4]{};    // HD's rim: intensity (2), exponent (5), back-light share (0.75), cloud (1)
+  float screen[4]{}; // 1 / the target's width and height: a fragment's uv in the shadow texture
+};
+static_assert(sizeof(HdActorLightConstants) == 10 * 16);
+
+// HD's light for one pixel, the formula the WGSL implements (for tests and
+// reference): s the lit channel (the ramp's u), sh the shadow (1 lit), fade
+// the shadow's strength, ramp(u) supplied by the caller, n_up the world
+// normal's y, n_dot_e = dot(N_view, normalize(P_view)), l_dot_e = dot(the
+// direction to the light, normalize(P_view)); albedo_gamma the albedo texel
+// (0..1, the GX texture's own gamma). Returns the gamma-space colour, clipped
+// before the gamma as HD's UNORM target clips.
+struct HdActorLightPixel {
+  float out[3]{};
+  float ramp = 0.f;
+  float hemi[3]{};
+  float light[3]{};
+  float rim = 0.f;
+};
+HdActorLightPixel hd_actor_light_reference(const HdActorLightConstants& c, float s, float sh, float (*ramp)(float u),
+                                           float n_up, float n_dot_e, float l_dot_e, const float albedo_gamma[3]);
 
 // The ubershader (gxcore_uber.cpp): one module for any key, which it reads
 // from the pixel uniform (UberPixelConstants), for a draw whose own pipeline
