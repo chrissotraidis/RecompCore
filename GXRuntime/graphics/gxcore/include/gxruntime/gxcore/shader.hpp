@@ -269,6 +269,11 @@ struct ShaderKey {
   // switch on): generate_wgsl adds HD's light beside the GX result, picked by
   // HdActorLightConstants::params.x (group 0).
   std::uint8_t hd_actor_light = 0;
+  // Wind Waker HD's fog curve (linear fog only): the GX factor, clamped, is
+  // squared before the blend, as HD's shaders fog (clamp((d - start) / (end -
+  // start))^2). Set per draw while the host has HD's fog distances in place
+  // (aurora_set_fog_hd). Two pad bytes keep the scalar block a multiple of 4.
+  std::uint8_t hd_fog = 0;
   // Wind Waker HD's light buffer on the lit scenery (hd_point_light_stage()
   // matched and the host's switch on): HD's point and effect lights, x 1.25,
   // added to stage 0's light before the texture multiplies it (HdPointLights at
@@ -276,9 +281,9 @@ struct ShaderKey {
   // vertices' normal slot holds smooth normals made on the CPU for a draw that
   // has none of its own (the sun shadows' scenery), turned by the position
   // matrix. Bit 4 (with 2): Wind Waker HD's lava glow, the vertices' colour 1 x the last stage's texel added after
-  // it (gxcore_shader.cpp hd_scenery_lava()). Two pad bytes keep the scalar block a multiple of 4.
+  // it (gxcore_shader.cpp hd_scenery_lava()). One pad byte keeps the scalar block a multiple of 4.
   std::uint8_t hd_point_light = 0;
-  std::uint8_t pad_hd[2]{};
+  std::uint8_t pad_hd[1]{};
   LightChanKey litchan[4]{}; // color0, color1, alpha0, alpha1
   TexGenKey tex_gens[kMaxTexGens]{};
   IndirectStageKey ind_stages[kMaxIndirectStages]{};

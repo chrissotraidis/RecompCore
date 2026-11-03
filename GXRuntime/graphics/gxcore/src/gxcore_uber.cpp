@@ -43,6 +43,7 @@ void emit_key_layout(std::string& out) {
   K(fog_fsel);
   K(fog_proj);
   K(fog_range);
+  K(hd_fog);
   K(tex_mtx_idx_mask);
   K(chan_captured_mask);
   K(has_vertex_normal);
@@ -854,6 +855,7 @@ fn fog(prev: vec4i, in: VertexOut) -> vec4i {
     else if (fsel == 5u) { fogv = 1.0 - exp2(-8.0 * fogv * fogv); }
     else if (fsel == 6u) { fogv = exp2(-8.0 * (1.0 - fogv)); }
     else if (fsel == 7u) { fogv = 1.0 - fogv; fogv = exp2(-8.0 * fogv * fogv); }
+    else if (kb(K_hd_fog) != 0u) { fogv = fogv * fogv; }
     let ifog = i32(round(fogv * 256.0));
     return vec4i((prev.rgb * (256 - ifog) + psc.fogcolor.rgb * ifog) >> vec3u(8u), prev.a);
 }

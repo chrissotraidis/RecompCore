@@ -257,6 +257,17 @@ void aurora_set_sun_caster_cull(int on);
 void aurora_set_monotone_hd(int on, float level, float start, float end, const float mul[3], float saturate,
                             uint32_t frame_copy);
 int aurora_monotone_hd_supported(void);
+/* Wind Waker HD's fog curve: with `on`, the game's linear fog is squared (clamp((d - start) / (end - start))^2, as
+   HD's shaders fog), for while the game's palettes hold HD's fog distances, which HD retuned for that curve (on the
+   GameCube's linear one they give about twice HD's fog at mid range). `on` 0, the default, keeps the GameCube's
+   curve. Takes effect at the next draw. */
+void aurora_set_fog_hd(int on);
+/* Wind Waker HD's fog starts before the camera in many places (Ganon's Tower -5000, the Tower of the Gods -1000), and
+   the GameCube's palette blend (float_kankyo_color_ratio_set) clamps every blended value at 0, so the game's fog
+   starts at 0 there and fogs far less than HD. The host gives the stage's HD palette entries with a start below 0
+   (count pairs of start, end; at most 8; 0 or NULL: none): where the lit scenery's fog starts at 0 and ends at one
+   of those ends, the sun pass fogs it from that start instead, as HD does. */
+void aurora_set_fog_hd_starts(const float* start_end, int count);
 /* Wind Waker HD's own normals for the stage in play (the HD pack's optional/hd-normals/<stage>.bin, made by the
    importer from the player's HD dump), for the sun shadows' facing term; NULL or a missing file: none, and
    the facing term makes its own. Loaded at once; call it as the stage changes. */

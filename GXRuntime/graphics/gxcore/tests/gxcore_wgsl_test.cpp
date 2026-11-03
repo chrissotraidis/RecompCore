@@ -2831,6 +2831,35 @@ void test_fog() {
                                    gxc::FogProjection::Perspective, false))
             .find("// Fog (Dolphin WriteFog)") == std::string::npos);
 
+  // Wind Waker HD's fog curve (hd_fog): linear fog squared after the clamp,
+  // before the integer blend; unflagged, the module is as it was; the other
+  // curves keep theirs.
+  {
+    auto key = fog_key(gxc::FogType::Linear, gxc::FogProjection::Perspective, true);
+    const std::string gc = gxc::generate_wgsl(key);
+    key.hd_fog = 1;
+    const std::string hd = gxc::generate_wgsl(key);
+    const char* square = "    fogv = fogv * fogv; // Wind Waker HD's fog curve\n";
+    CHECK(gc.find("fogv * fogv") == std::string::npos);
+    CHECK(hd != gc);
+    const auto clamp_at = hd.find("var fogv = clamp(ze - psc.fogf.y, 0.0, 1.0);");
+    const auto square_at = hd.find(square);
+    CHECK(clamp_at != std::string::npos && square_at != std::string::npos && clamp_at < square_at);
+    CHECK(square_at < hd.find("let ifog = i32(round(fogv * 256.0));"));
+    // Only that line differs.
+    std::string back = hd;
+    back.erase(square_at, std::strlen(square));
+    CHECK(back == gc);
+    auto exp = fog_key(gxc::FogType::Exp, gxc::FogProjection::Perspective, false);
+    const std::string exp_gc = gxc::generate_wgsl(exp);
+    exp.hd_fog = 1;
+    CHECK(gxc::generate_wgsl(exp) == exp_gc);
+    // The ubershader reads the bit from the key.
+    const std::string uber = gxc::generate_uber_wgsl(false);
+    CHECK(uber.find("const K_hd_fog: u32 = ") != std::string::npos);
+    CHECK(uber.find("else if (kb(K_hd_fog) != 0u) { fogv = fogv * fogv; }") != std::string::npos);
+  }
+
   // --- Plan uniforms decoded from BP fog registers (state path) ------------
   gxc::GxCoreState state;
   state.reset();

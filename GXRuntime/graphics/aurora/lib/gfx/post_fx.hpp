@@ -84,6 +84,17 @@ bool actor_light_hd_switch() noexcept;
 // (the host sends the lights) and the characters' light wanted this frame.
 bool point_lights_hd_switch() noexcept;
 bool point_lights_hd_active() noexcept;
+// Wind Waker HD's fog curve (aurora_set_fog_hd): linear fog squared (gxc::ShaderKey::hd_fog), set by the host while
+// HD's fog distances are in the game's palettes. Read per draw.
+bool fog_hd() noexcept;
+void set_fog_hd(bool on) noexcept;
+// Wind Waker HD's palette fog starts below 0, as start, end pairs (aurora_set_fog_hd_starts).
+void set_fog_hd_starts(const float* start_end, int count) noexcept;
+// The fog the lit scenery's draws took this frame (GX's: A, B's magnitude and shift, C, its colour 0-255, and HD's
+// square), for the sun pass to fog after the shade, by the distance from the eye, as Wind Waker HD's scenery
+// shaders do (DOL_AURORA_SUN_FOG_HD=0: as drawn). From the draw thread.
+void note_scene_fog(float a, int b_magnitude, int b_shift, float c, const int colour[3], bool hd_square,
+                    const float* range = nullptr, float centre = 0.f, float width = 0.f) noexcept;
 void set_actor_light_hd(bool on, const float c0[3], const float shadow[3], const float k[3]) noexcept;
 bool actor_light_palette(float c0[3], float shadow[3], float k[3]) noexcept;
 // The GameCube's global actor C0 and K0 (linear) the characters' own registers are set against

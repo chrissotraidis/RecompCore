@@ -4120,6 +4120,19 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   t_hdLavaDraw = smoothNormal && key.shader.hd_point_light != 0u && hd_lava_draw(plan);
   if (t_hdLavaDraw)
     key.shader.hd_point_light |= 4u;
+  // Wind Waker HD's fog curve (aurora_set_fog_hd): while the host has HD's fog distances in the game's palettes,
+  // linear fog is squared, as HD's shaders fog; on the GameCube's linear curve HD's distances (retuned for the
+  // square) gave about twice HD's fog at mid range.
+  if (tev && key.shader.fog_fsel != static_cast<uint8_t>(gxc::FogType::Off) && post_fx::fog_hd())
+    key.shader.hd_fog = 1u;
+  // The lit scenery's fog (its linear perspective fog, with GX's range adjust if it has it), for the sun pass to put after
+  // its shade, as Wind Waker HD fogs its scenery (post_fx::note_scene_fog()).
+  if (tev && key.shader.fog_fsel == static_cast<uint8_t>(gxc::FogType::Linear) &&
+      key.shader.fog_proj == static_cast<uint8_t>(gxc::FogProjection::Perspective) && hd_light_draw(plan)) {
+    const auto& pc = plan.pixel_constants;
+    post_fx::note_scene_fog(pc.fogf[0], pc.fogi[1], pc.fogi[3], pc.fogf[1], pc.fogcolor, key.shader.hd_fog != 0u,
+                            key.shader.fog_range != 0u ? &pc.fogrange[0][0] : nullptr, pc.fogf[2], pc.fogf[3]);
+  }
   const PipelineConfig colorConfig{
       .version = GXCorePipelineConfigVersion,
       .key = key,
@@ -4221,7 +4234,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       static gxc::UberPixelConstants block; // one recording thread at a time
       std::memcpy(&block.psc, &pixelConstants, sizeof block.psc);
       std::memset(block.key, 0, sizeof block.key);
-      std::memcpy(block.key, &plan.pipeline.shader, sizeof plan.pipeline.shader);
+      std::memcpy(block.key, &key.shader, sizeof key.shader); // with the per-draw bits (hd_fog)
       block.extra[0] = gxc::texmap_popcount(gxc::used_texmap_mask(plan.pipeline.shader)) > 1u ? 1u : 0u;
       uberPixelRange = push_uniform_dedup(g_uberPixelUniformCache, reinterpret_cast<const uint8_t*>(&block),
                                           sizeof block);

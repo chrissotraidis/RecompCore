@@ -263,7 +263,11 @@ void emit_fog(std::string& out, const ShaderKey& key) {
     break;
   case FogType::Linear:
   default:
-    break; // linear: fogv unchanged
+    // linear: fogv unchanged, or Wind Waker HD's curve, its square (HD's own
+    // fog distances, retuned for it, are what the game then holds).
+    if (key.hd_fog != 0u)
+      emit(out, "    fogv = fogv * fogv; // Wind Waker HD's fog curve\n");
+    break;
   }
   // Integer blend: prev.rgb = (prev.rgb*(256-ifog) + fogcolor*ifog) >> 8.
   emit(out, "    let ifog = i32(round(fogv * 256.0));\n"
