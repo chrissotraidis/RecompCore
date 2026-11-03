@@ -434,6 +434,45 @@ inline std::uint32_t used_texmap_mask(const ShaderKey& key) {
   return mask != 0u ? mask : 1u;
 }
 
+// The texmap an alpha-tested draw's cutout comes from, for a caster that draws
+// it again with that one texture (the HD look's sun shadow map): the texmap of
+// the TEV stages whose alpha reads the texture's alpha (TEXA), when they all
+// read the same one through a texcoord made from the vertex's first texture
+// coordinate (a regular texgen from TEX0, the coordinate such a caster has),
+// else -1. A Windfall girl's body samples its colour and alpha from texmap 0
+// and its toon ramp from texmap 1: 0. Without TEV stages a textured draw
+// samples texmap 0 through texcoord 0.
+inline int cutout_alpha_texmap(const ShaderKey& key) {
+  constexpr std::uint8_t kTexA = 4u; // TevAlphaArg TexAlpha
+  const auto from_first_uv = [&key](std::uint32_t texcoord) {
+    if (texcoord >= key.num_tex_gens || texcoord >= kMaxTexGens)
+      return false;
+    const TexGenKey& g = key.tex_gens[texcoord];
+    return g.texgentype == static_cast<std::uint8_t>(TexGenType::Regular) &&
+           g.sourcerow == static_cast<std::uint8_t>(TexSourceRow::Tex0) && g.projection == 0u;
+  };
+  if (key.textured == 0u)
+    return -1;
+  if (key.tev_valid == 0u)
+    return from_first_uv(0u) ? 0 : -1;
+  int texmap = -1;
+  for (std::uint32_t n = 0; n < key.num_tev_stages && n < kMaxTevStages; ++n) {
+    const TevStageKey& s = key.tev_stages[n];
+    if (s.ac_a != kTexA && s.ac_b != kTexA && s.ac_c != kTexA && s.ac_d != kTexA)
+      continue;
+    // A stage reading TEXA with no texture enabled reads nothing usable; a
+    // warped (indirect) lookup isn't the vertex's coordinate.
+    if (s.tevorders_enable == 0u || !from_first_uv(s.tevorders_texcoord & 7u) ||
+        (s.ind_stage < key.num_ind_stages && s.ind_matrix_index != 0u))
+      return -1;
+    const int map = static_cast<int>(s.tevorders_texmap & 7u);
+    if (texmap >= 0 && texmap != map)
+      return -1;
+    texmap = map;
+  }
+  return texmap;
+}
+
 // One bound texture for a specific TEV texmap slot (63/Mfin multi-texmap). The
 // single-texmap fast path uses DrawPlan's flat tex_*/tlut_* fields; when more
 // than one distinct texmap is sampled (e.g. a THP YUV movie draws Y/U/V on
