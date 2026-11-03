@@ -74,6 +74,8 @@ struct DrawData {
   // per-vertex matrices (a skinned model) or the current one.
   bool sunCaster = false;
   bool posMtxIdx = false;
+  // The draw's own cull mode (gxc::CullMode), for the map's casters while post_fx::sun_caster_cull() is on.
+  uint8_t sunCasterCull = 0;
   // It casts in the cascades past the second too (gxc::DrawPlan::far_caster: the stage's BG lists, as Wind Waker
   // HD's far cascades draw only its BG model list).
   bool farCaster = true;

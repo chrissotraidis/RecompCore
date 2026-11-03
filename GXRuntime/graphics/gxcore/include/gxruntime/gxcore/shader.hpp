@@ -275,9 +275,14 @@ struct ShaderKey {
   // group 0, which a flagged key takes as the characters' do). 2: the
   // vertices' normal slot holds smooth normals made on the CPU for a draw that
   // has none of its own (the sun shadows' scenery), turned by the position
-  // matrix. Two pad bytes keep the scalar block a multiple of 4.
+  // matrix. Bit 4 (with 2): Wind Waker HD's lava glow, the vertices' colour 1 x the last stage's texel added after
+  // it (gxcore_shader.cpp hd_scenery_lava()).
   std::uint8_t hd_point_light = 0;
-  std::uint8_t pad_hd[2]{};
+  // Wind Waker HD's water floor (hd_water_floor_stage() matched while HD's palettes are in place): its three stages
+  // worked in linear light on HD's linear colours, as HD's shader for it does. One pad byte keeps the scalar block a
+  // multiple of 4.
+  std::uint8_t hd_water = 0;
+  std::uint8_t pad_hd[1]{};
   LightChanKey litchan[4]{}; // color0, color1, alpha0, alpha1
   TexGenKey tex_gens[kMaxTexGens]{};
   IndirectStageKey ind_stages[kMaxIndirectStages]{};
@@ -747,6 +752,12 @@ ToonLightMatch toon_light_stage(const ShaderKey& key);
 // and 16 of 18 and 25 of 26 of Dragon Roost Cavern's and the Tower of the
 // Gods' room materials). Not a toon draw (toon_light_stage()).
 bool hd_point_light_stage(const ShaderKey& key);
+
+// The water floor of the Tower of the Gods' flooded rooms: KONST + C0 x TEXC (alpha RASA x TEXA) into C2, KONST x
+// TEXC (another texcoord) into PREV, then PREV x (1 - APREV) + C2, untextured. Wind Waker HD's shader for it (Cemu,
+// ToG room 0) adds the same terms in linear light on the colours made linear (u8, (c / 255)^2.2): two layers of
+// caustics over the floor's colour. On the GameCube's gamma colours the sum came out twice as bright in linear.
+bool hd_water_floor_stage(const ShaderKey& key);
 
 // The uniform a ShaderKey::hd_actor_light shader reads at group(0) binding(2)
 // (binding 0 and 1 are the pass's static storage buffers; binding 3 the shadow

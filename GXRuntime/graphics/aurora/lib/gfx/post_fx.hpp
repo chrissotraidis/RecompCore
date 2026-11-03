@@ -120,6 +120,10 @@ bool actor_cloud_source(const Camera& camera, float cloud[4], wgpu::TextureView&
 void set_sun_hd_light(bool on, bool night, float fade) noexcept;
 // Wind Waker HD's cloud floor from the host's clock (aurora_set_cloud_hd_floor), negative while unset.
 void set_cloud_hd_floor(float floor) noexcept;
+// The scenery's shadow casters culled as their draws are (aurora_set_sun_caster_cull; DOL_AURORA_SUN_SHADOW_CASTER_CULL
+// =1 or 0 overrides it).
+void set_sun_caster_cull(bool on) noexcept;
+bool sun_caster_cull() noexcept;
 void set_sun_direction(float x, float y, float z) noexcept;
 void set_exposure(float gain) noexcept;
 // The scene is brightened this frame (the game's gain over 1): the sea's draws
