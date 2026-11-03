@@ -2933,6 +2933,48 @@ void test_fog() {
                                    gxc::FogProjection::Perspective, false))
             .find("// Fog (Dolphin WriteFog)") == std::string::npos);
 
+  // Wind Waker HD's fog curve (hd_fog): linear fog squared after the clamp,
+  // then mixed in linear light in place of the integer blend; unflagged, the
+  // module is as it was; the other curves keep theirs.
+  {
+    auto key = fog_key(gxc::FogType::Linear, gxc::FogProjection::Perspective, true);
+    const std::string gc = gxc::generate_wgsl(key);
+    key.hd_fog = 1;
+    const std::string hd = gxc::generate_wgsl(key);
+    const char* square = "    fogv = fogv * fogv; // Wind Waker HD's fog curve\n";
+    CHECK(gc.find("fogv * fogv") == std::string::npos);
+    CHECK(hd != gc);
+    const auto clamp_at = hd.find("var fogv = clamp(ze - psc.fogf.y, 0.0, 1.0);");
+    const auto square_at = hd.find(square);
+    CHECK(clamp_at != std::string::npos && square_at != std::string::npos && clamp_at < square_at);
+    const char* mix_lin = "    let fog_p = vec3f(clamp(prev.rgb, vec3i(0), vec3i(255))) / 255.0;\n";
+    const char* mix_end = "    prev = vec4i(vec3i(round(fog_out * 255.0)), prev.a);\n";
+    const char* blend = "    let ifog = i32(round(fogv * 256.0));\n"
+                        "    prev = vec4i((prev.rgb * (256 - ifog) + psc.fogcolor.rgb * ifog) >> vec3u(8u), prev.a);\n";
+    const auto mix_at = hd.find(mix_lin);
+    const auto end_at = hd.find(mix_end);
+    CHECK(mix_at != std::string::npos && square_at < mix_at && mix_at < end_at && end_at != std::string::npos);
+    CHECK(hd.find("let fog_lin = mix(select(pow((fog_p + 0.055) / 1.055, vec3f(2.4))", mix_at) < end_at);
+    CHECK(hd.find("1.055 * pow(fog_lin, vec3f(1.0 / 2.4)) - 0.055", mix_at) < end_at);
+    CHECK(hd.find("let ifog = i32(round(fogv * 256.0));") == std::string::npos);
+    // Only those lines differ: the square, and the linear mix in place of the integer blend.
+    std::string back = hd;
+    back.replace(mix_at, end_at + std::strlen(mix_end) - mix_at, blend);
+    back.erase(square_at, std::strlen(square));
+    CHECK(back == gc);
+    auto exp = fog_key(gxc::FogType::Exp, gxc::FogProjection::Perspective, false);
+    const std::string exp_gc = gxc::generate_wgsl(exp);
+    exp.hd_fog = 1;
+    CHECK(gxc::generate_wgsl(exp) == exp_gc);
+    // The ubershader reads the bit from the key.
+    const std::string uber = gxc::generate_uber_wgsl(false);
+    CHECK(uber.find("const K_hd_fog: u32 = ") != std::string::npos);
+    const auto uber_hd = uber.find("else if (kb(K_hd_fog) != 0u) {");
+    CHECK(uber_hd != std::string::npos);
+    CHECK(uber.find("fogv = fogv * fogv;", uber_hd) < uber.find("let fog_lin = mix(", uber_hd));
+    CHECK(uber.find("return vec4i(vec3i(round(fog_out * 255.0)), prev.a);", uber_hd) != std::string::npos);
+  }
+
   // --- Plan uniforms decoded from BP fog registers (state path) ------------
   gxc::GxCoreState state;
   state.reset();
@@ -3032,6 +3074,58 @@ void test_fog() {
   CHECK(!state.build_draw_plan(draw, counters).far_caster);
   state.apply(bp(gxc::GxCoreState::kDrawListRegister, 0u));
   CHECK(state.build_draw_plan(draw, counters).far_caster);
+}
+
+// Wind Waker HD's fog start before the camera (gxc::fog_start_before_camera()): a draw fogged from a start of 0 to
+// the given end gets GXSetFog's A and C for HD's start to the same end; other draws are left alone.
+void test_fog_start_before_camera() {
+  const float n = 1.f, f = 200000.f;
+  // GXSetFog's terms, as the SDK stores them (a = A / 2^shift, b = B x 2^23 / 2^(shift - 1)).
+  auto set_fog = [&](gxc::PixelShaderConstants& pc, float s, float e) {
+    const float A = (f * n) / ((f - n) * (e - s)), C = s / (e - s);
+    float B = f / (f - n);
+    int shift = 0;
+    while (B > 0.5f) {
+      B *= 0.5f;
+      ++shift;
+    }
+    pc.fogf[0] = A / static_cast<float>(1 << (shift + 1));
+    pc.fogf[1] = C;
+    pc.fogi[1] = static_cast<std::int32_t>(8.388638e6f * B);
+    pc.fogi[3] = shift + 1;
+  };
+  float proj[4][4]{};
+  proj[0][0] = 1.f;
+  proj[1][1] = 1.f;
+  proj[2][2] = -n / (f - n);
+  proj[2][3] = -(f * n) / (f - n);
+  proj[3][2] = -1.f;
+  gxc::ShaderKey key{};
+  key.fog_fsel = static_cast<std::uint8_t>(gxc::FogType::Linear);
+  key.fog_proj = static_cast<std::uint8_t>(gxc::FogProjection::Perspective);
+  gxc::PixelShaderConstants pc{}, want{};
+  set_fog(pc, 0.f, 8000.f);
+  set_fog(want, -1000.f, 8000.f);
+  CHECK(gxc::fog_start_before_camera(pc, key, proj, -1000.f, 8000.f));
+  CHECK(std::abs(pc.fogf[0] / want.fogf[0] - 1.f) < 1e-4f);
+  CHECK(std::abs(pc.fogf[1] - want.fogf[1]) < 1e-4f);
+  CHECK(pc.fogi[1] == want.fogi[1] && pc.fogi[3] == want.fogi[3]);
+  // Not taken: another end, a start already set, a start not below 0, other fog, an orthographic projection.
+  gxc::PixelShaderConstants other{};
+  set_fog(other, 0.f, 4000.f);
+  CHECK(!gxc::fog_start_before_camera(other, key, proj, -1000.f, 8000.f));
+  set_fog(other, 500.f, 8000.f);
+  CHECK(!gxc::fog_start_before_camera(other, key, proj, -1000.f, 8000.f));
+  set_fog(other, 0.f, 8000.f);
+  CHECK(!gxc::fog_start_before_camera(other, key, proj, 0.f, 8000.f));
+  gxc::ShaderKey exp_key = key;
+  exp_key.fog_fsel = static_cast<std::uint8_t>(gxc::FogType::Exp);
+  CHECK(!gxc::fog_start_before_camera(other, exp_key, proj, -1000.f, 8000.f));
+  float ortho[4][4]{};
+  ortho[3][3] = 1.f;
+  CHECK(!gxc::fog_start_before_camera(other, key, ortho, -1000.f, 8000.f));
+  set_fog(want, 0.f, 8000.f);
+  CHECK(other.fogf[0] == want.fogf[0] && other.fogf[1] == 0.f);
 }
 
 // S16 EFB copy: the GxCoreSink turns a resolved CopyDestination packet into an
@@ -3154,6 +3248,7 @@ int main() {
   test_lighting_completeness();
   test_cached_normal();
   test_fog();
+  test_fog_start_before_camera();
   test_efb_copy_sink();
   test_draw_fusion();
   if (g_failures != 0) {
