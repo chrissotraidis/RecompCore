@@ -282,13 +282,34 @@ void emit_fog(std::string& out, const ShaderKey& key) {
 // the lit channel the GX ramp reads (already HD's ramp coordinate), looked up
 // with a float bilinear sample (the GX lookup is quantised and filtered by the
 // game's sampler). The optional third stage (PREV + K1 x the ramp) is the
-// GameCube's effect light (K1 added to lit models, black but for effects such
-// as the sword's glow): Wind Waker HD drops that stage and sends K1 to its light
-// manager as a point light (the decomp; Link's and the shield's HD shaders have
-// no such term, and their traced pixels match without it), so it is left out
-// here; its light comes back with HD's point lights. Alpha, the alpha
-// test, fog and destination alpha are the GX path's. params.x 0 keeps the GX
-// colour bit for bit.
+// GameCube's effect light: the sword-hit flash, a bomb's, the item-get light
+// (dScnKy_env_light_c::settingTevStruct_eflightcol_plus). The game has the
+// stage only while such a light reaches the model: setLightTevColorType_sub
+// cuts the material's stage count back to before it whenever K1 is unset, so
+// with no effect the key has two stages and there is nothing to add. Wind
+// Waker HD has no such term in its toon shader (Link's and the shield's traced
+// pixels match without it): it sends the effect lights to its light buffer
+// instead, which isn't ported. Until it is, the stage runs on HD's colour as
+// the GameCube ran it on its own (PREV + K1 x the ramp, clamped), so characters
+// keep the flashes; hdl.screen.z 0 (DOL_AURORA_ACTOR_LIGHT_HD_EFFECT=0) leaves
+// it out, HD's result alone. Alpha, the alpha test, fog and destination alpha
+// are the GX path's. params.x 0 keeps the GX colour bit for bit. With a later
+// stage (E, F and G, ToonLightMatch::after_albedo, or the main pattern's
+// effect light) the block comes right after the albedo stage, in place of its
+// colour (plus its d), the albedo C1 for E with no rim (and no rim for F), and
+// the later stages run on it as the GameCube's did.
+// The effect light's stages (PREV + K x the ramp): E, F and G's, and the main pattern's third.
+unsigned hd_effect_mask(const ToonLightMatch& hd) {
+  unsigned mask = hd.effect_stages;
+  if (hd.highlight_stage < kMaxTevStages)
+    mask |= 1u << hd.highlight_stage;
+  return mask;
+}
+
+// HD's light goes right after the albedo stage, so the stages after it run on it: E, F, G, and the main pattern
+// with the effect light, which then adds the GameCube's effect light to HD's colour.
+bool hd_after_albedo(const ToonLightMatch& hd) { return hd.after_albedo || hd_effect_mask(hd) != 0u; }
+
 void emit_hd_actor_light(std::string& out, const ShaderKey& key, const ToonLightMatch& hd) {
   const bool multi = texmap_popcount(used_texmap_mask(key)) > 1u;
   const TevStageKey& rs = key.tev_stages[hd.ramp_stage];
@@ -323,9 +344,20 @@ void emit_hd_actor_light(std::string& out, const ShaderKey& key, const ToonLight
        "        let hd_l = mix(hd_hemi, hdl.k.rgb, hd_ramp * hd_cloud);\n"
        "        let hd_rev = mix(1.0, clamp(dot(hdl.light.xyz, hd_e), 0.0, 1.0), hdl.rim.z);\n"
        "        let hd_rim = pow(clamp(1.0 + dot(hd_n, hd_e), 0.0, 1.0), hdl.rim.y) * hd_rev;\n"
-       "        let hd_alb = pow(vec3f(hd_albedo) / 255.0, vec3f(2.2));\n"
-       "        var hd_out = pow(clamp(hd_l * (hd_alb + hd_hemi * (hdl.rim.x * hd_rim)), vec3f(0.0), vec3f(1.0)), "
-       "vec3f(1.0 / 2.2));\n");
+       "        let hd_alb = pow(vec3f(hd_albedo) / 255.0, vec3f(2.2));\n");
+  if (hd.rim)
+    emit(out, "        var hd_out = pow(clamp(hd_l * (hd_alb + hd_hemi * (hdl.rim.x * hd_rim)), vec3f(0.0), vec3f(1.0)), "
+              "vec3f(1.0 / 2.2));\n");
+  else if (hd.sheen_stage < kMaxTevStages) {
+    // E with the glint (PREV + K x APREV): Wind Waker HD adds K x APREV in linear light before the clip (the
+    // Mirror Shield's PS 2960: U2 x L + U7.x x clamp(ramp.a + I4), U7.x = 0.1166 = (96 / 255)^2.2, its K3.r), where
+    // the GameCube adds K to the gamma colour. APREV is stage 1's alpha here (the glint texel and the ramp's).
+    emitf(out,
+          "        let hd_sheen = pow(vec3f(%s) / 255.0, vec3f(2.2)) * clamp(f32(prev.a) / 255.0, 0.0, 1.0);\n",
+          kKselC[key.tev_stages[hd.sheen_stage].ksel_kc]);
+    emit(out, "        var hd_out = pow(clamp(hd_l * hd_alb + hd_sheen, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));\n");
+  } else // the colour-register albedo (E): HD's rim-only materials, no rim
+    emit(out, "        var hd_out = pow(clamp(hd_l * hd_alb, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));\n");
   emit(out,
        "        let hd_debug = i32(hdl.params.y + 0.5);\n"
        "        if (hd_debug == 1) { hd_out = vec3f(hd_s); }\n"
@@ -333,9 +365,25 @@ void emit_hd_actor_light(std::string& out, const ShaderKey& key, const ToonLight
        "        if (hd_debug == 3) { hd_out = hd_ramp; }\n"
        "        if (hd_debug == 4) { hd_out = pow(clamp(hd_hemi, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)); }\n"
        "        if (hd_debug == 5) { hd_out = vec3f(clamp(hd_rim, 0.0, 1.0)); }\n"
-       "        if (hd_debug == 6) { hd_out = vec3f(hd_cloud); }\n"
-       "        prev = vec4i(vec3i(round(clamp(hd_out, vec3f(0.0), vec3f(1.0)) * 255.0)), prev.a);\n"
-       "    }\n");
+       "        if (hd_debug == 6) { hd_out = vec3f(hd_cloud); }\n");
+  if (!hd_after_albedo(hd)) {
+    emit(out, "        prev = vec4i(vec3i(round(clamp(hd_out, vec3f(0.0), vec3f(1.0)) * 255.0)), prev.a);\n"
+              "    }\n");
+    return;
+  }
+  // E, F, G: in place of the albedo stage's colour, with its d (F's added register, set by code, e.g. the bomb's
+  // flash) added after the light and clamped as the stage clamps; the later stages run on it.
+  const TevStageKey& as = key.tev_stages[hd.albedo_stage];
+  const char* lo = as.cc_clamp ? "0" : "-1024";
+  const char* hi = as.cc_clamp ? "255" : "1023";
+  if (as.cc_d != 15u)
+    emitf(out,
+          "        prev = vec4i(clamp(vec3i(round(clamp(hd_out, vec3f(0.0), vec3f(1.0)) * 255.0)) + tevin_d.rgb, "
+          "vec3<i32>(%s), vec3<i32>(%s)), prev.a);\n",
+          lo, hi);
+  else
+    emit(out, "        prev = vec4i(vec3i(round(clamp(hd_out, vec3f(0.0), vec3f(1.0)) * 255.0)), prev.a);\n");
+  emit(out, "    }\n");
 }
 
 
@@ -393,6 +441,15 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key, const ToonLightMa
   for (std::uint32_t n = 0; n < key.num_tev_stages; ++n) {
     const TevStageKey& s = key.tev_stages[n];
     emitf(out, "    // TEV stage %u\n", n);
+    // An effect-light stage after HD's light: added to HD's colour, as the GameCube adds it to its own, unless
+    // hdl.screen.z says to leave it out (DOL_AURORA_ACTOR_LIGHT_HD_EFFECT=0, HD's result without it).
+    const bool hd_skip = hd.matched && (hd_effect_mask(hd) & (1u << n)) != 0u;
+    if (hd_skip)
+      emitf(out, "    let hd_keep%u = prev.rgb;\n", n);
+    // E's glint stage: HD's block added it in linear already, so the GX stage's add (in gamma) is taken out again.
+    const bool hd_sheen = hd.matched && n == hd.sheen_stage;
+    if (hd_sheen)
+      emitf(out, "    let hd_sheen_keep%u = prev.rgb;\n", n);
 
     // Rasterized color, if referenced (RASC=10/RASA=11 color; RASA=5 alpha).
     const bool uses_ras =
@@ -611,9 +668,19 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key, const ToonLightMa
           adest, adest, aexp.c_str(), alo, ahi);
 
     // Wind Waker HD's actor light keeps what it needs of the GX stages: the
-    // albedo texel.
-    if (hd.matched && n == hd.albedo_stage)
-      emit(out, "    let hd_albedo = textemp.rgb & vec3i(255, 255, 255);\n");
+    // albedo texel (or C1, E). E, F and G take the light here.
+    if (hd.matched && n == hd.albedo_stage) {
+      if (hd.albedo_c1)
+        emit(out, "    let hd_albedo = c1.rgb & vec3i(255, 255, 255);\n");
+      else
+        emit(out, "    let hd_albedo = textemp.rgb & vec3i(255, 255, 255);\n");
+      if (hd_after_albedo(hd))
+        emit_hd_actor_light(out, key, hd);
+    }
+    if (hd_skip)
+      emitf(out, "    if (hdl.params.x > 0.5 && hdl.screen.z < 0.5) { prev = vec4i(hd_keep%u, prev.a); }\n", n);
+    if (hd_sheen)
+      emitf(out, "    if (hdl.params.x > 0.5) { prev = vec4i(hd_sheen_keep%u, prev.a); }\n", n);
   }
 
   // The last stage's destination register is what reaches the framebuffer.
@@ -623,7 +690,7 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key, const ToonLightMa
   if (last.ac_dest != 0)
     emitf(out, "    prev = vec4i(prev.rgb, %s.a);\n", kTevOutput[last.ac_dest]);
 
-  if (hd.matched)
+  if (hd.matched && !hd_after_albedo(hd))
     emit_hd_actor_light(out, key, hd);
 
   // Alpha test (Dolphin WriteAlphaTest): discard on failure.
@@ -826,7 +893,7 @@ bool channel_lit_path(const ShaderKey& k, unsigned j) {
 ToonLightMatch toon_light_stage(const ShaderKey& key) {
   ToonLightMatch none;
   if (key.tev_valid == 0u || key.textured == 0u || key.lit_valid == 0u || key.num_ind_stages != 0u ||
-      key.num_tev_stages < 2u || key.num_tev_stages > 3u || key.num_tex_gens == 0u)
+      key.num_tev_stages < 2u || key.num_tev_stages > kMaxTevStages || key.num_tex_gens == 0u)
     return none;
   // A stage whose combine is d + mix(a, b, c) with no bias, an add, scale 1, into PREV.
   const auto plain = [](const TevStageKey& s, std::uint8_t a, std::uint8_t b, std::uint8_t c, std::uint8_t d) {
@@ -849,35 +916,60 @@ ToonLightMatch toon_light_stage(const ShaderKey& key) {
       return -1;
     return ch;
   };
-  constexpr std::uint8_t kPrev = 0, kC0 = 2, kTexC = 8, kKonst = 14, kZero = 15;
+  constexpr std::uint8_t kPrev = 0, kAPrev = 1, kC0 = 2, kC1 = 4, kC2 = 6, kTexC = 8, kKonst = 14, kZero = 15;
+  // The effect light (PREV + KONST x the ramp), which HD leaves to its point lights.
+  const auto effect_light = [&](const TevStageKey& s) {
+    return plain(s, kZero, kKonst, kTexC, kPrev) && ramp_channel(texgen(s)) >= 0;
+  };
   const TevStageKey& s0 = key.tev_stages[0];
   const TevStageKey& s1 = key.tev_stages[1];
   const int ramp_tg = texgen(s0);
   const int ch = ramp_channel(ramp_tg);
   if (!plain(s0, kC0, kKonst, kTexC, kZero) || ch < 0)
     return none;
-  const int albedo_tg = texgen(s1);
-  if (!plain(s1, kZero, kTexC, kPrev, kZero) || albedo_tg < 0 ||
-      static_cast<TexGenType>(key.tex_gens[albedo_tg].texgentype) != TexGenType::Regular)
-    return none;
   ToonLightMatch match;
-  if (key.num_tev_stages == 3u) {
-    const TevStageKey& s2 = key.tev_stages[2];
-    if (!plain(s2, kZero, kKonst, kTexC, kPrev) || ramp_channel(texgen(s2)) < 0)
-      return none;
-    match.highlight_stage = 2;
-  }
-  match.matched = true;
   match.ramp_stage = 0;
   match.albedo_stage = 1;
   match.ramp_texcoord = static_cast<std::uint8_t>(ramp_tg);
   match.ramp_channel = static_cast<std::uint8_t>(ch);
+  const int albedo_tg = texgen(s1);
+  const bool texel_albedo = albedo_tg >= 0 &&
+                            static_cast<TexGenType>(key.tex_gens[albedo_tg].texgentype) == TexGenType::Regular;
+  // The main pattern: the albedo texel, then nothing or the effect light.
+  if (plain(s1, kZero, kTexC, kPrev, kZero) && texel_albedo &&
+      (key.num_tev_stages == 2u || (key.num_tev_stages == 3u && effect_light(key.tev_stages[2])))) {
+    match.matched = true;
+    if (key.num_tev_stages == 3u)
+      match.highlight_stage = 2;
+    return match;
+  }
+  // E, F and G: the light after stage 1, the stages after it run on the lit colour.
+  const bool register_added = s1.cc_d == kZero || s1.cc_d == kC1 || s1.cc_d == kC2 || s1.cc_d == kKonst;
+  if (plain(s1, kZero, kC1, kPrev, kZero)) {
+    match.albedo_c1 = true; // E
+    match.rim = false;
+  } else if (!(plain(s1, kZero, kTexC, kPrev, s1.cc_d) && register_added && texel_albedo)) {
+    return none;
+  } else if (s1.cc_d != kZero) {
+    match.rim = false; // F: all 28 of the disc's are rim-only in HD's table (the bomb, the Tingle statues)
+  }
+  for (std::uint32_t n = 2; n < key.num_tev_stages; ++n) {
+    const TevStageKey& s = key.tev_stages[n];
+    if (s.cc_dest != kPrev || (s.cc_a != kPrev && s.cc_b != kPrev && s.cc_c != kPrev && s.cc_d != kPrev))
+      return none;
+    if (effect_light(s))
+      match.effect_stages = static_cast<std::uint16_t>(match.effect_stages | (1u << n));
+    else if (match.albedo_c1 && match.sheen_stage == 0xFF && plain(s, kZero, kKonst, kAPrev, kPrev))
+      match.sheen_stage = static_cast<std::uint8_t>(n);
+  }
+  match.matched = true;
+  match.after_albedo = true;
   return match;
 }
 
 HdActorLightPixel hd_actor_light_reference(const HdActorLightConstants& c, float s, float sh, float (*ramp)(float u),
                                            float n_up, float n_dot_e, float l_dot_e, const float albedo_gamma[3],
-                                           float cloud) {
+                                           float cloud, bool rim) {
   const auto clamp01 = [](float v) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; };
   const auto mix = [](float a, float b, float t) { return a + (b - a) * t; };
   HdActorLightPixel px;
@@ -888,7 +980,7 @@ HdActorLightPixel hd_actor_light_reference(const HdActorLightConstants& c, float
     px.hemi[i] = mix(c.c0[i], c.shadow[i], 0.5f + 0.5f * n_up);
     px.light[i] = mix(px.hemi[i], c.k[i], px.ramp * cloud);
     const float albedo = std::pow(albedo_gamma[i], 2.2f);
-    px.out[i] = std::pow(clamp01(px.light[i] * (albedo + px.hemi[i] * c.rim[0] * px.rim)), 1.f / 2.2f);
+    px.out[i] = std::pow(clamp01(px.light[i] * (albedo + (rim ? px.hemi[i] * c.rim[0] * px.rim : 0.f))), 1.f / 2.2f);
   }
   return px;
 }
