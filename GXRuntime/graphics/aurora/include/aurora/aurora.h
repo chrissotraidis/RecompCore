@@ -246,6 +246,17 @@ void aurora_set_cloud_hd_floor(float floor);
    room's ceiling seen from below. Characters keep their own. `on` 0, the default, draws every caster's both sides.
    DOL_AURORA_SUN_SHADOW_CASTER_CULL=1 or 0 (local test) overrides it. Takes effect at the next frame. */
 void aurora_set_sun_caster_cull(int on);
+/* Wind Waker HD's monotone (Frozen Hyrule's sepia, its DOF pass while the game's mMonotone is set). With `on`, at the
+   game's grey composite (its I8 copy of the frame to `frame_copy`, mDoGph_gInf_c::mFrameBufferTex, and the quad that
+   lays it back, which is left out), the scene's effects run and then HD's pass: the scene's grey (HD's weights) at
+   half size, `saturate` of the way, times `mul`, over the scene by clamp(level x clamp((distance - start) / (end -
+   start))), all of it beyond `start` when start == end; what the game draws after the composite (the player's
+   lists, Link and his things) stays in colour, and bloom goes over all of it, as in HD. `on` 0, the default, leaves
+   the game's own grey. Single-sampled only (aurora_monotone_hd_supported()); DOL_AURORA_MONOTONE_HD=0 turns it off.
+   Takes effect at the next frame the game records. */
+void aurora_set_monotone_hd(int on, float level, float start, float end, const float mul[3], float saturate,
+                            uint32_t frame_copy);
+int aurora_monotone_hd_supported(void);
 /* Wind Waker HD's own normals for the stage in play (the HD pack's optional/hd-normals/<stage>.bin, made by the
    importer from the player's HD dump), for the sun shadows' facing term; NULL or a missing file: none, and
    the facing term makes its own. Loaded at once; call it as the stage changes. */

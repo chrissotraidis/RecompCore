@@ -232,6 +232,27 @@ void end_actor_shadow() noexcept;
 const wgpu::TextureView& sun_map_view();
 // One cascade's layer, for drawing its casters into.
 const wgpu::TextureView& sun_map_layer(uint32_t cascade);
+// Wind Waker HD's monotone (Frozen Hyrule's sepia, aurora_set_monotone_hd()): the host's parameters for its DOF
+// pass, taken when a frame is recorded and kept on the frame's passes, so every in-between frame draws the same.
+struct Monotone {
+  bool on = false;
+  float level = 0.8f;                     // how much of the sepia replaces the scene (HD's DOF level)
+  float start = 0.f;                      // distance where it starts, nearer: colour (HD's DOF start and end)
+  float end = 0.f;
+  std::array<float, 3> mul{1.4f, 1.5f, 0.6f}; // the tint on the grey (HD's DOF colour multiply)
+  float saturate = 1.f;                   // how far to the grey (1: all of it)
+  uint32_t frameCopy = 0;                 // the game's frame copy (mDoGph_gInf_c::mFrameBufferTex), physical
+};
+// The host's monotone, while the HD look's version of it can be drawn (single-sampled, core features,
+// DOL_AURORA_MONOTONE_HD not 0); else off, and the game draws its own grey.
+Monotone monotone_params() noexcept;
+void set_monotone(bool on, float level, float start, float end, const float mul[3], float saturate,
+                  uint32_t frameCopy) noexcept;
+bool monotone_hd_supported() noexcept;
+// Which of the effects encode() draws: all of them; in a monotone frame, at the game's grey composite, the scene's
+// (no far blur, as HD; no bloom) and then the monotone; or, after the player's lists, only the lighting (no far blur,
+// no bloom, no monotone), for encode_late().
+enum class Phase : uint8_t { Full, Scene, LateLight };
 // Every effect that is on, in order (ambient occlusion, sun shadows, edge
 // light, torch light, cloud shadows, far blur, bloom);
 // depthView: the EFB's depth; camera: the one the frame is drawn from;
@@ -239,7 +260,18 @@ const wgpu::TextureView& sun_map_layer(uint32_t cascade);
 void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
             const wgpu::Extent3D& size, wgpu::TextureFormat format, const wgpu::TextureView& dst,
             const wgpu::TextureView& resolve, uint32_t msaaSamples, const Camera& camera,
-            const SunMap* sunMap = nullptr);
+            const SunMap* sunMap = nullptr, Phase phase = Phase::Full, const Monotone* monotone = nullptr);
+// A monotone frame's EFB depth at the grey composite (before the player's lists), for encode_late().
+void snapshot_monotone_depth(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView,
+                             const wgpu::Extent3D& size);
+// A monotone frame after the player's lists (HD's pass 6, then its bloom): with `lateLight`, the lighting
+// (Phase::LateLight) on a copy of the EFB, laid back where something was drawn nearer than the snapshot's depth (an
+// arrow, a bomb, a rupee: what the game draws after the grey and Wind Waker HD's light doesn't light in its own
+// draw); then bloom over all of it.
+void encode_late(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
+                 const wgpu::Extent3D& size, wgpu::TextureFormat format, const wgpu::TextureView& dst,
+                 const wgpu::TextureView& resolve, uint32_t msaaSamples, const Camera& camera,
+                 const SunMap* sunMap, bool lateLight);
 // scene: the EFB as a texture (resolved when multisampled), size: its size;
 // dst: the EFB's color attachment, with msaaSamples samples, and resolve its
 // single-sample copy when multisampled (null otherwise).

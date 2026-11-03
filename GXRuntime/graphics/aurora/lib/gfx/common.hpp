@@ -380,6 +380,13 @@ const State& get_state();
 void set_next_draw_flat(bool flat) noexcept;
 // Whether the next draw lays a copy of the frame back over it (gxcore_draw).
 void set_next_draw_composite(bool composite) noexcept;
+namespace post_fx {
+struct Monotone;
+}
+// The copy that ends the current pass is the game's grey composite's frame copy in a monotone frame
+// (gxcore_draw.cpp copy_efb_to_texture(), before it calls resolve_pass): the scene's effects and Wind Waker HD's
+// monotone go in at the start of the pass after it, with these parameters, and its bloom after the player's lists.
+void mark_monotone_copy(const post_fx::Monotone& monotone) noexcept;
 
 template <typename DrawData>
 void push_draw_command(DrawData data);
