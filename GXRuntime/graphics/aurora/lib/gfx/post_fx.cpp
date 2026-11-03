@@ -2067,7 +2067,14 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
     if (sea_shadow < 0.999 && view.facing.x > 0.5) {
         let ssize = vec2<f32>(textureDimensions(mask));
         let sp = clamp(vec2<i32>(in.uv * ssize), vec2<i32>(0), vec2<i32>(ssize) - vec2<i32>(1));
-        shade = mix(shade, mix(vec3(1.0), shade, sea_shadow), textureLoad(mask, sp, 0).r);
+        // With HD's light (view.facing.y), HD's own sea: base x (1 - s + s x clamp(cloud + floor) x shadow) in
+        // linear light (its sea quad and wave grid, PS 949 and 951, s = 0.5): lit here already holds the shadow
+        // times the cloud term, and the sea takes neither the shade's ambient over the sunlight nor the AO.
+        var sea_shade = mix(vec3(1.0), shade, sea_shadow);
+        if (view.facing.y > 0.5) {
+            sea_shade = vec3(pow(max(1.0 - sea_shadow * (1.0 - lit) * fade, 0.0), 1.0 / 2.2));
+        }
+        shade = mix(shade, sea_shade, textureLoad(mask, sp, 0).r);
     }
     // Multiplied into the 8-bit scene: half a step of noise against bands (fs_ao_apply).
     let noise = (fract(52.9829189 * fract(dot(in.pos.xy, vec2(0.06711056, 0.00583715)))) - 0.5) * (1.5 / 255.0);

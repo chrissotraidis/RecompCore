@@ -2264,6 +2264,7 @@ static void encode_sea_mask(const wgpu::CommandEncoder& cmd, const RenderPass& p
     // With Wind Waker HD's bloom mask, what is solid but writes no depth (the sky) too.
     solidDraws += command.data.draw.gxcore.sunCaster || command.data.draw.gxcore.sunCasterAlpha ||
                   (command.data.draw.gxcore.character && command.data.draw.gxcore.depthWrite) ||
+                  command.data.draw.gxcore.maskOccluder ||
                   (command.data.draw.gxcore.maskCover && post_fx::bloom_mask_wanted());
   }
   if (seaDraws == 0 && solidDraws == 0 && !clear)
