@@ -506,6 +506,27 @@ bool sun_caster_alpha(const gxc::PipelineKey& key) {
          !alpha_test_always_passes(key.shader) && !alpha_test_always_fails(key.shader);
 }
 
+// A blended draw that casts with its texture's cutout all the same (part of
+// DrawData::sunCasterAlpha, with submit_draw_plan()'s checks that its positions
+// stand still and it is no character): alpha blended (SRCALPHA, INVSRCALPHA),
+// writing depth and alpha-tested, as the GameCube draws its grass and bushes so
+// they fade near the camera (Outset's tufts, texture 0037EE00). Wind Waker HD
+// draws the same tufts opaque and alpha-tested and casts them, cut out, in all
+// of its cascades (bridge_frame14789: 764 instances x 3 cascades). Additive
+// glows (ONE), what writes no depth, and what moves (the sea's crests and the
+// wake, which the game writes each frame) are left out.
+// DOL_AURORA_SUN_SHADOW_MAP_BLENDED_CUTOUT=0 leaves them all out, to compare.
+bool sun_caster_blended_cutout(const gxc::PipelineKey& key) {
+  static const bool s_on = [] {
+    const char* value = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_BLENDED_CUTOUT");
+    return value == nullptr || value[0] != '0';
+  }();
+  return s_on && key.depth_test != 0u && key.depth_update != 0u && key.color_update != 0u && key.blend_enable != 0u &&
+         key.blend_subtract == 0u && key.src_factor == static_cast<uint8_t>(gxc::SrcBlendFactor::SrcAlpha) &&
+         key.dst_factor == static_cast<uint8_t>(gxc::DstBlendFactor::InvSrcAlpha) && key.primitive_topology == 0u &&
+         key.shader.textured != 0u && !alpha_test_always_passes(key.shader) && !alpha_test_always_fails(key.shader);
+}
+
 // The sea's surface, which the solid caster rule takes (it is opaque and
 // writes depth): strips the game lays around the player in world space, about
 // 51,000 units across, and flat quads out to 450,000 for the distance, flat
@@ -1768,7 +1789,7 @@ void draw_parts(const DrawData& data, const wgpu::RenderPassEncoder& pass, SunCa
 } // namespace
 
 void render_sun_caster(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
-  const bool alpha = data.sunCasterAlpha && data.textureBindGroup != 0;
+  const bool alpha = data.sunCasterAlpha && data.cutoutBindGroup != 0;
   if (!data.sunCaster && !alpha)
     return;
   SunCasterState& state = g_sunCasterState;
@@ -1781,7 +1802,7 @@ void render_sun_caster(const DrawData& data, const wgpu::RenderPassEncoder& pass
     state.pipeline = pipeline;
   }
   if (alpha) {
-    const auto& group = find_bind_group(data.textureBindGroup);
+    const auto& group = find_bind_group(data.cutoutBindGroup);
     if (group.Get() != state.group2) {
       pass.SetBindGroup(2, group);
       state.group2 = group.Get();
@@ -2185,7 +2206,7 @@ void render_sea_mask(const DrawData& data, const wgpu::RenderPassEncoder& pass) 
   // What covers the sea is what the sun map takes as solid: a blended draw
   // doesn't, and an alpha-tested one only where its texture is solid (a wave's
   // crest whole covered a box of sea, which was then brightened).
-  const bool cutout = !data.seaSurface && !data.sunCaster && data.textureBindGroup != 0 &&
+  const bool cutout = !data.seaSurface && !data.sunCaster && data.cutoutBindGroup != 0 &&
                       (data.sunCasterAlpha || data.maskOccluderCutout);
   // A skinned draw that writes depth is a character (Link, the islanders), whether or not it casts in the sun
   // map (Link's own draws don't all): the sun shadows' facing term leaves it out.
@@ -2219,7 +2240,7 @@ void render_sea_mask(const DrawData& data, const wgpu::RenderPassEncoder& pass) 
     g_seaMaskPipeline = pipeline;
   }
   if (cutout) {
-    const auto& group = find_bind_group(data.textureBindGroup);
+    const auto& group = find_bind_group(data.cutoutBindGroup);
     if (group.Get() != g_seaMaskState.group2) {
       pass.SetBindGroup(2, group);
       g_seaMaskState.group2 = group.Get();
@@ -3680,6 +3701,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   };
 
   BindGroupRef textureBindGroup = 0;
+  BindGroupRef cutoutBindGroup = 0; // DrawData::cutoutBindGroup
   if (plan.pipeline.shader.textured != 0) {
     if (plan.texmap_mask == 0u) {
       // Single-texmap fast path: primary texture at binding 0/1 (unchanged).
@@ -3726,6 +3748,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
             textureBindGroup = bind_group_ref(descriptor);
             s_last = LastBind{view, samplerState, frame, generation, textureBindGroup};
           }
+          cutoutBindGroup = textureBindGroup;
         }
       }
     } else {
@@ -3737,6 +3760,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       std::array<TextureHandle, 8> held{};
       std::array<wgpu::Sampler, 8> heldSamplers{};
       std::array<WGPUBindGroupEntry, 16> entries{};
+      // Each texmap's view and sampler, for the cutout's own group below.
+      std::array<WGPUTextureView, 8> mapViews{};
+      std::array<WGPUSampler, 8> mapSamplers{};
       size_t heldCount = 0;
       size_t entryCount = 0;
       bool complete = true;
@@ -3760,6 +3786,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
             .binding = 2u * t, .textureView = bound->sampleTextureView.Get()};
         entries[entryCount++] = WGPUBindGroupEntry{
             .binding = 2u * t + 1u, .sampler = heldSamplers[heldCount].Get()};
+        mapViews[t] = bound->sampleTextureView.Get();
+        mapSamplers[t] = heldSamplers[heldCount].Get();
         ++heldCount;
       }
       if (!complete)
@@ -3771,6 +3799,26 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
           .entries = entries.data(),
       };
       textureBindGroup = bind_group_ref(descriptor);
+      // An alpha-tested draw of more than one texmap (a Windfall girl's body: its colour and alpha from texmap 0, its
+      // toon ramp from texmap 1) casts in the sun map with the cutout of the texmap its alpha is read from, bound
+      // alone as the single-texmap casters' texture is. Without it neither caster rule took the draw, and the
+      // character cast no shadow (the game's own under her is left out while the map is on).
+      if (sun_caster_alpha(plan.pipeline) || sun_caster_blended_cutout(plan.pipeline)) {
+        const int cutoutMap = gxc::cutout_alpha_texmap(plan.pipeline.shader);
+        if (cutoutMap >= 0 && mapViews[cutoutMap] != nullptr) {
+          const std::array cutoutEntries{
+              WGPUBindGroupEntry{.binding = 0, .textureView = mapViews[cutoutMap]},
+              WGPUBindGroupEntry{.binding = 1, .sampler = mapSamplers[cutoutMap]},
+          };
+          const WGPUBindGroupDescriptor cutoutDescriptor{
+              .label = {"GXCore Cutout Bind Group", WGPU_STRLEN},
+              .layout = texture_bind_group_layout(1u).Get(),
+              .entryCount = cutoutEntries.size(),
+              .entries = cutoutEntries.data(),
+          };
+          cutoutBindGroup = bind_group_ref(cutoutDescriptor);
+        }
+      }
     }
   }
 
@@ -3904,6 +3952,12 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       sizeof(plan.constants), repeatsLast ? 1 : 0);
   g_pushedConstantsId = plan.constants_id;
   const bool seaSurface = sea_mask_draw(plan);
+  // Still scenery the game blends and alpha-tests (its grass and bushes, sun_caster_blended_cutout()) casts with its
+  // texture's cutout, as Wind Waker HD casts its grass.
+  const bool blendedCutout = !plan.match_direct_position && plan.draw_scope_part == 0 &&
+                             plan.constants.projection[3][3] != 1.f && sun_caster_blended_cutout(plan.pipeline) &&
+                             !character_draw(plan.pipeline) && !seaSurface && !positions_written(plan);
+  const bool alphaCaster = cutoutBindGroup != 0 && (sun_caster_alpha(plan.pipeline) || blendedCutout);
   const bool smoothNormal = smooth_normal_draw(plan, seaSurface);
   // A palm with Wind Waker HD's light (apply_hd_colours()): its shade colour black.
   const gxc::PixelShaderConstants& pixelConstants =
@@ -4151,8 +4205,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                             plan.constants.projection[3][3] != 1.f && maskOccluderShape &&
                             !alpha_test_always_fails(plan.pipeline.shader) &&
                             !((sun_caster(plan.pipeline) || clothCaster || blendedCaster) ||
-                              (plan.texmap_mask == 0u && textureBindGroup != 0 && sun_caster_alpha(plan.pipeline)) ||
-                              character_draw(plan.pipeline) || seaSurface || effectDepth);
+                              alphaCaster || character_draw(plan.pipeline) || seaSurface || effectDepth);
   push_draw_command(DrawData{
       .pipeline = pipeline,
       .depthPipeline = depthPipeline,
@@ -4165,6 +4218,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .pixelUniformRange = pixelUniformRange,
       .indexCount = indexCount,
       .textureBindGroup = textureBindGroup,
+      .cutoutBindGroup = cutoutBindGroup,
       .tev = tev,
       .ownVertices = ownVertices,
       .uberPipeline = uberPipeline,
@@ -4179,7 +4233,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
 
       // The cutout pipeline binds one texture and sampler at group 2, the
       // single-texmap layout: a multi-texmap material keeps the screen's steps.
-      .sunCasterAlpha = plan.texmap_mask == 0u && textureBindGroup != 0 && sun_caster_alpha(plan.pipeline),
+      .sunCasterAlpha = alphaCaster,
       .seaSurface = seaSurface,
       .depthWrite = plan.pipeline.depth_test != 0u && plan.pipeline.depth_update != 0u,
       .softEffect = softEffect,
