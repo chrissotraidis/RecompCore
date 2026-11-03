@@ -241,13 +241,20 @@ void aurora_set_sun_hd_light(int on, int night, float fade);
    true sun: with HD's light rule the light is held at 40,000 high at dawn and dusk. DOL_AURORA_CLOUD_SHADOWS_HD_POWER
    still overrides both. Takes effect at the next frame. */
 void aurora_set_cloud_hd_floor(float floor);
+/* Wind Waker HD's caster culling: with `on`, the scenery draws into the sun shadow map with its own cull mode (as HD
+   draws its map's casters: back faces culled for most), so what faces away from the light casts nothing, as a closed
+   room's ceiling seen from below. Characters keep their own. `on` 0, the default, draws every caster's both sides.
+   DOL_AURORA_SUN_SHADOW_CASTER_CULL=1 or 0 (local test) overrides it. Takes effect at the next frame. */
+void aurora_set_sun_caster_cull(int on);
 /* Wind Waker HD's own normals for the stage in play (the HD pack's optional/hd-normals/<stage>.bin, made by the
    importer from the player's HD dump), for the sun shadows' facing term; NULL or a missing file: none, and
    the facing term makes its own. Loaded at once; call it as the stage changes. */
 void aurora_set_hd_normals(const char* path);
 /* Wind Waker HD's own vertex colours for the stage in play's rooms (the HD pack's optional/hd-colours/<stage>.bin,
    made by the importer): HD remade its rooms' colours, so the draws with HD's light take HD's (in the game's gamma)
-   where a position has one, before the objects' table. NULL or a missing file: none. Call it as the stage changes. */
+   where a position has one, before the objects' table. A version 2 table also has HD's lava glow (its lava rooms'
+   konst2 animation and each vertex's glow), which the lit room draws add outside the shade. NULL or a missing file:
+   none. Call it as the stage changes. */
 void aurora_set_hd_stage_colours(const char* path);
 /* Wind Waker HD's normals and vertex colours for the game's object models (the HD pack's
    optional/hd-normals/objects.bin and optional/hd-colours/objects.bin, made by the importer from the player's HD
