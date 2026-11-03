@@ -82,6 +82,26 @@ constexpr wgpu::TextureFormat kSeaMaskFormat = wgpu::TextureFormat::R8Unorm;
 constexpr wgpu::TextureFormat kSeaMaskDepthFormat = wgpu::TextureFormat::Depth32Float;
 wgpu::TextureView sea_mask_target(const wgpu::Extent3D& sceneSize);
 wgpu::TextureView sea_mask_depth(const wgpu::Extent3D& sceneSize);
+// The effects' mask (common.cpp encode_effect_mask()): what the frame's effects
+// (gxcore_draw.hpp DrawData::effect) added to each pixel, drawn again with their
+// own pipelines over black, in the frame buffer's format, at the scene's size.
+// The sun shadows, the occlusion and the cloud shadows leave as much of a pixel
+// as it holds unshaded. Asking for it marks it drawn for the next encode().
+wgpu::TextureView effect_mask_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format);
+// How far back the effects are drawn into it, a share of their distance
+// (DOL_AURORA_EFFECT_MASK_PUSH, 0.05): what lies on a surface is left out.
+float effect_mask_push() noexcept;
+// The same effects drawn again over white (common.cpp encode_effect_mask()), for their opacity: what a dark effect
+// blended over the scene hides of it, which its colour over black doesn't tell (post_fx.cpp effect_cover_view()).
+// Off with DOL_AURORA_EFFECT_MASK_OPACITY=0. Asking for it marks it drawn for the next encode().
+bool effect_mask_opacity() noexcept;
+wgpu::TextureView effect_white_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format);
+// The effects' mask has an effect that writes depth this frame (common.cpp render_pass(), DrawData::effectDepth):
+// the occlusion, the sun shadows and the cloud shadows then shade from the scenery's depth under it, the sea mask's.
+void note_effect_depth() noexcept;
+// The effects' mask's depth for a pass with effects drawn at their own depth (common.cpp encode_effect_mask()): a
+// copy of the sea mask's depth (the scenery's, without such effects), or none when it isn't this size.
+wgpu::TextureView effect_mask_depth(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& size);
 bool cloud_shadows_enabled() noexcept;
 void set_cloud_shadows(bool enabled) noexcept;
 void set_world_view(const float invView[12], float tanHalfFovy, float aspect, float nearPlane, float seaLevel,

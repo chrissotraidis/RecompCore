@@ -650,7 +650,7 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
 static float g_softScale = 1.f;
 
 static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, const RenderPass& passInfo,
-                        size_t first = 0, size_t last = SIZE_MAX);
+                        size_t first = 0, size_t last = SIZE_MAX, bool effectsOnly = false, int effectPart = 0);
 static void expire_cached_bind_groups();
 static void push_command(CommandType type, const Command::Data& data);
 
@@ -2350,6 +2350,111 @@ static void encode_sea_mask(const wgpu::CommandEncoder& cmd, const RenderPass& p
 }
 #endif
 
+#ifdef AURORA_ENABLE_GXCORE
+// The effects' mask for the HD look's shading (post_fx.hpp effect_mask_target()): a scene pass's effects up to
+// `end` (gxcore_draw.hpp DrawData::effect: blended and writing no depth, so the depth buffer under them is the
+// scenery's behind) drawn again with their own pipelines over black, against the pass's depth, so each pixel
+// holds what the effects added there. The sun shadows, the occlusion and the cloud shadows, which shade from the
+// depth buffer, leave that much of the pixel as it is. The frame's first pass with effects clears it.
+static void encode_effect_mask(const wgpu::CommandEncoder& cmd, FramePacket& frame, const RenderPass& passInfo,
+                               size_t end, uint64_t frameKey) {
+  if (passInfo.msaaSamples != 1 || !passInfo.depthStencilView || !passInfo.hasDepth ||
+      !(post_fx::sun_shadows_enabled() || post_fx::ambient_occlusion_enabled() ||
+        post_fx::cloud_shadows_enabled()))
+    return;
+  if (passInfo.targetSize.width != webgpu::g_frameBuffer.texture.GetWidth() ||
+      passInfo.targetSize.height != webgpu::g_frameBuffer.texture.GetHeight())
+    return;
+  bool any = false;
+  bool ownDepth = false;
+  for (size_t i = 0; i < end && i < passInfo.commands.size() && !ownDepth; ++i) {
+    const auto& command = passInfo.commands[i];
+    const bool effect = command.type == CommandType::Draw && command.data.draw.type == ShaderType::GXCore &&
+                        !command.flat && command.data.draw.gxcore.effect;
+    any = any || effect;
+    ownDepth = effect && command.data.draw.gxcore.effectOwnDepth;
+  }
+  if (!any)
+    return;
+  // With an effect drawn at its own depth (DrawData::effectOwnDepth: a lava geyser, a particle's dust), the
+  // effects test against the sea mask's depth, which leaves such effects out: the scenery's. The other effects
+  // first, pushed back against it, then those at their own depth: a geyser's sparks drawn on its surface, pushed
+  // back against the geyser's depth, failed, and kept its shade.
+  const wgpu::TextureView ownDepthView =
+      ownDepth ? post_fx::effect_mask_depth(cmd, passInfo.targetSize) : wgpu::TextureView{};
+  static uint64_t clearedFrame = UINT64_MAX;
+  const bool clear = clearedFrame != frameKey;
+  clearedFrame = frameKey;
+  const webgpu::gpu_prof::Zone zone{cmd, "Effects mask"};
+  const std::array attachments{wgpu::RenderPassColorAttachment{
+      .view = post_fx::effect_mask_target(passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat()),
+      .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+      .storeOp = wgpu::StoreOp::Store,
+      .clearValue = {0.0, 0.0, 0.0, 0.0},
+  }};
+  // The pass's depth as the scene left it: the effects test against it and write none.
+  const bool own = static_cast<bool>(ownDepthView) && !passInfo.hasStencil;
+  const wgpu::RenderPassDepthStencilAttachment depth{
+      .view = own ? ownDepthView : passInfo.depthStencilView,
+      .depthLoadOp = wgpu::LoadOp::Load,
+      .depthStoreOp = wgpu::StoreOp::Store,
+      .stencilLoadOp = passInfo.hasStencil ? wgpu::LoadOp::Load : wgpu::LoadOp::Undefined,
+      .stencilStoreOp = passInfo.hasStencil ? wgpu::StoreOp::Store : wgpu::StoreOp::Undefined,
+  };
+  const wgpu::RenderPassDescriptor descriptor{
+      .label = "Effects mask",
+      .colorAttachmentCount = attachments.size(),
+      .colorAttachments = attachments.data(),
+      .depthStencilAttachment = &depth,
+      .timestampWrites = webgpu::gpu_prof::pass_writes("Effects mask"),
+  };
+  auto pass = cmd.BeginRenderPass(&descriptor);
+  if (own) {
+    render_pass(pass, frame, passInfo, 0, end, true, 1);
+    render_pass(pass, frame, passInfo, 0, end, true, 2);
+  } else {
+    render_pass(pass, frame, passInfo, 0, end, true);
+  }
+  pass.End();
+  // Again over white, for their opacity (post_fx.hpp effect_white_target()): a dark effect blended over the scene
+  // (the dust a shutting door raises) adds little over black but hides what is behind it. Against a fresh copy of
+  // the sea mask's depth when the effects drawn at their own depth wrote theirs into the first.
+  if (!post_fx::effect_mask_opacity())
+    return;
+  const wgpu::TextureView whiteDepthView =
+      own ? post_fx::effect_mask_depth(cmd, passInfo.targetSize) : wgpu::TextureView{};
+  const bool whiteOwn = own && static_cast<bool>(whiteDepthView);
+  const std::array whiteAttachments{wgpu::RenderPassColorAttachment{
+      .view = post_fx::effect_white_target(passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat()),
+      .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+      .storeOp = wgpu::StoreOp::Store,
+      .clearValue = {1.0, 1.0, 1.0, 1.0},
+  }};
+  const wgpu::RenderPassDepthStencilAttachment whiteDepth{
+      .view = whiteOwn ? whiteDepthView : passInfo.depthStencilView,
+      .depthLoadOp = wgpu::LoadOp::Load,
+      .depthStoreOp = wgpu::StoreOp::Store,
+      .stencilLoadOp = passInfo.hasStencil ? wgpu::LoadOp::Load : wgpu::LoadOp::Undefined,
+      .stencilStoreOp = passInfo.hasStencil ? wgpu::StoreOp::Store : wgpu::StoreOp::Undefined,
+  };
+  const wgpu::RenderPassDescriptor whiteDescriptor{
+      .label = "Effects mask (over white)",
+      .colorAttachmentCount = whiteAttachments.size(),
+      .colorAttachments = whiteAttachments.data(),
+      .depthStencilAttachment = &whiteDepth,
+      .timestampWrites = webgpu::gpu_prof::pass_writes("Effects mask (over white)"),
+  };
+  auto whitePass = cmd.BeginRenderPass(&whiteDescriptor);
+  if (whiteOwn) {
+    render_pass(whitePass, frame, passInfo, 0, end, true, 1);
+    render_pass(whitePass, frame, passInfo, 0, end, true, 2);
+  } else {
+    render_pass(whitePass, frame, passInfo, 0, end, true);
+  }
+  whitePass.End();
+}
+#endif
+
 static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
   ZoneScoped;
   if (!passInfo.sealed) {
@@ -2666,8 +2771,10 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
     pass.End();
   }
 #ifdef AURORA_ENABLE_GXCORE
-  if (efbPass)
+  if (efbPass) {
     encode_sea_mask(cmd, passInfo, split == SIZE_MAX ? passInfo.commands.size() : split, frameKey);
+    encode_effect_mask(cmd, frame, passInfo, split == SIZE_MAX ? passInfo.commands.size() : split, frameKey);
+  }
 #endif
 
   if (bloomBeforeCopy) {
@@ -3255,14 +3362,6 @@ float calculate_fps() noexcept {
   return static_cast<float>(g_presentTimes.size() - 1) / elapsed;
 }
 
-static void apply_viewport(const wgpu::RenderPassEncoder& pass, const Command& command) {
-  const auto& vp = command.data.setViewport;
-  const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
-  const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
-  const float k = g_softScale;
-  pass.SetViewport(vp.left * k, vp.top * k, vp.width * k, vp.height * k, minDepth, maxDepth);
-}
-
 static void apply_scissor(const wgpu::RenderPassEncoder& pass, const Command& command, const wgpu::Extent3D& size) {
   const auto& sc = command.data.setScissor;
   const auto x = std::clamp(static_cast<uint32_t>(sc.x), 0u, size.width);
@@ -3284,7 +3383,7 @@ static void apply_scissor(const wgpu::RenderPassEncoder& pass, const Command& co
 }
 
 static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, const RenderPass& passInfo,
-                        size_t first, size_t last) {
+                        size_t first, size_t last, bool effectsOnly, int effectPart) {
   ZoneScoped;
   g_currentPipeline = UINTPTR_MAX;
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -3298,6 +3397,26 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
   gxcore::reset_pass_state();
 #endif
 
+  // The effects' mask (encode_effect_mask) pushes the effects back by a share
+  // of their distance (reversed Z: a depth range that much smaller), so what
+  // lies on a surface (the surf on a beach, a grass fringe, Link's eyes on his
+  // face) fails the depth test and keeps the surface's shade, and what stands
+  // clear of it (the spin attack's rings, a glow, sparks in the air) is marked.
+  // An effect that writes depth, or a particle's colour over its own depth (DrawData::effectOwnDepth), is drawn at
+  // its own depth, which the pass's holds: pushed back, it failed against itself.
+  const float depthScale = effectsOnly ? 1.f - post_fx::effect_mask_push() : 1.f;
+  float vpRect[4] = {0.f, 0.f, static_cast<float>(passInfo.targetSize.width),
+                     static_cast<float>(passInfo.targetSize.height)};
+  float vpDepth[2] = {0.f, 1.f};
+  float vpScale = depthScale;
+  const auto setViewport = [&](float scale) {
+    vpScale = scale;
+    // A run of soft effects in the half-size buffer (g_softScale) draws its rectangle there.
+    const float k = g_softScale;
+    pass.SetViewport(vpRect[0] * k, vpRect[1] * k, vpRect[2] * k, vpRect[3] * k, vpDepth[0] * scale, vpDepth[1] * scale);
+  };
+  if (effectsOnly)
+    setViewport(depthScale);
   // A pass drawn in two parts (post_fx: the scene, then the HUD) starts its
   // second part with the viewport and scissor the first part left.
   last = std::min(last, passInfo.commands.size());
@@ -3310,8 +3429,13 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
       else if (passInfo.commands[i].type == CommandType::SetScissor)
         scissor = &passInfo.commands[i];
     }
-    if (viewport != nullptr)
-      apply_viewport(pass, *viewport);
+    if (viewport != nullptr) {
+      const auto& vp = viewport->data.setViewport;
+      vpRect[0] = vp.left, vpRect[1] = vp.top, vpRect[2] = vp.width, vpRect[3] = vp.height;
+      vpDepth[0] = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
+      vpDepth[1] = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
+      setViewport(depthScale);
+    }
     if (scissor != nullptr)
       apply_scissor(pass, *scissor, passInfo.targetSize);
   }
@@ -3344,14 +3468,30 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
     }
 #endif
     switch (cmd.type) {
-    case CommandType::SetViewport:
-      apply_viewport(pass, cmd);
-      break;
+    case CommandType::SetViewport: {
+      const auto& vp = cmd.data.setViewport;
+      vpRect[0] = vp.left, vpRect[1] = vp.top, vpRect[2] = vp.width, vpRect[3] = vp.height;
+      vpDepth[0] = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
+      vpDepth[1] = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
+      setViewport(vpScale);
+    } break;
     case CommandType::SetScissor:
       apply_scissor(pass, cmd, passInfo.targetSize);
       break;
     case CommandType::Draw: {
       const auto& draw = cmd.data.draw;
+#ifdef AURORA_ENABLE_GXCORE
+      // The effects' mask (encode_effect_mask): their draws alone, nothing cleared.
+      if (effectsOnly && (draw.type != ShaderType::GXCore || cmd.flat || !draw.gxcore.effect))
+        break;
+      // In two parts (encode_effect_mask()): 1 the effects drawn pushed back, 2 those at their own depth.
+      if (effectsOnly && effectPart != 0 && draw.gxcore.effectOwnDepth != (effectPart == 2))
+        break;
+      if (effectsOnly && (draw.gxcore.effectOwnDepth ? 1.f : depthScale) != vpScale)
+        setViewport(draw.gxcore.effectOwnDepth ? 1.f : depthScale);
+      if (effectsOnly && draw.gxcore.effectDepth)
+        post_fx::note_effect_depth();
+#endif
       switch (draw.type) {
       case ShaderType::Clear:
         clear::render(draw.clear, pass, passInfo.targetSize);
