@@ -442,6 +442,15 @@ struct EfbCopyBinding {
   bool memory_epoch_valid = false;
 };
 absl::flat_hash_map<uint32_t, EfbCopyBinding> g_efbCopyTextures;
+// The grey composite's copy's second texture while monotone, per copy (copy_efb_to_texture()), and the bindings it
+// stands in for until the frame's end (note_frame_presented()).
+absl::flat_hash_map<EfbCopyKey, TextureHandle> g_monotoneHazeTextures;
+struct MonotoneHazeRestore {
+  uint32_t address = 0;
+  EfbCopyBinding copy;
+  TextureHandle haze;
+};
+std::vector<MonotoneHazeRestore> g_monotoneHazeRestore;
 
 } // namespace
 
@@ -2331,6 +2340,13 @@ void render_sea_mask(const DrawData& data, const wgpu::RenderPassEncoder& pass) 
 }
 
 void note_frame_presented() {
+  // The grey composite's copy back in place of its haze texture (copy_efb_to_texture()).
+  for (auto it = g_monotoneHazeRestore.rbegin(); it != g_monotoneHazeRestore.rend(); ++it) {
+    const auto found = g_efbCopyTextures.find(it->address);
+    if (found != g_efbCopyTextures.end() && found->second.handle == it->haze)
+      found->second = it->copy;
+  }
+  g_monotoneHazeRestore.clear();
   g_textureVerifyFrame.fetch_add(1u, std::memory_order_relaxed);
   frame_interp::end_game_frame();
 }
@@ -2341,6 +2357,8 @@ void reset_texture_cache() {
   g_textureAddrKey.clear();
   g_efbCopyCache.clear();
   g_efbCopyTextures.clear();
+  g_monotoneHazeTextures.clear();
+  g_monotoneHazeRestore.clear();
   g_textureCacheStats = {};
 }
 
@@ -2416,6 +2434,11 @@ std::vector<uint8_t> read_efb_copy(const gxc::EfbCopyCommand& cmd) {
       cmd.destination_height, rgba, texture->size.width, texture->size.height);
 }
 
+// The grey composite's frame copy while monotone (copy_efb_to_texture()), whose quad is left out; 0: none.
+static uint32_t g_monotoneDrop = 0;
+// The format of the frame's last EFB copy.
+static uint32_t g_lastCopyFormat = 0;
+
 void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
   // Mirror the copy-clear color/Z (BP 0x4F-0x51 at this copy) into the gx
   // state GXSetCopyClear would have written: begin_frame's pass-0 EFB clear
@@ -2433,6 +2456,8 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
   if (cmd.format == 0xFu) {
     // Display copy (GXCopyDisp): no texture destination; its requested clear
     // becomes the next frame's EFB clear via the state mirrored above.
+    g_monotoneDrop = 0;
+    g_lastCopyFormat = 0;
     return;
   }
   const auto fmt = static_cast<GXTexFmt>(cmd.format);
@@ -2491,6 +2516,39 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
   g_efbCopyTextures.insert_or_assign(
       cmd.dest_address,
       EfbCopyBinding{it->second, cmd.byte_size, memoryEpoch, memoryEpochValid});
+  // Wind Waker HD's monotone (post_fx::Monotone): Wind Waker's grey composite (m_Do_graphic.cpp drawDepth) copies
+  // the depth (asked for as Z16; the copy's register reads Z24X8), then the frame as I8 to mDoGph_gInf_c::mFrameBufferTex while monotone, and lays that copy back
+  // over the scene in one flat quad, before the player's lists. That copy marks the point (the scene's effects and
+  // HD's monotone go in after it) and the quad is left out (submit_draw_plan()). A copy at an offset in it (the
+  // frame's y below 0) is the same copy.
+  g_monotoneDrop = 0;
+  {
+    const auto monotone = post_fx::monotone_params();
+    const uint32_t dest = cmd.dest_address & 0x3FFFFFFFu;
+    if (monotone.on && monotone.frameCopy != 0 && fmt == GX_TF_I8 && (g_lastCopyFormat & _GX_TF_ZTF) != 0u &&
+        dest >= monotone.frameCopy && dest < monotone.frameCopy + 0x100000u) {
+      // What samples the copy after it this frame (the heat haze, drawn after HD's monotone) takes a second texture
+      // the copy is made into again from the frame with the monotone in (common.cpp render()); the next frame's
+      // motion blur, laid back under the monotone, the copy itself (restored at the frame's end).
+      auto& haze = g_monotoneHazeTextures[key];
+      if (!haze)
+        haze = gfx::new_conv_texture(dstWidth, dstHeight, fmt, "GXCore Copy Conv (monotone haze)");
+      gfx::mark_monotone_copy(monotone, haze);
+      if (haze) {
+        auto& binding = g_efbCopyTextures[cmd.dest_address];
+        g_monotoneHazeRestore.push_back(MonotoneHazeRestore{cmd.dest_address, binding, haze});
+        binding.handle = haze;
+      }
+      g_monotoneDrop = dest;
+      static bool s_logged = false;
+      if (!s_logged) {
+        s_logged = true;
+        std::fprintf(stderr, "[monotone] the grey composite's copy (I8 to %08X): Wind Waker HD's monotone from here\n",
+                     dest);
+      }
+    }
+  }
+  g_lastCopyFormat = cmd.format;
   float clearDepthValue = static_cast<float>(cmd.clear_z) / 16777215.f;
   if (gx::UseReversedZ) {
     clearDepthValue = 1.f - clearDepthValue;
@@ -3620,6 +3678,23 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       plan.tex_address != 0 && plan.pipeline.blend_enable != 0u && plan.constants.projection[3][2] != 0.f &&
       post_fx::sun_shadow_map_enabled())
     return true;
+  // The quad that lays the grey composite's frame copy back while monotone (copy_efb_to_texture()): Wind Waker HD's
+  // monotone replaces it. The first flat draw that samples the copy, once.
+  if (g_monotoneDrop != 0 && plan.constants.projection[3][3] == 1.f && plan.pipeline.shader.textured != 0) {
+    bool samples = plan.texmap_mask == 0u && plan.has_texture && (plan.tex_address & 0x3FFFFFFFu) == g_monotoneDrop;
+    for (uint32_t t = 0; t < 8u && !samples; ++t)
+      samples = (plan.texmap_mask & (1u << t)) != 0u && plan.textures[t].valid &&
+                (plan.textures[t].address & 0x3FFFFFFFu) == g_monotoneDrop;
+    if (samples) {
+      g_monotoneDrop = 0;
+      static bool s_logged = false;
+      if (!s_logged) {
+        s_logged = true;
+        std::fprintf(stderr, "[monotone] the game's grey quad left out\n");
+      }
+      return true;
+    }
+  }
   // The rest of the game's own shadows: every one, real or simple (the blob
   // under a pot, a rupee or a character, and the shadow-volume passes),
   // indexes its positions from one of two fixed arrays (d_drawlist's

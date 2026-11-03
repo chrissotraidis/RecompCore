@@ -212,6 +212,20 @@ struct RenderPass {
   bool offscreen = false;
   bool observable = false;
   bool captureDepthSnapshot = false;
+  // Recorded while the host's monotone was on (post_fx::monotone_params()): the frame's effects wait for its grey
+  // composite, and none goes in before a copy of the frame laid back over it.
+  bool monotoneFrame = false;
+  // Ends with the grey composite's frame copy (mark_monotone_copy()): no effects before the copy.
+  bool monotoneCopy = false;
+  // Starts after it: the scene's effects and the monotone first, bloom after the player's lists.
+  bool monotonePoint = false;
+  post_fx::Monotone monotone;
+  // In the pass after the grey composite's copy (mark_monotone_copy()): the copy made again into this texture from
+  // the frame after the monotone, with the copy's uniform and format.
+  TextureHandle monotoneHaze;
+  Range monotoneHazeUniform;
+  GXTexFmt monotoneHazeFormat = GX_TF_I8;
+  ClipRect monotoneHazeRect;
   bool sealed = false;
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
 };
@@ -574,6 +588,7 @@ static void set_efb_targets(RenderPass& pass) {
   pass.copySourceView =
       webgpu::g_graphicsConfig.msaaSamples > 1 ? webgpu::g_frameBufferResolved.view : webgpu::g_frameBuffer.view;
   pass.copySourceDepthView = webgpu::g_depthBuffer.view;
+  pass.monotoneFrame = post_fx::monotone_params().on;
   pass.targetSize = webgpu::g_frameBuffer.size;
   pass.msaaSamples = webgpu::g_graphicsConfig.msaaSamples;
   pass.hasDepth = true;
@@ -804,6 +819,18 @@ static bool g_nextDrawComposite = false;
 
 void set_next_draw_composite(bool composite) noexcept { g_nextDrawComposite = composite; }
 
+static post_fx::Monotone g_pendingMonotone; // the recording thread's, for the pass after a marked copy
+static TextureHandle g_pendingMonotoneHaze;
+
+void mark_monotone_copy(const post_fx::Monotone& monotone, TextureHandle haze) noexcept {
+  if (g_currentRenderPass == UINT32_MAX || g_inOffscreen)
+    return;
+  auto& pass = current_render_passes()[g_currentRenderPass];
+  pass.monotoneCopy = true;
+  g_pendingMonotone = monotone;
+  g_pendingMonotoneHaze = std::move(haze);
+}
+
 static inline void push_command(CommandType type, const Command::Data& data) {
   if (g_currentRenderPass == UINT32_MAX)
     UNLIKELY {
@@ -916,7 +943,15 @@ void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool cl
       .clearDepth = clearDepth,
       .hasDepth = prevPass.hasDepth,
       .hasStencil = prevPass.hasStencil,
+      .monotoneFrame = prevPass.monotoneFrame,
+      .monotonePoint = prevPass.monotoneCopy,
+      .monotone = prevPass.monotoneCopy ? g_pendingMonotone : post_fx::Monotone{},
+      .monotoneHaze = prevPass.monotoneCopy ? g_pendingMonotoneHaze : TextureHandle{},
+      .monotoneHazeUniform = prevPass.resolveUniformRange,
+      .monotoneHazeFormat = resolveFormat,
+      .monotoneHazeRect = rect,
   };
+  g_pendingMonotoneHaze = {};
   newPass.commands.reserve(2048);
   current_render_passes().emplace_back(std::move(newPass));
   ++g_currentRenderPass;
@@ -2539,24 +2574,31 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
       .timestampWrites = webgpu::gpu_prof::pass_writes(label),
   };
 
-  // DOL_AURORA_PASS_TRACE=1: the passes of one frame (the 300th) and their draws.
-  static const bool passTrace = std::getenv("DOL_AURORA_PASS_TRACE") != nullptr;
-  if (passTrace) {
+  // DOL_AURORA_PASS_TRACE=1: the passes of one frame (the 300th, or the frame given: =1500) and their draws.
+  static const uint32_t passTrace = [] {
+    const char* value = std::getenv("DOL_AURORA_PASS_TRACE");
+    if (value == nullptr)
+      return 0u;
+    const int frame = std::atoi(value);
+    return frame > 1 ? static_cast<uint32_t>(frame) : 300u;
+  }();
+  if (passTrace != 0) {
     static uint32_t frames = 0;
     if (passIndex == 0)
       frames++;
-    if (frames == 300) {
+    if (frames == passTrace) {
       size_t draws = 0, flat = 0;
       for (const auto& command : passInfo.commands)
         if (command.type == CommandType::Draw && command.data.draw.type != ShaderType::Clear) {
           draws++;
           flat += command.flat;
         }
-      std::fprintf(stderr, "[pass] %u: %zu draws (%zu flat), efb=%d observable=%d offscreen=%d resolve=%s %dx%d at %d,%d fmt=%d\n",
+      std::fprintf(stderr, "[pass] %u: %zu draws (%zu flat), efb=%d observable=%d offscreen=%d resolve=%s %dx%d at %d,%d fmt=%d monotone=%d%d%d\n",
                    passIndex, draws, flat, passInfo.colorView.Get() == webgpu::g_frameBuffer.view.Get(),
                    passInfo.observable, passInfo.offscreen, passInfo.resolveTarget ? "yes" : "no",
                    passInfo.resolveRect.width, passInfo.resolveRect.height, passInfo.resolveRect.x, passInfo.resolveRect.y,
-                   static_cast<int>(passInfo.resolveFormat));
+                   static_cast<int>(passInfo.resolveFormat), passInfo.monotoneFrame, passInfo.monotoneCopy,
+                   passInfo.monotonePoint);
     }
   }
   // Bloom (post_fx), once a frame, on the EFB before the HUD. The game copies
@@ -2575,8 +2617,10 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
   // effects from the frame it was copied from: they go in before it. After it,
   // they were multiplied into the copy a second time, and shadows went darker
   // and lighter again with every frame of the blur (bluewake #491).
+  // In a monotone frame the effects wait for the game's grey composite (below): a copy laid back before it is
+  // the game's own (its motion blur), drawn under the monotone, and its copy holds no effects.
   size_t composite = SIZE_MAX;
-  if (post_fx::any_enabled() && efbPass && bloomedFrame != frameKey) {
+  if (post_fx::any_enabled() && efbPass && bloomedFrame != frameKey && !passInfo.monotoneFrame) {
     bool scene = false;
     for (size_t i = 0; i < passInfo.commands.size() && composite == SIZE_MAX; ++i) {
       const auto& command = passInfo.commands[i];
@@ -2587,20 +2631,38 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
       scene = scene || !command.flat;
     }
   }
+  // Wind Waker HD's monotone (post_fx::Monotone): the pass after the game's grey composite's frame copy holds what
+  // the game draws after it (the player's lists, Link and his things). The scene's effects and the monotone go in
+  // at its start, before any of its draws; its bloom after its last perspective draw, over all of it, as HD's.
+  // (Its quad is left out, so the monotone is drawn whichever effects are on.)
+  const bool monotonePoint = passInfo.monotonePoint && efbPass && passInfo.msaaSamples == 1;
   const bool bloomBeforeCopy = composite == SIZE_MAX && post_fx::any_enabled() && efbPass && bloomedFrame != frameKey &&
-                               passInfo.resolveTarget && !gx::is_depth_format(passInfo.resolveFormat) &&
+                               !passInfo.monotoneCopy && passInfo.resolveTarget &&
+                               !gx::is_depth_format(passInfo.resolveFormat) &&
                                passInfo.resolveRect.x == 0 && passInfo.resolveRect.y == 0 &&
                                static_cast<uint32_t>(passInfo.resolveRect.width) == passInfo.targetSize.width &&
                                static_cast<uint32_t>(passInfo.resolveRect.height) == passInfo.targetSize.height;
   size_t split = composite;
-  if (split == SIZE_MAX && post_fx::any_enabled() && efbPass && passInfo.observable && bloomedFrame != frameKey &&
-      !bloomBeforeCopy) {
+  if (split == SIZE_MAX && efbPass && (post_fx::any_enabled() || monotonePoint) &&
+      (passInfo.observable || monotonePoint) && bloomedFrame != frameKey && !bloomBeforeCopy) {
     for (size_t i = passInfo.commands.size(); i-- > 0;) {
       const auto& command = passInfo.commands[i];
       if (command.type == CommandType::Draw && command.data.draw.type != ShaderType::Clear && !command.flat) {
         split = i + 1;
         break;
       }
+    }
+    if (split == SIZE_MAX && monotonePoint)
+      split = 0;
+  }
+  // The late lighting (post_fx::encode_late()): what the pass draws before the split that writes depth and takes
+  // no Wind Waker HD light of its own (Link takes his in his draws).
+  bool lateLight = false;
+  if (monotonePoint && split != SIZE_MAX) {
+    for (size_t i = 0; i < split && !lateLight; ++i) {
+      const auto& command = passInfo.commands[i];
+      lateLight = command.type == CommandType::Draw && command.data.draw.type == ShaderType::GXCore &&
+                  !command.flat && command.data.draw.gxcore.depthWrite && !command.data.draw.gxcore.actorLight;
     }
   }
 
@@ -2682,6 +2744,32 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
   }
 #endif
 
+  if (monotonePoint) {
+    // The scene as the game left it at the composite, its sun map with this pass's casters (Link's) already in.
+    post_fx::encode(cmd, passInfo.copySourceView, passInfo.copySourceDepthView, passInfo.targetSize,
+                    webgpu::g_frameBuffer.texture.GetFormat(), passInfo.colorView, passInfo.resolveView,
+                    passInfo.msaaSamples, frame_camera(frame, frameKey), frameSunMap, post_fx::Phase::Scene,
+                    &passInfo.monotone);
+    if (lateLight)
+      post_fx::snapshot_monotone_depth(cmd, passInfo.copySourceDepthView, passInfo.targetSize);
+    // The grey composite's copy again, from the frame with HD's monotone in (the heat haze's): the copy keeps the
+    // colour (for the next frame's motion blur, laid back under the monotone), and the haze drawn from it after the
+    // monotone showed the colours in its quads over the sepia (Xboss0, the boss replays).
+    if (passInfo.monotoneHaze && passInfo.msaaSamples == 1) {
+      const auto& hazeSize = passInfo.monotoneHaze->size;
+      const bool scaled = hazeSize.width != static_cast<uint32_t>(passInfo.monotoneHazeRect.width) ||
+                          hazeSize.height != static_cast<uint32_t>(passInfo.monotoneHazeRect.height);
+      tex_copy_conv::run(cmd, tex_copy_conv::ConvRequest{
+                                  .fmt = passInfo.monotoneHazeFormat,
+                                  .srcView = passInfo.copySourceView,
+                                  .uniformRange = passInfo.monotoneHazeUniform,
+                                  .dst = passInfo.monotoneHaze,
+                                  .sampleFilter = scaled ? tex_copy_conv::SampleFilter::Linear
+                                                         : tex_copy_conv::SampleFilter::Nearest,
+                                  .keepColour = true,
+                              });
+    }
+  }
   // DOL_AURORA_GPU_PROF_CHUNK=N (diagnostic): a pass of more than N commands is
   // encoded as timed sub-passes of N commands, "EFB 1 @0", "EFB 1 @N", ...,
   // each loading what the one before stored, the last resolving. The same
@@ -2844,9 +2932,14 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
     bloomedFrame = frameKey;
   }
   if (split != SIZE_MAX) {
-    post_fx::encode(cmd, passInfo.copySourceView, passInfo.copySourceDepthView, passInfo.targetSize,
-                    webgpu::g_frameBuffer.texture.GetFormat(), passInfo.colorView, passInfo.resolveView,
-                    passInfo.msaaSamples, frame_camera(frame, frameKey), frameSunMap);
+    if (monotonePoint)
+      post_fx::encode_late(cmd, passInfo.copySourceView, passInfo.copySourceDepthView, passInfo.targetSize,
+                           webgpu::g_frameBuffer.texture.GetFormat(), passInfo.colorView, passInfo.resolveView,
+                           passInfo.msaaSamples, frame_camera(frame, frameKey), frameSunMap, lateLight);
+    else
+      post_fx::encode(cmd, passInfo.copySourceView, passInfo.copySourceDepthView, passInfo.targetSize,
+                      webgpu::g_frameBuffer.texture.GetFormat(), passInfo.colorView, passInfo.resolveView,
+                      passInfo.msaaSamples, frame_camera(frame, frameKey), frameSunMap);
     bloomedFrame = frameKey;
     if (split < passInfo.commands.size()) {
       auto attachmentsAfter = attachments;
@@ -2895,6 +2988,7 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
         .uniformRange = passInfo.resolveUniformRange,
         .dst = passInfo.resolveTarget,
         .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
+        .keepColour = passInfo.monotoneCopy,
     };
     if (needsConversion) {
       tex_copy_conv::run(cmd, convReq);
