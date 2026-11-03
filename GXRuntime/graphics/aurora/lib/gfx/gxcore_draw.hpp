@@ -70,6 +70,9 @@ struct DrawData {
   // per-vertex matrices (a skinned model) or the current one.
   bool sunCaster = false;
   bool posMtxIdx = false;
+  // It casts in the cascades past the second too (gxc::DrawPlan::far_caster: the stage's BG lists, as Wind Waker
+  // HD's far cascades draw only its BG model list).
+  bool farCaster = true;
   // Alpha-tested solid scenery (a roof, an awning, leaves, a fence): drawn
   // into the map with its texture's cutout (sun_caster_alpha()).
   bool sunCasterAlpha = false;
