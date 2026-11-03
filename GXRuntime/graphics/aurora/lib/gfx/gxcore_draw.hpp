@@ -127,6 +127,9 @@ struct DrawData {
   // Its pipeline is the shader with Wind Waker HD's character light (gxc ShaderKey::hd_actor_light): group 0 is
   // the pass's actor light group (begin_actor_light_pass()).
   bool actorLight = false;
+  // Its pipeline is the lit scenery's with Wind Waker HD's light buffer (gxc ShaderKey::hd_point_light): group 0 is
+  // the pass's actor light group, for its lights.
+  bool pointLight = false;
 };
 
 // Recording: the pass's last command, when it is a GXCore draw a following
@@ -153,7 +156,9 @@ DrawData* last_recorded_draw() noexcept;
 // v15: Wind Waker HD's character light (ShaderKey::hd_actor_light: a longer key, and a flagged key's WGSL and group
 // 0 layout).
 // v16: its cloud term (HD's cloud shadow texture and sampler at group 0 bindings 5 and 6, a longer uniform).
-constexpr uint32_t GXCorePipelineConfigVersion = 16;
+// v17: HD's light buffer on the characters (its point and effect lights at group 0 binding 7).
+// v18: and on the lit scenery (ShaderKey::hd_point_light: a key byte, its WGSL and group 0).
+constexpr uint32_t GXCorePipelineConfigVersion = 18;
 
 struct PipelineConfig {
   uint32_t version = GXCorePipelineConfigVersion;

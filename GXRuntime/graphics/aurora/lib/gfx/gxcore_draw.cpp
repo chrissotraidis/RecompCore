@@ -271,7 +271,8 @@ wgpu::BindGroupLayout texture_bind_group_layout(uint32_t used_mask = 1u) {
 // Wind Waker HD's character light (gxc ShaderKey::hd_actor_light): a flagged pipeline's group 0 is the pass's
 // static group (its two storage buffers, bindings 0 and 1, which the shader doesn't read) and HD's light: its
 // uniform (gxc::HdActorLightConstants), the shadow pre-pass and its sampler (bindings 2 to 4), HD's cloud shadow
-// texture and its sampler (5 and 6; post_fx::actor_cloud_source(), else a white texel). Made on first use by
+// texture and its sampler (5 and 6; post_fx::actor_cloud_source(), else a white texel), and HD's light buffer's
+// lights (7, gxc::HdPointLights; none in the off group). Made on first use by
 // the pipeline compiler or the render thread, under the texture layouts' lock.
 wgpu::BindGroupLayout g_actorLightLayout;
 wgpu::Device g_actorLightLayoutOwner;
@@ -318,6 +319,12 @@ wgpu::BindGroupLayout actor_light_group_layout() {
           .binding = 6,
           .visibility = wgpu::ShaderStage::Fragment,
           .sampler = wgpu::SamplerBindingLayout{.type = wgpu::SamplerBindingType::Filtering},
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 7,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .buffer = wgpu::BufferBindingLayout{.type = wgpu::BufferBindingType::Uniform,
+                                              .minBindingSize = sizeof(gxc::HdPointLights)},
       },
   };
   const wgpu::BindGroupLayoutDescriptor descriptor{
@@ -848,7 +855,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   // group agree. Untextured draws never use the texture group (layoutCount below).
   const uint32_t tex_mask = uber ? 0xFFu : textured ? gxc::used_texmap_mask(key.shader) : 1u;
   // Wind Waker HD's character light: group 0 longer, with its uniform and shadow (actor_light_group_layout()).
-  const bool actorLight = !uber && !depthOnly && key.shader.hd_actor_light != 0u;
+  // HD's light buffer on the lit scenery (hd_point_light) takes the same group 0 for its lights.
+  const bool actorLight = !uber && !depthOnly && (key.shader.hd_actor_light != 0u || key.shader.hd_point_light != 0u);
   std::array<wgpu::BindGroupLayout, 4> bindGroupLayouts{
       actorLight ? actor_light_group_layout() : g_staticBindGroupLayout,
       g_uniformBindGroupLayout,
@@ -934,7 +942,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   const bool tex_hi = key.shader.raw_tex_hi_in_nbt != 0u;
   if (uber || tex_hi ||
       ((key.shader.lit_valid != 0 || has_emboss || has_normal_source) &&
-       key.shader.has_vertex_normal != 0)) {
+       key.shader.has_vertex_normal != 0) ||
+      key.shader.hd_point_light == 2u) {
     attributes.push_back(wgpu::VertexAttribute{
         .format = wgpu::VertexFormat::Float32x3,
         .offset = gxc::kVertexNormalOffset,
@@ -1196,7 +1205,8 @@ const std::array<float, 3>& actor_light_rim() {
 }
 
 wgpu::BindGroup make_actor_group(const gxc::HdActorLightConstants& constants, const wgpu::TextureView& shadow,
-                                 const wgpu::TextureView& cloud = {}, const wgpu::Sampler& cloudSampler = {}) {
+                                 const wgpu::TextureView& cloud = {}, const wgpu::Sampler& cloudSampler = {},
+                                 const gxc::HdPointLights& lights = {}) {
   if (!g_actorSampler) {
     const wgpu::SamplerDescriptor sampler{
         .label = "GXCore actor light (HD) shadow",
@@ -1217,6 +1227,17 @@ wgpu::BindGroup make_actor_group(const gxc::HdActorLightConstants& constants, co
   const auto buffer = g_device.CreateBuffer(&bufferDescriptor);
   std::memcpy(buffer.GetMappedRange(0, sizeof(constants)), &constants, sizeof(constants));
   buffer.Unmap();
+  // Only the lights in use are copied (the rest of the buffer is zero).
+  const size_t lightBytes = sizeof(lights);
+  const wgpu::BufferDescriptor lightDescriptor{
+      .label = "GXCore point lights (HD)",
+      .usage = wgpu::BufferUsage::Uniform,
+      .size = lightBytes,
+      .mappedAtCreation = true,
+  };
+  const auto lightBuffer = g_device.CreateBuffer(&lightDescriptor);
+  std::memcpy(lightBuffer.GetMappedRange(0, lightBytes), &lights, lightBytes);
+  lightBuffer.Unmap();
   const std::array entries{
       wgpu::BindGroupEntry{.binding = 0, .buffer = g_vertexBuffer},
       wgpu::BindGroupEntry{.binding = 1, .buffer = g_storageBuffer},
@@ -1225,6 +1246,7 @@ wgpu::BindGroup make_actor_group(const gxc::HdActorLightConstants& constants, co
       wgpu::BindGroupEntry{.binding = 4, .sampler = g_actorSampler},
       wgpu::BindGroupEntry{.binding = 5, .textureView = cloud ? cloud : empty_texmap_view()},
       wgpu::BindGroupEntry{.binding = 6, .sampler = cloudSampler ? cloudSampler : g_actorSampler},
+      wgpu::BindGroupEntry{.binding = 7, .buffer = lightBuffer, .offset = 0, .size = lightBytes},
   };
   const wgpu::BindGroupDescriptor descriptor{
       .label = "GXCore actor light (HD) group",
@@ -1299,14 +1321,36 @@ bool begin_actor_light_pass(const post_fx::Camera* camera, const post_fx::SunMap
   c.screen[0] = 1.f / static_cast<float>(size.width);
   c.screen[1] = 1.f / static_cast<float>(size.height);
   // The GameCube's effect light on characters (the sword-hit flash, bombs, the item get: a TEV stage the game adds
-  // only while one reaches the model) on HD's colour, until HD's light buffer is ported;
-  // DOL_AURORA_ACTOR_LIGHT_HD_EFFECT=0 leaves it out (HD's toon shader has no such term).
-  static const bool effect = [] {
+  // only while one reaches the model) on HD's colour, while HD's light buffer is off: with it on, the same effect
+  // lights reach the characters through it (below), as in HD, whose toon shader has no such term, and the stage
+  // would count them twice. DOL_AURORA_ACTOR_LIGHT_HD_EFFECT=1 keeps the stage, 0 leaves it out, either way.
+  static const int effectSwitch = [] {
     const char* env = std::getenv("DOL_AURORA_ACTOR_LIGHT_HD_EFFECT");
-    return env == nullptr || env[0] != '0';
+    return env == nullptr || env[0] == '\0' ? -1 : env[0] != '0' ? 1 : 0;
   }();
-  c.screen[2] = effect ? 1.f : 0.f;
-  g_actorPassGroup = make_actor_group(c, haveShadow ? shadow : empty_texmap_view(), cloud, cloudSampler);
+  const bool pointLights = post_fx::point_lights_hd_active();
+  c.screen[2] = (effectSwitch >= 0 ? effectSwitch == 1 : !pointLights) ? 1.f : 0.f;
+  // Wind Waker HD's light buffer (post_fx::point_lights_hd_active()): the frame's lights, to the camera's view space
+  // (world - eye through the inverse view's rotation, transposed).
+  gxc::HdPointLights lights{};
+  if (pointLights) {
+    const uint32_t count = std::min<uint32_t>(camera->lightCount, gxc::kMaxHdPointLights);
+    const float eye[3] = {v[3], v[7], v[11]};
+    for (uint32_t i = 0; i < count; ++i) {
+      const float* l = camera->lights.data() + i * 8;
+      const float d[3] = {l[0] - eye[0], l[1] - eye[1], l[2] - eye[2]};
+      for (int j = 0; j < 3; ++j)
+        lights.pos_r[i][j] = v[j] * d[0] + v[4 + j] * d[1] + v[8 + j] * d[2];
+      lights.pos_r[i][3] = l[3];
+      for (int j = 0; j < 3; ++j)
+        lights.colour[i][j] = std::max(l[4 + j], 0.f);
+    }
+    lights.count[0] = static_cast<float>(count);
+    lights.count[1] = gxc::kHdPointLightActor;
+    lights.count[2] = gxc::kHdPointLightScenery;
+  }
+  g_actorPassGroup =
+      make_actor_group(c, haveShadow ? shadow : empty_texmap_view(), cloud, cloudSampler, lights);
   return true;
 }
 
@@ -1524,8 +1568,9 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
       g_pass.offset2 = UINT32_MAX;
     }
   }
-  if (data.actorLight) {
-    // Wind Waker HD's character light: the pass's group 0 with its uniform and shadow, and the static group back
+  if (data.actorLight || data.pointLight) {
+    // Wind Waker HD's character light (and its light buffer on the lit scenery): the pass's group 0 with its uniform,
+    // shadow and lights, and the static group back
     // after (the other draws' pipelines, and the other draw types', expect it).
     pass.SetBindGroup(0, actor_light_pass_group());
     draw(data.tev);
@@ -4005,6 +4050,13 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     if (toon.matched && (extended || !toon.after_albedo))
       key.shader.hd_actor_light = 1u;
   }
+  // Wind Waker HD's light buffer on the lit scenery (DOL_AURORA_POINT_LIGHTS_HD=1, with its character light): a draw
+  // whose stage 0 is the GameCube's light (gxc::hd_point_light_stage()) takes the flagged shader, which adds HD's
+  // lights x 1.25 to it while the pass has them (the characters' group 0; none in the off group). 2: its vertices
+  // carry the smooth normals made for the sun shadows (with_smooth_normals()), which it takes for the lights' N.L.
+  if (tev && post_fx::point_lights_hd_switch() && post_fx::actor_light_hd_switch() &&
+      key.shader.hd_actor_light == 0u && gxc::hd_point_light_stage(key.shader))
+    key.shader.hd_point_light = smoothNormal ? 2u : 1u;
   const PipelineConfig colorConfig{
       .version = GXCorePipelineConfigVersion,
       .key = key,
@@ -4268,6 +4320,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                    smoothNormal,
       .toon = toon_draw(plan.pipeline),
       .actorLight = key.shader.hd_actor_light != 0u,
+      .pointLight = key.shader.hd_point_light != 0u,
       .maskOccluder = maskOccluder,
       .maskOccluderCutout = maskOccluder && !alpha_test_always_passes(plan.pipeline.shader),
       .maskOccluderLit = maskOccluder && plan.pipeline.shader.lit_valid != 0u,
