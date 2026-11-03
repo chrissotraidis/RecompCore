@@ -175,6 +175,10 @@ void aurora_set_bloom(bool enabled);
    sharp, before bloom. Takes effect at the next frame. DOL_AURORA_FAR_BLUR=1
    sets the starting value. */
 void aurora_set_far_blur(bool enabled);
+/* Wind Waker HD's far blur level for the hour (its DOF presets: wwHD_basic 1.2 by day, wwHD_night 0.65, blended
+   over 06:00-08:00 and 18:00-20:00), used with DOL_AURORA_FAR_BLUR_HD=1: the blend is clamp(level x (distance -
+   start) / (end - start)) times DOL_AURORA_FAR_BLUR_AMOUNT. 1.2 until set. Takes effect at the next frame. */
+void aurora_set_far_blur_level(float level);
 /* Ambient occlusion: creases and contact areas darkened, from the scene's
    depth, before the far blur and bloom. Takes effect at the next frame.
    DOL_AURORA_AO=1 sets the starting value. */

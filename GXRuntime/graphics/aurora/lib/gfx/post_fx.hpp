@@ -19,7 +19,9 @@
 // DOL_AURORA_FAR_BLUR_AMOUNT (default 0.8); where the game drew without depth
 // (the sky, the horizon, the islands' far models), _BACKGROUND (default 0.35). Off unless
 // DOL_AURORA_FAR_BLUR=1 or aurora_set_far_blur(true); _DEBUG=1 shows the
-// distance as brightness.
+// distance as brightness. _HD=1: Wind Waker HD's linear ramp in place of the
+// smoothstep, clamp(level x (distance - start) / (end - start)) x the amount,
+// the level the host's for the hour (aurora_set_far_blur_level).
 //
 // Ambient occlusion (HD's darkened creases and contact shadows): first, from
 // depth alone, at a quarter of the size, blurred and multiplied into the
@@ -52,6 +54,7 @@ bool bloom_enabled() noexcept;
 void set_bloom(bool enabled) noexcept;
 bool far_blur_enabled() noexcept;
 void set_far_blur(bool enabled) noexcept;
+void set_far_blur_level(float level) noexcept;
 bool ambient_occlusion_enabled() noexcept;
 void set_ambient_occlusion(bool enabled) noexcept;
 bool torch_light_enabled() noexcept;
