@@ -48,6 +48,10 @@ struct DrawData {
   Range pixelUniformRange;  // PixelShaderConstants (group 2), TEV path only
   uint32_t indexCount;
   BindGroupRef textureBindGroup; // 0 when untextured
+  // The one texture an alpha-tested draw's cutout comes from, in the single-texmap layout (the sun map's cutout
+  // casters and the sea mask's cutout bind it at group 2): the draw's own group when it has one texmap, else a
+  // group of the texmap its alpha is read from (gxc::cutout_alpha_texmap()); 0 when there is none.
+  BindGroupRef cutoutBindGroup = 0;
   bool tev = false; // TEV path: PS uniform at group 2, texture at group 3
   // A tagged particle's, whose in-between vertices are its own (interpVertRange).
   bool ownVertices = false;
