@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gxruntime/gxcore/shader.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -270,6 +271,38 @@ void emit_fog(std::string& out, const ShaderKey& key) {
             "ifog) >> vec3u(8u), prev.a);\n");
 }
 
+// Wind Waker HD's light buffer (HdPointLights at group 0 binding 7): HD's light pass, per pixel, for a view-space
+// position and unit normal: the sum of colour x sat(N.L) x sat(1 - d / r)^1.5 (HD's exponent, 1.5 for every light).
+void emit_hd_point_light_decl(std::string& out) {
+  emitf(out,
+        "struct HdPointLights {\n"
+        "    count: vec4f,\n"
+        "    pos_r: array<vec4f, %u>,\n"
+        "    colour: array<vec4f, %u>,\n"
+        "};\n"
+        "@group(0) @binding(7) var<uniform> hdp: HdPointLights;\n"
+        "fn hd_point_sum(p: vec3f, n: vec3f) -> vec3f {\n"
+        "    var sum = vec3f(0.0);\n"
+        "    let count = u32(hdp.count.x);\n"
+        "    for (var i = 0u; i < %uu; i++) {\n",
+        kMaxHdPointLights, kMaxHdPointLights, kMaxHdPointLights);
+  emit(out,
+        "        if (i >= count) {\n"
+        "            break;\n"
+        "        }\n"
+        "        let v = hdp.pos_r[i].xyz - p;\n"
+        "        let d = length(v);\n"
+        "        let fall = clamp(1.0 - d / hdp.pos_r[i].w, 0.0, 1.0);\n"
+        "        if (fall <= 0.0) {\n"
+        "            continue;\n"
+        "        }\n"
+        "        let nl = clamp(dot(n, v) / max(d, 1e-4), 0.0, 1.0);\n"
+        "        sum += hdp.colour[i].rgb * (nl * fall * sqrt(fall));\n"
+        "    }\n"
+        "    return sum;\n"
+        "}\n");
+}
+
 // Wind Waker HD's actor light (ShaderKey::hd_actor_light; RecompCore's
 // drafts/hd-actor-light/LINK-LIGHT.md has the formula from a RenderDoc
 // capture of Cemu). It replaces stage 0's mix(C0, K, ramp) x albedo with
@@ -289,10 +322,11 @@ void emit_fog(std::string& out, const ShaderKey& key) {
 // with no effect the key has two stages and there is nothing to add. Wind
 // Waker HD has no such term in its toon shader (Link's and the shield's traced
 // pixels match without it): it sends the effect lights to its light buffer
-// instead, which isn't ported. Until it is, the stage runs on HD's colour as
-// the GameCube ran it on its own (PREV + K1 x the ramp, clamped), so characters
-// keep the flashes; hdl.screen.z 0 (DOL_AURORA_ACTOR_LIGHT_HD_EFFECT=0) leaves
-// it out, HD's result alone. Alpha, the alpha test, fog and destination alpha
+// instead (HdPointLights, added to the light above). With that buffer off the
+// stage runs on HD's colour as the GameCube ran it on its own (PREV + K1 x the
+// ramp, clamped), so characters keep the flashes; with it on, hdl.screen.z 0
+// leaves the stage out, HD's result alone (DOL_AURORA_ACTOR_LIGHT_HD_EFFECT
+// overrides either way). Alpha, the alpha test, fog and destination alpha
 // are the GX path's. params.x 0 keeps the GX colour bit for bit. With a later
 // stage (E, F and G, ToonLightMatch::after_albedo, or the main pattern's
 // effect light) the block comes right after the albedo stage, in place of its
@@ -341,7 +375,8 @@ void emit_hd_actor_light(std::string& out, const ShaderKey& key, const ToonLight
        "            hd_cloud = clamp(textureSampleLevel(hdl_cloud, hdl_cloud_samp, hd_cloud_uv, hd_cloud_lod).r + "
        "hdl.cloud.w, 0.0, 1.0);\n"
        "        }\n"
-       "        let hd_l = mix(hd_hemi, hdl.k.rgb, hd_ramp * hd_cloud);\n"
+       // HD's light buffer (the point and effect lights) on the light, x 1.75, with no shadow, cloud or ramp.
+       "        let hd_l = mix(hd_hemi, hdl.k.rgb, hd_ramp * hd_cloud) + hdp.count.y * hd_point_sum(in.hd_pv, hd_n);\n"
        "        let hd_rev = mix(1.0, clamp(dot(hdl.light.xyz, hd_e), 0.0, 1.0), hdl.rim.z);\n"
        "        let hd_rim = pow(clamp(1.0 + dot(hd_n, hd_e), 0.0, 1.0), hdl.rim.y) * hd_rev;\n"
        "        let hd_alb = pow(vec3f(hd_albedo) / 255.0, vec3f(2.2));\n");
@@ -387,6 +422,22 @@ void emit_hd_actor_light(std::string& out, const ShaderKey& key, const ToonLight
 }
 
 
+// Wind Waker HD's light buffer on the lit scenery (ShaderKey::hd_point_light): the key flagged and in the pattern.
+bool hd_scenery_light(const ShaderKey& key, const ToonLightMatch& hd) {
+  return key.hd_point_light != 0u && !hd.matched && hd_point_light_stage(key);
+}
+
+// Its normal: the smooth one made for the sun shadows in the normal slot (hd_point_light 2), else the draw's own
+// where its vertex shader works one out (a lit channel and a vertex normal), else the triangle's, from the
+// position's screen derivatives.
+bool hd_scenery_smooth_normal(const ShaderKey& key) { return key.hd_point_light == 2u && key.raw_tex_hi_in_nbt == 0u; }
+
+bool hd_scenery_vertex_normal(const ShaderKey& key) {
+  return hd_scenery_smooth_normal(key) ||
+         (key.lit_valid != 0u && key.has_vertex_normal != 0u && key.raw_tex_hi_in_nbt == 0u &&
+          (channel_lit_path(key, 0u) || channel_lit_path(key, 1u)));
+}
+
 void emit_tev_fragment(std::string& out, const ShaderKey& key, const ToonLightMatch& hd) {
   // Single-texmap (<=1 distinct texmap) samples tex0 exactly as before; a
   // multi-texmap TEV (e.g. THP YUV Y/U/V on texmap 0/1/2) samples tex{texmap}.
@@ -419,6 +470,16 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key, const ToonLightMa
               "    let hd_cloud_texels = hd_cloud_uv * vec2f(textureDimensions(hdl_cloud));\n"
               "    let hd_cloud_span = max(length(dpdx(hd_cloud_texels)), length(dpdy(hd_cloud_texels)));\n"
               "    let hd_cloud_lod = log2(max(hd_cloud_span, 1.0));\n");
+  // HD's light buffer on the lit scenery: the normal, here before any branch (derivatives need uniform control flow),
+  // turned to the camera when it comes from the triangle.
+  const bool scenery = hd_scenery_light(key, hd);
+  if (scenery) {
+    if (hd_scenery_vertex_normal(key))
+      emit(out, "    let hd_sn = normalize(in.hd_nv);\n");
+    else
+      emit(out, "    var hd_sn = normalize(cross(dpdy(in.hd_pv), dpdx(in.hd_pv)));\n"
+                "    if (dot(hd_sn, in.hd_pv) > 0.0) { hd_sn = -hd_sn; }\n");
+  }
   emit(out,
             "    let col0i = vec4i(round(in.color0 * 255.0));\n"
             "    let col1i = vec4i(round(in.color1 * 255.0));\n");
@@ -681,6 +742,16 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key, const ToonLightMa
       emitf(out, "    if (hdl.params.x > 0.5 && hdl.screen.z < 0.5) { prev = vec4i(hd_keep%u, prev.a); }\n", n);
     if (hd_sheen)
       emitf(out, "    if (hdl.params.x > 0.5) { prev = vec4i(hd_sheen_keep%u, prev.a); }\n", n);
+    // HD's light buffer on the lit scenery: stage 0 is the light (the vertex colour between the shade and lit
+    // colours); HD's sum of the lights x 1.25 goes on it in linear, before the texture multiplies it, as HD adds it
+    // outside the vertex colour. The channel is 8-bit, as the TEV's inputs are.
+    if (scenery && n == 0u)
+      emit(out, "    if (hdp.count.x > 0.5) {\n"
+                "        let hd_pl = hdp.count.z * hd_point_sum(in.hd_pv, hd_sn);\n"
+                "        let hd_lit = pow(clamp(vec3f(prev.rgb) / 255.0, vec3f(0.0), vec3f(1.0)), vec3f(2.2)) + hd_pl;\n"
+                "        prev = vec4i(vec3i(round(pow(clamp(hd_lit, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)) * 255.0)), "
+                "prev.a);\n"
+                "    }\n");
   }
 
   // The last stage's destination register is what reaches the framebuffer.
@@ -967,9 +1038,27 @@ ToonLightMatch toon_light_stage(const ShaderKey& key) {
   return match;
 }
 
+bool hd_point_light_stage(const ShaderKey& key) {
+  if (key.tev_valid == 0u || key.num_tev_stages < 2u || key.num_tev_stages > kMaxTevStages || key.num_ind_stages != 0u ||
+      toon_light_stage(key).matched)
+    return false;
+  const TevStageKey& s0 = key.tev_stages[0];
+  // a C0, b KONST, c RASC, d ZERO; add, no bias or scale, into PREV; colour channel 0
+  if (s0.cc_a != 2u || s0.cc_b != 14u || s0.cc_c != 10u || s0.cc_d != 15u || s0.cc_bias != 0u || s0.cc_op != 0u ||
+      s0.cc_scale != 0u || s0.cc_dest != 0u || s0.tevorders_colorchan != 0u)
+    return false;
+  for (std::uint32_t n = 1; n < key.num_tev_stages; ++n) {
+    const TevStageKey& t = key.tev_stages[n];
+    for (const std::uint8_t arg : {t.cc_a, t.cc_b, t.cc_c, t.cc_d})
+      if (arg == 2u || arg == 3u)
+        return false;
+  }
+  return true;
+}
+
 HdActorLightPixel hd_actor_light_reference(const HdActorLightConstants& c, float s, float sh, float (*ramp)(float u),
                                            float n_up, float n_dot_e, float l_dot_e, const float albedo_gamma[3],
-                                           float cloud, bool rim) {
+                                           float cloud, bool rim, const float* point) {
   const auto clamp01 = [](float v) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; };
   const auto mix = [](float a, float b, float t) { return a + (b - a) * t; };
   HdActorLightPixel px;
@@ -978,11 +1067,28 @@ HdActorLightPixel hd_actor_light_reference(const HdActorLightConstants& c, float
   px.rim = std::pow(clamp01(1.f + n_dot_e), c.rim[1]) * rev;
   for (int i = 0; i < 3; ++i) {
     px.hemi[i] = mix(c.c0[i], c.shadow[i], 0.5f + 0.5f * n_up);
-    px.light[i] = mix(px.hemi[i], c.k[i], px.ramp * cloud);
+    px.light[i] = mix(px.hemi[i], c.k[i], px.ramp * cloud) + (point != nullptr ? kHdPointLightActor * point[i] : 0.f);
     const float albedo = std::pow(albedo_gamma[i], 2.2f);
     px.out[i] = std::pow(clamp01(px.light[i] * (albedo + (rim ? px.hemi[i] * c.rim[0] * px.rim : 0.f))), 1.f / 2.2f);
   }
   return px;
+}
+
+void hd_point_light_reference(const HdPointLights& lights, const float p_view[3], const float n_view[3],
+                              float out[3]) {
+  out[0] = out[1] = out[2] = 0.f;
+  const auto count = static_cast<std::uint32_t>(lights.count[0]);
+  for (std::uint32_t i = 0; i < count && i < kMaxHdPointLights; ++i) {
+    const float v[3] = {lights.pos_r[i][0] - p_view[0], lights.pos_r[i][1] - p_view[1],
+                        lights.pos_r[i][2] - p_view[2]};
+    const float d = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (d <= 0.f || lights.pos_r[i][3] <= 0.f)
+      continue;
+    const float n_dot_l = std::clamp((n_view[0] * v[0] + n_view[1] * v[1] + n_view[2] * v[2]) / d, 0.f, 1.f);
+    const float fall = std::pow(std::clamp(1.f - d / lights.pos_r[i][3], 0.f, 1.f), 1.5f);
+    for (int c = 0; c < 3; ++c)
+      out[c] += lights.colour[i][c] * n_dot_l * fall;
+  }
 }
 
 std::string generate_wgsl(const ShaderKey& key) {
@@ -995,6 +1101,8 @@ std::string generate_wgsl(const ShaderKey& key) {
   const bool lit = key.lit_valid != 0;
   // Wind Waker HD's actor light, for a toon key the host flagged.
   const ToonLightMatch hd = key.hd_actor_light != 0u && tev ? toon_light_stage(key) : ToonLightMatch{};
+  // Wind Waker HD's light buffer on the lit scenery, for a key the host flagged.
+  const bool hd_scenery = tev && hd_scenery_light(key, hd);
   // Color texgens (Dolphin VertexShaderGen texgentype switch, TexGenType::Color0/
   // Color1) drive the texcoord from a lit color channel. A Color1 texgen consumes
   // o.color1 even on a non-TEV draw, and an emboss texgen needs the light dir in
@@ -1137,6 +1245,8 @@ std::string generate_wgsl(const ShaderKey& key) {
                 "}\n");
     }
   }
+  if (hd.matched || hd_scenery)
+    emit_hd_point_light_decl(out);
   if (hd.matched) {
     // Wind Waker HD's actor light: its uniform and shadow at group 0, beside
     // the pass's storage buffers (bindings 0 and 1), and the ramp's bilinear
@@ -1184,7 +1294,7 @@ std::string generate_wgsl(const ShaderKey& key) {
             "    @location(6) rawtex2: vec2f,\n"
             "    @location(7) rawtex3: vec2f,\n");
   const bool tex_hi = key.raw_tex_hi_in_nbt != 0u; // TEX5..7 in the N/B/T slots
-  if (((lit || emit_nbt || has_normal_source) && has_normal) || tex_hi)
+  if (((lit || emit_nbt || has_normal_source) && has_normal) || tex_hi || (hd_scenery && hd_scenery_smooth_normal(key)))
     emit(out, "    @location(8) rawnormal: vec3f,\n");
   if (key.has_tex_mtx_idx != 0)
     emit(out, "    @location(9) texmtxidx: u32,\n");
@@ -1209,6 +1319,12 @@ std::string generate_wgsl(const ShaderKey& key) {
   if (hd.matched)
     emitf(out, "    @location(%u) hd_nv: vec3f,\n    @location(%u) hd_pv: vec3f,\n",
           uv_loc_base + key.num_tex_gens, uv_loc_base + key.num_tex_gens + 1u);
+  // HD's light buffer on the lit scenery: the view-space position, and the normal where the vertex shader has one.
+  if (hd_scenery) {
+    emitf(out, "    @location(%u) hd_pv: vec3f,\n", uv_loc_base + key.num_tex_gens);
+    if (hd_scenery_vertex_normal(key))
+      emitf(out, "    @location(%u) hd_nv: vec3f,\n", uv_loc_base + key.num_tex_gens + 1u);
+  }
   emit(out, "};\n\n");
 
   // Integer lighting header (Dolphin GenerateLightingShaderHeader): one function
@@ -1297,6 +1413,15 @@ std::string generate_wgsl(const ShaderKey& key) {
   if (hd.matched)
     emit(out, "    o.hd_nv = _normal;\n"
               "    o.hd_pv = viewpos.xyz;\n");
+  if (hd_scenery) {
+    emit(out, "    o.hd_pv = viewpos.xyz;\n");
+    // The smooth normal, turned into view space by the position matrix (the scenery's is a rotation, scale and
+    // move), as the sea mask's pass turns it.
+    if (hd_scenery_smooth_normal(key))
+      emit(out, "    o.hd_nv = vec3f(dot(p0.xyz, in.rawnormal), dot(p1.xyz, in.rawnormal), dot(p2.xyz, in.rawnormal));\n");
+    else if (hd_scenery_vertex_normal(key))
+      emit(out, "    o.hd_nv = _normal;\n");
+  }
 
   for (std::uint32_t i = 0; i < key.num_tex_gens; ++i) {
     const TexGenKey& tg = key.tex_gens[i];
