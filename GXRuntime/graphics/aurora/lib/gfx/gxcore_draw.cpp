@@ -4065,7 +4065,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         last->uniformRange.offset == uniformRange.offset && last->tev == tev &&
         (!tev || last->pixelUniformRange.offset == pixelUniformRange.offset) &&
         last->textureBindGroup == textureBindGroup && last->ownVertices == ownVertices &&
-        last->smoothNormal == smoothNormal &&
+        last->smoothNormal == smoothNormal && last->farCaster == plan.far_caster &&
         last->interpUniformRange.size == 0 && last->interpVertRange.size == 0 &&
         (interpolating ? last->interpJob != UINT32_MAX && last->interpJob + last->batchSize == next_interp_job()
                        : last->interpJob == UINT32_MAX) &&
@@ -4173,6 +4173,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .sunCaster = (sun_caster(plan.pipeline) || clothCaster || blendedCaster) &&
                    !(sun_caster(plan.pipeline) && post_fx::sun_shadow_map_enabled() && sea_surface(plan)),
       .posMtxIdx = plan.pipeline.shader.has_pos_mtx_idx != 0,
+      .farCaster = plan.far_caster,
       // DOL_AURORA_SUN_CASTER_LOG=1: why a cloth's or wake's draw (a scope)
       // does or does not cast, once per distinct state (local debug).
 

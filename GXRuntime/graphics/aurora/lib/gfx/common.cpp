@@ -2118,9 +2118,19 @@ static void encode_sun_map(const wgpu::CommandEncoder& cmd, const RenderPass& pa
     };
     auto pass = cmd.BeginRenderPass(&descriptor);
     if (casters != 0) {
+      // Past the second cascade only the stage's BG lists cast (gxcore::DrawData::farCaster), as in Wind Waker HD
+      // (hd_layer_shadow.cpp drawShadowCascade: from cascade 2 on only mpModelList). The objects and characters'
+      // shadows there (the Tower of the Gods' pillars on its far face) are HD's to leave out.
+      // DOL_AURORA_SUN_SHADOW_FAR_CASTERS=all: every caster in every cascade, as before.
+      static const bool allFar = [] {
+        const char* env = std::getenv("DOL_AURORA_SUN_SHADOW_FAR_CASTERS");
+        return env != nullptr && std::strcmp(env, "all") == 0;
+      }();
+      const bool bgOnly = cascade >= 2 && !allFar;
       gxcore::begin_sun_casters(pass, map.caster[cascade].data());
       for (const auto& command : passInfo.commands)
-        if (command.type == CommandType::Draw && command.data.draw.type == ShaderType::GXCore && !command.flat)
+        if (command.type == CommandType::Draw && command.data.draw.type == ShaderType::GXCore && !command.flat &&
+            (!bgOnly || command.data.draw.gxcore.farCaster))
           gxcore::render_sun_caster(command.data.draw.gxcore, pass);
     }
     pass.End();
