@@ -1281,6 +1281,7 @@ bool begin_actor_light_pass(const post_fx::Camera* camera, const post_fx::SunMap
   gxc::HdActorLightConstants c{};
   if (!post_fx::actor_light_palette(c.c0, c.shadow, c.k))
     return false;
+  c.own_k[3] = post_fx::actor_light_own(c.own_c0, c.own_k) ? 1.f : 0.f;
   // The shadow: this frame's pre-pass of the characters' own where common.cpp made it for this pass
   // (post_fx::draw_actor_shadow(), HD's mip 1), else last frame's blurred pre-pass where the post pass made one; how
   // strongly the shadow map's light shows; none: lit (1).

@@ -86,6 +86,10 @@ bool point_lights_hd_switch() noexcept;
 bool point_lights_hd_active() noexcept;
 void set_actor_light_hd(bool on, const float c0[3], const float shadow[3], const float k[3]) noexcept;
 bool actor_light_palette(float c0[3], float shadow[3], float k[3]) noexcept;
+// The GameCube's global actor C0 and K0 (linear) the characters' own registers are set against
+// (aurora_set_actor_light_hd_own); false while none are given or with DOL_AURORA_ACTOR_LIGHT_HD_OWN=0.
+void set_actor_light_hd_own(bool on, const float c0[3], const float k[3]) noexcept;
+bool actor_light_own(float c0[3], float k[3]) noexcept;
 // The switch is on and the host has given colours: the characters may take HD's light this frame.
 bool actor_light_wanted() noexcept;
 // The shadow the characters' light reads: the last post pass's blurred shadow pre-pass (HD's terrain mix or its
