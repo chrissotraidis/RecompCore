@@ -222,6 +222,13 @@ void aurora_set_sun_palette(int on, const float sky[3], const float ground[3], c
    renderer's switch DOL_AURORA_ACTOR_LIGHT_HD=1 is on (read at startup). `on` 0 goes back to the GameCube shading.
    Takes effect at the next frame. */
 void aurora_set_actor_light_hd(int on, const float c0[3], const float shadow[3], const float k[3]);
+/* Each character's own palettes on Wind Waker HD's light (its setLightTevColorType: a character's colours are its
+   own tevstr's, from the floor under it, times the intensities of the global light, Link's): `c0` and `k0`, the
+   GameCube's global actor C0 and K0 (g_env_light's, linear: bytes / 255 to the 2.2). A character draw whose own toon
+   registers (C0 and KONST) differ from them takes HD's colours from aurora_set_actor_light_hd times the ratio, in
+   linear light: an islander in the sun keeps the sun's light while Link stands under a roof whose floor names a
+   darker palette. `on` 0: every character on the global colours. */
+void aurora_set_actor_light_hd_own(int on, const float c0[3], const float k0[3]);
 /* Wind Waker HD's light rule for the sun shadow map (its setLightPosHD): with `on`, the direction given by
    aurora_set_sun_direction is HD's light already (the sun by day, the moon's side by night, its height held as
    HD holds it), `night` says which, and `fade` (0 to 1) is HD's day/night switch fade, which takes the lit side
