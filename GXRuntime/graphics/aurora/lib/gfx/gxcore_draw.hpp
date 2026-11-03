@@ -104,6 +104,14 @@ struct DrawData {
   // Solid and not blended but writing no depth (the sky's layers): with Wind Waker HD's bloom mask
   // (post_fx::bloom_mask_wanted()) drawn into the sea mask, where it may glow.
   bool maskCover = false;
+  // It writes depth and colour but is none of the above: blended scenery that writes depth (a bush fading as
+  // the camera nears, alpha-tested), which the sea mask's pass draws too so what it hides marks nothing. Only
+  // whole (no alpha test) or with one texture's cutout (maskOccluderCutout, as sunCasterAlpha).
+  bool maskOccluder = false;
+  bool maskOccluderCutout = false;
+  // Lit by the game (a bush): not the sea, so it clears the sea's mark under it as well. An unlit one (the
+  // waves' crests and the horizon's wave sheets over the sea) keeps it.
+  bool maskOccluderLit = false;
   // Its vertices carry their own normals (the rim light takes a character's from the sea mask's pass).
   bool hasNormal = false;
   // Toon-shaded (a texgen from a lit colour): Wind Waker HD's rim light takes these characters, not a skinned
