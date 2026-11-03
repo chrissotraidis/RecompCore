@@ -835,6 +835,32 @@ void test_toon_light_wgsl() {
         std::string::npos);
   // Without the HD block, the flagged module is the GX one plus the declarations and varyings.
   CHECK(w.find("hd_hl_k") == std::string::npos);
+  // The cloud term: HD's cloud shadow texture and its sampler at bindings 5 and 6, the uniform's last vec4.
+  CHECK(w.find("@group(0) @binding(5) var hdl_cloud: texture_2d<f32>;") != std::string::npos);
+  CHECK(w.find("@group(0) @binding(6) var hdl_cloud_samp: sampler;") != std::string::npos);
+  CHECK(w.find("    screen: vec4f,\n    cloud: vec4f,\n};") != std::string::npos);
+  // Its uv is the world position from above (the inverse view's x and z rows), its mip from the uv's derivatives,
+  // worked out at the top of fs_main, before any branch or discard (uniform control flow).
+  const auto main_at = w.find("fn fs_main(");
+  const auto uv_at = w.find("let hd_cloud_uv = vec2f(-dot(hdl.rows[0], hd_cloud_p), -dot(hdl.rows[2], hd_cloud_p)) * "
+                            "hdl.cloud.z + hdl.cloud.xy;");
+  const auto dpdx_at = w.find("let hd_cloud_span = max(length(dpdx(hd_cloud_texels)), length(dpdy(hd_cloud_texels)));");
+  CHECK(w.find("let hd_cloud_p = vec4f(in.hd_pv, 1.0);") != std::string::npos);
+  CHECK(w.find("let hd_cloud_lod = log2(max(hd_cloud_span, 1.0));") != std::string::npos);
+  CHECK(main_at != std::string::npos && uv_at != std::string::npos && dpdx_at != std::string::npos);
+  CHECK(main_at < uv_at && uv_at < dpdx_at && dpdx_at < hd_at);
+  {
+    const std::string head = w.substr(main_at, dpdx_at - main_at);
+    CHECK(head.find("if (") == std::string::npos && head.find("discard") == std::string::npos);
+  }
+  // Sampled at that mip, only with the term on (rim.w), clamp(texel + floor); it multiplies the ramp's value.
+  CHECK(w.find("        if (hdl.rim.w > 0.5) {\n"
+               "            hd_cloud = clamp(textureSampleLevel(hdl_cloud, hdl_cloud_samp, hd_cloud_uv, hd_cloud_lod).r "
+               "+ hdl.cloud.w, 0.0, 1.0);\n") != std::string::npos);
+  CHECK(w.find("let hd_l = mix(hd_hemi, hdl.k.rgb, hd_ramp * hd_cloud);") != std::string::npos);
+  CHECK(w.find("hdl.rim.w)") == std::string::npos);
+  CHECK(w.find("if (hd_debug == 6) { hd_out = vec3f(hd_cloud); }") != std::string::npos);
+  CHECK(gx.find("dpdx") == std::string::npos);
   // The effect-light stage (PREV + K1 x the ramp) is matched but left out of HD's light, as HD drops it.
   auto hl = toon_key(true);
   hl.hd_actor_light = 1;
@@ -866,13 +892,13 @@ void test_toon_light_reference() {
   // The world normal's y that puts the hemisphere at `t` between C0 and the shadow colour.
   const auto up_for = [](float t) { return 2.f * t - 1.f; };
   const auto run = [](const gxc::HdActorLightConstants& c, float s, float sh, float (*ramp)(float), float up,
-                      float rim, const float albedo_linear[3]) {
+                      float rim, const float albedo_linear[3], float cloud = 1.f) {
     // rim = (1 + N.E)^5 x rev with rev 1 (the light straight ahead).
     const float n_dot_e = std::pow(rim, 1.f / 5.f) - 1.f;
     float gamma[3];
     for (int i = 0; i < 3; ++i)
       gamma[i] = std::pow(albedo_linear[i], 1.f / 2.2f);
-    auto px = gxc::hd_actor_light_reference(c, s, sh, ramp, up, n_dot_e, 1.f, gamma);
+    auto px = gxc::hd_actor_light_reference(c, s, sh, ramp, up, n_dot_e, 1.f, gamma, cloud);
     for (float& v : px.out)
       v = std::pow(v, 2.2f); // back to linear, as the traces are
     return px;
@@ -890,7 +916,7 @@ void test_toon_light_reference() {
   day.rim[0] = 2.f;
   day.rim[1] = 5.f;
   day.rim[2] = 0.75f;
-  day.rim[3] = 1.f;
+  day.rim[3] = 1.f; // the cloud term on (the shader's switch; the reference takes the cloud itself)
   // 2500,1300 shirt back in shade: s 0.196 x sh 0.246 off the ramp, rim 0: hemi x albedo exactly.
   {
     const float shirt[3] = {0.063f, 0.175f, 0.387f};
@@ -913,6 +939,29 @@ void test_toon_light_reference() {
     CHECK(near(px.out[2], 0.725f, 0.01f));
     // The table's ramp at s x sh = 0.514 is in the same band (the capture's 0.387 is the filtered texel).
     CHECK(near(hd_ramp_table(0.643f * 0.8f), 0.387f, 0.03f));
+    // The cloud term: 1 (clear) is the traced pixel bit for bit; it scales the ramp's value, not s, so under a full
+    // cloud the light is hemi alone, and the noon floor (0.1307) leaves that share of the ramp.
+    const auto clear = run(day, 0.643f, 0.8f, traced_ramp, up_for(t), 0.517f, hair, 1.f);
+    for (int i = 0; i < 3; ++i)
+      CHECK(clear.out[i] == px.out[i] && clear.light[i] == px.light[i]);
+    const auto dark = run(day, 0.643f, 0.8f, traced_ramp, up_for(t), 0.517f, hair, 0.f);
+    CHECK(dark.ramp == px.ramp);
+    for (int i = 0; i < 3; ++i)
+      CHECK(dark.light[i] == dark.hemi[i]);
+    const float floor_noon = 0.1307f;
+    const auto noon = run(day, 0.643f, 0.8f, traced_ramp, up_for(t), 0.517f, hair, floor_noon);
+    for (int i = 0; i < 3; ++i)
+      CHECK(near(noon.light[i], noon.hemi[i] + (day.k[i] - noon.hemi[i]) * 0.387f * floor_noon, 1e-5f));
+    CHECK(noon.out[2] < px.out[2]);
+  }
+  // In shade (ramp 0) the cloud changes nothing: HD's clouds take away only the sun's light.
+  {
+    const float shirt[3] = {0.063f, 0.175f, 0.387f};
+    const float t = (0.291f - 0.494f) / (0.106f - 0.494f);
+    const auto lit = run(day, 0.196f, 0.246f, hd_ramp_table, up_for(t), 0.f, shirt, 1.f);
+    const auto cloudy = run(day, 0.196f, 0.246f, hd_ramp_table, up_for(t), 0.f, shirt, 0.364f);
+    for (int i = 0; i < 3; ++i)
+      CHECK(lit.out[i] == cloudy.out[i]);
   }
   // 2610,1140 hair underside: no light at all, the normal facing down (hemi toward C0).
   {

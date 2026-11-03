@@ -270,7 +270,8 @@ wgpu::BindGroupLayout texture_bind_group_layout(uint32_t used_mask = 1u) {
 
 // Wind Waker HD's character light (gxc ShaderKey::hd_actor_light): a flagged pipeline's group 0 is the pass's
 // static group (its two storage buffers, bindings 0 and 1, which the shader doesn't read) and HD's light: its
-// uniform (gxc::HdActorLightConstants), the shadow pre-pass and its sampler (bindings 2 to 4). Made on first use by
+// uniform (gxc::HdActorLightConstants), the shadow pre-pass and its sampler (bindings 2 to 4), HD's cloud shadow
+// texture and its sampler (5 and 6; post_fx::actor_cloud_source(), else a white texel). Made on first use by
 // the pipeline compiler or the render thread, under the texture layouts' lock.
 wgpu::BindGroupLayout g_actorLightLayout;
 wgpu::Device g_actorLightLayoutOwner;
@@ -304,6 +305,17 @@ wgpu::BindGroupLayout actor_light_group_layout() {
       },
       wgpu::BindGroupLayoutEntry{
           .binding = 4,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .sampler = wgpu::SamplerBindingLayout{.type = wgpu::SamplerBindingType::Filtering},
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 5,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .texture = wgpu::TextureBindingLayout{.sampleType = wgpu::TextureSampleType::Float,
+                                                .viewDimension = wgpu::TextureViewDimension::e2D},
+      },
+      wgpu::BindGroupLayoutEntry{
+          .binding = 6,
           .visibility = wgpu::ShaderStage::Fragment,
           .sampler = wgpu::SamplerBindingLayout{.type = wgpu::SamplerBindingType::Filtering},
       },
@@ -1138,11 +1150,12 @@ wgpu::BindGroup g_actorPassGroup;
 wgpu::BindGroup g_actorOffGroup;
 wgpu::Sampler g_actorSampler;
 
-// DOL_AURORA_ACTOR_LIGHT_DEBUG: 1 the ramp coordinate s, 2 the shadow, 3 the ramp, 4 the hemisphere, 5 the rim.
+// DOL_AURORA_ACTOR_LIGHT_DEBUG: 1 the ramp coordinate s, 2 the shadow, 3 the ramp, 4 the hemisphere, 5 the rim,
+// 6 the cloud.
 float actor_light_debug() {
   static const float value = [] {
     const char* env = std::getenv("DOL_AURORA_ACTOR_LIGHT_DEBUG");
-    return env != nullptr ? static_cast<float>(std::clamp(std::atoi(env), 0, 5)) : 0.f;
+    return env != nullptr ? static_cast<float>(std::clamp(std::atoi(env), 0, 6)) : 0.f;
   }();
   return value;
 }
@@ -1161,7 +1174,8 @@ const std::array<float, 3>& actor_light_rim() {
   return value;
 }
 
-wgpu::BindGroup make_actor_group(const gxc::HdActorLightConstants& constants, const wgpu::TextureView& shadow) {
+wgpu::BindGroup make_actor_group(const gxc::HdActorLightConstants& constants, const wgpu::TextureView& shadow,
+                                 const wgpu::TextureView& cloud = {}, const wgpu::Sampler& cloudSampler = {}) {
   if (!g_actorSampler) {
     const wgpu::SamplerDescriptor sampler{
         .label = "GXCore actor light (HD) shadow",
@@ -1188,6 +1202,8 @@ wgpu::BindGroup make_actor_group(const gxc::HdActorLightConstants& constants, co
       wgpu::BindGroupEntry{.binding = 2, .buffer = buffer, .offset = 0, .size = sizeof(constants)},
       wgpu::BindGroupEntry{.binding = 3, .textureView = shadow},
       wgpu::BindGroupEntry{.binding = 4, .sampler = g_actorSampler},
+      wgpu::BindGroupEntry{.binding = 5, .textureView = cloud ? cloud : empty_texmap_view()},
+      wgpu::BindGroupEntry{.binding = 6, .sampler = cloudSampler ? cloudSampler : g_actorSampler},
   };
   const wgpu::BindGroupDescriptor descriptor{
       .label = "GXCore actor light (HD) group",
@@ -1254,10 +1270,14 @@ bool begin_actor_light_pass(const post_fx::Camera* camera, const post_fx::SunMap
   c.rim[0] = rim[0];
   c.rim[1] = rim[1];
   c.rim[2] = rim[2];
-  c.rim[3] = 1.f; // the cloud (HD's cloud shadow on characters: later)
+  // HD's cloud shadow, from the scenery's (post_fx::actor_cloud_source()); none: the cloud is 1 (rim.w 0).
+  wgpu::TextureView cloud;
+  wgpu::Sampler cloudSampler;
+  const bool haveCloud = post_fx::actor_cloud_source(*camera, c.cloud, cloud, cloudSampler);
+  c.rim[3] = haveCloud ? 1.f : 0.f;
   c.screen[0] = 1.f / static_cast<float>(size.width);
   c.screen[1] = 1.f / static_cast<float>(size.height);
-  g_actorPassGroup = make_actor_group(c, haveShadow ? shadow : empty_texmap_view());
+  g_actorPassGroup = make_actor_group(c, haveShadow ? shadow : empty_texmap_view(), cloud, cloudSampler);
   return true;
 }
 
