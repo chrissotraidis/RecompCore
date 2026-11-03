@@ -47,6 +47,44 @@ wgpu::TextureView g_seaMaskView;
 wgpu::Texture g_seaMaskDepth;
 wgpu::TextureView g_seaMaskDepthView;
 wgpu::Extent3D g_seaMaskSize{};
+// The effects' mask (effect_mask_target()), whether it was drawn for the next
+// encode(), and a black texel in its place when not.
+wgpu::Texture g_effectMask;
+wgpu::TextureView g_effectMaskView;
+bool g_effectMaskDrawn = false;
+wgpu::Texture g_effectNone;
+wgpu::TextureView g_effectNoneView;
+// The frame's effects' mask holds an effect that writes depth (note_effect_depth()), and the shading's depth made
+// for it (shading_depth()).
+bool g_effectDepthDrawn = false;
+wgpu::Texture g_shadeDepth;
+wgpu::TextureView g_shadeDepthView;
+wgpu::RenderPipeline g_shadeDepthPass;
+wgpu::BindGroupLayout g_shadeDepthLayout;
+wgpu::Texture g_effectMaskDepth;
+wgpu::TextureView g_effectMaskDepthView;
+// The effects drawn again over white (effect_white_target()), and the cover the shading reads (effect_cover_view()):
+// the effects' share of each pixel, and in alpha where one at its own depth is.
+wgpu::Texture g_effectWhite;
+wgpu::TextureView g_effectWhiteView;
+bool g_effectWhiteDrawn = false;
+wgpu::Texture g_effectCover;
+wgpu::TextureView g_effectCoverView;
+wgpu::RenderPipeline g_effectCoverPass[4]; // [own depth * 2 + over white]
+wgpu::BindGroupLayout g_effectCoverLayout[4];
+// DOL_AURORA_EFFECT_MASK_OPACITY=0: the effects' share from their colour over black alone (effect_white_target()).
+bool g_effectOpacity = true;
+// DOL_AURORA_EFFECT_MASK_DEBUG=1: the effects the sun shadows leave alone, in
+// red (multiplied in where the sun shadows would be, local debug).
+bool g_effectDebug = false;
+// How much of a pixel's shade (the sun shadows, the occlusion and the cloud
+// shadows) its effects take away: their brightest channel times this
+// (DOL_AURORA_EFFECT_MASK_GAIN), 2, so where an effect adds half or more (most
+// of a glow over the ground) the pixel is left as it is, and under a faint one
+// it is mostly shaded with what is behind.
+float g_effectGain = 2.f;
+// How far back the effects are drawn into the mask (effect_mask_push()).
+float g_effectPush = 0.05f;
 // The sun shadow map's full shadow as a colour the scene is multiplied by, the
 // shade lit by the sky as in Wind Waker HD: Link's shadow on Windfall's dock at
 // noon kept 0.21, 0.39 and 0.56 of the sunlit planks' red, green and blue (0.65
@@ -340,10 +378,12 @@ override strength: f32 = 0.6;
 override fade_start: f32 = 1000.0;
 override fade_end: f32 = 2500.0;
 override debug_view: f32 = 0.0;
+override effect_gain: f32 = 2.0;
 
 @group(0) @binding(0) var samp: sampler;
 @group(0) @binding(1) var src: texture_2d<f32>;
 @group(0) @binding(2) var depth: texture_depth_2d;
+@group(0) @binding(3) var effects: texture_2d<f32>; // the effects' mask, which the occlusion leaves
 var<private> weights: array<f32, 5> = array<f32, 5>(0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
 
 struct VertexOutput {
@@ -511,6 +551,21 @@ fn dither(pos: vec2<f32>) -> f32 {
     return (fract(52.9829189 * fract(dot(pos, vec2(0.06711056, 0.00583715)))) - 0.5) * (1.5 / 255.0);
 }
 
+// How much of the pixel the effects drawn over it make up (effect_cover_view()):
+// their colour over black or their opacity, its brightest channel times
+// effect_gain. That much of the pixel is left unshaded. Only near the camera
+// (dist, the distance of the surface behind, under 3,000 units and fading out by
+// 6,000): far off, what is drawn so is the haze over the sea toward the horizon,
+// which the cloud shadows shade with the sea. An effect drawn at its own depth
+// (alpha 1: a lava geyser in front of the far wall it hides) is near wherever it is.
+fn effect_cover(uv: vec2<f32>, dist: f32) -> f32 {
+    let size = textureDimensions(effects);
+    let p = min(vec2<u32>(uv * vec2<f32>(size)), size - vec2<u32>(1u));
+    let c = textureLoad(effects, p, 0);
+    let near = select(1.0 - smoothstep(3000.0, 6000.0, dist), 1.0, c.a > 0.5);
+    return clamp(max(c.r, max(c.g, c.b)) * effect_gain, 0.0, 1.0) * near;
+}
+
 // To the scene's size: the four nearest texels, as a bilinear filter weighs
 // them, each by how near its distance is to the pixel's. Where none is on the
 // pixel's surface (a thin edge), the nearest in distance.
@@ -542,7 +597,8 @@ fn fs_ao_upscale(in: VertexOutput) -> @location(0) vec4<f32> {
             closest = shade;
         }
     }
-    let shade = select(closest, sum / total, total > 1e-3);
+    // Not on an effect drawn over the surface (effect_cover()).
+    let shade = mix(select(closest, sum / total, total > 1e-3), 1.0, effect_cover(in.uv, 0.0));
     // DOL_AURORA_AO_DEBUG=2: what the occlusion darkens, tinted red over the
     // scene (four times as strong, so a faint shade shows), as the cascades are.
     if (debug_view > 1.5) {
@@ -560,6 +616,7 @@ constexpr const char* kCloudShader = R"""(
 override strength: f32 = 0.28;
 override scale: f32 = 7000.0;
 override debug_view: bool = false;
+override effect_gain: f32 = 2.0;
 
 struct View {
     rows: array<vec4<f32>, 3>,  // the inverse view matrix (view to world), by rows
@@ -568,7 +625,8 @@ struct View {
 };
 
 @group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var sea_mask: texture_2d<f32>; // the exposure's sea mask; the cloud shadows leave it
+// The exposure's sea mask; for the cloud shadows, the effects' mask, which they leave.
+@group(0) @binding(1) var mask: texture_2d<f32>;
 @group(0) @binding(4) var scene: texture_2d<f32>;    // the scene before the effects, for the exposure
 @group(0) @binding(2) var depth: texture_depth_2d;
 @group(0) @binding(3) var<uniform> view: View;
@@ -637,6 +695,21 @@ fn dither(pos: vec2<f32>) -> f32 {
     return (fract(52.9829189 * fract(dot(pos, vec2(0.06711056, 0.00583715)))) - 0.5) * (1.5 / 255.0);
 }
 
+// How much of the pixel the effects drawn over it make up (effect_cover_view()):
+// their colour over black or their opacity, its brightest channel times
+// effect_gain. That much of the pixel is left unshaded. Only near the camera
+// (dist, the distance of the surface behind, under 3,000 units and fading out by
+// 6,000): far off, what is drawn so is the haze over the sea toward the horizon,
+// which the cloud shadows shade with the sea. An effect drawn at its own depth
+// (alpha 1: a lava geyser in front of the far wall it hides) is near wherever it is.
+fn effect_cover(uv: vec2<f32>, dist: f32) -> f32 {
+    let size = textureDimensions(mask);
+    let p = min(vec2<u32>(uv * vec2<f32>(size)), size - vec2<u32>(1u));
+    let c = textureLoad(mask, p, 0);
+    let near = select(1.0 - smoothstep(3000.0, 6000.0, dist), 1.0, c.a > 0.5);
+    return clamp(max(c.r, max(c.g, c.b)) * effect_gain, 0.0, 1.0) * near;
+}
+
 @fragment
 fn fs_clouds(in: VertexOutput) -> @location(0) vec4<f32> {
     let d = textureLoad(depth, vec2<i32>(in.pos.xy), 0);
@@ -670,7 +743,10 @@ fn fs_clouds(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     let drift = vec2(0.6, 0.25) * view.time.x * 0.02;
     let n = fbm(world.xz / scale + drift);
-    let shade = smoothstep(0.42, 0.6, n) * strength * (1.0 - smoothstep(60000.0, 160000.0, distance));
+    // Not on an effect drawn over the surface (effect_cover()).
+    let cover = effect_cover(in.uv, distance);
+    let shade = smoothstep(0.42, 0.6, n) * strength * (1.0 - smoothstep(60000.0, 160000.0, distance)) *
+                (1.0 - cover);
     return vec4(vec3(1.0 - shade + select(0.0, dither(in.pos.xy), shade > 0.0)), 1.0);
 }
 
@@ -700,7 +776,7 @@ fn fs_exposure(in: VertexOutput) -> @location(0) vec4<f32> {
     if (d <= 0.0) {
         return vec4(0.0); // no depth: left as it is
     }
-    let land = 1.0 - textureLoad(sea_mask, p, 0).r;
+    let land = 1.0 - textureLoad(mask, p, 0).r;
     if (sea_debug) {
         // The sea mask: the sea twice as bright, the rest left as it is (the pass scales the scene by
         // one more than this; the target clamps what is below zero).
@@ -724,6 +800,7 @@ wgpu::ShaderModule g_cloudModule;
 constexpr const char* kSunShader = R"""(
 override strength: f32 = 0.35;
 override reach: f32 = 1500.0;
+override effect_gain: f32 = 2.0;
 
 struct View {
     rows: array<vec4<f32>, 3>,  // the inverse view matrix (view to world), by rows
@@ -732,7 +809,7 @@ struct View {
 };
 
 @group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var unused: texture_2d<f32>;
+@group(0) @binding(1) var effects: texture_2d<f32>; // the effects' mask, which the shade leaves
 @group(0) @binding(2) var depth: texture_depth_2d;
 @group(0) @binding(3) var<uniform> view: View;
 
@@ -757,6 +834,21 @@ fn view_depth(uv: vec2<f32>) -> f32 {
     let p = clamp(vec2<i32>(uv * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
     let d = textureLoad(depth, p, 0);
     return select(view.lens.z / d, 0.0, d <= 0.0);
+}
+
+// How much of the pixel the effects drawn over it make up (effect_cover_view()):
+// their colour over black or their opacity, its brightest channel times
+// effect_gain. That much of the pixel is left unshaded. Only near the camera
+// (dist, the distance of the surface behind, under 3,000 units and fading out by
+// 6,000): far off, what is drawn so is the haze over the sea toward the horizon,
+// which the cloud shadows shade with the sea. An effect drawn at its own depth
+// (alpha 1: a lava geyser in front of the far wall it hides) is near wherever it is.
+fn effect_cover(uv: vec2<f32>, dist: f32) -> f32 {
+    let size = textureDimensions(effects);
+    let p = min(vec2<u32>(uv * vec2<f32>(size)), size - vec2<u32>(1u));
+    let c = textureLoad(effects, p, 0);
+    let near = select(1.0 - smoothstep(3000.0, 6000.0, dist), 1.0, c.a > 0.5);
+    return clamp(max(c.r, max(c.g, c.b)) * effect_gain, 0.0, 1.0) * near;
 }
 
 @fragment
@@ -794,7 +886,7 @@ fn fs_sun(in: VertexOutput) -> @location(0) vec4<f32> {
             break;
         }
     }
-    let fade = (1.0 - smoothstep(4000.0, 9000.0, z)) * smoothstep(0.05, 0.25, sun.y);
+    let fade = (1.0 - smoothstep(4000.0, 9000.0, z)) * smoothstep(0.05, 0.25, sun.y) * (1.0 - effect_cover(in.uv, z));
     return vec4(vec3(1.0 - strength * (1.0 - lit) * fade), 1.0);
 }
 )""";
@@ -832,6 +924,8 @@ override shadow_g: f32 = 0.41;
 override shadow_b: f32 = 0.60;
 override soft: f32 = 0.01;
 override soft_max: f32 = 4.0;
+override effect_gain: f32 = 2.0;
+override effect_debug: f32 = 0.0;
 
 struct View {
     rows: array<vec4<f32>, 3>,  // the inverse view matrix (view to world), by rows
@@ -843,7 +937,7 @@ struct View {
 };
 
 @group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var unused: texture_2d<f32>;
+@group(0) @binding(1) var effects: texture_2d<f32>; // the effects' mask, which the shade leaves
 @group(0) @binding(2) var depth: texture_depth_2d;
 @group(0) @binding(3) var<uniform> view: View;
 @group(0) @binding(4) var sun_map: texture_depth_2d_array;
@@ -872,6 +966,21 @@ fn view_depth(uv: vec2<f32>) -> f32 {
     // near / depth is the distance only for a far plane infinitely far; with
     // the camera's own (params.w: near / (far - near)) it is exact.
     return select(view.lens.z / (d + view.params.w), 0.0, d <= 0.0);
+}
+
+// How much of the pixel the effects drawn over it make up (effect_cover_view()):
+// their colour over black or their opacity, its brightest channel times
+// effect_gain. That much of the pixel is left unshaded. Only near the camera
+// (dist, the distance of the surface behind, under 3,000 units and fading out by
+// 6,000): far off, what is drawn so is the haze over the sea toward the horizon,
+// which the cloud shadows shade with the sea. An effect drawn at its own depth
+// (alpha 1: a lava geyser in front of the far wall it hides) is near wherever it is.
+fn effect_cover(uv: vec2<f32>, dist: f32) -> f32 {
+    let size = textureDimensions(effects);
+    let p = min(vec2<u32>(uv * vec2<f32>(size)), size - vec2<u32>(1u));
+    let c = textureLoad(effects, p, 0);
+    let near = select(1.0 - smoothstep(3000.0, 6000.0, dist), 1.0, c.a > 0.5);
+    return clamp(max(c.r, max(c.g, c.b)) * effect_gain, 0.0, 1.0) * near;
 }
 
 // Whether the surface a screen step found (at s, its depth) is one the map
@@ -1248,7 +1357,14 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
     }
-    let fade = view.params.z;
+    // An effect drawn over the pixel (the spin attack's rings, a glow) isn't in
+    // the shade of the scenery behind it, whose depth this is: Link's shadow
+    // was drawn across the rings. As much of the pixel as they make up is left.
+    let cover = effect_cover(in.uv, z);
+    if (effect_debug > 0.5) {
+        return vec4(1.0, 1.0 - cover, 1.0 - cover, 1.0);
+    }
+    let fade = view.params.z * (1.0 - cover);
     let shade = mix(vec3(1.0), vec3(shadow_r, shadow_g, shadow_b), (1.0 - lit) * fade);
     // Multiplied into the 8-bit scene: half a step of noise against bands (fs_ao_apply).
     let noise = (fract(52.9829189 * fract(dot(in.pos.xy, vec2(0.06711056, 0.00583715)))) - 0.5) * (1.5 / 255.0);
@@ -1487,6 +1603,7 @@ wgpu::RenderPipeline make_ao_pipeline(const char* label, const char* entry, wgpu
       wgpu::ConstantEntry{.key = "fade_start", .value = g_aoFadeStart},
       wgpu::ConstantEntry{.key = "fade_end", .value = g_aoFadeEnd},
       wgpu::ConstantEntry{.key = "debug_view", .value = static_cast<double>(g_aoDebug)},
+      wgpu::ConstantEntry{.key = "effect_gain", .value = g_effectGain},
   };
   const wgpu::BlendState multiply{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -1522,6 +1639,7 @@ wgpu::RenderPipeline make_cloud_pipeline(wgpu::TextureFormat format, uint32_t sa
       wgpu::ConstantEntry{.key = "strength", .value = g_cloudStrength},
       wgpu::ConstantEntry{.key = "scale", .value = g_cloudScale},
       wgpu::ConstantEntry{.key = "debug_view", .value = g_cloudDebug ? 1.0 : 0.0},
+      wgpu::ConstantEntry{.key = "effect_gain", .value = g_effectGain},
   };
   const wgpu::BlendState boost{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -1584,6 +1702,7 @@ wgpu::RenderPipeline make_sun_pipeline(wgpu::TextureFormat format) {
   const std::array constants{
       wgpu::ConstantEntry{.key = "strength", .value = g_sunStrength},
       wgpu::ConstantEntry{.key = "reach", .value = g_sunReach},
+      wgpu::ConstantEntry{.key = "effect_gain", .value = g_effectGain},
   };
   const std::array targets{wgpu::ColorTargetState{.format = format, .blend = nullptr, .writeMask = wgpu::ColorWriteMask::All}};
   const wgpu::FragmentState fragment{
@@ -1631,6 +1750,8 @@ wgpu::RenderPipeline make_sun_map_pipeline(wgpu::TextureFormat format, bool dire
       wgpu::ConstantEntry{.key = "sea_bias", .value = g_sunMapSeaBias},
       wgpu::ConstantEntry{.key = "soft", .value = g_sunMapSoft},
       wgpu::ConstantEntry{.key = "soft_max", .value = g_sunMapSoftMax},
+      wgpu::ConstantEntry{.key = "effect_gain", .value = g_effectGain},
+      wgpu::ConstantEntry{.key = "effect_debug", .value = g_effectDebug ? 1.0 : 0.0},
   };
   const wgpu::BlendState multiply{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -1903,13 +2024,15 @@ void draw(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::Render
   pass.Draw(3);
   pass.End();
 }
+// effects: the effects' mask (effect_mask_target()) for the occlusion's apply, else a black texel.
 void draw_depth(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::RenderPipeline& pipeline,
                 const wgpu::TextureView& source, const wgpu::TextureView& depthView, const wgpu::TextureView& target,
-                const wgpu::TextureView& resolve, bool load) {
+                const wgpu::TextureView& resolve, bool load, const wgpu::TextureView& effects = nullptr) {
   const std::array entries{
       wgpu::BindGroupEntry{.binding = 0, .sampler = g_sampler},
       wgpu::BindGroupEntry{.binding = 1, .textureView = source},
       wgpu::BindGroupEntry{.binding = 2, .textureView = depthView},
+      wgpu::BindGroupEntry{.binding = 3, .textureView = effects ? effects : g_effectNoneView},
   };
   const wgpu::BindGroupDescriptor bindGroupDescriptor{
       .layout = g_depthLayout,
@@ -1998,9 +2121,10 @@ void draw_with_uniform(const wgpu::CommandEncoder& cmd, const char* label, const
 }
 // The sun shadows from the shadow map (kSunMapShader) into `target`.
 // direct: multiplied into `target`, the scene (with `resolve`), else drawn into a target of its own.
+// effects: the effects' mask (effect_mask_target()), whose effects it leaves.
 void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const SunMap& sunMap,
-                  const wgpu::TextureView& depthView, const wgpu::TextureView& target, bool direct,
-                  const wgpu::TextureView& resolve = nullptr) {
+                  const wgpu::TextureView& depthView, const wgpu::TextureView& effects,
+                  const wgpu::TextureView& target, bool direct, const wgpu::TextureView& resolve = nullptr) {
   std::array<float, kSunMapUniformFloats> uniform{};
   std::memcpy(uniform.data(), camera.view.data(), sizeof(camera.view));
   for (uint32_t cascade = 0; cascade < kSunMapCascades; ++cascade)
@@ -2031,7 +2155,7 @@ void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const S
   buffer.Unmap();
   const std::array entries{
       wgpu::BindGroupEntry{.binding = 0, .sampler = g_sampler},
-      wgpu::BindGroupEntry{.binding = 1, .textureView = g_farView[0]},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = effects},
       wgpu::BindGroupEntry{.binding = 2, .textureView = depthView},
       wgpu::BindGroupEntry{.binding = 3, .buffer = buffer, .offset = 0, .size = sizeof(uniform)},
       wgpu::BindGroupEntry{.binding = 4, .textureView = g_sunMapView},
@@ -2123,6 +2247,11 @@ void initialize() {
   g_sunMapSlopeNear = env_float("DOL_AURORA_SUN_SHADOW_MAP_SLOPE_NEAR", g_sunMapSlopeNear, 0.f, 32.f);
   g_sunMapNormalOffset = env_float("DOL_AURORA_SUN_SHADOW_MAP_NORMAL_OFFSET", g_sunMapNormalOffset, 0.f, 16.f);
   g_sunMapContact = env_float("DOL_AURORA_SUN_SHADOW_MAP_CONTACT", g_sunMapContact, 20.f, 5000.f);
+  g_effectDebug = std::getenv("DOL_AURORA_EFFECT_MASK_DEBUG") != nullptr;
+  g_effectGain = env_float("DOL_AURORA_EFFECT_MASK_GAIN", 2.f, 0.f, 1000.f);
+  if (const char* opacity = std::getenv("DOL_AURORA_EFFECT_MASK_OPACITY"); opacity != nullptr && opacity[0] != '\0')
+    g_effectOpacity = opacity[0] != '0';
+  g_effectPush = env_float("DOL_AURORA_EFFECT_MASK_PUSH", 0.05f, 0.f, 0.9f);
   const char* sunMapDebug = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_DEBUG");
   g_sunMapDebug = sunMapDebug != nullptr ? sunMapDebug[0] - '0' : 0;
   const char* sunMapSteps = std::getenv("DOL_AURORA_SUN_SHADOW_MAP_STEPS");
@@ -2209,6 +2338,13 @@ void initialize() {
           .visibility = wgpu::ShaderStage::Fragment,
           .texture = {.sampleType = wgpu::TextureSampleType::Depth, .viewDimension = wgpu::TextureViewDimension::e2D},
       },
+      // The effects' mask (effect_mask_target(), read with textureLoad), which the occlusion leaves.
+      wgpu::BindGroupLayoutEntry{
+          .binding = 3,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .texture = {.sampleType = wgpu::TextureSampleType::UnfilterableFloat,
+                      .viewDimension = wgpu::TextureViewDimension::e2D},
+      },
   };
   const wgpu::BindGroupLayoutDescriptor depthLayoutDescriptor{
       .label = "Far blur",
@@ -2219,8 +2355,9 @@ void initialize() {
   const wgpu::PipelineLayoutDescriptor depthPipelineLayoutDescriptor{.bindGroupLayoutCount = 1,
                                                                      .bindGroupLayouts = &g_depthLayout};
   g_depthPipelineLayout = g_device.CreatePipelineLayout(&depthPipelineLayoutDescriptor);
-  // Binding 1 is the exposure's sea mask (read with textureLoad);
-  // the cloud shadows, sun shadows and edge light leave it.
+  // Binding 1 is the exposure's sea mask, or for the cloud shadows and the
+  // screen's sun shadows the effects' mask (both read with textureLoad); the
+  // edge light leaves it.
   const std::array cloudEntries{
       depthEntries[0],
       wgpu::BindGroupLayoutEntry{
@@ -2346,6 +2483,27 @@ void shutdown() {
   g_seaMaskDepthView = {};
   g_seaMaskDepth = {};
   g_seaMaskSize = {};
+  g_effectMaskView = {};
+  g_effectMask = {};
+  g_effectMaskDrawn = false;
+  g_effectDepthDrawn = false;
+  g_shadeDepthView = {};
+  g_shadeDepth = {};
+  g_shadeDepthPass = {};
+  g_shadeDepthLayout = {};
+  g_effectMaskDepthView = {};
+  g_effectMaskDepth = {};
+  g_effectWhiteView = {};
+  g_effectWhite = {};
+  g_effectWhiteDrawn = false;
+  g_effectCoverView = {};
+  g_effectCover = {};
+  for (int i = 0; i < 4; ++i) {
+    g_effectCoverPass[i] = {};
+    g_effectCoverLayout[i] = {};
+  }
+  g_effectNoneView = {};
+  g_effectNone = {};
   g_tex = {};
   g_view = {};
   g_farTex = {};
@@ -2556,7 +2714,8 @@ wgpu::TextureView sea_mask_target(const wgpu::Extent3D& sceneSize) {
     g_seaMaskView = g_seaMask.CreateView();
     const wgpu::TextureDescriptor depthDescriptor{
         .label = "Sea mask depth",
-        .usage = wgpu::TextureUsage::RenderAttachment,
+        // Copied for the effects' mask (effect_mask_depth()).
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,
         .size = {sceneSize.width, sceneSize.height, 1},
         .format = kSeaMaskDepthFormat,
     };
@@ -2571,6 +2730,316 @@ wgpu::TextureView sea_mask_depth(const wgpu::Extent3D& sceneSize) {
   sea_mask_target(sceneSize);
   return g_seaMaskDepthView;
 }
+
+wgpu::TextureView effect_mask_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format) {
+  if (!g_effectMask || g_effectMask.GetWidth() != sceneSize.width || g_effectMask.GetHeight() != sceneSize.height ||
+      g_effectMask.GetFormat() != format) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Effects mask",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+        .size = {sceneSize.width, sceneSize.height, 1},
+        .format = format,
+    };
+    g_effectMask = g_device.CreateTexture(&descriptor);
+    g_effectMaskView = g_effectMask.CreateView();
+  }
+  g_effectMaskDrawn = true;
+  return g_effectMaskView;
+}
+
+float effect_mask_push() noexcept { return g_effectPush; }
+
+bool effect_mask_opacity() noexcept { return g_effectOpacity; }
+
+wgpu::TextureView effect_white_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format) {
+  if (!g_effectWhite || g_effectWhite.GetWidth() != sceneSize.width ||
+      g_effectWhite.GetHeight() != sceneSize.height || g_effectWhite.GetFormat() != format) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Effects mask (over white)",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+        .size = {sceneSize.width, sceneSize.height, 1},
+        .format = format,
+    };
+    g_effectWhite = g_device.CreateTexture(&descriptor);
+    g_effectWhiteView = g_effectWhite.CreateView();
+  }
+  g_effectWhiteDrawn = true;
+  return g_effectWhiteView;
+}
+
+void note_effect_depth() noexcept { g_effectDepthDrawn = true; }
+
+wgpu::TextureView effect_mask_depth(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& size) {
+  if (!g_seaMaskDepth || g_seaMaskSize.width != size.width || g_seaMaskSize.height != size.height)
+    return {};
+  if (!g_effectMaskDepth || g_effectMaskDepth.GetWidth() != size.width || g_effectMaskDepth.GetHeight() != size.height) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Effects mask depth",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopyDst,
+        .size = {size.width, size.height, 1},
+        .format = kSeaMaskDepthFormat,
+    };
+    g_effectMaskDepth = g_device.CreateTexture(&descriptor);
+    g_effectMaskDepthView = g_effectMaskDepth.CreateView();
+  }
+  const wgpu::TexelCopyTextureInfo from{.texture = g_seaMaskDepth, .aspect = wgpu::TextureAspect::DepthOnly};
+  const wgpu::TexelCopyTextureInfo to{.texture = g_effectMaskDepth, .aspect = wgpu::TextureAspect::DepthOnly};
+  const wgpu::Extent3D extent{size.width, size.height, 1};
+  cmd.CopyTextureToTexture(&from, &to, &extent);
+  return g_effectMaskDepthView;
+}
+
+namespace {
+// The shading's depth (shading_depth()): the scene's, but where an effect that writes depth covers a pixel (the
+// effects' mask has it there, and the sea mask's depth, which leaves such effects out, is farther), the sea mask's:
+// the scenery's under the effect, which Wind Waker HD lights before it draws its effects.
+constexpr const char* kShadeDepthShader = R"""(
+@group(0) @binding(0) var scene_depth: texture_depth_2d;
+@group(0) @binding(1) var mask_depth: texture_depth_2d;
+@group(0) @binding(2) var effects: texture_2d<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
+    let p = vec2<i32>(pos.xy);
+    let d = textureLoad(scene_depth, p, 0);
+    let m = textureLoad(mask_depth, p, 0);
+    let e = textureLoad(effects, p, 0).rgb;
+    // Reversed Z: farther is less.
+    if (max(e.r, max(e.g, e.b)) > 0.5 / 255.0 && m < d * 0.9999) {
+        return m;
+    }
+    return d;
+}
+)""";
+
+wgpu::TextureView shading_depth(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView,
+                                const wgpu::Extent3D& size) {
+  if (!g_effectDepthDrawn || !g_effectMaskView || !g_seaMaskDepthView || g_seaMaskSize.width != size.width ||
+      g_seaMaskSize.height != size.height || !g_effectMask || g_effectMask.GetWidth() != size.width ||
+      g_effectMask.GetHeight() != size.height)
+    return depthView;
+  if (!g_shadeDepthPass) {
+    wgpu::ShaderSourceWGSL source{};
+    source.code = kShadeDepthShader;
+    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &source, .label = "Shading depth"};
+    const auto module = g_device.CreateShaderModule(&moduleDescriptor);
+    const std::array layoutEntries{
+        wgpu::BindGroupLayoutEntry{.binding = 0, .visibility = wgpu::ShaderStage::Fragment,
+                                   .texture = {.sampleType = wgpu::TextureSampleType::Depth}},
+        wgpu::BindGroupLayoutEntry{.binding = 1, .visibility = wgpu::ShaderStage::Fragment,
+                                   .texture = {.sampleType = wgpu::TextureSampleType::Depth}},
+        wgpu::BindGroupLayoutEntry{.binding = 2, .visibility = wgpu::ShaderStage::Fragment,
+                                   .texture = {.sampleType = wgpu::TextureSampleType::Float}},
+    };
+    const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+        .label = "Shading depth", .entryCount = layoutEntries.size(), .entries = layoutEntries.data()};
+    g_shadeDepthLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
+    const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{
+        .label = "Shading depth", .bindGroupLayoutCount = 1, .bindGroupLayouts = &g_shadeDepthLayout};
+    const auto pipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
+    const wgpu::DepthStencilState depth{
+        .format = kSeaMaskDepthFormat,
+        .depthWriteEnabled = true,
+        .depthCompare = wgpu::CompareFunction::Always,
+    };
+    const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs_main", .targetCount = 0, .targets = nullptr};
+    const wgpu::RenderPipelineDescriptor descriptor{
+        .label = "Shading depth",
+        .layout = pipelineLayout,
+        .vertex = {.module = module, .entryPoint = "vs_main"},
+        .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+        .depthStencil = &depth,
+        .multisample = {.count = 1, .mask = UINT32_MAX},
+        .fragment = &fragment,
+    };
+    g_shadeDepthPass = g_device.CreateRenderPipeline(&descriptor);
+  }
+  if (!g_shadeDepth || g_shadeDepth.GetWidth() != size.width || g_shadeDepth.GetHeight() != size.height) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Shading depth",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+        .size = {size.width, size.height, 1},
+        .format = kSeaMaskDepthFormat,
+    };
+    g_shadeDepth = g_device.CreateTexture(&descriptor);
+    g_shadeDepthView = g_shadeDepth.CreateView();
+  }
+  const std::array entries{
+      wgpu::BindGroupEntry{.binding = 0, .textureView = depthView},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = g_seaMaskDepthView},
+      wgpu::BindGroupEntry{.binding = 2, .textureView = g_effectMaskView},
+  };
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .layout = g_shadeDepthLayout, .entryCount = entries.size(), .entries = entries.data()};
+  const auto group = g_device.CreateBindGroup(&groupDescriptor);
+  const wgpu::RenderPassDepthStencilAttachment depth{
+      .view = g_shadeDepthView,
+      .depthLoadOp = wgpu::LoadOp::Clear,
+      .depthStoreOp = wgpu::StoreOp::Store,
+      .depthClearValue = 0.f,
+  };
+  const wgpu::RenderPassDescriptor descriptor{
+      .label = "Shading depth",
+      .colorAttachmentCount = 0,
+      .depthStencilAttachment = &depth,
+      .timestampWrites = webgpu::gpu_prof::pass_writes("Shading depth"),
+  };
+  const auto pass = cmd.BeginRenderPass(&descriptor);
+  pass.SetPipeline(g_shadeDepthPass);
+  pass.SetBindGroup(0, group);
+  pass.Draw(3);
+  pass.End();
+  return g_shadeDepthView;
+}
+// The effects' cover (effect_cover_view()): the share of each pixel its effects make up, in the form the shading
+// reads (effect_cover()). Over black an effect leaves its colour times its opacity, over white that plus what it
+// lets through: so 1 - white + black is its opacity (a blended effect) or its colour (an added one, white staying
+// white). The brighter of the colour and the opacity over the gain is kept: a dark effect blended over the scene
+// (the dust a shutting door raises in Dragon Roost Cavern) hides as much of it as its opacity, where its colour
+// alone made it see-through. Alpha 1 where an effect at its own depth covers the pixel (the scene's depth nearer
+// than the sea mask's, which leaves such effects out), whose share isn't faded with the distance behind it.
+constexpr const char* kEffectCoverShader = R"""(
+@group(0) @binding(0) var black: texture_2d<f32>;
+@group(0) @binding(1) var white: texture_2d<f32>;
+@group(0) @binding(2) var scene_depth: texture_depth_2d;
+@group(0) @binding(3) var mask_depth: texture_depth_2d;
+override opacity: bool = true;
+override effect_gain: f32 = 2.0;
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+
+fn share(p: vec2<i32>) -> vec3<f32> {
+    let b = textureLoad(black, p, 0).rgb;
+    if (!opacity) {
+        return b;
+    }
+    let t = clamp(vec3(1.0) - textureLoad(white, p, 0).rgb + b, vec3(0.0), vec3(1.0));
+    return max(b, vec3(max(t.r, max(t.g, t.b)) / max(effect_gain, 1e-3)));
+}
+
+@fragment
+fn fs_plain(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    return vec4(share(vec2<i32>(pos.xy)), 0.0);
+}
+
+@fragment
+fn fs_own(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let p = vec2<i32>(pos.xy);
+    let c = share(p);
+    let b = textureLoad(black, p, 0).rgb;
+    // Reversed Z: nearer is more.
+    let own = max(b.r, max(b.g, b.b)) > 0.5 / 255.0 &&
+              textureLoad(mask_depth, p, 0) < textureLoad(scene_depth, p, 0) * 0.9999;
+    return vec4(c, select(0.0, 1.0, own));
+}
+)""";
+
+// The cover the shading reads for this frame's effects (kEffectCoverShader), or none when the mask isn't there.
+wgpu::TextureView effect_cover_view(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView,
+                                    const wgpu::Extent3D& size, uint32_t msaaSamples) {
+  const bool white = g_effectOpacity && g_effectWhiteDrawn && g_effectWhite && g_effectWhite.GetWidth() == size.width &&
+                     g_effectWhite.GetHeight() == size.height;
+  g_effectWhiteDrawn = false;
+  const int own = g_effectDepthDrawn && depthView && msaaSamples == 1 && g_seaMaskDepthView &&
+                          g_seaMaskSize.width == size.width && g_seaMaskSize.height == size.height
+                      ? 1
+                      : 0;
+  const int key = own * 2 + (white ? 1 : 0);
+  if (!g_effectCoverPass[key]) {
+    wgpu::ShaderSourceWGSL source{};
+    source.code = kEffectCoverShader;
+    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &source, .label = "Effects cover"};
+    const auto module = g_device.CreateShaderModule(&moduleDescriptor);
+    std::array<wgpu::BindGroupLayoutEntry, 4> layoutEntries{
+        wgpu::BindGroupLayoutEntry{.binding = 0, .visibility = wgpu::ShaderStage::Fragment,
+                                   .texture = {.sampleType = wgpu::TextureSampleType::Float}},
+        wgpu::BindGroupLayoutEntry{.binding = 1, .visibility = wgpu::ShaderStage::Fragment,
+                                   .texture = {.sampleType = wgpu::TextureSampleType::Float}},
+        wgpu::BindGroupLayoutEntry{.binding = 2, .visibility = wgpu::ShaderStage::Fragment,
+                                   .texture = {.sampleType = wgpu::TextureSampleType::Depth}},
+        wgpu::BindGroupLayoutEntry{.binding = 3, .visibility = wgpu::ShaderStage::Fragment,
+                                   .texture = {.sampleType = wgpu::TextureSampleType::Depth}},
+    };
+    const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+        .label = "Effects cover", .entryCount = own ? 4u : 2u, .entries = layoutEntries.data()};
+    g_effectCoverLayout[key] = g_device.CreateBindGroupLayout(&layoutDescriptor);
+    const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{
+        .label = "Effects cover", .bindGroupLayoutCount = 1, .bindGroupLayouts = &g_effectCoverLayout[key]};
+    const auto pipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
+    const std::array constants{
+        wgpu::ConstantEntry{.key = "opacity", .value = white ? 1.0 : 0.0},
+        wgpu::ConstantEntry{.key = "effect_gain", .value = g_effectGain},
+    };
+    const wgpu::ColorTargetState target{.format = wgpu::TextureFormat::RGBA8Unorm,
+                                        .writeMask = wgpu::ColorWriteMask::All};
+    const wgpu::FragmentState fragment{.module = module,
+                                       .entryPoint = own ? "fs_own" : "fs_plain",
+                                       .constantCount = constants.size(),
+                                       .constants = constants.data(),
+                                       .targetCount = 1,
+                                       .targets = &target};
+    const wgpu::RenderPipelineDescriptor descriptor{
+        .label = "Effects cover",
+        .layout = pipelineLayout,
+        .vertex = {.module = module, .entryPoint = "vs_main"},
+        .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+        .multisample = {.count = 1, .mask = UINT32_MAX},
+        .fragment = &fragment,
+    };
+    g_effectCoverPass[key] = g_device.CreateRenderPipeline(&descriptor);
+  }
+  if (!g_effectCover || g_effectCover.GetWidth() != size.width || g_effectCover.GetHeight() != size.height) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Effects cover",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+        .size = {size.width, size.height, 1},
+        .format = wgpu::TextureFormat::RGBA8Unorm,
+    };
+    g_effectCover = g_device.CreateTexture(&descriptor);
+    g_effectCoverView = g_effectCover.CreateView();
+  }
+  // Without the pass over white (DOL_AURORA_EFFECT_MASK_OPACITY=0, or not drawn) the colour alone (opacity off),
+  // the mask bound in its place unread.
+  const wgpu::TextureView& whiteView = white ? g_effectWhiteView : g_effectMaskView;
+  std::array entries{
+      wgpu::BindGroupEntry{.binding = 0, .textureView = g_effectMaskView},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = whiteView},
+      wgpu::BindGroupEntry{.binding = 2, .textureView = own ? depthView : wgpu::TextureView{}},
+      wgpu::BindGroupEntry{.binding = 3, .textureView = own ? g_seaMaskDepthView : wgpu::TextureView{}},
+  };
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .layout = g_effectCoverLayout[key], .entryCount = own ? 4u : 2u, .entries = entries.data()};
+  const auto group = g_device.CreateBindGroup(&groupDescriptor);
+  const std::array attachments{wgpu::RenderPassColorAttachment{
+      .view = g_effectCoverView,
+      .loadOp = wgpu::LoadOp::Clear,
+      .storeOp = wgpu::StoreOp::Store,
+      .clearValue = {0.0, 0.0, 0.0, 0.0},
+  }};
+  const wgpu::RenderPassDescriptor descriptor{
+      .label = "Effects cover",
+      .colorAttachmentCount = attachments.size(),
+      .colorAttachments = attachments.data(),
+      .timestampWrites = webgpu::gpu_prof::pass_writes("Effects cover"),
+  };
+  const auto pass = cmd.BeginRenderPass(&descriptor);
+  pass.SetPipeline(g_effectCoverPass[key]);
+  pass.SetBindGroup(0, group);
+  pass.Draw(3);
+  pass.End();
+  return g_effectCoverView;
+}
+} // namespace
 
 void set_sun_direction(float x, float y, float z) noexcept {
   const float length = std::sqrt(x * x + y * y + z * z);
@@ -2662,18 +3131,43 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
             const wgpu::TextureView& resolve, uint32_t msaaSamples, const Camera& camera, const SunMap* sunMap) {
   const bool exposureScene = camera.exposure > 1.f && g_module && msaaSamples == 1 && camera.valid &&
                              size.width >= 4 && size.height >= 4 && copy_exposure_scene(cmd, size, dst);
+  // The effects drawn over the scene, which the shading below leaves (common.cpp
+  // encode_effect_mask()), or a black texel: no effects this frame.
+  if (!g_effectNone && g_module) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "No effects",
+        .usage = wgpu::TextureUsage::TextureBinding,
+        .size = {1, 1, 1},
+        .format = wgpu::TextureFormat::RGBA8Unorm,
+    };
+    g_effectNone = g_device.CreateTexture(&descriptor);
+    g_effectNoneView = g_effectNone.CreateView();
+  }
+  const bool effects = g_effectMaskDrawn && g_effectMask && g_effectMask.GetWidth() == size.width &&
+                       g_effectMask.GetHeight() == size.height;
+  g_effectMaskDrawn = false;
+  // Their share of each pixel (effect_cover_view(), from the mask and the pass over white).
+  const wgpu::TextureView effectView =
+      effects ? effect_cover_view(cmd, depthView, size, msaaSamples) : g_effectNoneView;
+  if (!effects)
+    g_effectWhiteDrawn = false;
+  // With an effect that writes depth in the mask: the occlusion, the sun shadows and the cloud shadows shade from
+  // the scenery's depth under it (shading_depth()); the passes after them keep the scene's.
+  const wgpu::TextureView shadeDepthView =
+      effects && depthView && msaaSamples == 1 ? shading_depth(cmd, depthView, size) : depthView;
+  g_effectDepthDrawn = false;
   // Ambient occlusion and the far blur need single-sample depth (the depth
   // buffer is multisampled with MSAA).
   if (ambient_occlusion_enabled() && g_module && depthView && msaaSamples == 1 && size.width >= 4 && size.height >= 4) {
     const webgpu::gpu_prof::Zone zone{cmd, "Ambient occlusion"};
     ensure_targets(size, format, msaaSamples);
-    draw_depth(cmd, "Ambient occlusion", g_aoPass, g_aoView[1], depthView, g_aoView[0], nullptr, false);
-    draw_depth(cmd, "Ambient occlusion blur (horizontal)", g_aoBlurH, g_aoView[0], depthView, g_aoView[1], nullptr,
+    draw_depth(cmd, "Ambient occlusion", g_aoPass, g_aoView[1], shadeDepthView, g_aoView[0], nullptr, false);
+    draw_depth(cmd, "Ambient occlusion blur (horizontal)", g_aoBlurH, g_aoView[0], shadeDepthView, g_aoView[1], nullptr,
                false);
-    draw_depth(cmd, "Ambient occlusion blur (vertical)", g_aoBlurV, g_aoView[1], depthView, g_aoView[0], nullptr,
+    draw_depth(cmd, "Ambient occlusion blur (vertical)", g_aoBlurV, g_aoView[1], shadeDepthView, g_aoView[0], nullptr,
                false);
     // With DOL_AURORA_AO_DEBUG=1 the occlusion replaces the scene; with 2 it tints it.
-    draw_depth(cmd, "Ambient occlusion apply", g_aoUpscale, g_aoView[0], depthView, dst, resolve, true);
+    draw_depth(cmd, "Ambient occlusion apply", g_aoUpscale, g_aoView[0], shadeDepthView, dst, resolve, true, effectView);
   }
   if (sun_shadows_enabled() && g_module && depthView && msaaSamples == 1) {
     if (camera.valid) {
@@ -2683,12 +3177,12 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
       // the scene's size; at a quarter of it, blurred as the screen's version
       // is, Link's shadow was a blob.
       if (sunMap != nullptr && sunMap->valid && g_sunMapView && !g_sunMapDebug) {
-        draw_sun_map(cmd, camera, *sunMap, depthView, dst, true, resolve);
+        draw_sun_map(cmd, camera, *sunMap, shadeDepthView, effectView, dst, true, resolve);
       } else {
         if (sunMap != nullptr && sunMap->valid && g_sunMapView)
-          draw_sun_map(cmd, camera, *sunMap, depthView, g_aoView[0], false);
+          draw_sun_map(cmd, camera, *sunMap, shadeDepthView, effectView, g_aoView[0], false);
         else
-          draw_with_view(cmd, "Sun shadows", g_sunPass, camera.view, depthView, g_aoView[0], nullptr);
+          draw_with_view(cmd, "Sun shadows", g_sunPass, camera.view, shadeDepthView, g_aoView[0], nullptr, &effectView);
         if (!g_sunMapDebug) {
           draw(cmd, "Sun shadows blur (horizontal)", g_blurH, g_aoView[0], g_aoView[1], false);
           draw(cmd, "Sun shadows blur (vertical)", g_blurV, g_aoView[1], g_aoView[0], false);
@@ -2720,7 +3214,7 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
     if (camera.valid) {
       const webgpu::gpu_prof::Zone zone{cmd, "Cloud shadows"};
       ensure_targets(size, format, msaaSamples);
-      draw_with_view(cmd, "Cloud shadows", g_cloudPass, camera.view, depthView, dst, resolve);
+      draw_with_view(cmd, "Cloud shadows", g_cloudPass, camera.view, shadeDepthView, dst, resolve, &effectView);
     }
   }
   if (far_blur_enabled() && g_module && depthView && msaaSamples == 1 && size.width >= 4 && size.height >= 4) {
