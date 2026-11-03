@@ -1298,6 +1298,14 @@ bool begin_actor_light_pass(const post_fx::Camera* camera, const post_fx::SunMap
   c.rim[3] = haveCloud ? 1.f : 0.f;
   c.screen[0] = 1.f / static_cast<float>(size.width);
   c.screen[1] = 1.f / static_cast<float>(size.height);
+  // The GameCube's effect light on characters (the sword-hit flash, bombs, the item get: a TEV stage the game adds
+  // only while one reaches the model) on HD's colour, until HD's light buffer is ported;
+  // DOL_AURORA_ACTOR_LIGHT_HD_EFFECT=0 leaves it out (HD's toon shader has no such term).
+  static const bool effect = [] {
+    const char* env = std::getenv("DOL_AURORA_ACTOR_LIGHT_HD_EFFECT");
+    return env == nullptr || env[0] != '0';
+  }();
+  c.screen[2] = effect ? 1.f : 0.f;
   g_actorPassGroup = make_actor_group(c, haveShadow ? shadow : empty_texmap_view(), cloud, cloudSampler);
   return true;
 }
@@ -3986,8 +3994,17 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   }
   // Wind Waker HD's character light (DOL_AURORA_ACTOR_LIGHT_HD=1): a toon draw in the ramp pattern
   // (gxc::toon_light_stage()) takes the flagged shader, HD's light beside the GX result, picked per pass.
-  if (tev && post_fx::actor_light_hd_switch() && gxc::toon_light_stage(key.shader).matched)
-    key.shader.hd_actor_light = 1u;
+  // DOL_AURORA_ACTOR_LIGHT_HD_EXT=0 (to compare): only the main pattern, not the ones after it (E, F, G: the
+  // colour-register albedo, an added register, later stages; ToonLightMatch::after_albedo).
+  static const bool extended = [] {
+    const char* env = std::getenv("DOL_AURORA_ACTOR_LIGHT_HD_EXT");
+    return env == nullptr || env[0] != '0';
+  }();
+  if (tev && post_fx::actor_light_hd_switch()) {
+    const gxc::ToonLightMatch toon = gxc::toon_light_stage(key.shader);
+    if (toon.matched && (extended || !toon.after_albedo))
+      key.shader.hd_actor_light = 1u;
+  }
   const PipelineConfig colorConfig{
       .version = GXCorePipelineConfigVersion,
       .key = key,
