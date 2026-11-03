@@ -1851,6 +1851,46 @@ void aurora_backend_gx_flush(void) {
 #endif
 }
 
+// The stream position a draw-done is deferred to. Publishing here is what gives
+// the worker this frame to translate: the host records the position at
+// GXDrawDone's return, then compares it with the parsed count on each turn
+// instead of standing still until the stream has been translated.
+u32 aurora_backend_gx_position(void) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    if (!gx_aurora::g_initialized || !gx_aurora::g_shadow_frontend_enabled ||
+        !gx_aurora::g_fifo_worker_started ||
+        gx_aurora::g_shadow_frontend_failed.load(std::memory_order_relaxed))
+        return 0u;
+    gx_aurora::g_fifo_publish_local();
+    return static_cast<u32>(gx_aurora::g_fifo_parsed);
+#else
+    return 0u;
+#endif
+}
+
+u32 aurora_backend_gx_parsed(void) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    return static_cast<u32>(gx_aurora::g_fifo_parsed);
+#else
+    return 0u;
+#endif
+}
+
+// The present the worker stopped at, served once per turn: what the drain used
+// to reach on its way to raising the finish.
+bool aurora_backend_gx_service(void) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    if (!gx_aurora::g_initialized || !gx_aurora::g_gx_core_enabled)
+        return false;
+    if (!gx_aurora::g_display_copy_pending.exchange(false, std::memory_order_relaxed))
+        return false;
+    aurora_backend_present();
+    return true;
+#else
+    return false;
+#endif
+}
+
 // A run of consecutive gather-pipe writes as their bytes in guest order (the
 // game module's batch). Installed only where the FIFO is a byte stream - the
 // GX core on and nothing traced (install_platform_ops) - so a byte at a time
