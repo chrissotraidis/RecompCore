@@ -255,7 +255,7 @@ void aurora_set_hd_cloud_texture(const char* path);
    from the same sun and camera. Takes effect at the next frame. */
 void aurora_set_edge_light(bool enabled);
 /* Torch and fire light: the point lights last passed to aurora_set_point_lights
-   (up to 16, each x, y, z, radius, then r, g, b from 0 to 1 and a flicker
+   (up to 32, each x, y, z, radius, then r, g, b from 0 to 1 and a flicker
    amount, in world space) glow on the surfaces around them, with the camera
    last passed to aurora_set_world_view. Takes effect at the next frame. */
 void aurora_set_torch_light(bool enabled);

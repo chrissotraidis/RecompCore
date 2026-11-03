@@ -267,10 +267,17 @@ struct ShaderKey {
   std::uint8_t raw_tex_hi_in_nbt = 0;
   // Wind Waker HD's character light (toon_light_stage() matched and the host's
   // switch on): generate_wgsl adds HD's light beside the GX result, picked by
-  // HdActorLightConstants::params.x (group 0). Three pad bytes keep the scalar
-  // block a multiple of 4.
+  // HdActorLightConstants::params.x (group 0).
   std::uint8_t hd_actor_light = 0;
-  std::uint8_t pad_hd[3]{};
+  // Wind Waker HD's light buffer on the lit scenery (hd_point_light_stage()
+  // matched and the host's switch on): HD's point and effect lights, x 1.25,
+  // added to stage 0's light before the texture multiplies it (HdPointLights at
+  // group 0, which a flagged key takes as the characters' do). 2: the
+  // vertices' normal slot holds smooth normals made on the CPU for a draw that
+  // has none of its own (the sun shadows' scenery), turned by the position
+  // matrix. Two pad bytes keep the scalar block a multiple of 4.
+  std::uint8_t hd_point_light = 0;
+  std::uint8_t pad_hd[2]{};
   LightChanKey litchan[4]{}; // color0, color1, alpha0, alpha1
   TexGenKey tex_gens[kMaxTexGens]{};
   IndirectStageKey ind_stages[kMaxIndirectStages]{};
@@ -729,6 +736,15 @@ struct ToonLightMatch {
 };
 ToonLightMatch toon_light_stage(const ShaderKey& key);
 
+// The lit scenery Wind Waker HD adds its light buffer to (its terrain and room
+// shaders: (vertex colour x light + 1.25 x the buffer) x albedo, read from
+// Cemu): the GameCube's stage 0 is the light, lerp(C0, KONST, RASC) from
+// colour channel 0 (the baked vertex colour between the shade and lit
+// colours) into PREV, no later stage reads C0 (the field terrain, the palms,
+// and 16 of 18 and 25 of 26 of Dragon Roost Cavern's and the Tower of the
+// Gods' room materials). Not a toon draw (toon_light_stage()).
+bool hd_point_light_stage(const ShaderKey& key);
+
 // The uniform a ShaderKey::hd_actor_light shader reads at group(0) binding(2)
 // (binding 0 and 1 are the pass's static storage buffers; binding 3 the shadow
 // texture, 4 its sampler; 5 HD's cloud shadow texture, 6 its sampler). All
@@ -747,7 +763,8 @@ struct HdActorLightConstants {
   // cloud term is on (HD's cloud shadow texture bound at binding 5), else cloud = 1.
   float rim[4]{};
   // xy: 1 / the target's width and height: a fragment's uv in the shadow texture; z: 1 to add the GameCube's effect
-  // light stage (PREV + K1 x the ramp) to HD's colour, 0 to leave it out (DOL_AURORA_ACTOR_LIGHT_HD_EFFECT=0).
+  // light stage (PREV + K1 x the ramp) to HD's colour, 0 to leave it out (HD's light buffer on, or
+  // DOL_AURORA_ACTOR_LIGHT_HD_EFFECT=0).
   float screen[4]{};
   // HD's cloud shadow (ww_shadow_clouds seen from above), at world (X, Z):
   // uv = (-X, -Z) * cloud.z + cloud.xy. x u0 (drifting with the wind), y v0
@@ -756,6 +773,26 @@ struct HdActorLightConstants {
 };
 static_assert(sizeof(HdActorLightConstants) == 11 * 16);
 
+// Wind Waker HD's light buffer, the point and effect lights (its light pass, PS 1472 in the Cemu captures:
+// drafts/hd-look-remaining/CAPTURES-NOV3-READ-lights.md), for the draws with HD's light, at group(0) binding(7):
+// each light adds colour x sat(N.L) x sat(1 - |L - P| / r)^1.5, in linear. HD adds them in a half-size buffer the
+// materials read; here each draw sums them itself, the same sum without the upsample. Up to kMaxHdPointLights, in
+// the camera's view space (made once a frame on the CPU). Off (count 0): nothing added.
+inline constexpr std::uint32_t kMaxHdPointLights = 32;
+inline constexpr float kHdPointLightActor = 1.75f;   // the characters' weight
+inline constexpr float kHdPointLightScenery = 1.25f; // the lit scenery's
+struct HdPointLights {
+  // x: how many lights; y: the characters' weight (1.75, HD's uf[3].y); z: the scenery's (1.25, HD's uf[5].x).
+  float count[4]{};
+  float pos_r[kMaxHdPointLights][4]{};  // view-space position, radius
+  float colour[kMaxHdPointLights][4]{}; // linear colour (S10 / 255, may pass 1)
+};
+static_assert(sizeof(HdPointLights) == (1 + 2 * kMaxHdPointLights) * 16);
+
+// HD's sum of the lights at a view-space position and unit normal (the formula the WGSL implements).
+void hd_point_light_reference(const HdPointLights& lights, const float p_view[3], const float n_view[3],
+                              float out[3]);
+
 // HD's light for one pixel, the formula the WGSL implements (for tests and
 // reference): s the lit channel (the ramp's u), sh the shadow (1 lit), fade
 // the shadow's strength, ramp(u) supplied by the caller, n_up the world
@@ -763,8 +800,10 @@ static_assert(sizeof(HdActorLightConstants) == 11 * 16);
 // direction to the light, normalize(P_view)); albedo_gamma the albedo texel
 // (0..1, the GX texture's own gamma); cloud HD's cloud term (clamp(texel +
 // floor, 0, 1); 1 clear), which multiplies the ramp's value; rim false leaves
-// the rim out (ToonLightMatch::rim, the colour-register albedo). Returns the
-// gamma-space colour, clipped before the gamma as HD's UNORM target clips.
+// the rim out (ToonLightMatch::rim, the colour-register albedo); point HD's
+// light buffer at the pixel (linear rgb, hd_point_light_reference(); null:
+// none), added to the light x kHdPointLightActor. Returns the gamma-space
+// colour, clipped before the gamma as HD's UNORM target clips.
 struct HdActorLightPixel {
   float out[3]{};
   float ramp = 0.f;
@@ -774,7 +813,7 @@ struct HdActorLightPixel {
 };
 HdActorLightPixel hd_actor_light_reference(const HdActorLightConstants& c, float s, float sh, float (*ramp)(float u),
                                            float n_up, float n_dot_e, float l_dot_e, const float albedo_gamma[3],
-                                           float cloud = 1.f, bool rim = true);
+                                           float cloud = 1.f, bool rim = true, const float* point = nullptr);
 
 // The ubershader (gxcore_uber.cpp): one module for any key, which it reads
 // from the pixel uniform (UberPixelConstants), for a draw whose own pipeline

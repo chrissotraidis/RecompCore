@@ -1143,7 +1143,12 @@ void test_toon_light_wgsl() {
   CHECK(w.find("        if (hdl.rim.w > 0.5) {\n"
                "            hd_cloud = clamp(textureSampleLevel(hdl_cloud, hdl_cloud_samp, hd_cloud_uv, hd_cloud_lod).r "
                "+ hdl.cloud.w, 0.0, 1.0);\n") != std::string::npos);
-  CHECK(w.find("let hd_l = mix(hd_hemi, hdl.k.rgb, hd_ramp * hd_cloud);") != std::string::npos);
+  CHECK(w.find("let hd_l = mix(hd_hemi, hdl.k.rgb, hd_ramp * hd_cloud) + hdp.count.y * hd_point_sum(in.hd_pv, hd_n);") !=
+        std::string::npos);
+  // HD's light buffer: its lights at binding 7, summed per pixel with HD's falloff (exponent 1.5).
+  CHECK(w.find("@group(0) @binding(7) var<uniform> hdp: HdPointLights;") != std::string::npos);
+  CHECK(w.find("    pos_r: array<vec4f, 32>,\n    colour: array<vec4f, 32>,") != std::string::npos);
+  CHECK(w.find("sum += hdp.colour[i].rgb * (nl * fall * sqrt(fall));") != std::string::npos);
   CHECK(w.find("hdl.rim.w)") == std::string::npos);
   CHECK(w.find("if (hd_debug == 6) { hd_out = vec3f(hd_cloud); }") != std::string::npos);
   CHECK(gx.find("dpdx") == std::string::npos);
@@ -1284,6 +1289,171 @@ void test_toon_light_reference() {
     CHECK(near(std::pow(px.out[1], 2.2f), 0.1079f, 1e-3f));
     CHECK(near(std::pow(px.out[2], 2.2f), 0.2952f, 1e-3f));
   }
+}
+
+// Wind Waker HD's light buffer (drafts/hd-look-remaining/CAPTURES-NOV3-READ-lights.md): its light pass's sum, and
+// the characters' 1.75 x it on the light, against Link's hair under a Windfall lamp at 21:00 (Cemu s07, event 4352,
+// pixel 2499,1017: ramp 0, hemi (0.0205, 0.1835, 0.3461), the buffer (0.2228, 0.1480, 0.0443), albedo
+// (1, 0.863, 0.005); stored (0.4105, 0.3831, 0.0043), the rim the rest).
+void test_point_light_reference() {
+  const auto near = [](float a, float b, float tol) { return std::fabs(a - b) <= tol; };
+  gxc::HdPointLights lights{};
+  // A lamp (600, 400, 120) / 255 at r 381.3, 200 units off along the normal, and one behind the surface.
+  lights.count[0] = 2.f;
+  lights.pos_r[0][0] = 0.f;
+  lights.pos_r[0][1] = 0.f;
+  lights.pos_r[0][2] = 200.f;
+  lights.pos_r[0][3] = 381.3f;
+  lights.colour[0][0] = 600.f / 255.f;
+  lights.colour[0][1] = 400.f / 255.f;
+  lights.colour[0][2] = 120.f / 255.f;
+  lights.pos_r[1][2] = -100.f;
+  lights.pos_r[1][3] = 1000.f;
+  lights.colour[1][0] = lights.colour[1][1] = lights.colour[1][2] = 1.f;
+  const float p[3] = {0.f, 0.f, 0.f}, n[3] = {0.f, 0.f, 1.f};
+  float sum[3];
+  gxc::hd_point_light_reference(lights, p, n, sum);
+  const float fall = std::pow(1.f - 200.f / 381.3f, 1.5f);
+  CHECK(near(sum[0], 600.f / 255.f * fall, 1e-5f) && near(sum[1], 400.f / 255.f * fall, 1e-5f) &&
+        near(sum[2], 120.f / 255.f * fall, 1e-5f));
+  // At 45 degrees, N.L 0.707; out of reach, nothing.
+  lights.count[0] = 1.f;
+  lights.pos_r[0][0] = 100.f;
+  lights.pos_r[0][2] = 100.f;
+  gxc::hd_point_light_reference(lights, p, n, sum);
+  CHECK(near(sum[0], 600.f / 255.f * std::sqrt(0.5f) * std::pow(1.f - std::sqrt(20000.f) / 381.3f, 1.5f), 1e-5f));
+  lights.pos_r[0][3] = 100.f;
+  gxc::hd_point_light_reference(lights, p, n, sum);
+  CHECK(sum[0] == 0.f && sum[1] == 0.f && sum[2] == 0.f);
+  // Link's hair: hemi (c0 at n_up -1), ramp 0, the buffer x 1.75 on the light; no rim at N.E -1.
+  gxc::HdActorLightConstants c{};
+  c.params[0] = 1.f;
+  const float hemi[3] = {0.0205f, 0.1835f, 0.3461f};
+  for (int i = 0; i < 3; ++i) {
+    c.c0[i] = hemi[i];
+    c.shadow[i] = 0.f;
+    c.k[i] = 1.f;
+  }
+  c.rim[0] = 2.f;
+  c.rim[1] = 5.f;
+  c.rim[2] = 0.75f;
+  const float buffer[3] = {0.2228f, 0.1480f, 0.0443f};
+  float gamma[3];
+  const float albedo[3] = {1.f, 0.863f, 0.005f};
+  for (int i = 0; i < 3; ++i)
+    gamma[i] = std::pow(albedo[i], 1.f / 2.2f);
+  const auto zero = [](float) { return 0.f; };
+  const auto px = gxc::hd_actor_light_reference(c, 0.f, 1.f, zero, -1.f, -1.f, 0.f, gamma, 1.f, true, buffer);
+  CHECK(near(px.light[0], 0.410f, 1e-3f) && near(px.light[1], 0.442f, 1e-3f) && near(px.light[2], 0.424f, 1e-3f));
+  CHECK(near(std::pow(px.out[0], 2.2f), 0.410f, 2e-3f) && near(std::pow(px.out[1], 2.2f), 0.383f, 2e-3f) &&
+        near(std::pow(px.out[2], 2.2f), 0.002f, 1e-3f));
+  // Without the buffer, the shade alone (0.02 in red).
+  const auto off = gxc::hd_actor_light_reference(c, 0.f, 1.f, zero, -1.f, -1.f, 0.f, gamma, 1.f, true);
+  CHECK(near(off.light[0], 0.0205f, 1e-4f));
+}
+
+// Wind Waker HD's light buffer on the lit scenery: the GameCube's stage 0 light, lerp(C0, KONST, RASC) from colour
+// channel 0, then the texture x PREV (the field terrain's and the dungeon rooms' materials).
+gxc::ShaderKey scenery_key() {
+  gxc::ShaderKey key{};
+  key.num_tex_gens = 1;
+  key.uv_mask = 1;
+  key.textured = 1;
+  key.tev_valid = 1;
+  key.num_tev_stages = 2;
+  key.num_color_chans = 1;
+  key.has_color0 = 1;
+  key.chan_captured_mask = 0x5;
+  key.tex_gens[0].enabled = 1;
+  key.tex_gens[0].texgentype = static_cast<std::uint8_t>(gxc::TexGenType::Regular);
+  key.tex_gens[0].sourcerow = 5;
+  auto& s0 = key.tev_stages[0];
+  s0.cc_a = 2;
+  s0.cc_b = 14;
+  s0.cc_c = 10;
+  s0.cc_d = 15;
+  s0.cc_clamp = 1;
+  s0.ac_a = 7;
+  s0.ac_b = 7;
+  s0.ac_c = 7;
+  s0.ac_d = 5;
+  s0.ksel_kc = 12;
+  s0.tevorders_enable = 1;
+  s0.tevorders_colorchan = 0;
+  for (int i = 0; i < 4; ++i)
+    s0.ras_swap[i] = s0.tex_swap[i] = static_cast<std::uint8_t>(i);
+  auto& s1 = key.tev_stages[1];
+  s1 = s0;
+  s1.cc_a = 15;
+  s1.cc_b = 8;
+  s1.cc_c = 0;
+  s1.cc_d = 15;
+  s1.ac_d = 0;
+  return key;
+}
+
+void test_point_light_scenery() {
+  auto key = scenery_key();
+  CHECK(gxc::hd_point_light_stage(key));
+  // Not when a later stage reads C0, nor for another stage 0.
+  {
+    auto c0 = key;
+    c0.tev_stages[1].cc_d = 2;
+    CHECK(!gxc::hd_point_light_stage(c0));
+    auto other = key;
+    other.tev_stages[0].cc_c = 8;
+    CHECK(!gxc::hd_point_light_stage(other));
+    auto chan1 = key;
+    chan1.tev_stages[0].tevorders_colorchan = 1;
+    CHECK(!gxc::hd_point_light_stage(chan1));
+  }
+  // Unflagged: no lights in the module.
+  const std::string gx = gxc::generate_wgsl(key);
+  CHECK(gx.find("hdp") == std::string::npos);
+  key.hd_point_light = 1;
+  const std::string w = gxc::generate_wgsl(key);
+  if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
+    std::printf("%s\n", w.c_str());
+  CHECK(w.find("@group(0) @binding(7) var<uniform> hdp: HdPointLights;") != std::string::npos);
+  CHECK(w.find("hdl") == std::string::npos);
+  // The view-space position after the texcoord (color0 0, color1 1, uv 2); no vertex normal: the triangle's, worked
+  // out before any branch.
+  CHECK(w.find("@location(3) hd_pv: vec3f,") != std::string::npos);
+  CHECK(w.find("hd_nv") == std::string::npos);
+  CHECK(w.find("o.hd_pv = viewpos.xyz;") != std::string::npos);
+  const auto main_at = w.find("fn fs_main(");
+  const auto n_at = w.find("var hd_sn = normalize(cross(dpdy(in.hd_pv), dpdx(in.hd_pv)));");
+  const auto stage1_at = w.find("// TEV stage 1");
+  const auto add_at = w.find("let hd_pl = hdp.count.z * hd_point_sum(in.hd_pv, hd_sn);");
+  CHECK(main_at != std::string::npos && n_at != std::string::npos && stage1_at != std::string::npos &&
+        add_at != std::string::npos);
+  CHECK(main_at < n_at && n_at < add_at && add_at < stage1_at);
+  {
+    const std::string head = w.substr(main_at, n_at - main_at);
+    CHECK(head.find("if (") == std::string::npos && head.find("discard") == std::string::npos);
+  }
+  // In linear, on stage 0's light, clipped at the channel's 8 bits.
+  CHECK(w.find("let hd_lit = pow(clamp(vec3f(prev.rgb) / 255.0, vec3f(0.0), vec3f(1.0)), vec3f(2.2)) + hd_pl;") !=
+        std::string::npos);
+  // A lit channel with a vertex normal: that normal.
+  auto lit = key;
+  lit.lit_valid = 1;
+  lit.has_vertex_normal = 1;
+  lit.litchan[0].enablelighting = 1;
+  lit.litchan[0].light_mask = 1;
+  const std::string wl = gxc::generate_wgsl(lit);
+  CHECK(wl.find("@location(4) hd_nv: vec3f,") != std::string::npos);
+  CHECK(wl.find("o.hd_nv = _normal;") != std::string::npos);
+  CHECK(wl.find("let hd_sn = normalize(in.hd_nv);") != std::string::npos);
+  CHECK(wl.find("dpdy(in.hd_pv)") == std::string::npos);
+  // The smooth normals made for the sun shadows (2): the vertex's normal slot, turned by the position matrix.
+  auto smooth = key;
+  smooth.hd_point_light = 2;
+  const std::string ws = gxc::generate_wgsl(smooth);
+  CHECK(ws.find("@location(8) rawnormal: vec3f,") != std::string::npos);
+  CHECK(ws.find("o.hd_nv = vec3f(dot(p0.xyz, in.rawnormal), dot(p1.xyz, in.rawnormal), dot(p2.xyz, in.rawnormal));") !=
+        std::string::npos);
+  CHECK(ws.find("let hd_sn = normalize(in.hd_nv);") != std::string::npos);
 }
 
 // Dolphin VertexShaderGen SourceRow::Normal: use the raw normal only when the
@@ -2829,6 +2999,8 @@ int main() {
   test_toon_light_classifier();
   test_toon_light_wgsl();
   test_toon_light_reference();
+  test_point_light_reference();
+  test_point_light_scenery();
   test_toon_light_extended();
   test_texgen_normal_source();
   test_five_texgens();

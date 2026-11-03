@@ -372,7 +372,8 @@ float cascade_depth_of(uint32_t cascade) noexcept {
   return cascade_depth(cascade_range(cascade));
 }
 // The sun shadow pass's uniform (kSunMapShader's View).
-constexpr size_t kSunMapUniformFloats = 100;
+// 100 floats of the view, then Wind Waker HD's light buffer for the scenery's shade (points, pl: 4 + kMaxLights x 8).
+constexpr size_t kSunMapUniformFloats = 104 + kMaxLights * 8;
 float g_cloudStrength = 0.28f;  // how dark a cloud's shadow is
 float g_cloudScale = 7000.f;    // world units across one cloud
 bool g_cloudDebug = false;
@@ -1356,6 +1357,9 @@ struct View {
     fit: vec4<f32>,             // x: 1 when the cascades follow the camera (each fitted to a slice of the view
                                 // between splits); y: where the fourth starts (0: three); z, w: the far fade's start
                                 // and end (lit from there, HD's pre-pass's far fade)
+    points: vec4<f32>,          // Wind Waker HD's light buffer on the lit scenery: x how many lights, y the scenery's
+                                // weight (HD's 1.25), z 1 when the scenery took them in its draws
+    pl: array<vec4<f32>, 64>,   // each light: its world position and radius, then its linear colour
 };
 
 @group(0) @binding(0) var samp: sampler;
@@ -1716,6 +1720,26 @@ fn depth_facing_blurred(uv: vec2<f32>, z: f32, tx: f32, ty: f32, sun: vec3<f32>)
         }
     }
     return select(1.0, sum / weight, weight > 0.0);
+}
+
+// Wind Waker HD's light buffer at a world position and unit world normal (its light pass): the sum of
+// colour x sat(N.L) x sat(1 - d / r)^1.5 (the lit scenery's draws add the same, gxcore_shader.cpp hd_point_sum).
+fn point_sum(p: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    var sum = vec3(0.0);
+    let count = u32(view.points.x);
+    for (var i = 0u; i < 32u; i++) {
+        if (i >= count) {
+            break;
+        }
+        let v = view.pl[i * 2u].xyz - p;
+        let d = length(v);
+        let fall = clamp(1.0 - d / view.pl[i * 2u].w, 0.0, 1.0);
+        if (fall <= 0.0) {
+            continue;
+        }
+        sum += view.pl[i * 2u + 1u].rgb * clamp(dot(n, v / max(d, 1e-4)), 0.0, 1.0) * pow(fall, 1.5);
+    }
+    return sum;
 }
 
 @fragment
@@ -2137,6 +2161,7 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
     let fade = view.params.z * (1.0 - cover);
     // HD's SSAO darkens its ambient: mix(ambient x AO, sunlight, lit), against the sunlight.
     var shade = mix(vec3(1.0), view.shade.rgb * ao_term, (1.0 - lit) * fade);
+    var shade_lin = vec3(1.0);  // with HD's palette: the multiplier in linear light
     if (view.facing.y > 0.5 && fade * (1.0 - lit) > 0.0) {
         // Wind Waker HD's light (its terrain shaders, read in Cemu): its shade takes the sky's light from above
         // and the ambient from the side (0.5 + 0.5 N.y between them), against its sunlight; that ratio, in the
@@ -2157,7 +2182,38 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
         }
         let ambient = mix(view.palette.rgb, view.shade.rgb, 0.5 + 0.5 * up);
         let ratio = clamp(ambient / max(view.lit.rgb, vec3(1e-3)), vec3(0.0), vec3(1.0));
-        shade = pow(mix(vec3(1.0), ratio * ao_term, (1.0 - lit) * fade), vec3(1.0 / 2.2));
+        shade_lin = mix(vec3(1.0), ratio * ao_term, (1.0 - lit) * fade);
+        shade = pow(shade_lin, vec3(1.0 / 2.2));
+    }
+    // Wind Waker HD's light buffer on the lit scenery (its draws added 1.25 x P to their light, view.points.z): HD
+    // adds it after the shade, times its AO alone, (vtx x L + 1.25 x AO x P) x albedo. The scene holds the sunlit
+    // light plus the lamps' (taken as HD's sunlight, view.lit, plus 1.25 x P here), so its multiplier is
+    // (lit x shade + 1.25 x P x AO) / (lit + 1.25 x P): a lamp's light on shaded scenery isn't darkened with the
+    // sunlight, and takes HD's AO where the sun is. Not on the sea or characters, which take the lamps their own way.
+    if (view.points.z > 0.5 && view.facing.y > 0.5 && view.points.x > 0.5 && water < 0.5) {
+        var chr = false;
+        if (view.facing.x > 0.5) {
+            let csize = vec2<f32>(textureDimensions(mask));
+            let cp = clamp(vec2<i32>(in.uv * csize), vec2<i32>(0), vec2<i32>(csize) - vec2<i32>(1));
+            chr = textureLoad(mask, cp, 0).g > character_g;
+        }
+        if (!chr) {
+            var nv = depth_normal(in.uv, p, tx, ty);
+            if (view.facing.z > 0.5) {
+                let nsize = vec2<f32>(textureDimensions(normals));
+                let np = clamp(vec2<i32>(in.uv * nsize), vec2<i32>(0), vec2<i32>(nsize) - vec2<i32>(1));
+                let sn = textureLoad(normals, np, 0);
+                if (sn.a > 0.5) {
+                    nv = normalize(sn.xyz * 2.0 - 1.0);
+                }
+            }
+            let nw = vec3(dot(view.rows[0].xyz, nv), dot(view.rows[1].xyz, nv), dot(view.rows[2].xyz, nv));
+            let q = view.points.y * point_sum(world.xyz, nw);
+            if (max(q.r, max(q.g, q.b)) > 1e-4) {
+                let k = max(view.lit.rgb, vec3(0.02));
+                shade = pow((k * shade_lin + q * ao_term) / (k + q), vec3(1.0 / 2.2));
+            }
+        }
     }
     // The sea's shadow at sea_shadow of its strength (HD's cPrimShadowIntensity, 0.5 in its pass), where the sea mask
     // has the sea.
@@ -2275,7 +2331,7 @@ struct View {
     lens: vec4<f32>,
     time: vec4<f32>,
     count: vec4<f32>,
-    lights: array<Light, 16>,
+    lights: array<Light, 32>,
 };
 
 @group(0) @binding(0) var samp: sampler;
@@ -2312,7 +2368,7 @@ fn fs_torch(in: VertexOutput) -> @location(0) vec4<f32> {
     let world = eye + dir * (view.lens.z / d);
     var glow = vec3(0.0);
     let n = u32(view.count.x);
-    for (var i = 0u; i < 16u; i++) {
+    for (var i = 0u; i < 32u; i++) {
         if (i >= n) {
             break;
         }
@@ -3565,6 +3621,13 @@ SunMapInputs sun_map_inputs(const Camera& camera, const SunMap& sunMap, bool act
   uniform[78] = normals ? 1.f : 0.f;
   // Wind Waker HD's character light took the toon characters' shade in their draws: their pixels are left as drawn.
   uniform[94] = actor_light_applied() ? 1.f : 0.f;
+  // Wind Waker HD's light buffer on the lit scenery, for the shade to leave (fs_sun_map's point_sum).
+  if (point_lights_hd_active() && actor_light_applied() && camera.lightCount > 0) {
+    uniform[100] = static_cast<float>(camera.lightCount);
+    uniform[101] = 1.25f;
+    uniform[102] = 1.f;
+    std::memcpy(uniform.data() + 104, camera.lights.data(), camera.lightCount * 8 * sizeof(float));
+  }
   // The full shadow's colour, or Wind Waker HD's light for the hour when the host gives it.
   {
     std::lock_guard lock{g_cameraMutex};
@@ -4575,6 +4638,16 @@ bool actor_light_palette(float c0[3], float shadow[3], float k[3]) noexcept {
   return g_actorLight.on;
 }
 
+bool point_lights_hd_switch() noexcept {
+  static const bool on = [] {
+    const char* env = std::getenv("DOL_AURORA_POINT_LIGHTS_HD");
+    return env != nullptr && env[0] == '1';
+  }();
+  return on;
+}
+
+bool point_lights_hd_active() noexcept { return point_lights_hd_switch() && torch_light_enabled() && actor_light_wanted(); }
+
 bool actor_light_wanted() noexcept {
   if (!actor_light_hd_switch())
     return false;
@@ -5155,7 +5228,10 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
       draw_with_view(cmd, "Edge light", g_edgePass, camera.view, depthView, dst, resolve);
     }
   }
-  if (torch_light_enabled() && g_module && depthView && msaaSamples == 1) {
+  // The torch glow, while Wind Waker HD's light buffer isn't drawn: with it, the characters and the lit scenery take
+  // the lights in their own draws (gxcore_draw.cpp begin_actor_light_pass()).
+  if (torch_light_enabled() && !(point_lights_hd_active() && actor_light_applied()) && g_module && depthView &&
+      msaaSamples == 1) {
     if (camera.valid && camera.lightCount > 0) {
       std::array<float, kTorchUniformSize / sizeof(float)> uniform{};
       std::memcpy(uniform.data(), camera.view.data(), sizeof(camera.view));

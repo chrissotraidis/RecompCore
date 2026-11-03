@@ -42,7 +42,7 @@
 // toward the same sun. DOL_AURORA_EDGE_LIGHT_STRENGTH (default 0.4). Off unless
 // aurora_set_edge_light(true).
 //
-// Torch light: the game's point lights (aurora_set_point_lights: up to 16 of
+// Torch light: the game's point lights (aurora_set_point_lights: up to 32 of
 // x, y, z, radius, r, g, b, flicker) glow on the surfaces around them.
 // DOL_AURORA_TORCH_LIGHT_STRENGTH (default 0.35) and _REACH (the glow's radius,
 // times the game's lighting radius, default 3). Off unless
@@ -77,6 +77,13 @@ void set_sun_palette(bool on, const float sky[3], const float ground[3], const f
 // once) lets the toon characters' draws take it; the host gives the hour's colours (aurora_set_actor_light_hd,
 // linear). actor_light_palette(): the colours, false while none are given (the GameCube shading).
 bool actor_light_hd_switch() noexcept;
+// Wind Waker HD's light buffer (DOL_AURORA_POINT_LIGHTS_HD=1, read once; off unless set): the point lights the host
+// gives (aurora_set_point_lights) are on HD's rule (radius 2.3 x power, or the effect light's power; colour S10 / 255,
+// unclamped), and the draws with HD's light add HD's sum of them, colour x sat(N.L) x sat(1 - d / r)^1.5: the
+// characters' x 1.75 (gxc::HdPointLights), with HD's character light. point_lights_hd_active(): on, the torch light on
+// (the host sends the lights) and the characters' light wanted this frame.
+bool point_lights_hd_switch() noexcept;
+bool point_lights_hd_active() noexcept;
 void set_actor_light_hd(bool on, const float c0[3], const float shadow[3], const float k[3]) noexcept;
 bool actor_light_palette(float c0[3], float shadow[3], float k[3]) noexcept;
 // The switch is on and the host has given colours: the characters may take HD's light this frame.
@@ -162,8 +169,8 @@ void set_world_view(const float invView[12], float tanHalfFovy, float aspect, fl
                     float seconds) noexcept;
 void set_world_view_far(float farPlane) noexcept;
 bool any_enabled() noexcept;
-// The game's point lights, at most (aurora_set_point_lights).
-constexpr uint32_t kMaxLights = 16;
+// The game's point lights, at most (aurora_set_point_lights; 16 before Wind Waker HD's light buffer).
+constexpr uint32_t kMaxLights = 32;
 // What the effects drawn from the camera (sun and cloud shadows, edge and
 // torch light) are drawn with: the inverse view matrix's three rows, then
 // tan(fovy / 2), aspect, near, the sea's height and the time in seconds, then
