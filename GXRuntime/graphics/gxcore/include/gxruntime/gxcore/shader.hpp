@@ -269,6 +269,11 @@ struct ShaderKey {
   // switch on): generate_wgsl adds HD's light beside the GX result, picked by
   // HdActorLightConstants::params.x (group 0).
   std::uint8_t hd_actor_light = 0;
+  // Wind Waker HD's fog curve (linear fog only): the GX factor, clamped, is
+  // squared before the blend, as HD's shaders fog (clamp((d - start) / (end -
+  // start))^2). Set per draw while the host has HD's fog distances in place
+  // (aurora_set_fog_hd). Two pad bytes keep the scalar block a multiple of 4.
+  std::uint8_t hd_fog = 0;
   // Wind Waker HD's light buffer on the lit scenery (hd_point_light_stage()
   // matched and the host's switch on): HD's point and effect lights, x 1.25,
   // added to stage 0's light before the texture multiplies it (HdPointLights at
@@ -279,10 +284,8 @@ struct ShaderKey {
   // it (gxcore_shader.cpp hd_scenery_lava()).
   std::uint8_t hd_point_light = 0;
   // Wind Waker HD's water floor (hd_water_floor_stage() matched while HD's palettes are in place): its three stages
-  // worked in linear light on HD's linear colours, as HD's shader for it does. One pad byte keeps the scalar block a
-  // multiple of 4.
+  // worked in linear light on HD's linear colours, as HD's shader for it does. Keeps the scalar block a multiple of 4.
   std::uint8_t hd_water = 0;
-  std::uint8_t pad_hd[1]{};
   LightChanKey litchan[4]{}; // color0, color1, alpha0, alpha1
   TexGenKey tex_gens[kMaxTexGens]{};
   IndirectStageKey ind_stages[kMaxIndirectStages]{};
@@ -758,6 +761,14 @@ bool hd_point_light_stage(const ShaderKey& key);
 // ToG room 0) adds the same terms in linear light on the colours made linear (u8, (c / 255)^2.2): two layers of
 // caustics over the floor's colour. On the GameCube's gamma colours the sum came out twice as bright in linear.
 bool hd_water_floor_stage(const ShaderKey& key);
+
+// Wind Waker HD's fog start before the camera on a draw's own GX fog. HD's palettes start the fog below 0 in many
+// places (Ganon's Tower -5000, the Tower of the Gods -1000), where the GameCube's palette blend clamps the start at 0,
+// so a draw fogged from the game's palette (C 0) fogs far less than HD's shaders. For a draw with linear perspective
+// fog, C 0 and a perspective projection whose fog ends at `end` (within 1%: its end is the projection's near x B / A,
+// GXSetFog's terms), sets A and C to GXSetFog's for `start` to `end`: the same fog, from `start`. True if it did.
+bool fog_start_before_camera(PixelShaderConstants& pc, const ShaderKey& key, const float projection[4][4],
+                             float start, float end);
 
 // The uniform a ShaderKey::hd_actor_light shader reads at group(0) binding(2)
 // (binding 0 and 1 are the pass's static storage buffers; binding 3 the shadow

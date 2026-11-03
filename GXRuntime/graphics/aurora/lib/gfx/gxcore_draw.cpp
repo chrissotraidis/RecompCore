@@ -3323,6 +3323,21 @@ static const gxc::PixelShaderConstants& hd_light_constants(const gxc::DrawPlan& 
   return pc;
 }
 
+// A draw's pixel constants with Wind Waker HD's fog start before the camera (gxc::fog_start_before_camera()), while
+// the host has HD's fog in the game's palettes and a start below 0 for the frame; else `pc` itself.
+static const gxc::PixelShaderConstants& hd_fog_constants(const gxc::PixelShaderConstants& pc,
+                                                         const gxc::DrawPlan& plan) {
+  const gxc::ShaderKey& key = plan.pipeline.shader;
+  if (key.fog_fsel != static_cast<uint8_t>(gxc::FogType::Linear) || pc.fogf[1] != 0.f || !post_fx::fog_hd())
+    return pc;
+  float start = 0.f, end = 0.f;
+  if (!post_fx::fog_hd_start(start, end))
+    return pc;
+  static thread_local gxc::PixelShaderConstants out;
+  out = pc;
+  return gxc::fog_start_before_camera(out, key, plan.constants.projection, start, end) ? out : pc;
+}
+
 // Wind Waker HD's lava and fire rooms (GanonB, Cave01, MiniKaz, Ganon's Tower's lava parts): their materials with
 // a konst2 animation add the lava's light, albedo x lava K x 4 x the vertex red squared (Cemu, GanonB's PS 4345;
 // lava K the animation at the game frame, 0.453, 0.0415, 0.0005 at frame 23), outside the shade and before the fog.
@@ -4217,8 +4232,12 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const bool noGcGlow = lightDraw && tev && hd_lava_gc_glow(plan.pipeline.shader) &&
                         post_fx::point_lights_hd_switch() && post_fx::actor_light_hd_switch() &&
                         gxc::hd_point_light_stage(plan.pipeline.shader) && hd_lava_draw(plan);
-  const gxc::PixelShaderConstants& pixelConstants =
+  const gxc::PixelShaderConstants& lightConstants =
       lightDraw ? hd_light_constants(plan, noGcGlow) : plan.pixel_constants;
+  // Wind Waker HD's fog start before the camera (aurora_set_fog_hd_starts) on every draw fogged from the game's
+  // clamped start (C 0) to the same end: the characters, plants and objects as well as the lit scenery, all fogged
+  // from that start in HD's shaders. The lit scenery's fog the sun pass takes (note_scene_fog()) is these constants.
+  const gxc::PixelShaderConstants& pixelConstants = tev ? hd_fog_constants(lightConstants, plan) : lightConstants;
   Range pixelUniformRange{};
   bool pixelRepeats = false;
   if (tev) {
@@ -4269,6 +4288,19 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // HD's palettes (whose colours it takes) and its light are in place.
   if (tev && gxc::hd_water_floor_stage(key.shader) && post_fx::actor_light_wanted())
     key.shader.hd_water = 1u;
+  // Wind Waker HD's fog curve (aurora_set_fog_hd): while the host has HD's fog distances in the game's palettes,
+  // linear fog is squared, as HD's shaders fog; on the GameCube's linear curve HD's distances (retuned for the
+  // square) gave about twice HD's fog at mid range.
+  if (tev && key.shader.fog_fsel != static_cast<uint8_t>(gxc::FogType::Off) && post_fx::fog_hd())
+    key.shader.hd_fog = 1u;
+  // The lit scenery's fog (its linear perspective fog, with GX's range adjust if it has it), for the sun pass to put after
+  // its shade, as Wind Waker HD fogs its scenery (post_fx::note_scene_fog()).
+  if (tev && key.shader.fog_fsel == static_cast<uint8_t>(gxc::FogType::Linear) &&
+      key.shader.fog_proj == static_cast<uint8_t>(gxc::FogProjection::Perspective) && hd_light_draw(plan)) {
+    const auto& pc = pixelConstants;
+    post_fx::note_scene_fog(pc.fogf[0], pc.fogi[1], pc.fogi[3], pc.fogf[1], pc.fogcolor, key.shader.hd_fog != 0u,
+                            key.shader.fog_range != 0u ? &pc.fogrange[0][0] : nullptr, pc.fogf[2], pc.fogf[3]);
+  }
   const PipelineConfig colorConfig{
       .version = GXCorePipelineConfigVersion,
       .key = key,
@@ -4370,7 +4402,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       static gxc::UberPixelConstants block; // one recording thread at a time
       std::memcpy(&block.psc, &pixelConstants, sizeof block.psc);
       std::memset(block.key, 0, sizeof block.key);
-      std::memcpy(block.key, &plan.pipeline.shader, sizeof plan.pipeline.shader);
+      std::memcpy(block.key, &key.shader, sizeof key.shader); // with the per-draw bits (hd_fog)
       block.extra[0] = gxc::texmap_popcount(gxc::used_texmap_mask(plan.pipeline.shader)) > 1u ? 1u : 0u;
       uberPixelRange = push_uniform_dedup(g_uberPixelUniformCache, reinterpret_cast<const uint8_t*>(&block),
                                           sizeof block);
