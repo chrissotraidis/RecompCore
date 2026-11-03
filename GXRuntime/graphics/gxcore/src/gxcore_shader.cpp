@@ -274,6 +274,8 @@ void emit_fog(std::string& out, const ShaderKey& key) {
 // drafts/hd-actor-light/LINK-LIGHT.md has the formula from a RenderDoc
 // capture of Cemu). It replaces stage 0's mix(C0, K, ramp) x albedo with
 //   L   = mix(hemi, K, ramp(s x mix(1, shadow, fade)) x cloud)
+// cloud = clamp(HD's cloud shadow texel at the world position + floor), or 1
+// with the cloud term off (rim.w 0),
 //   out = pow(clamp(L x (albedo^2.2 + hemi x 2 x rim)), 1 / 2.2)
 // hemi = mix(c0, shadow colour, 0.5 + 0.5 N_world.y), rim = (1 + N.E)^5 x
 // mix(1, clamp(L_dir.E), 0.75), all from group 0's HdActorLightConstants. s is
@@ -313,7 +315,12 @@ void emit_hd_actor_light(std::string& out, const ShaderKey& key, const ToonLight
        "        let hd_e = normalize(in.hd_pv);\n"
        "        let hd_up = dot(hdl.rows[1].xyz, hd_n);\n"
        "        let hd_hemi = mix(hdl.c0.rgb, hdl.shadow.rgb, 0.5 + 0.5 * hd_up);\n"
-       "        let hd_l = mix(hd_hemi, hdl.k.rgb, hd_ramp * hdl.rim.w);\n"
+       "        var hd_cloud = 1.0;\n"
+       "        if (hdl.rim.w > 0.5) {\n"
+       "            hd_cloud = clamp(textureSampleLevel(hdl_cloud, hdl_cloud_samp, hd_cloud_uv, hd_cloud_lod).r + "
+       "hdl.cloud.w, 0.0, 1.0);\n"
+       "        }\n"
+       "        let hd_l = mix(hd_hemi, hdl.k.rgb, hd_ramp * hd_cloud);\n"
        "        let hd_rev = mix(1.0, clamp(dot(hdl.light.xyz, hd_e), 0.0, 1.0), hdl.rim.z);\n"
        "        let hd_rim = pow(clamp(1.0 + dot(hd_n, hd_e), 0.0, 1.0), hdl.rim.y) * hd_rev;\n"
        "        let hd_alb = pow(vec3f(hd_albedo) / 255.0, vec3f(2.2));\n"
@@ -326,6 +333,7 @@ void emit_hd_actor_light(std::string& out, const ShaderKey& key, const ToonLight
        "        if (hd_debug == 3) { hd_out = hd_ramp; }\n"
        "        if (hd_debug == 4) { hd_out = pow(clamp(hd_hemi, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)); }\n"
        "        if (hd_debug == 5) { hd_out = vec3f(clamp(hd_rim, 0.0, 1.0)); }\n"
+       "        if (hd_debug == 6) { hd_out = vec3f(hd_cloud); }\n"
        "        prev = vec4i(vec3i(round(clamp(hd_out, vec3f(0.0), vec3f(1.0)) * 255.0)), prev.a);\n"
        "    }\n");
 }
@@ -352,6 +360,17 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key, const ToonLightMa
   if (indirect_enabled)
     emit(out, "    var alphabump = 0;\n"
               "    var tevcoord = vec2i(0,0);\n");
+  // Wind Waker HD's cloud shadow on the characters: the world position seen
+  // from above, and its mip from the uv's screen derivatives, here, before any
+  // branch (derivatives need uniform control flow; the sample is in the HD
+  // block, textureSampleLevel).
+  if (hd.matched)
+    emit(out, "    let hd_cloud_p = vec4f(in.hd_pv, 1.0);\n"
+              "    let hd_cloud_uv = vec2f(-dot(hdl.rows[0], hd_cloud_p), -dot(hdl.rows[2], hd_cloud_p)) * "
+              "hdl.cloud.z + hdl.cloud.xy;\n"
+              "    let hd_cloud_texels = hd_cloud_uv * vec2f(textureDimensions(hdl_cloud));\n"
+              "    let hd_cloud_span = max(length(dpdx(hd_cloud_texels)), length(dpdy(hd_cloud_texels)));\n"
+              "    let hd_cloud_lod = log2(max(hd_cloud_span, 1.0));\n");
   emit(out,
             "    let col0i = vec4i(round(in.color0 * 255.0));\n"
             "    let col1i = vec4i(round(in.color1 * 255.0));\n");
@@ -857,7 +876,8 @@ ToonLightMatch toon_light_stage(const ShaderKey& key) {
 }
 
 HdActorLightPixel hd_actor_light_reference(const HdActorLightConstants& c, float s, float sh, float (*ramp)(float u),
-                                           float n_up, float n_dot_e, float l_dot_e, const float albedo_gamma[3]) {
+                                           float n_up, float n_dot_e, float l_dot_e, const float albedo_gamma[3],
+                                           float cloud) {
   const auto clamp01 = [](float v) { return v < 0.f ? 0.f : v > 1.f ? 1.f : v; };
   const auto mix = [](float a, float b, float t) { return a + (b - a) * t; };
   HdActorLightPixel px;
@@ -866,7 +886,7 @@ HdActorLightPixel hd_actor_light_reference(const HdActorLightConstants& c, float
   px.rim = std::pow(clamp01(1.f + n_dot_e), c.rim[1]) * rev;
   for (int i = 0; i < 3; ++i) {
     px.hemi[i] = mix(c.c0[i], c.shadow[i], 0.5f + 0.5f * n_up);
-    px.light[i] = mix(px.hemi[i], c.k[i], px.ramp * c.rim[3]);
+    px.light[i] = mix(px.hemi[i], c.k[i], px.ramp * cloud);
     const float albedo = std::pow(albedo_gamma[i], 2.2f);
     px.out[i] = std::pow(clamp01(px.light[i] * (albedo + px.hemi[i] * c.rim[0] * px.rim)), 1.f / 2.2f);
   }
@@ -1038,10 +1058,13 @@ std::string generate_wgsl(const ShaderKey& key) {
               "    rows: array<vec4f, 3>,\n"
               "    rim: vec4f,\n"
               "    screen: vec4f,\n"
+              "    cloud: vec4f,\n"
               "};\n"
               "@group(0) @binding(2) var<uniform> hdl: HdActorLight;\n"
               "@group(0) @binding(3) var hdl_shadow: texture_2d<f32>;\n"
               "@group(0) @binding(4) var hdl_samp: sampler;\n"
+              "@group(0) @binding(5) var hdl_cloud: texture_2d<f32>;\n"
+              "@group(0) @binding(6) var hdl_cloud_samp: sampler;\n"
               "fn hd_ramp_sample(t: texture_2d<f32>, uv: vec2f) -> vec4f {\n"
               "    let size = vec2i(textureDimensions(t));\n"
               "    let p = uv * vec2f(size) - 0.5;\n"

@@ -271,9 +271,12 @@ bool g_aoHdDebug = false;
 // DOL_AURORA_CLOUD_SHADOWS_HD=1 (local test; with the sun shadow map and the cloud shadows on): the cloud shadows
 // on Wind Waker HD's rule, in the sun shadows' pass in place of their own: they take away the sun's light (HD's
 // shadow term x clamp(cloud + floor)), so they don't darken shade, and are lighter at a low sun.
-// DOL_AURORA_CLOUD_SHADOWS_HD_POWER sets the floor (HD's cCloudShadowPower, else 1 - 0.9 x the sun's height).
+// DOL_AURORA_CLOUD_SHADOWS_HD_POWER sets the floor (HD's cCloudShadowPower, else HD's from the game's clock as the
+// host gives it, or 1 - max(0.25, 0.9 x the sun's height): cloud_hd_floor()).
 bool g_cloudHd = false;
 float g_cloudHdPower = -1.f;
+// The floor from the host's clock (aurora_set_cloud_hd_floor), negative while unset.
+std::atomic<float> g_cloudHdFloor{-1.f};
 // DOL_AURORA_CLOUD_SHADOWS_HD_TEXTURE=path to a BC4 DDS of Wind Waker HD's ww_shadow_clouds (the sea stage's
 // Stage.bfres, 4096 x 4096): with it, the clouds are HD's as a RenderDoc capture and Cemu's memory show them, the
 // texture seen from above, a repeat every 15,000 units (cCloudProjMtx: u = -x / 15000 + u0, v = -z / 15000 + 0.5),
@@ -2002,8 +2005,8 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     }
     // The cloud shadows on Wind Waker HD's rule (g_cloudHd): its shadow term times clamp(cloud + floor), the floor
-    // 1 - 0.9 x the sun's height (cCloudShadowPower), so they darken only what the sun lights, and are lighter at a
-    // low sun. The cloud is BlueWake's own drifting noise (kCloudNoise), 1 clear, 0 under a cloud.
+    // 1 - max(0.25, -0.9 cos(the hour's sun angle)) (cCloudShadowPower, cloud_hd_floor()), so they darken only what the sun
+    // lights, and are lighter at a low sun (0.75 at night). The cloud is BlueWake's own drifting noise (kCloudNoise), 1 clear, 0 under a cloud.
     if (view.shade.w > 0.5) {
         if (view.lit.w > 0.5) {
             // HD's: its texture from above, its mip from how much ground a pixel spans (after an early return, so
@@ -3288,6 +3291,22 @@ bool ao_hd_on() noexcept { return g_aoHd && hd_mix_on() && ambient_occlusion_ena
 // The cloud shadows on HD's rule run this frame, in the sun shadows' pass in place of their own.
 bool clouds_hd_on() noexcept { return g_cloudHd && cloud_shadows_enabled() && sun_shadow_map_enabled(); }
 
+// The cloud shadows' floor on HD's rule (cCloudShadowPower; cloud = clamp(texel + floor)): DOL_AURORA_CLOUD_SHADOWS_HD_
+// POWER, else the host's from the game's clock (aurora_set_cloud_hd_floor: hd/d/d_kankyo_3.cpp setSunpos's
+// 1 - max(0.25, -0.9 cos(t - 15 deg)), 0.364 at 10:00, 0.1307 at noon, and 0.75 from a low sun through the night,
+// when HD's clouds still take a quarter of the light), else 1 - max(0.25, 0.9 x the light's height). That last is
+// HD's only with the true sun's height: with HD's light rule (aurora_set_sun_hd_light) the light is held at 40,000
+// high before 09:00 and after 17:00, and gave 0.596 at 07:30 and 18:30 where HD has 0.75. The scenery (uniform[87])
+// and the characters (actor_cloud_source()) both take it from here.
+float cloud_hd_floor(const Camera& camera) noexcept {
+  if (g_cloudHdPower >= 0.f)
+    return g_cloudHdPower;
+  const float host = g_cloudHdFloor.load(std::memory_order_relaxed);
+  if (host >= 0.f)
+    return host;
+  return 1.f - std::max(0.25f, 0.9f * std::clamp(camera.view[18], 0.f, 1.f));
+}
+
 // A black texel in the effects' mask's place (no effects), made on first use.
 const wgpu::TextureView& effect_none_view() {
   if (!g_effectNone) {
@@ -3416,8 +3435,7 @@ SunMapInputs sun_map_inputs(const Camera& camera, const SunMap& sunMap, bool act
   // HD's splits this frame, as its first two cascades are sized (cascade_range).
   uniform[92] = g_sunHdPrepass ? hd_split(0) : g_sunHdSplits[0];
   uniform[93] = g_sunHdPrepass ? hd_split(1) : g_sunHdSplits[1];
-  uniform[87] = g_cloudHdPower >= 0.f ? g_cloudHdPower
-                                      : 1.f - 0.9f * std::clamp(camera.view[18], 0.f, 1.f); // the sun's height
+  uniform[87] = cloud_hd_floor(camera);
   // The scenery's smooth normals (sun_normal_target()), drawn with the mask while the facing term is on.
   const bool normals = mask && g_sunNormalView && sun_normals_wanted();
   uniform[78] = normals ? 1.f : 0.f;
@@ -4314,6 +4332,10 @@ bool far_blur_enabled() noexcept { return g_farBlur.load(std::memory_order_relax
 
 void set_far_blur(bool enabled) noexcept { g_farBlur.store(enabled, std::memory_order_relaxed); }
 
+void set_cloud_hd_floor(float floor) noexcept {
+  g_cloudHdFloor.store(floor >= 0.f ? std::min(floor, 1.f) : -1.f, std::memory_order_relaxed);
+}
+
 bool ambient_occlusion_enabled() noexcept { return g_ao.load(std::memory_order_relaxed) && webgpu::g_hasCoreFeatures; }
 
 void set_ambient_occlusion(bool enabled) noexcept { g_ao.store(enabled, std::memory_order_relaxed); }
@@ -4421,6 +4443,21 @@ bool actor_shadow_source(wgpu::TextureView& view, float& lod, bool& sameFrame) n
     return false;
   view = g_sunLowView[0];
   lod = g_sunHdPrepass ? 1.f : 0.f;
+  return true;
+}
+
+bool actor_cloud_source(const Camera& camera, float cloud[4], wgpu::TextureView& view, wgpu::Sampler& sampler) noexcept {
+  if (!clouds_hd_on() || !g_cloudTexView || !g_cloudSampler)
+    return false;
+  // fs_sun_map's uv: (-x / cloud_repeat + time x cloud_speed, -z / cloud_repeat + 0.5). u0 is taken modulo 1 (the
+  // sampler repeats) so a long session's seconds keep their precision.
+  const double u0 = static_cast<double>(camera.view[16]) * static_cast<double>(g_cloudHdSpeed);
+  cloud[0] = static_cast<float>(u0 - std::floor(u0));
+  cloud[1] = 0.5f;
+  cloud[2] = 1.f / g_cloudHdRepeat;
+  cloud[3] = cloud_hd_floor(camera);
+  view = g_cloudTexView;
+  sampler = g_cloudSampler;
   return true;
 }
 
@@ -4950,6 +4987,8 @@ void aurora_set_hd_cloud_texture(const char* path) {
 void aurora_set_sun_hd_light(int on, int night, float fade) {
   aurora::gfx::post_fx::set_sun_hd_light(on != 0, night != 0, fade);
 }
+
+void aurora_set_cloud_hd_floor(float floor) { aurora::gfx::post_fx::set_cloud_hd_floor(floor); }
 
 void aurora_set_edge_light(bool enabled) { aurora::gfx::post_fx::set_edge_light(enabled); }
 
