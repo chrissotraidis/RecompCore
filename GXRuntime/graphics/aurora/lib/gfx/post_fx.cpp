@@ -100,6 +100,13 @@ struct ActorLightPalette {
   float c0[3]{}, shadow[3]{}, k[3]{};
 };
 ActorLightPalette g_actorLight;
+// The GameCube's global actor C0 and K0 (Link's, linear) each character's own toon registers are set against
+// (aurora_set_actor_light_hd_own), under g_cameraMutex.
+struct ActorLightOwn {
+  bool on = false;
+  float c0[3]{}, k[3]{};
+};
+ActorLightOwn g_actorLightOwn;
 // The scene pass drew the characters with it this frame (set_actor_light_applied), render thread.
 std::atomic_bool g_actorLightApplied{false};
 // Post passes encoded so far, and the one that last made the shadow pre-pass (g_sunLow), render thread: the
@@ -4628,6 +4635,29 @@ void set_actor_light_hd(bool on, const float c0[3], const float shadow[3], const
   }
 }
 
+void set_actor_light_hd_own(bool on, const float c0[3], const float k[3]) noexcept {
+  std::lock_guard lock{g_cameraMutex};
+  g_actorLightOwn.on = on && c0 != nullptr && k != nullptr;
+  for (int i = 0; g_actorLightOwn.on && i < 3; ++i) {
+    g_actorLightOwn.c0[i] = std::max(c0[i], 0.f);
+    g_actorLightOwn.k[i] = std::max(k[i], 0.f);
+  }
+}
+
+// DOL_AURORA_ACTOR_LIGHT_HD_OWN=0 (to compare): every character on the host's colours (Link's floor's).
+bool actor_light_own(float c0[3], float k[3]) noexcept {
+  static const bool allowed = [] {
+    const char* env = std::getenv("DOL_AURORA_ACTOR_LIGHT_HD_OWN");
+    return env == nullptr || env[0] != '0';
+  }();
+  std::lock_guard lock{g_cameraMutex};
+  for (int i = 0; i < 3; ++i) {
+    c0[i] = g_actorLightOwn.c0[i];
+    k[i] = g_actorLightOwn.k[i];
+  }
+  return allowed && g_actorLightOwn.on;
+}
+
 bool actor_light_palette(float c0[3], float shadow[3], float k[3]) noexcept {
   std::lock_guard lock{g_cameraMutex};
   for (int i = 0; i < 3; ++i) {
@@ -5338,6 +5368,10 @@ void aurora_set_sun_palette(int on, const float sky[3], const float ground[3], c
 
 void aurora_set_actor_light_hd(int on, const float c0[3], const float shadow[3], const float k[3]) {
   aurora::gfx::post_fx::set_actor_light_hd(on != 0, c0, shadow, k);
+}
+
+void aurora_set_actor_light_hd_own(int on, const float c0[3], const float k0[3]) {
+  aurora::gfx::post_fx::set_actor_light_hd_own(on != 0, c0, k0);
 }
 
 void aurora_set_hd_cloud_texture(const char* path) {

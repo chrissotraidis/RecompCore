@@ -368,15 +368,30 @@ void emit_hd_actor_light(std::string& out, const ShaderKey& key, const ToonLight
   emit(out,
        "        let hd_n = normalize(in.hd_nv);\n"
        "        let hd_e = normalize(in.hd_pv);\n"
-       "        let hd_up = dot(hdl.rows[1].xyz, hd_n);\n"
-       "        let hd_hemi = mix(hdl.c0.rgb, hdl.shadow.rgb, 0.5 + 0.5 * hd_up);\n"
+       "        let hd_up = dot(hdl.rows[1].xyz, hd_n);\n");
+  emitf(out,
+       // Each character's own palettes (HD's per-tevstr colours times the global intensities): the draw's toon
+       // registers (register C0 its C0, KONST its K0: dKy_tevstr setLightTevColorType) against the
+       // GameCube's global ones (Link's), in linear light, scale HD's colours; Link's own draws keep them.
+       "        var hd_c0 = hdl.c0.rgb;\n"
+       "        var hd_k = hdl.k.rgb;\n"
+       "        if (hdl.own_k.w > 0.5) {\n"
+       "            let hd_own_k = pow(clamp(vec3f(%s) / 255.0, vec3f(0.0), vec3f(1.0)), vec3f(2.2));\n"
+       "            let hd_own_c0 = pow(clamp(vec3f(psc.colors[1].rgb) / 255.0, vec3f(0.0), vec3f(1.0)), vec3f(2.2));\n",
+       kKselC[rs.ksel_kc]);
+  emit(out,
+       "            hd_k = hd_k * select(vec3f(1.0), clamp(hd_own_k / max(hdl.own_k.rgb, vec3f(1e-4)), vec3f(0.0), vec3f(4.0)), hdl.own_k.rgb > vec3f(1e-3));\n"
+       "            hd_c0 = hd_c0 * select(vec3f(1.0), clamp(hd_own_c0 / max(hdl.own_c0.rgb, vec3f(1e-4)), vec3f(0.0), vec3f(4.0)), hdl.own_c0.rgb > vec3f(1e-3));\n"
+       "        }\n");
+  emit(out,
+       "        let hd_hemi = mix(hd_c0, hdl.shadow.rgb, 0.5 + 0.5 * hd_up);\n"
        "        var hd_cloud = 1.0;\n"
        "        if (hdl.rim.w > 0.5) {\n"
        "            hd_cloud = clamp(textureSampleLevel(hdl_cloud, hdl_cloud_samp, hd_cloud_uv, hd_cloud_lod).r + "
        "hdl.cloud.w, 0.0, 1.0);\n"
        "        }\n"
        // HD's light buffer (the point and effect lights) on the light, x 1.75, with no shadow, cloud or ramp.
-       "        let hd_l = mix(hd_hemi, hdl.k.rgb, hd_ramp * hd_cloud) + hdp.count.y * hd_point_sum(in.hd_pv, hd_n);\n"
+       "        let hd_l = mix(hd_hemi, hd_k, hd_ramp * hd_cloud) + hdp.count.y * hd_point_sum(in.hd_pv, hd_n);\n"
        "        let hd_rev = mix(1.0, clamp(dot(hdl.light.xyz, hd_e), 0.0, 1.0), hdl.rim.z);\n"
        "        let hd_rim = pow(clamp(1.0 + dot(hd_n, hd_e), 0.0, 1.0), hdl.rim.y) * hd_rev;\n"
        "        let hd_alb = pow(vec3f(hd_albedo) / 255.0, vec3f(2.2));\n");
@@ -1261,6 +1276,8 @@ std::string generate_wgsl(const ShaderKey& key) {
               "    rim: vec4f,\n"
               "    screen: vec4f,\n"
               "    cloud: vec4f,\n"
+              "    own_c0: vec4f,\n"
+              "    own_k: vec4f,\n"
               "};\n"
               "@group(0) @binding(2) var<uniform> hdl: HdActorLight;\n"
               "@group(0) @binding(3) var hdl_shadow: texture_2d<f32>;\n"

@@ -770,8 +770,15 @@ struct HdActorLightConstants {
   // uv = (-X, -Z) * cloud.z + cloud.xy. x u0 (drifting with the wind), y v0
   // (0.5), z 1 / the repeat (1 / 15000), w the floor: cloud = clamp(texel + w).
   float cloud[4]{};
+  // Each character's own colours (Wind Waker HD's setLightTevColorType: a character's tevstr colours, from the
+  // palettes of the floor under it, times the global intensities, mActorC0/K0Intensity from Link's): the GameCube's
+  // global actor C0 and K0 (g_env_light, Link's), linear (bytes / 255 to the 2.2), that the draw's own toon registers
+  // (register C0: its C0, KONST: its K0) are set against; HD's c0 and k above are taken by those ratios. w: 1 on
+  // (aurora_set_actor_light_hd_own), 0 every character on c0 and k as given.
+  float own_c0[4]{};
+  float own_k[4]{};
 };
-static_assert(sizeof(HdActorLightConstants) == 11 * 16);
+static_assert(sizeof(HdActorLightConstants) == 13 * 16);
 
 // Wind Waker HD's light buffer, the point and effect lights (its light pass, PS 1472 in the Cemu captures:
 // drafts/hd-look-remaining/CAPTURES-NOV3-READ-lights.md), for the draws with HD's light, at group(0) binding(7):

@@ -1124,7 +1124,7 @@ void test_toon_light_wgsl() {
   // The cloud term: HD's cloud shadow texture and its sampler at bindings 5 and 6, the uniform's last vec4.
   CHECK(w.find("@group(0) @binding(5) var hdl_cloud: texture_2d<f32>;") != std::string::npos);
   CHECK(w.find("@group(0) @binding(6) var hdl_cloud_samp: sampler;") != std::string::npos);
-  CHECK(w.find("    screen: vec4f,\n    cloud: vec4f,\n};") != std::string::npos);
+  CHECK(w.find("    screen: vec4f,\n    cloud: vec4f,\n    own_c0: vec4f,\n    own_k: vec4f,\n};") != std::string::npos);
   // Its uv is the world position from above (the inverse view's x and z rows), its mip from the uv's derivatives,
   // worked out at the top of fs_main, before any branch or discard (uniform control flow).
   const auto main_at = w.find("fn fs_main(");
@@ -1143,8 +1143,14 @@ void test_toon_light_wgsl() {
   CHECK(w.find("        if (hdl.rim.w > 0.5) {\n"
                "            hd_cloud = clamp(textureSampleLevel(hdl_cloud, hdl_cloud_samp, hd_cloud_uv, hd_cloud_lod).r "
                "+ hdl.cloud.w, 0.0, 1.0);\n") != std::string::npos);
-  CHECK(w.find("let hd_l = mix(hd_hemi, hdl.k.rgb, hd_ramp * hd_cloud) + hdp.count.y * hd_point_sum(in.hd_pv, hd_n);") !=
+  CHECK(w.find("let hd_l = mix(hd_hemi, hd_k, hd_ramp * hd_cloud) + hdp.count.y * hd_point_sum(in.hd_pv, hd_n);") !=
         std::string::npos);
+  // Each character's own palettes: its toon registers (C0, the ramp stage's KONST) against the global ones, in linear.
+  CHECK(w.find("let hd_own_k = pow(clamp(vec3f(psc.kcolors[0].rgb) / 255.0, vec3f(0.0), vec3f(1.0)), vec3f(2.2));") !=
+        std::string::npos);
+  CHECK(w.find("hd_c0 = hd_c0 * select(vec3f(1.0), clamp(hd_own_c0 / max(hdl.own_c0.rgb, vec3f(1e-4)), vec3f(0.0), "
+               "vec3f(4.0)), hdl.own_c0.rgb > vec3f(1e-3));") != std::string::npos);
+  CHECK(w.find("let hd_hemi = mix(hd_c0, hdl.shadow.rgb, 0.5 + 0.5 * hd_up);") != std::string::npos);
   // HD's light buffer: its lights at binding 7, summed per pixel with HD's falloff (exponent 1.5).
   CHECK(w.find("@group(0) @binding(7) var<uniform> hdp: HdPointLights;") != std::string::npos);
   CHECK(w.find("    pos_r: array<vec4f, 32>,\n    colour: array<vec4f, 32>,") != std::string::npos);
