@@ -95,8 +95,17 @@ bool actor_light_applied() noexcept;
 // Wind Waker HD's cloud shadow texture (aurora_set_hd_cloud_texture): a BC4 DDS, loaded by the render thread; null
 // or empty: none (BlueWake's noise).
 void set_hd_cloud_texture(const char* path) noexcept;
+// The characters' cloud term (Wind Waker HD's character light, gxc::HdActorLightConstants::cloud): the scenery's
+// cloud shadows on HD's rule as fs_sun_map applies them, from the same values (the texture and its repeating
+// sampler, the repeat, the drift from camera.view[16]'s seconds, v0 0.5, the floor uniform[87] has). `cloud` gets
+// (u0, v0, 1 / repeat, floor). False, and the characters' cloud 1, while the cloud shadows on HD's rule are off this
+// frame or no HD cloud texture is loaded (the scenery's noise fallback isn't HD's, so characters don't take it).
+struct Camera;
+bool actor_cloud_source(const Camera& camera, float cloud[4], wgpu::TextureView& view, wgpu::Sampler& sampler) noexcept;
 // Wind Waker HD's light rule (aurora_set_sun_hd_light).
 void set_sun_hd_light(bool on, bool night, float fade) noexcept;
+// Wind Waker HD's cloud floor from the host's clock (aurora_set_cloud_hd_floor), negative while unset.
+void set_cloud_hd_floor(float floor) noexcept;
 void set_sun_direction(float x, float y, float z) noexcept;
 void set_exposure(float gain) noexcept;
 // The scene is brightened this frame (the game's gain over 1): the sea's draws

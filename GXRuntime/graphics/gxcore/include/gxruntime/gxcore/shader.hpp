@@ -663,10 +663,11 @@ ToonLightMatch toon_light_stage(const ShaderKey& key);
 
 // The uniform a ShaderKey::hd_actor_light shader reads at group(0) binding(2)
 // (binding 0 and 1 are the pass's static storage buffers; binding 3 the shadow
-// texture, 4 its sampler). All colours linear. vec4-aligned.
+// texture, 4 its sampler; 5 HD's cloud shadow texture, 6 its sampler). All
+// colours linear. vec4-aligned.
 struct HdActorLightConstants {
   // x: 1 = HD's light, 0 = the GameCube result unchanged; y: debug view
-  // (DOL_AURORA_ACTOR_LIGHT_DEBUG: 1 s, 2 shadow, 3 ramp, 4 hemi, 5 rim);
+  // (DOL_AURORA_ACTOR_LIGHT_DEBUG: 1 s, 2 shadow, 3 ramp, 4 hemi, 5 rim, 6 cloud);
   // z: the shadow texture's LOD; w: how strongly the shadow shows (0 to 1).
   float params[4]{};
   float c0[4]{};     // the hemisphere's lower colour (actor_c0); w: 1 when a shadow texture is bound
@@ -674,18 +675,25 @@ struct HdActorLightConstants {
   float k[4]{};      // the lit colour (actor_k0 x its factor, 2.75 at noon)
   float light[4]{};  // the direction to the light (the shadow map's sun or moon), view space
   float rows[3][4]{}; // the inverse view matrix (view to world), by rows
-  float rim[4]{};    // HD's rim: intensity (2), exponent (5), back-light share (0.75), cloud (1)
+  // HD's rim: intensity (2), exponent (5), back-light share (0.75); w: 1 when the
+  // cloud term is on (HD's cloud shadow texture bound at binding 5), else cloud = 1.
+  float rim[4]{};
   float screen[4]{}; // 1 / the target's width and height: a fragment's uv in the shadow texture
+  // HD's cloud shadow (ww_shadow_clouds seen from above), at world (X, Z):
+  // uv = (-X, -Z) * cloud.z + cloud.xy. x u0 (drifting with the wind), y v0
+  // (0.5), z 1 / the repeat (1 / 15000), w the floor: cloud = clamp(texel + w).
+  float cloud[4]{};
 };
-static_assert(sizeof(HdActorLightConstants) == 10 * 16);
+static_assert(sizeof(HdActorLightConstants) == 11 * 16);
 
 // HD's light for one pixel, the formula the WGSL implements (for tests and
 // reference): s the lit channel (the ramp's u), sh the shadow (1 lit), fade
 // the shadow's strength, ramp(u) supplied by the caller, n_up the world
 // normal's y, n_dot_e = dot(N_view, normalize(P_view)), l_dot_e = dot(the
 // direction to the light, normalize(P_view)); albedo_gamma the albedo texel
-// (0..1, the GX texture's own gamma). Returns the gamma-space colour, clipped
-// before the gamma as HD's UNORM target clips.
+// (0..1, the GX texture's own gamma); cloud HD's cloud term (clamp(texel +
+// floor, 0, 1); 1 clear), which multiplies the ramp's value. Returns the
+// gamma-space colour, clipped before the gamma as HD's UNORM target clips.
 struct HdActorLightPixel {
   float out[3]{};
   float ramp = 0.f;
@@ -694,7 +702,8 @@ struct HdActorLightPixel {
   float rim = 0.f;
 };
 HdActorLightPixel hd_actor_light_reference(const HdActorLightConstants& c, float s, float sh, float (*ramp)(float u),
-                                           float n_up, float n_dot_e, float l_dot_e, const float albedo_gamma[3]);
+                                           float n_up, float n_dot_e, float l_dot_e, const float albedo_gamma[3],
+                                           float cloud = 1.f);
 
 // The ubershader (gxcore_uber.cpp): one module for any key, which it reads
 // from the pixel uniform (UberPixelConstants), for a draw whose own pipeline

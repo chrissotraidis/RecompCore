@@ -145,7 +145,8 @@ DrawData* last_recorded_draw() noexcept;
 // v14: softTarget, a soft effect's pipeline for the reduced-size buffer.
 // v15: Wind Waker HD's character light (ShaderKey::hd_actor_light: a longer key, and a flagged key's WGSL and group
 // 0 layout).
-constexpr uint32_t GXCorePipelineConfigVersion = 15;
+// v16: its cloud term (HD's cloud shadow texture and sampler at group 0 bindings 5 and 6, a longer uniform).
+constexpr uint32_t GXCorePipelineConfigVersion = 16;
 
 struct PipelineConfig {
   uint32_t version = GXCorePipelineConfigVersion;

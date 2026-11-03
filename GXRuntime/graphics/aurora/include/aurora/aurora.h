@@ -223,6 +223,13 @@ void aurora_set_actor_light_hd(int on, const float c0[3], const float shadow[3],
    HD holds it), `night` says which, and `fade` (0 to 1) is HD's day/night switch fade, which takes the lit side
    down to the shade before the light changes sides. `on` 0 goes back to BlueWake's own rule. */
 void aurora_set_sun_hd_light(int on, int night, float fade);
+/* Wind Waker HD's cloud shadow floor (cCloudShadowPower, cloud = clamp(texel + floor)) from the game's clock, as HD
+   works it out in setSunpos: 1 - max(0.25, -0.9 cos(time - 15 degrees)), 0.364 at 10:00, 0.131 at noon, 0.75 from
+   a low sun through the night. Used by the cloud shadows on HD's rule, on the scenery and the characters. A negative
+   value, the default, goes back to the renderer's own (from the shadow light's height), which is HD's only for a
+   true sun: with HD's light rule the light is held at 40,000 high at dawn and dusk. DOL_AURORA_CLOUD_SHADOWS_HD_POWER
+   still overrides both. Takes effect at the next frame. */
+void aurora_set_cloud_hd_floor(float floor);
 /* Wind Waker HD's own normals for the stage in play (the HD pack's optional/hd-normals/<stage>.bin, made by the
    importer from the player's HD dump), for the sun shadows' facing term; NULL or a missing file: none, and
    the facing term makes its own. Loaded at once; call it as the stage changes. */
