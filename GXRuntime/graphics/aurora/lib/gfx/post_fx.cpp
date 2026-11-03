@@ -2222,6 +2222,17 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
             }
         }
     }
+    // Wind Waker HD's lava glow (gxcore_draw.cpp hd_lava_draw()): HD adds it outside the shade, so its share of the
+    // scenery's lit light, 1 - the normals' alpha over 0.49 where the sea mask's pass put it there, is left unshaded.
+    if (view.facing.z > 0.5 && view.facing.y > 0.5 && water < 0.5) {
+        let gsize = vec2<f32>(textureDimensions(normals));
+        let gp = clamp(vec2<i32>(in.uv * gsize), vec2<i32>(0), vec2<i32>(gsize) - vec2<i32>(1));
+        let ga = textureLoad(normals, gp, 0).a;
+        if (ga > 0.5 && ga < 0.995) {
+            let glow = clamp((1.0 - ga) / 0.49, 0.0, 1.0);
+            shade = pow(mix(pow(shade, vec3(2.2)), vec3(1.0), glow), vec3(1.0 / 2.2));
+        }
+    }
     // The sea's shadow at sea_shadow of its strength (HD's cPrimShadowIntensity, 0.5 in its pass), where the sea mask
     // has the sea.
     if (sea_shadow < 0.999 && view.facing.x > 0.5) {
@@ -4561,6 +4572,20 @@ void set_cloud_hd_floor(float floor) noexcept {
   g_cloudHdFloor.store(floor >= 0.f ? std::min(floor, 1.f) : -1.f, std::memory_order_relaxed);
 }
 
+namespace {
+std::atomic<bool> g_sunCasterCull{false};
+} // namespace
+
+void set_sun_caster_cull(bool on) noexcept { g_sunCasterCull.store(on, std::memory_order_relaxed); }
+
+bool sun_caster_cull() noexcept {
+  static const int forced = [] {
+    const char* value = std::getenv("DOL_AURORA_SUN_SHADOW_CASTER_CULL");
+    return value == nullptr || value[0] == '\0' ? -1 : value[0] == '1' ? 1 : 0;
+  }();
+  return forced >= 0 ? forced == 1 : g_sunCasterCull.load(std::memory_order_relaxed);
+}
+
 void set_far_blur_level(float level) noexcept {
   g_farLevel.store(std::clamp(level, 0.f, 4.f), std::memory_order_relaxed);
 }
@@ -5383,6 +5408,7 @@ void aurora_set_sun_hd_light(int on, int night, float fade) {
 }
 
 void aurora_set_cloud_hd_floor(float floor) { aurora::gfx::post_fx::set_cloud_hd_floor(floor); }
+void aurora_set_sun_caster_cull(int on) { aurora::gfx::post_fx::set_sun_caster_cull(on != 0); }
 
 void aurora_set_edge_light(bool enabled) { aurora::gfx::post_fx::set_edge_light(enabled); }
 

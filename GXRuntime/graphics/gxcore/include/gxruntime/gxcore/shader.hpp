@@ -275,7 +275,8 @@ struct ShaderKey {
   // group 0, which a flagged key takes as the characters' do). 2: the
   // vertices' normal slot holds smooth normals made on the CPU for a draw that
   // has none of its own (the sun shadows' scenery), turned by the position
-  // matrix. Two pad bytes keep the scalar block a multiple of 4.
+  // matrix. Bit 4 (with 2): Wind Waker HD's lava glow, the vertices' colour 1 x the last stage's texel added after
+  // it (gxcore_shader.cpp hd_scenery_lava()). Two pad bytes keep the scalar block a multiple of 4.
   std::uint8_t hd_point_light = 0;
   std::uint8_t pad_hd[2]{};
   LightChanKey litchan[4]{}; // color0, color1, alpha0, alpha1

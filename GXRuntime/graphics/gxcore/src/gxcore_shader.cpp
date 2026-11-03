@@ -445,7 +445,17 @@ bool hd_scenery_light(const ShaderKey& key, const ToonLightMatch& hd) {
 // Its normal: the smooth one made for the sun shadows in the normal slot (hd_point_light 2), else the draw's own
 // where its vertex shader works one out (a lit channel and a vertex normal), else the triangle's, from the
 // position's screen derivatives.
-bool hd_scenery_smooth_normal(const ShaderKey& key) { return key.hd_point_light == 2u && key.raw_tex_hi_in_nbt == 0u; }
+bool hd_scenery_smooth_normal(const ShaderKey& key) {
+  return (key.hd_point_light & 3u) == 2u && key.raw_tex_hi_in_nbt == 0u;
+}
+
+// Wind Waker HD's lava glow on the lit scenery (hd_point_light 4, with the smooth normal): the vertices' colour 1
+// holds the glow's light, linear (alpha below -0.5 where it does), which goes on after the last stage times its
+// texel, the albedo, as HD adds albedo x lava K x 4 x red^2 to its lit colour (the host's lava rooms, gxcore_draw.cpp
+// hd_lava_draw()).
+bool hd_scenery_lava(const ShaderKey& key, const ToonLightMatch& hd) {
+  return (key.hd_point_light & 4u) != 0u && hd_scenery_light(key, hd);
+}
 
 bool hd_scenery_vertex_normal(const ShaderKey& key) {
   return hd_scenery_smooth_normal(key) ||
@@ -775,6 +785,14 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key, const ToonLightMa
     emitf(out, "    prev = vec4i(%s.rgb, prev.a);\n", kTevOutput[last.cc_dest]);
   if (last.ac_dest != 0)
     emitf(out, "    prev = vec4i(prev.rgb, %s.a);\n", kTevOutput[last.ac_dest]);
+  if (hd_scenery_lava(key, hd))
+    emit(out, "    if (in.hd_em.a < -0.5) {\n"
+              "        let hd_alb = pow(vec3f(textemp.rgb & vec3i(255, 255, 255)) / 255.0, vec3f(2.2));\n"
+              "        let hd_glow = pow(clamp(vec3f(prev.rgb) / 255.0, vec3f(0.0), vec3f(1.0)), vec3f(2.2)) + "
+              "hd_alb * in.hd_em.rgb;\n"
+              "        prev = vec4i(vec3i(round(pow(clamp(hd_glow, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)) * "
+              "255.0)), prev.a);\n"
+              "    }\n");
 
   if (hd.matched && !hd_after_albedo(hd))
     emit_hd_actor_light(out, key, hd);
@@ -1341,6 +1359,8 @@ std::string generate_wgsl(const ShaderKey& key) {
     emitf(out, "    @location(%u) hd_pv: vec3f,\n", uv_loc_base + key.num_tex_gens);
     if (hd_scenery_vertex_normal(key))
       emitf(out, "    @location(%u) hd_nv: vec3f,\n", uv_loc_base + key.num_tex_gens + 1u);
+    if (hd_scenery_lava(key, hd))
+      emitf(out, "    @location(%u) hd_em: vec4f,\n", uv_loc_base + key.num_tex_gens + 2u);
   }
   emit(out, "};\n\n");
 
@@ -1438,6 +1458,8 @@ std::string generate_wgsl(const ShaderKey& key) {
       emit(out, "    o.hd_nv = vec3f(dot(p0.xyz, in.rawnormal), dot(p1.xyz, in.rawnormal), dot(p2.xyz, in.rawnormal));\n");
     else if (hd_scenery_vertex_normal(key))
       emit(out, "    o.hd_nv = _normal;\n");
+    if (hd_scenery_lava(key, hd))
+      emit(out, "    o.hd_em = in.rawcolor1;\n");
   }
 
   for (std::uint32_t i = 0; i < key.num_tex_gens; ++i) {

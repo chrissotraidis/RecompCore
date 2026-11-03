@@ -74,6 +74,8 @@ struct DrawData {
   // per-vertex matrices (a skinned model) or the current one.
   bool sunCaster = false;
   bool posMtxIdx = false;
+  // The draw's own cull mode (gxc::CullMode), for the map's casters while post_fx::sun_caster_cull() is on.
+  uint8_t sunCasterCull = 0;
   // Alpha-tested solid scenery (a roof, an awning, leaves, a fence): drawn
   // into the map with its texture's cutout (sun_caster_alpha()).
   bool sunCasterAlpha = false;

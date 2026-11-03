@@ -1460,6 +1460,23 @@ void test_point_light_scenery() {
   CHECK(ws.find("o.hd_nv = vec3f(dot(p0.xyz, in.rawnormal), dot(p1.xyz, in.rawnormal), dot(p2.xyz, in.rawnormal));") !=
         std::string::npos);
   CHECK(ws.find("let hd_sn = normalize(in.hd_nv);") != std::string::npos);
+  CHECK(ws.find("hd_em") == std::string::npos);
+  // Wind Waker HD's lava glow (4, with the smooth normals): colour 1 passed on after the normal, and its light times
+  // the last stage's texel added after the stages, in linear, where its alpha marks it.
+  auto lava = smooth;
+  lava.hd_point_light = 6;
+  const std::string wv = gxc::generate_wgsl(lava);
+  if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
+    std::printf("%s\n", wv.c_str());
+  CHECK(wv.find("@location(5) hd_em: vec4f,") != std::string::npos);
+  CHECK(wv.find("o.hd_em = in.rawcolor1;") != std::string::npos);
+  CHECK(wv.find("o.hd_nv = vec3f(dot(p0.xyz, in.rawnormal)") != std::string::npos);
+  const auto glow_at = wv.find("hd_alb * in.hd_em.rgb");
+  const auto last_at = wv.find("// TEV stage 1");
+  const auto alpha_at = wv.find("discard");
+  CHECK(glow_at != std::string::npos && last_at != std::string::npos && alpha_at != std::string::npos);
+  CHECK(last_at < glow_at && glow_at < alpha_at);
+  CHECK(wv.find("if (in.hd_em.a < -0.5) {") != std::string::npos);
 }
 
 // Dolphin VertexShaderGen SourceRow::Normal: use the raw normal only when the
