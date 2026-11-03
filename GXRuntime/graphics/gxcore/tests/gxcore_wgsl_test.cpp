@@ -778,17 +778,303 @@ void test_toon_light_classifier() {
   CHECK(rejects([](gxc::ShaderKey& k) { k.litchan[0].enablelighting = 0; }));
   CHECK(rejects([](gxc::ShaderKey& k) { k.lit_valid = 0; }));
   CHECK(rejects([](gxc::ShaderKey& k) { k.num_tev_stages = 1; }));
-  CHECK(rejects([](gxc::ShaderKey& k) { k.num_tev_stages = 4; }));
   CHECK(rejects([](gxc::ShaderKey& k) { k.num_ind_stages = 1; }));
+  // The main pattern's stages then more (G): matched, the light after the albedo stage, the rest run on it.
+  const auto later = [](void (*change)(gxc::ShaderKey&)) {
+    auto key = toon_key(false);
+    change(key);
+    return gxc::toon_light_stage(key);
+  };
+  {
+    const auto m = later([](gxc::ShaderKey& k) {
+      k.num_tev_stages = 3; // a third stage that isn't the highlight
+      k.tev_stages[2] = k.tev_stages[1];
+    });
+    CHECK(m.matched && m.after_albedo && m.highlight_stage == 0xFF && m.effect_stages == 0u);
+    CHECK(m.rim && !m.albedo_c1);
+  }
+  {
+    const auto m = later([](gxc::ShaderKey& k) {
+      k.num_tev_stages = 3; // K x a texel added (not the ramp: not the effect light, kept)
+      k.tev_stages[2] = k.tev_stages[0];
+      k.tev_stages[2].cc_a = 15; k.tev_stages[2].cc_d = 0; k.tev_stages[2].tevorders_texcoord = 1;
+    });
+    CHECK(m.matched && m.after_albedo && m.effect_stages == 0u);
+  }
+  // A later stage must write PREV and read it, or the light wouldn't reach the output.
   CHECK(rejects([](gxc::ShaderKey& k) {
-    k.num_tev_stages = 3; // a third stage that isn't the highlight
+    k.num_tev_stages = 3;
     k.tev_stages[2] = k.tev_stages[1];
+    k.tev_stages[2].cc_c = 2; // ZERO, TEXC, C0, ZERO: no PREV
   }));
   CHECK(rejects([](gxc::ShaderKey& k) {
-    k.num_tev_stages = 3; // the highlight's lookup not through the ramp
-    k.tev_stages[2] = k.tev_stages[0];
-    k.tev_stages[2].cc_a = 15; k.tev_stages[2].cc_d = 0; k.tev_stages[2].tevorders_texcoord = 1;
+    k.num_tev_stages = 3;
+    k.tev_stages[2] = k.tev_stages[1];
+    k.tev_stages[2].cc_dest = 2; // into C1
   }));
+  CHECK(rejects([](gxc::ShaderKey& k) {
+    k.num_tev_stages = 4; // the fourth into C2
+    k.tev_stages[2] = k.tev_stages[1];
+    k.tev_stages[3] = k.tev_stages[1];
+    k.tev_stages[3].cc_dest = 3;
+  }));
+  // Stage 1's d: a register (F) but not another input.
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_d = 8; }));  // + TEXC
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_d = 10; })); // + RASC
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_d = 2; }));  // + C0
+  // The colour-register albedo is C1 only.
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_b = 6; }));  // C2
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_b = 2; }));  // C0
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_b = 4; k.tev_stages[1].cc_d = 4; })); // C1 + C1
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_b = 4; k.tev_stages[1].cc_scale = 1; }));
+  // F with the albedo read through the ramp, or a scale: no.
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_d = 4; k.tev_stages[1].tevorders_texcoord = 0; }));
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_d = 4; k.tev_stages[1].cc_scale = 3; }));
+}
+
+// The ramp's value for the reference: fixed per pixel, the value traced (LINK-LIGHT.md section 3).
+float g_traced_ramp = 0.f;
+float traced_ramp(float) { return g_traced_ramp; }
+
+// The patterns past the main one, as the GameCube's materials have them (CLASSIFIER-EXT.md).
+// E, the Mirror Shield's SHMSBMAT (and the Master Sword's grip, ice arrows, ice): RAMP(C0,K,TEXC,ZERO) |
+// tex(ZERO,C1,PREV,ZERO), an environment map through a normal texgen read for its alpha | -(ZERO,K,APREV,PREV) K3.r:
+// PREV + K x APREV, the glint (the '-' is "no texture", not a subtraction).
+gxc::ShaderKey mirror_shield_key() {
+  auto key = toon_key(false);
+  key.num_tex_gens = 3;
+  key.num_tev_stages = 3;
+  key.tex_gens[2].enabled = 1;
+  key.tex_gens[2].texgentype = static_cast<std::uint8_t>(gxc::TexGenType::Regular);
+  key.tex_gens[2].sourcerow = static_cast<std::uint8_t>(gxc::TexSourceRow::Normal);
+  auto& s1 = key.tev_stages[1];
+  s1.cc_a = 15; s1.cc_b = 4; s1.cc_c = 0; s1.cc_d = 15;
+  s1.ac_a = 7; s1.ac_b = 7; s1.ac_c = 7; s1.ac_d = 4; // alpha = the environment texel's
+  s1.tevorders_texcoord = 2;
+  auto& s2 = key.tev_stages[2];
+  s2 = key.tev_stages[0];
+  s2.cc_a = 15; s2.cc_b = 14; s2.cc_c = 1; s2.cc_d = 0; // PREV + K x APREV
+  s2.ac_a = 7; s2.ac_b = 7; s2.ac_c = 7; s2.ac_d = 0;
+  s2.ksel_kc = 19;
+  s2.tevorders_enable = 0;
+  s2.tevorders_texcoord = 0; s2.tevorders_texmap = 0;
+  return key;
+}
+// E, Chus (vchul/SC_VchuL): -(ZERO,C1,PREV,ZERO), no texture | tex(ZERO,K,TEXC,PREV) a sheen texel.
+gxc::ShaderKey chu_key() {
+  auto key = mirror_shield_key();
+  auto& s1 = key.tev_stages[1];
+  s1.tevorders_enable = 0;
+  auto& s2 = key.tev_stages[2];
+  s2.cc_a = 15; s2.cc_b = 14; s2.cc_c = 8; s2.cc_d = 0;
+  s2.tevorders_enable = 1; s2.tevorders_texcoord = 2; s2.tevorders_texmap = 2;
+  return key;
+}
+// F, the bomb (Link/bomb/Bom1): tex(ZERO,TEXC,PREV,C1), C1 the flash before it goes off | the effect light.
+gxc::ShaderKey bomb_key() {
+  auto key = toon_key(true);
+  key.tev_stages[1].cc_d = 4;
+  return key;
+}
+// G, the treasure chests (Dalways/boxa/BoxA1): the main two | tex(PREV,TEXC,A1,ZERO), a decal mixed by A1.
+gxc::ShaderKey chest_key() {
+  auto key = toon_key(false);
+  key.num_tev_stages = 3;
+  auto& s2 = key.tev_stages[2];
+  s2 = key.tev_stages[1];
+  s2.cc_a = 0; s2.cc_b = 8; s2.cc_c = 5; s2.cc_d = 15;
+  s2.tevorders_texmap = 2;
+  return key;
+}
+
+void test_toon_light_extended() {
+  {
+    const auto m = gxc::toon_light_stage(mirror_shield_key());
+    CHECK(m.matched && m.after_albedo && m.albedo_c1 && !m.rim);
+    CHECK(m.albedo_stage == 1 && m.ramp_stage == 0 && m.effect_stages == 0u && m.highlight_stage == 0xFF);
+    CHECK(m.sheen_stage == 2); // the glint, added in linear in HD's block
+  }
+  {
+    // The glint only for E: the main pattern's later K x APREV (G) stays a GX stage.
+    auto key = toon_key(false);
+    key.num_tev_stages = 3;
+    key.tev_stages[2] = mirror_shield_key().tev_stages[2];
+    const auto g = gxc::toon_light_stage(key);
+    CHECK(g.matched && g.after_albedo && !g.albedo_c1 && g.sheen_stage == 0xFF);
+    // K x APREV with a scale, or into the sum's other side: not the glint.
+    auto scaled = mirror_shield_key();
+    scaled.tev_stages[2].cc_scale = 1;
+    CHECK(gxc::toon_light_stage(scaled).sheen_stage == 0xFF);
+    auto other = mirror_shield_key();
+    other.tev_stages[2].cc_c = 8; // K x TEXC: the Chus' texel sheen
+    CHECK(gxc::toon_light_stage(other).sheen_stage == 0xFF);
+  }
+  {
+    auto key = mirror_shield_key(); // the same with no texture on stage 1 (Stalfos' body_lambert3) and the effect light
+    key.tev_stages[1].tevorders_enable = 0;
+    key.tev_stages[2] = toon_key(true).tev_stages[2];
+    const auto m = gxc::toon_light_stage(key);
+    CHECK(m.matched && m.albedo_c1 && m.effect_stages == (1u << 2));
+  }
+  {
+    const auto m = gxc::toon_light_stage(chu_key());
+    CHECK(m.matched && m.albedo_c1 && !m.rim && m.effect_stages == 0u && m.sheen_stage == 0xFF);
+  }
+  {
+    const auto m = gxc::toon_light_stage(bomb_key());
+    CHECK(m.matched && m.after_albedo && !m.albedo_c1 && !m.rim && m.effect_stages == (1u << 2));
+    CHECK(m.highlight_stage == 0xFF);
+    // F with C2 or K added: no rim either; the main pattern and G keep theirs.
+    for (const std::uint8_t d : {std::uint8_t{6}, std::uint8_t{14}}) {
+      auto key = bomb_key();
+      key.tev_stages[1].cc_d = d;
+      const auto f = gxc::toon_light_stage(key);
+      CHECK(f.matched && f.after_albedo && !f.rim);
+    }
+    CHECK(gxc::toon_light_stage(toon_key(true)).rim);
+  }
+  {
+    const auto m = gxc::toon_light_stage(chest_key());
+    CHECK(m.matched && m.after_albedo && m.rim && m.effect_stages == 0u);
+  }
+  {
+    auto key = toon_key(false); // Link in the tree (T_Tree/cl): the main two then two stages passing PREV on
+    key.num_tev_stages = 4;
+    for (int n = 2; n < 4; ++n) {
+      key.tev_stages[n] = key.tev_stages[1];
+      key.tev_stages[n].cc_a = 15; key.tev_stages[n].cc_b = 15; key.tev_stages[n].cc_c = 15; key.tev_stages[n].cc_d = 0;
+    }
+    const auto m = gxc::toon_light_stage(key);
+    CHECK(m.matched && m.after_albedo);
+  }
+  {
+    auto key = toon_key(false); // Ganondorf's gnd_ken_tx: + K0 x the ramp's alpha (kept), + K1 x the ramp (dropped)
+    key.num_tev_stages = 4;
+    key.tev_stages[2] = toon_key(true).tev_stages[2];
+    key.tev_stages[2].cc_c = 9; key.tev_stages[2].ksel_kc = 12;
+    key.tev_stages[3] = toon_key(true).tev_stages[2];
+    const auto m = gxc::toon_light_stage(key);
+    CHECK(m.matched && m.after_albedo && m.effect_stages == (1u << 3));
+  }
+
+  // The WGSL. E: the albedo is C1, the light right after stage 1, no rim, the sheen stage on HD's colour.
+  {
+    auto key = mirror_shield_key();
+    const std::string before = gxc::generate_wgsl(key);
+    key.hd_actor_light = 1;
+    const std::string w = gxc::generate_wgsl(key);
+    if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
+      std::printf("%s\n", w.c_str());
+    CHECK(w != before);
+    CHECK(w.find("let hd_albedo = c1.rgb & vec3i(255, 255, 255);") != std::string::npos);
+    CHECK(w.find("textemp.rgb & vec3i(255, 255, 255)") == std::string::npos);
+    // The glint: K3.r linearised times stage 1's alpha, added to HD's light before the clip.
+    CHECK(w.find("let hd_sheen = pow(vec3f(psc.kcolors[3].rrr) / 255.0, vec3f(2.2)) * "
+                 "clamp(f32(prev.a) / 255.0, 0.0, 1.0);") != std::string::npos);
+    CHECK(w.find("var hd_out = pow(clamp(hd_l * hd_alb + hd_sheen, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));") !=
+          std::string::npos);
+    CHECK(w.find("hdl.rim.x * hd_rim") == std::string::npos);
+    const auto st1 = w.find("    // TEV stage 1\n");
+    const auto hd_at = w.find("if (hdl.params.x > 0.5) {");
+    const auto st2 = w.find("    // TEV stage 2\n");
+    CHECK(st1 != std::string::npos && st1 < hd_at && hd_at < st2);
+    CHECK(w.find("if (hdl.params.x > 0.5) {\n", hd_at + 1) == std::string::npos); // once
+    CHECK(w.find("prev = vec4i(vec3i(round(clamp(hd_out, vec3f(0.0), vec3f(1.0)) * 255.0)), prev.a);") > hd_at);
+    // Stage 2 (GX's PREV + K x APREV, in gamma) runs, then HD's colour comes back: the glint isn't added twice.
+    const auto keep = w.find("let hd_sheen_keep2 = prev.rgb;");
+    const auto back = w.find("if (hdl.params.x > 0.5) { prev = vec4i(hd_sheen_keep2, prev.a); }");
+    CHECK(st2 < keep && keep < back && back < w.find("if (!("));
+    CHECK(w.find("hd_keep2") == std::string::npos); // not the effect light's switch
+    // The ramp still in tex0, its coordinate uv0; no added register.
+    CHECK(w.find("hd_ramp_sample(tex0, ") != std::string::npos);
+    CHECK(w.find("tevin_d.rgb, vec3<i32>") == std::string::npos);
+    // The cloud's derivatives still before any branch.
+    CHECK(w.find("let hd_cloud_lod") < w.find("    // TEV stage 0\n"));
+    // Unflagged: the GX module.
+    CHECK(before.find("hd_") == std::string::npos);
+  }
+  // E without the glint (the Chus' K x texel sheen): no linear add, its stage runs on HD's colour as before.
+  {
+    auto key = chu_key();
+    key.hd_actor_light = 1;
+    const std::string w = gxc::generate_wgsl(key);
+    CHECK(w.find("hd_sheen") == std::string::npos);
+    CHECK(w.find("var hd_out = pow(clamp(hd_l * hd_alb, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));") !=
+          std::string::npos);
+  }
+  // F: stage 1's register added after the light, clamped as the stage clamps; the effect light skipped.
+  {
+    auto key = bomb_key();
+    key.hd_actor_light = 1;
+    const std::string w = gxc::generate_wgsl(key);
+    CHECK(w.find("let hd_albedo = textemp.rgb & vec3i(255, 255, 255);") != std::string::npos);
+    CHECK(w.find("prev = vec4i(clamp(vec3i(round(clamp(hd_out, vec3f(0.0), vec3f(1.0)) * 255.0)) + tevin_d.rgb, "
+                 "vec3<i32>(0), vec3<i32>(255)), prev.a);") != std::string::npos);
+    CHECK(w.find("hdl.rim.x * hd_rim") == std::string::npos); // rim-only in HD: no rim
+    CHECK(w.find("var hd_out = pow(clamp(hd_l * hd_alb, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));") !=
+          std::string::npos);
+    const auto keep = w.find("let hd_keep2 = prev.rgb;");
+    const auto st2 = w.find("    // TEV stage 2\n");
+    const auto back = w.find("if (hdl.params.x > 0.5 && hdl.screen.z < 0.5) { prev = vec4i(hd_keep2, prev.a); }");
+    CHECK(st2 < keep && keep < back && back < w.find("if (!("));
+    // Unclamped stage: the TEV's 10-bit range.
+    key.tev_stages[1].cc_clamp = 0;
+    CHECK(gxc::generate_wgsl(key).find("tevin_d.rgb, vec3<i32>(-1024), vec3<i32>(1023)), prev.a);") !=
+          std::string::npos);
+  }
+  // G: the chest's decal stage after the light, nothing skipped.
+  {
+    auto key = chest_key();
+    key.hd_actor_light = 1;
+    const std::string w = gxc::generate_wgsl(key);
+    const auto hd_at = w.find("if (hdl.params.x > 0.5) {");
+    CHECK(hd_at != std::string::npos && hd_at < w.find("    // TEV stage 2\n"));
+    CHECK(w.find("hd_keep") == std::string::npos);
+    CHECK(w.find("tevin_d.rgb, vec3<i32>") == std::string::npos);
+  }
+  // The main pattern with the effect light: the block after the albedo stage, the effect light's stage (there only
+  // while an effect light reaches the model) run on HD's colour, or left out with hdl.screen.z 0.
+  {
+    auto key = toon_key(true);
+    key.hd_actor_light = 1;
+    const std::string w = gxc::generate_wgsl(key);
+    const auto hd_at = w.find("if (hdl.params.x > 0.5) {");
+    const auto st2 = w.find("    // TEV stage 2\n");
+    CHECK(w.find("    // TEV stage 1\n") < hd_at && hd_at < st2);
+    CHECK(w.find("if (hdl.params.x > 0.5) {", hd_at + 1) == std::string::npos); // once
+    const auto keep = w.find("let hd_keep2 = prev.rgb;");
+    const auto back = w.find("if (hdl.params.x > 0.5 && hdl.screen.z < 0.5) { prev = vec4i(hd_keep2, prev.a); }");
+    CHECK(st2 < keep && keep < back && back < w.find("if (!("));
+    // Stage 1 adds nothing (d ZERO): HD's colour as it was, then the stage.
+    CHECK(w.find("tevin_d.rgb, vec3<i32>") == std::string::npos);
+  }
+  // Without the effect light the main pattern keeps its block after the last stage.
+  {
+    auto key = toon_key(false);
+    key.hd_actor_light = 1;
+    const std::string w = gxc::generate_wgsl(key);
+    CHECK(w.find("if (hdl.params.x > 0.5) {") > w.find("    // TEV stage 1\n"));
+    CHECK(w.find("hd_keep") == std::string::npos);
+  }
+
+  // The reference without the rim: K x albedo where lit, whatever the rim.
+  {
+    gxc::HdActorLightConstants c{};
+    for (int i = 0; i < 3; ++i) {
+      c.c0[i] = 0.494f; c.shadow[i] = 0.106f; c.k[i] = 0.9f;
+    }
+    c.params[0] = 1.f; c.params[3] = 1.f;
+    c.rim[0] = 2.f; c.rim[1] = 5.f; c.rim[2] = 0.75f;
+    const float alb[3] = {0.5f, 0.6f, 0.7f};
+    g_traced_ramp = 1.f;
+    const auto with = gxc::hd_actor_light_reference(c, 0.9f, 1.f, traced_ramp, 0.f, -0.2f, 1.f, alb, 1.f, true);
+    const auto without = gxc::hd_actor_light_reference(c, 0.9f, 1.f, traced_ramp, 0.f, -0.2f, 1.f, alb, 1.f, false);
+    CHECK(with.rim > 0.f);
+    for (int i = 0; i < 3; ++i) {
+      CHECK(std::fabs(without.out[i] - std::pow(0.9f * std::pow(alb[i], 2.2f), 1.f / 2.2f)) < 1e-5f);
+      CHECK(with.out[i] > without.out[i]);
+    }
+  }
 }
 
 void test_toon_light_wgsl() {
@@ -871,9 +1157,6 @@ void test_toon_light_wgsl() {
   CHECK(wh.find("hd_ramp_sample(tex0, ") != std::string::npos);
 }
 
-// The ramp's value for the reference: fixed per pixel, the value traced (LINK-LIGHT.md section 3).
-float g_traced_ramp = 0.f;
-float traced_ramp(float) { return g_traced_ramp; }
 
 // HD's ramp (unit 5) as the capture's table, linear between its columns.
 float hd_ramp_table(float u) {
@@ -2546,6 +2829,7 @@ int main() {
   test_toon_light_classifier();
   test_toon_light_wgsl();
   test_toon_light_reference();
+  test_toon_light_extended();
   test_texgen_normal_source();
   test_five_texgens();
   test_eight_texgens_dungeon_map();

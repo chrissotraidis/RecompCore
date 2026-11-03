@@ -688,15 +688,44 @@ bool channel_lit_path(const ShaderKey& k, unsigned j);
 //            a texture (the albedo) read through a regular texgen;
 //   stage 2 (optional): a=ZERO b=KONST c=TEXC d=PREV, bias 0, add, scale 1,
 //            out PREV, read through a Color0/Color1 texgen.
+// Those two are the main pattern; three more take HD's light right after the
+// albedo stage (after_albedo) and run the stages after it, unchanged, on the
+// lit colour (drafts/hd-actor-light/CLASSIFIER-EXT.md):
+//   E  stage 1 a=ZERO b=C1 c=PREV d=ZERO, any or no texture: the albedo is the
+//      colour register C1 (the Mirror Shield, the Master Sword's grip, ice,
+//      Chus), its texture an environment map read for its alpha only; no rim
+//      (Wind Waker HD's "rim-only" materials: edge flag set, edge term absent);
+//      a later PREV + KONST x APREV (the glint) is added inside HD's block, in
+//      linear light as HD adds it (sheen_stage), not by its GX stage;
+//   F  stage 1 d = C1, C2 or KONST: that register is added after the light
+//      (the bomb's flash, set by code), clamped as the stage clamps; no rim
+//      (all 28 F materials on the disc are rim-only in HD's table: Bom1, the
+//      Tingle statues Vtil/Vtin, Os, Oq, VbakH, Ktaru, Rd, Pw);
+//   G  the main pattern's two stages then any others (a decal mixed by A1, a
+//      threshold compare, an environment sheen K x APREV or K x texel).
+// After stage 1 every stage must write PREV and read it, so the light reaches
+// the output. A later stage in the highlight's form (ZERO, KONST, the ramp,
+// PREV: the GameCube's effect light, there only while one reaches the model)
+// is marked (effect_stages, or the main pattern's highlight_stage): the
+// generator runs it on HD's colour, or leaves it out (hdl.screen.z 0).
 // Anything else (another stage order, C1 in place of C0, ONE/ONE, an eye or
-// emissive stage first) is no match, and keeps the GameCube shading.
+// emissive stage first, a later stage into another register) is no match, and
+// keeps the GameCube shading.
 struct ToonLightMatch {
   bool matched = false;
   std::uint8_t ramp_stage = 0;
   std::uint8_t albedo_stage = 0;
-  std::uint8_t highlight_stage = 0xFF; // 0xFF: none
+  std::uint8_t highlight_stage = 0xFF; // 0xFF: none (the main pattern's stage 2)
   std::uint8_t ramp_texcoord = 0;      // the ramp stage's texgen (Color0/Color1)
   std::uint8_t ramp_channel = 0;       // 0 color0, 1 color1: the lit channel it reads
+  bool after_albedo = false;           // E, F, G: the light after the albedo stage, the later stages on it
+  bool albedo_c1 = false;              // E: the albedo is C1, not the texel
+  bool rim = true;                     // E and F: false (no rim)
+  std::uint16_t effect_stages = 0;     // after_albedo: bit n, stage n is the effect light, left out
+  // E: a later PREV + KONST x APREV (the environment map's glint: the Mirror Shield, the Master Sword's grips, ice,
+  // bottles), added in linear light inside HD's block as Wind Waker HD adds it, its GX stage then taking it out
+  // again. 0xFF: none.
+  std::uint8_t sheen_stage = 0xFF;
 };
 ToonLightMatch toon_light_stage(const ShaderKey& key);
 
@@ -717,7 +746,9 @@ struct HdActorLightConstants {
   // HD's rim: intensity (2), exponent (5), back-light share (0.75); w: 1 when the
   // cloud term is on (HD's cloud shadow texture bound at binding 5), else cloud = 1.
   float rim[4]{};
-  float screen[4]{}; // 1 / the target's width and height: a fragment's uv in the shadow texture
+  // xy: 1 / the target's width and height: a fragment's uv in the shadow texture; z: 1 to add the GameCube's effect
+  // light stage (PREV + K1 x the ramp) to HD's colour, 0 to leave it out (DOL_AURORA_ACTOR_LIGHT_HD_EFFECT=0).
+  float screen[4]{};
   // HD's cloud shadow (ww_shadow_clouds seen from above), at world (X, Z):
   // uv = (-X, -Z) * cloud.z + cloud.xy. x u0 (drifting with the wind), y v0
   // (0.5), z 1 / the repeat (1 / 15000), w the floor: cloud = clamp(texel + w).
@@ -731,7 +762,8 @@ static_assert(sizeof(HdActorLightConstants) == 11 * 16);
 // normal's y, n_dot_e = dot(N_view, normalize(P_view)), l_dot_e = dot(the
 // direction to the light, normalize(P_view)); albedo_gamma the albedo texel
 // (0..1, the GX texture's own gamma); cloud HD's cloud term (clamp(texel +
-// floor, 0, 1); 1 clear), which multiplies the ramp's value. Returns the
+// floor, 0, 1); 1 clear), which multiplies the ramp's value; rim false leaves
+// the rim out (ToonLightMatch::rim, the colour-register albedo). Returns the
 // gamma-space colour, clipped before the gamma as HD's UNORM target clips.
 struct HdActorLightPixel {
   float out[3]{};
@@ -742,7 +774,7 @@ struct HdActorLightPixel {
 };
 HdActorLightPixel hd_actor_light_reference(const HdActorLightConstants& c, float s, float sh, float (*ramp)(float u),
                                            float n_up, float n_dot_e, float l_dot_e, const float albedo_gamma[3],
-                                           float cloud = 1.f);
+                                           float cloud = 1.f, bool rim = true);
 
 // The ubershader (gxcore_uber.cpp): one module for any key, which it reads
 // from the pixel uniform (UberPixelConstants), for a draw whose own pipeline
