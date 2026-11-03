@@ -82,6 +82,15 @@ constexpr wgpu::TextureFormat kSeaMaskFormat = wgpu::TextureFormat::R8Unorm;
 constexpr wgpu::TextureFormat kSeaMaskDepthFormat = wgpu::TextureFormat::Depth32Float;
 wgpu::TextureView sea_mask_target(const wgpu::Extent3D& sceneSize);
 wgpu::TextureView sea_mask_depth(const wgpu::Extent3D& sceneSize);
+// The effects' mask (common.cpp encode_effect_mask()): what the frame's effects
+// (gxcore_draw.hpp DrawData::effect) added to each pixel, drawn again with their
+// own pipelines over black, in the frame buffer's format, at the scene's size.
+// The sun shadows, the occlusion and the cloud shadows leave as much of a pixel
+// as it holds unshaded. Asking for it marks it drawn for the next encode().
+wgpu::TextureView effect_mask_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format);
+// How far back the effects are drawn into it, a share of their distance
+// (DOL_AURORA_EFFECT_MASK_PUSH, 0.05): what lies on a surface is left out.
+float effect_mask_push() noexcept;
 bool cloud_shadows_enabled() noexcept;
 void set_cloud_shadows(bool enabled) noexcept;
 void set_world_view(const float invView[12], float tanHalfFovy, float aspect, float nearPlane, float seaLevel,

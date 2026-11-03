@@ -84,6 +84,10 @@ struct DrawData {
   bool softEffect = false;
   bool softWritesAlpha = false;
   PipelineRef softPipeline = 0;
+  // An effect (effect_draw()): blended over the scene and writing no depth, so
+  // the HD look's shading from the depth buffer would take it for the scenery
+  // behind it; drawn again into the effects' mask (post_fx.hpp effect_mask_target()).
+  bool effect = false;
 };
 
 // Recording: the pass's last command, when it is a GXCore draw a following

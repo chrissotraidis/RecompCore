@@ -523,12 +523,11 @@ bool sea_texture(uint32_t address, uint32_t format, uint32_t width, uint32_t hei
   return it->second.sea;
 }
 
-// A sea draw for the sea mask (post_fx.hpp), while the scene is brightened:
-// one that samples the sea's textures, or the sea rooms' own sea, an
+// A sea draw: one that samples the sea's textures, or the sea rooms' own sea, an
 // untextured solid square of the environment's sea colour under d_a_sea's
 // grid (100,000 units across, at the sea's height), seen past the grid's edge.
-bool sea_mask_draw(const gxc::DrawPlan& plan) {
-  if (!post_fx::exposure_active() || plan.constants.projection[3][3] == 1.f)
+bool sea_draw(const gxc::DrawPlan& plan) {
+  if (plan.constants.projection[3][3] == 1.f)
     return false;
   bool sea = false;
   if (plan.texmap_mask > 1u && (plan.texmap_mask & (plan.texmap_mask - 1u)) != 0u) {
@@ -545,6 +544,40 @@ bool sea_mask_draw(const gxc::DrawPlan& plan) {
     sea = plan.pipeline.depth_update != 0u && plan.pipeline.blend_enable == 0u && sea_shape(plan);
   }
   return sea;
+}
+
+// A sea draw for the sea mask (post_fx.hpp), while the scene is brightened.
+bool sea_mask_draw(const gxc::DrawPlan& plan) {
+  return post_fx::exposure_active() && sea_draw(plan);
+}
+
+// An effect, which the HD look's sun shadows, occlusion and cloud shadows leave
+// as it is (post_fx.hpp effect_mask_target()): a draw blended over what is
+// behind it that writes no depth (the spin attack's rings, the Master Sword's
+// glow, sparks, smoke), so the depth buffer under it is the scenery's behind,
+// whose shade it is not in. Wind Waker HD draws these after its lighting.
+bool effect_draw(const gxc::DrawPlan& plan) {
+  const auto& key = plan.pipeline;
+  // Left out: the GameCube's own shadows (drawn through the frame buffer's
+  // alpha, the destination's alpha their blend factor), which darken the ground
+  // they are on; and what has no depth test (the sky's clouds), whose pixels
+  // are those the draws after it leave, which the mask, drawn against the
+  // finished depth, can't tell (the sky's clouds lit up shadows on the land
+  // drawn over them).
+  if (key.blend_enable == 0u || key.blend_subtract != 0u || key.depth_update != 0u || key.depth_test == 0u ||
+      key.color_update == 0u || key.src_factor == 6u || key.src_factor == 7u ||
+      plan.constants.projection[3][3] == 1.f)
+    return false;
+  // The sea's own blended draws (the surf and the ring of sea around an
+  // island) are the sea's surface, shaded as it is.
+  if (sea_draw(plan))
+    return false;
+  // A character's own decals (its eyes and mouth, blended over its face by its
+  // skinned model) are on the face and take its shade; what a skinned model
+  // adds as light (the Master Sword's glow) doesn't.
+  if (key.shader.has_pos_mtx_idx != 0u && key.dst_factor != 1u)
+    return false;
+  return true;
 }
 } // namespace
 
@@ -3003,6 +3036,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .softEffect = softEffect,
       .softWritesAlpha = plan.pipeline.alpha_update != 0,
       .softPipeline = softPipeline,
+      .effect = effect_draw(plan),
   });
   return true;
 }
