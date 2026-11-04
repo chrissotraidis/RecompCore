@@ -176,6 +176,11 @@ wgpu::TextureView effect_mask_target(const wgpu::Extent3D& sceneSize, wgpu::Text
 // How far back the effects are drawn into it, a share of their distance
 // (DOL_AURORA_EFFECT_MASK_PUSH, 0.05): what lies on a surface is left out.
 float effect_mask_push() noexcept;
+// The same effects drawn again over white (common.cpp encode_effect_mask()), for their opacity: what a dark effect
+// blended over the scene hides of it, which its colour over black doesn't tell (post_fx.cpp effect_cover_view()).
+// Off with DOL_AURORA_EFFECT_MASK_OPACITY=0. Asking for it marks it drawn for the next encode().
+bool effect_mask_opacity() noexcept;
+wgpu::TextureView effect_white_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format);
 // The effects' mask has an effect that writes depth this frame (common.cpp render_pass(), DrawData::effectDepth):
 // the occlusion, the sun shadows and the cloud shadows then shade from the scenery's depth under it, the sea mask's.
 void note_effect_depth() noexcept;

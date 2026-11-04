@@ -662,20 +662,26 @@ bool sea_mask_draw(const gxc::DrawPlan& plan) {
   return post_fx::sea_mask_wanted() && sea_draw(plan);
 }
 
-// A glow model (Dragon Roost Cavern's lava geysers): blended, and its colour from none of the stages' rasterized or
-// texture colours, only the registers and constants (its textures give the alpha alone): what the game lights or
-// paints, it isn't.
+// A glow model (Dragon Roost Cavern's lava geysers): blended, and its colour from none of the stages' texture
+// colours, only the registers and constants, or the rasterized colour where its textures cut its shape (their alpha
+// alone is used: a geyser's pale core, half the game's light added to its colour): what is painted, it
+// isn't. Untextured, a colour from the rasterized one is lit scenery's.
 static bool glow_model(const gxc::PipelineKey& key) {
   const auto& sh = key.shader;
   if (sh.tev_valid == 0u || sh.num_tev_stages == 0u)
     return false;
+  bool ras = false, cut = false;
   for (uint32_t i = 0; i < sh.num_tev_stages && i < gxc::kMaxTevStages; ++i) {
     const auto& t = sh.tev_stages[i];
-    for (const uint8_t arg : {t.cc_a, t.cc_b, t.cc_c, t.cc_d})
-      if (arg == 8u || arg == 10u || arg == 11u) // TEXC, RASC, RASA
+    for (const uint8_t arg : {t.cc_a, t.cc_b, t.cc_c, t.cc_d}) {
+      if (arg == 8u) // TEXC
         return false;
+      ras = ras || arg == 10u || arg == 11u; // RASC, RASA
+    }
+    for (const uint8_t arg : {t.ac_a, t.ac_b, t.ac_c, t.ac_d})
+      cut = cut || (arg == 4u && t.tevorders_enable != 0u); // TEXA
   }
-  return true;
+  return !ras || cut;
 }
 
 // An effect, which the HD look's sun shadows, occlusion and cloud shadows leave

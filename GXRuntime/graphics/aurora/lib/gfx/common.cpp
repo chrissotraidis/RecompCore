@@ -2430,6 +2430,42 @@ static void encode_effect_mask(const wgpu::CommandEncoder& cmd, FramePacket& fra
     render_pass(pass, frame, passInfo, 0, end, true);
   }
   pass.End();
+  // Again over white, for their opacity (post_fx.hpp effect_white_target()): a dark effect blended over the scene
+  // (the dust a shutting door raises) adds little over black but hides what is behind it. Against a fresh copy of
+  // the sea mask's depth when the effects drawn at their own depth wrote theirs into the first.
+  if (!post_fx::effect_mask_opacity())
+    return;
+  const wgpu::TextureView whiteDepthView =
+      own ? post_fx::effect_mask_depth(cmd, passInfo.targetSize) : wgpu::TextureView{};
+  const bool whiteOwn = own && static_cast<bool>(whiteDepthView);
+  const std::array whiteAttachments{wgpu::RenderPassColorAttachment{
+      .view = post_fx::effect_white_target(passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat()),
+      .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+      .storeOp = wgpu::StoreOp::Store,
+      .clearValue = {1.0, 1.0, 1.0, 1.0},
+  }};
+  const wgpu::RenderPassDepthStencilAttachment whiteDepth{
+      .view = whiteOwn ? whiteDepthView : passInfo.depthStencilView,
+      .depthLoadOp = wgpu::LoadOp::Load,
+      .depthStoreOp = wgpu::StoreOp::Store,
+      .stencilLoadOp = passInfo.hasStencil ? wgpu::LoadOp::Load : wgpu::LoadOp::Undefined,
+      .stencilStoreOp = passInfo.hasStencil ? wgpu::StoreOp::Store : wgpu::StoreOp::Undefined,
+  };
+  const wgpu::RenderPassDescriptor whiteDescriptor{
+      .label = "Effects mask (over white)",
+      .colorAttachmentCount = whiteAttachments.size(),
+      .colorAttachments = whiteAttachments.data(),
+      .depthStencilAttachment = &whiteDepth,
+      .timestampWrites = webgpu::gpu_prof::pass_writes("Effects mask (over white)"),
+  };
+  auto whitePass = cmd.BeginRenderPass(&whiteDescriptor);
+  if (whiteOwn) {
+    render_pass(whitePass, frame, passInfo, 0, end, true, 1);
+    render_pass(whitePass, frame, passInfo, 0, end, true, 2);
+  } else {
+    render_pass(whitePass, frame, passInfo, 0, end, true);
+  }
+  whitePass.End();
 }
 #endif
 
