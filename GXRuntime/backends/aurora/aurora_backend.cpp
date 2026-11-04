@@ -252,6 +252,9 @@ void install_platform_ops() {
     dol_platform_install(&ops);
 }
 
+// The texture pack's folder and the optional/ folders loaded over it (dol_aurora_set_texture_pack_optional).
+std::string g_texture_pack_root;
+std::vector<std::pair<std::string, aurora::texture::ReplacementGroup>> g_texture_pack_optional;
 } // namespace gx_aurora
 
 extern "C" {
@@ -393,26 +396,14 @@ bool dol_aurora_initialize(int argc, char** argv,
                      s_texture_pack.registrations.size());
         // DOL_AURORA_TEXTURE_PACK_OPTIONAL: comma-separated folders of the
         // pack's optional/ (which the pack itself leaves out), loaded over it.
-        static std::vector<aurora::texture::ReplacementGroup> s_optional;
+        gx_aurora::g_texture_pack_root = pack;
         if (const char* names = std::getenv("DOL_AURORA_TEXTURE_PACK_OPTIONAL"); names != nullptr) {
             std::string list = names;
             for (size_t start = 0; start <= list.size();) {
                 const size_t end = std::min(list.find(',', start), list.size());
                 const std::string name = list.substr(start, end - start);
                 start = end + 1;
-                if (name.empty() || name.find_first_of("/\\") != std::string::npos || name == "..")
-                    continue;
-                const std::filesystem::path folder = std::filesystem::path(pack) / "optional" / name;
-                std::error_code ec;
-                if (!std::filesystem::is_directory(folder, ec)) {
-                    // A pack imported before it had this folder (the loader
-                    // would make an empty one).
-                    std::fprintf(stderr, "[mods] texture-pack optional=%s missing\n", name.c_str());
-                    continue;
-                }
-                s_optional.push_back(aurora::texture::load_replacement_directory(folder, {.priority = 1}));
-                std::fprintf(stderr, "[mods] texture-pack optional=%s replacements=%zu\n", name.c_str(),
-                             s_optional.back().registrations.size());
+                dol_aurora_set_texture_pack_optional(name.c_str(), true);
             }
         }
     }
@@ -593,6 +584,37 @@ void dol_aurora_set_event_observer(DolAuroraEventObserverFn observe, void* user)
 void dol_aurora_set_fast_forward(bool on) {
     gx_aurora::g_audio_discard.store(on, std::memory_order_relaxed);
     aurora_set_present_suppressed(on);
+}
+
+void dol_aurora_set_texture_pack_optional(const char* name_c, bool on) {
+    using gx_aurora::g_texture_pack_optional;
+    const std::string name = name_c != nullptr ? name_c : "";
+    if (gx_aurora::g_texture_pack_root.empty() || name.empty() || name.find_first_of("/\\") != std::string::npos ||
+        name == "..")
+        return;
+    auto it = std::find_if(g_texture_pack_optional.begin(), g_texture_pack_optional.end(),
+                           [&](const auto& loaded) { return loaded.first == name; });
+    if (!on) {
+        if (it == g_texture_pack_optional.end())
+            return;
+        // Back to the pack's own textures (the cache of converted ones is cleared with them).
+        aurora::texture::unregister_replacements(it->second);
+        g_texture_pack_optional.erase(it);
+        std::fprintf(stderr, "[mods] texture-pack optional=%s dropped\n", name.c_str());
+        return;
+    }
+    if (it != g_texture_pack_optional.end())
+        return;
+    const std::filesystem::path folder = std::filesystem::path(gx_aurora::g_texture_pack_root) / "optional" / name;
+    std::error_code ec;
+    if (!std::filesystem::is_directory(folder, ec)) {
+        // A pack imported before it had this folder (the loader would make an empty one).
+        std::fprintf(stderr, "[mods] texture-pack optional=%s missing\n", name.c_str());
+        return;
+    }
+    g_texture_pack_optional.emplace_back(name, aurora::texture::load_replacement_directory(folder, {.priority = 1}));
+    std::fprintf(stderr, "[mods] texture-pack optional=%s replacements=%zu\n", name.c_str(),
+                 g_texture_pack_optional.back().second.registrations.size());
 }
 
 void dol_aurora_set_hold_redraw(bool redraw) { gx_aurora::g_hold_redraw = redraw; }
