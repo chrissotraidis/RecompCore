@@ -3248,11 +3248,14 @@ static bool hd_light_draw(const gxc::DrawPlan& plan) {
   return false;
 }
 
-// Such a draw's pixel constants: C0's colour black.
-static const gxc::PixelShaderConstants& hd_light_constants(const gxc::DrawPlan& plan) {
+// Such a draw's pixel constants: C0's colour black; C1's too for a lava draw with the GameCube's own glow
+// (hd_lava_gc_glow()), which HD's shaders for those materials haven't.
+static const gxc::PixelShaderConstants& hd_light_constants(const gxc::DrawPlan& plan, bool noGcGlow) {
   static thread_local gxc::PixelShaderConstants pc;
   pc = plan.pixel_constants;
   pc.colors[1][0] = pc.colors[1][1] = pc.colors[1][2] = 0;
+  if (noGcGlow)
+    pc.colors[2][0] = pc.colors[2][1] = pc.colors[2][2] = 0;
   return pc;
 }
 
@@ -3278,8 +3281,22 @@ static const gxc::PixelShaderConstants& hd_fog_constants(const gxc::PixelShaderC
 // form (the light, then x the texture: every such material's) with HD's light buffer on takes it: its vertices'
 // colour 1 (no stage reads it) carry the glow's light, linear, and in alpha -(1 + its share of the lit light), which
 // the sea mask's pass puts in the normals' alpha so the sun pass leaves that share unshaded.
+// Dragon Roost Cavern's (M_NewD2 rooms 2, 7, 8, 10-13, 15; the disc's model.sharcfb) add lava K x 4 x (1 - the
+// vertex alpha) squared, the importer's glow there, by the same rule. Its _v_x materials are three stages on the
+// GameCube, a third PREV + C1 x APREV (the GameCube's own glow, hd_lava_gc_glow()); HD's shaders for them are their
+// plain materials' (the same program, no such term), so the draw takes C1 black (hd_light_constants()) and the glow
+// goes on after the texture's stage (gxcore_shader.cpp emit_hd_lava()).
+static bool hd_lava_gc_glow(const gxc::ShaderKey& s) {
+  if (s.num_tev_stages != 3u)
+    return false;
+  const gxc::TevStageKey& t = s.tev_stages[2];
+  // a ZERO, b C1, c APREV, d CPREV; add, no bias or scale, into PREV
+  return t.cc_a == 15u && t.cc_b == 4u && t.cc_c == 1u && t.cc_d == 0u && t.cc_bias == 0u && t.cc_op == 0u &&
+         t.cc_scale == 0u && t.cc_dest == 0u;
+}
+
 static bool hd_lava_shape(const gxc::ShaderKey& s) {
-  if (s.num_tev_stages != 2u || s.num_color_chans > 1u)
+  if ((s.num_tev_stages != 2u && !hd_lava_gc_glow(s)) || s.num_color_chans > 1u)
     return false;
   const gxc::TevStageKey& t = s.tev_stages[1];
   return t.cc_a == 15u && t.cc_d == 15u && ((t.cc_b == 0u && t.cc_c == 8u) || (t.cc_b == 8u && t.cc_c == 0u)) &&
@@ -4099,9 +4116,14 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                              !character_draw(plan.pipeline) && !seaSurface && !positions_written(plan);
   const bool alphaCaster = cutoutBindGroup != 0 && (sun_caster_alpha(plan.pipeline) || blendedCutout);
   const bool smoothNormal = smooth_normal_draw(plan, seaSurface);
-  // A palm with Wind Waker HD's light (apply_hd_colours()): its shade colour black.
+  // A palm with Wind Waker HD's light (apply_hd_colours()): its shade colour black. A lava draw with the GameCube's
+  // own glow (hd_lava_gc_glow()) that takes HD's (t_hdLavaDraw below, the same tests): C1 black too.
+  const bool lightDraw = smoothNormal && hd_light_draw(plan);
+  const bool noGcGlow = lightDraw && tev && hd_lava_gc_glow(plan.pipeline.shader) &&
+                        post_fx::point_lights_hd_switch() && post_fx::actor_light_hd_switch() &&
+                        gxc::hd_point_light_stage(plan.pipeline.shader) && hd_lava_draw(plan);
   const gxc::PixelShaderConstants& lightConstants =
-      smoothNormal && hd_light_draw(plan) ? hd_light_constants(plan) : plan.pixel_constants;
+      lightDraw ? hd_light_constants(plan, noGcGlow) : plan.pixel_constants;
   // Wind Waker HD's fog start before the camera (aurora_set_fog_hd_starts) on every draw fogged from the game's
   // clamped start (C 0) to the same end: the characters, plants and objects as well as the lit scenery, all fogged
   // from that start in HD's shaders. The lit scenery's fog the sun pass takes (note_scene_fog()) is these constants.

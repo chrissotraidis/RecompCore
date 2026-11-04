@@ -1477,6 +1477,30 @@ void test_point_light_scenery() {
   CHECK(glow_at != std::string::npos && last_at != std::string::npos && alpha_at != std::string::npos);
   CHECK(last_at < glow_at && glow_at < alpha_at);
   CHECK(wv.find("if (in.hd_em.a < -0.5) {") != std::string::npos);
+  // Dragon Roost Cavern's three stages (a third PREV + C1 x APREV, the GameCube's own glow, untextured): the glow
+  // once, after stage 1, on its texel, before stage 2 (whose texel is white).
+  auto lava3 = lava;
+  lava3.num_tev_stages = 3;
+  auto& s2 = lava3.tev_stages[2];
+  s2 = lava3.tev_stages[1];
+  s2.cc_a = 15;
+  s2.cc_b = 4;
+  s2.cc_c = 1;
+  s2.cc_d = 0;
+  s2.tevorders_enable = 0;
+  CHECK(gxc::hd_point_light_stage(lava3));
+  const std::string w3 = gxc::generate_wgsl(lava3);
+  if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
+    std::printf("%s\n", w3.c_str());
+  const auto glow3_at = w3.find("hd_alb * in.hd_em.rgb");
+  const auto s1_at = w3.find("// TEV stage 1");
+  const auto s2_at = w3.find("// TEV stage 2");
+  CHECK(glow3_at != std::string::npos && s1_at != std::string::npos && s2_at != std::string::npos);
+  CHECK(s1_at < glow3_at && glow3_at < s2_at);
+  CHECK(w3.find("hd_alb * in.hd_em.rgb", glow3_at + 1) == std::string::npos);
+  CHECK(w3.find("textemp = vec4i(255,255,255,255);", s2_at) != std::string::npos);
+  // Two stages: still after the last.
+  CHECK(wv.find("hd_alb * in.hd_em.rgb", glow_at + 1) == std::string::npos);
 }
 
 // Dolphin VertexShaderGen SourceRow::Normal: use the raw normal only when the

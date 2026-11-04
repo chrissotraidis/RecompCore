@@ -461,6 +461,20 @@ bool hd_scenery_lava(const ShaderKey& key, const ToonLightMatch& hd) {
   return (key.hd_point_light & 4u) != 0u && hd_scenery_light(key, hd);
 }
 
+// The glow, in linear on the stage's result, its texel the albedo. Dragon Roost Cavern's lava materials have a third
+// stage, PREV + C1 x APREV (the GameCube's own glow, which HD's shaders for them haven't; the host gives such a draw C1
+// black, gxcore_draw.cpp hd_light_constants()): there the glow goes on after stage 1, the texture's, whose texel is
+// the albedo (stage 2 has none); with two stages, after the last.
+void emit_hd_lava(std::string& out) {
+  emit(out, "    if (in.hd_em.a < -0.5) {\n"
+            "        let hd_alb = pow(vec3f(textemp.rgb & vec3i(255, 255, 255)) / 255.0, vec3f(2.2));\n"
+            "        let hd_glow = pow(clamp(vec3f(prev.rgb) / 255.0, vec3f(0.0), vec3f(1.0)), vec3f(2.2)) + "
+            "hd_alb * in.hd_em.rgb;\n"
+            "        prev = vec4i(vec3i(round(pow(clamp(hd_glow, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)) * "
+            "255.0)), prev.a);\n"
+            "    }\n");
+}
+
 bool hd_scenery_vertex_normal(const ShaderKey& key) {
   return hd_scenery_smooth_normal(key) ||
          (key.lit_valid != 0u && key.has_vertex_normal != 0u && key.raw_tex_hi_in_nbt == 0u &&
@@ -781,6 +795,8 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key, const ToonLightMa
                 "        prev = vec4i(vec3i(round(pow(clamp(hd_lit, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)) * 255.0)), "
                 "prev.a);\n"
                 "    }\n");
+    if (n == 1u && key.num_tev_stages > 2u && hd_scenery_lava(key, hd))
+      emit_hd_lava(out);
   }
 
   // The last stage's destination register is what reaches the framebuffer.
@@ -789,14 +805,8 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key, const ToonLightMa
     emitf(out, "    prev = vec4i(%s.rgb, prev.a);\n", kTevOutput[last.cc_dest]);
   if (last.ac_dest != 0)
     emitf(out, "    prev = vec4i(prev.rgb, %s.a);\n", kTevOutput[last.ac_dest]);
-  if (hd_scenery_lava(key, hd))
-    emit(out, "    if (in.hd_em.a < -0.5) {\n"
-              "        let hd_alb = pow(vec3f(textemp.rgb & vec3i(255, 255, 255)) / 255.0, vec3f(2.2));\n"
-              "        let hd_glow = pow(clamp(vec3f(prev.rgb) / 255.0, vec3f(0.0), vec3f(1.0)), vec3f(2.2)) + "
-              "hd_alb * in.hd_em.rgb;\n"
-              "        prev = vec4i(vec3i(round(pow(clamp(hd_glow, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2)) * "
-              "255.0)), prev.a);\n"
-              "    }\n");
+  if (key.num_tev_stages <= 2u && hd_scenery_lava(key, hd))
+    emit_hd_lava(out);
 
   if (hd.matched && !hd_after_albedo(hd))
     emit_hd_actor_light(out, key, hd);
