@@ -855,7 +855,17 @@ fn fog(prev: vec4i, in: VertexOut) -> vec4i {
     else if (fsel == 5u) { fogv = 1.0 - exp2(-8.0 * fogv * fogv); }
     else if (fsel == 6u) { fogv = exp2(-8.0 * (1.0 - fogv)); }
     else if (fsel == 7u) { fogv = 1.0 - fogv; fogv = exp2(-8.0 * fogv * fogv); }
-    else if (kb(K_hd_fog) != 0u) { fogv = fogv * fogv; }
+    else if (kb(K_hd_fog) != 0u) {
+        // Wind Waker HD's curve, mixed in linear light by the sRGB curve as HD's shaders fog (emit_fog()).
+        fogv = fogv * fogv;
+        let fog_p = vec3f(clamp(prev.rgb, vec3i(0), vec3i(255))) / 255.0;
+        let fog_c = vec3f(psc.fogcolor.rgb) / 255.0;
+        let fog_lin = mix(select(pow((fog_p + 0.055) / 1.055, vec3f(2.4)), fog_p / 12.92, fog_p <= vec3f(0.04045)),
+                          select(pow((fog_c + 0.055) / 1.055, vec3f(2.4)), fog_c / 12.92, fog_c <= vec3f(0.04045)),
+                          fogv);
+        let fog_out = select(1.055 * pow(fog_lin, vec3f(1.0 / 2.4)) - 0.055, fog_lin * 12.92, fog_lin <= vec3f(0.0031308));
+        return vec4i(vec3i(round(fog_out * 255.0)), prev.a);
+    }
     let ifog = i32(round(fogv * 256.0));
     return vec4i((prev.rgb * (256 - ifog) + psc.fogcolor.rgb * ifog) >> vec3u(8u), prev.a);
 }

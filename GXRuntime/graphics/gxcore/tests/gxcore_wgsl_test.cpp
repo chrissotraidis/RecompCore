@@ -2934,8 +2934,8 @@ void test_fog() {
             .find("// Fog (Dolphin WriteFog)") == std::string::npos);
 
   // Wind Waker HD's fog curve (hd_fog): linear fog squared after the clamp,
-  // before the integer blend; unflagged, the module is as it was; the other
-  // curves keep theirs.
+  // then mixed in linear light in place of the integer blend; unflagged, the
+  // module is as it was; the other curves keep theirs.
   {
     auto key = fog_key(gxc::FogType::Linear, gxc::FogProjection::Perspective, true);
     const std::string gc = gxc::generate_wgsl(key);
@@ -2947,9 +2947,19 @@ void test_fog() {
     const auto clamp_at = hd.find("var fogv = clamp(ze - psc.fogf.y, 0.0, 1.0);");
     const auto square_at = hd.find(square);
     CHECK(clamp_at != std::string::npos && square_at != std::string::npos && clamp_at < square_at);
-    CHECK(square_at < hd.find("let ifog = i32(round(fogv * 256.0));"));
-    // Only that line differs.
+    const char* mix_lin = "    let fog_p = vec3f(clamp(prev.rgb, vec3i(0), vec3i(255))) / 255.0;\n";
+    const char* mix_end = "    prev = vec4i(vec3i(round(fog_out * 255.0)), prev.a);\n";
+    const char* blend = "    let ifog = i32(round(fogv * 256.0));\n"
+                        "    prev = vec4i((prev.rgb * (256 - ifog) + psc.fogcolor.rgb * ifog) >> vec3u(8u), prev.a);\n";
+    const auto mix_at = hd.find(mix_lin);
+    const auto end_at = hd.find(mix_end);
+    CHECK(mix_at != std::string::npos && square_at < mix_at && mix_at < end_at && end_at != std::string::npos);
+    CHECK(hd.find("let fog_lin = mix(select(pow((fog_p + 0.055) / 1.055, vec3f(2.4))", mix_at) < end_at);
+    CHECK(hd.find("1.055 * pow(fog_lin, vec3f(1.0 / 2.4)) - 0.055", mix_at) < end_at);
+    CHECK(hd.find("let ifog = i32(round(fogv * 256.0));") == std::string::npos);
+    // Only those lines differ: the square, and the linear mix in place of the integer blend.
     std::string back = hd;
+    back.replace(mix_at, end_at + std::strlen(mix_end) - mix_at, blend);
     back.erase(square_at, std::strlen(square));
     CHECK(back == gc);
     auto exp = fog_key(gxc::FogType::Exp, gxc::FogProjection::Perspective, false);
@@ -2959,7 +2969,10 @@ void test_fog() {
     // The ubershader reads the bit from the key.
     const std::string uber = gxc::generate_uber_wgsl(false);
     CHECK(uber.find("const K_hd_fog: u32 = ") != std::string::npos);
-    CHECK(uber.find("else if (kb(K_hd_fog) != 0u) { fogv = fogv * fogv; }") != std::string::npos);
+    const auto uber_hd = uber.find("else if (kb(K_hd_fog) != 0u) {");
+    CHECK(uber_hd != std::string::npos);
+    CHECK(uber.find("fogv = fogv * fogv;", uber_hd) < uber.find("let fog_lin = mix(", uber_hd));
+    CHECK(uber.find("return vec4i(vec3i(round(fog_out * 255.0)), prev.a);", uber_hd) != std::string::npos);
   }
 
   // --- Plan uniforms decoded from BP fog registers (state path) ------------

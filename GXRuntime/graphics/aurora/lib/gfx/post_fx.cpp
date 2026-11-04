@@ -2302,7 +2302,21 @@ fn fs_sun_map(in: VertexOutput) -> @location(0) vec4<f32> {
 // depth: the pass takes their fog out and puts HD's in, (scene - F fs) / (1 - fs) x shade x (1 - fh) + F fh, in the
 // scene's gamma, as GX fogs. Without it a shaded wall's fog was shaded too, and the far walls of a dungeon room
 // (most of them fog in HD) came out at under half HD's.
+// With the scene's copy (view.fog_x.w, copy_sun_fog_scene()): HD's mix in linear light, as HD's shaders fog (their
+// lit colour and fog colour both linear, shown through an sRGB output; the draws' own fog is the same mix with HD's
+// curve, gxcore emit_fog()): the draws' fog out, lit = (S - F fs) / (1 - fs), shaded as before (x the shade in the
+// scene's gamma), then shaded x (1 - fh) + F fh, linear by the sRGB curve, written whole.
 constexpr const char* kSunMapFogEntry = R"""(
+@group(0) @binding(11) var scene_copy: texture_2d<f32>;
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    return select(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, c <= vec3(0.04045));
+}
+
+fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
+    return select(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, c * 12.92, c <= vec3(0.0031308));
+}
+
 struct SunFogOut {
     @location(0) @blend_src(0) add: vec4<f32>,
     @location(0) @blend_src(1) mul: vec4<f32>,
@@ -2366,6 +2380,16 @@ fn fs_sun_map_fog(in: VertexOutput) -> SunFogOut {
         fs = fs * fs;
         fh = fh * fh;
     }
+    if (view.fog_x.w > 0.5) {
+        let f_lin = srgb_to_linear(view.fog_colour.rgb);
+        let lit = max((srgb_to_linear(textureLoad(scene_copy, p, 0).rgb) - f_lin * fs) / max(1.0 - fs, 1.0 / 256.0),
+                      vec3(0.0));
+        // The shade as it multiplies the unfogged scene (in its gamma), then HD's fog over it in linear light.
+        let shaded = srgb_to_linear(clamp(linear_to_srgb(lit) * m.rgb, vec3(0.0), vec3(1.0)));
+        out.mul = vec4(0.0, 0.0, 0.0, 1.0);
+        out.add = vec4(linear_to_srgb(shaded * (1.0 - fh) + f_lin * fh), 0.0);
+        return out;
+    }
     let keep = clamp(m.rgb * (1.0 - fh) / max(1.0 - fs, 1.0 / 256.0), vec3(0.0), vec3(1.0));
     out.mul = vec4(keep, 1.0);
     out.add = vec4(max(view.fog_colour.rgb * (fh - fs * keep), vec3(0.0)), 0.0);
@@ -2377,6 +2401,8 @@ wgpu::BindGroupLayout g_sunMapLayout;
 wgpu::PipelineLayout g_sunMapPipelineLayout;
 wgpu::RenderPipeline g_sunMapPass;
 wgpu::RenderPipeline g_sunMapDirect; // multiplied straight into the scene
+wgpu::Texture g_sunFogScene;          // the scene before the pass, for HD's fog in linear light (copy_sun_fog_scene())
+wgpu::TextureView g_sunFogSceneView;
 wgpu::Sampler g_sunMapCompare;
 wgpu::Texture g_sunMapTex;
 wgpu::TextureView g_sunMapView;
@@ -3699,10 +3725,12 @@ struct SunMapInputs {
   wgpu::Buffer buffer;
   bool mask = false;
   bool normals = false;
+  bool scene = false;  // the scene's copy is bound (copy_sun_fog_scene()), for HD's fog in linear light
   float farTerm = 0.f; // near / (far - near)
 };
 
-SunMapInputs sun_map_inputs(const Camera& camera, const SunMap& sunMap, bool actor) {
+// scene: the scene was copied for the pass (copy_sun_fog_scene()): the lit scenery's fog is HD's mix in linear light.
+SunMapInputs sun_map_inputs(const Camera& camera, const SunMap& sunMap, bool actor, bool scene = false) {
   std::array<float, kSunMapUniformFloats> uniform{};
   std::memcpy(uniform.data(), camera.view.data(), sizeof(camera.view));
   for (uint32_t cascade = 0; cascade < kSunMapCascades; ++cascade)
@@ -3791,6 +3819,7 @@ SunMapInputs sun_map_inputs(const Camera& camera, const SunMap& sunMap, bool act
       uniform[f + 8] = g_sceneFog.range ? 1.f : 0.f;
       uniform[f + 9] = g_sceneFog.centre;
       uniform[f + 10] = g_sceneFog.width;
+      uniform[f + 11] = scene ? 1.f : 0.f;
       for (int i = 0; i < 12; ++i)
         uniform[f + 12 + i] = g_sceneFog.table[i];
       for (int i = 0; i < 16; ++i)
@@ -3818,7 +3847,7 @@ SunMapInputs sun_map_inputs(const Camera& camera, const SunMap& sunMap, bool act
   const auto buffer = g_device.CreateBuffer(&bufferDescriptor);
   std::memcpy(buffer.GetMappedRange(0, sizeof(uniform)), uniform.data(), sizeof(uniform));
   buffer.Unmap();
-  return {.buffer = buffer, .mask = mask, .normals = normals, .farTerm = uniform[71]};
+  return {.buffer = buffer, .mask = mask, .normals = normals, .scene = scene, .farTerm = uniform[71]};
 }
 
 // effects: the effects' mask (effect_mask_target()), whose effects the shade leaves.
@@ -3837,6 +3866,7 @@ wgpu::BindGroup sun_map_group(const SunMapInputs& in, const wgpu::TextureView& d
       wgpu::BindGroupEntry{.binding = 8, .textureView = g_cloudTexView ? g_cloudTexView : g_farView[0]},
       wgpu::BindGroupEntry{.binding = 9, .sampler = g_cloudSampler},
       wgpu::BindGroupEntry{.binding = 10, .textureView = effects},
+      wgpu::BindGroupEntry{.binding = 11, .textureView = in.scene ? g_sunFogSceneView : g_farView[0]},
   };
   const wgpu::BindGroupDescriptor bindGroupDescriptor{
       .layout = g_sunMapLayout,
@@ -3846,12 +3876,43 @@ wgpu::BindGroup sun_map_group(const SunMapInputs& in, const wgpu::TextureView& d
   return g_device.CreateBindGroup(&bindGroupDescriptor);
 }
 
+// Wind Waker HD fogs its scenery in linear light, mix(lit, fog, f); the sun pass's blend works in the scene's gamma,
+// where a dark far wall kept about half of HD's fog. So the pass reads the scene from a copy taken just before it
+// (the frame buffer only, single-sampled) and writes HD's mix itself (fs_sun_map_fog).
+// The direct sun pass fogs the lit scenery after its shade (make_sun_map_pipeline(): fs_sun_map_fog).
+bool sun_fog_pipeline() { return g_sunFogHd && webgpu::g_dualSourceBlendingSupported; }
+
+bool copy_sun_fog_scene(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& size, const wgpu::TextureView& dst) {
+  const auto& frame = webgpu::g_frameBuffer;
+  if (!frame.texture || dst.Get() != frame.view.Get() || frame.texture.GetWidth() != size.width ||
+      frame.texture.GetHeight() != size.height || frame.texture.GetSampleCount() != 1)
+    return false;
+  if (!g_sunFogScene || g_sunFogScene.GetWidth() != size.width || g_sunFogScene.GetHeight() != size.height ||
+      g_sunFogScene.GetFormat() != frame.texture.GetFormat()) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Sun pass scene (HD fog)",
+        .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding,
+        .size = {size.width, size.height, 1},
+        .format = frame.texture.GetFormat(),
+    };
+    g_sunFogScene = g_device.CreateTexture(&descriptor);
+    g_sunFogSceneView = g_sunFogScene.CreateView();
+  }
+  const wgpu::TexelCopyTextureInfo from{.texture = frame.texture};
+  const wgpu::TexelCopyTextureInfo to{.texture = g_sunFogScene};
+  const wgpu::Extent3D extent{size.width, size.height, 1};
+  cmd.CopyTextureToTexture(&from, &to, &extent);
+  return true;
+}
+
 // effects: the effects' mask (effect_mask_target()), whose effects it leaves.
 void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const SunMap& sunMap,
                   const wgpu::TextureView& depthView, const wgpu::TextureView& effects,
                   const wgpu::TextureView& target, bool direct, const wgpu::Extent3D& size,
                   const wgpu::TextureView& resolve = nullptr) {
-  const SunMapInputs inputs = sun_map_inputs(camera, sunMap, false);
+  // With HD's fog after the shade, the scene as it is now, for the pass to fog in linear light.
+  const bool scene = direct && resolve == nullptr && sun_fog_pipeline() && copy_sun_fog_scene(cmd, size, target);
+  const SunMapInputs inputs = sun_map_inputs(camera, sunMap, false, scene);
   const auto sun_group = [&](const wgpu::TextureView& blurred) {
     return sun_map_group(inputs, depthView, blurred, effects);
   };
@@ -4895,7 +4956,7 @@ void initialize() {
       .visibility = wgpu::ShaderStage::Fragment,
       .sampler = {.type = wgpu::SamplerBindingType::Filtering},
   };
-  std::array<wgpu::BindGroupLayoutEntry, 11> sunMapEntries{
+  std::array<wgpu::BindGroupLayoutEntry, 12> sunMapEntries{
       cloudEntries[0],
       cloudEntries[1],
       cloudEntries[2],
@@ -4907,6 +4968,13 @@ void initialize() {
       // The effects' mask (effect_mask_target(), read with textureLoad), which the shade leaves.
       wgpu::BindGroupLayoutEntry{
           .binding = 10,
+          .visibility = wgpu::ShaderStage::Fragment,
+          .texture = {.sampleType = wgpu::TextureSampleType::UnfilterableFloat,
+                      .viewDimension = wgpu::TextureViewDimension::e2D},
+      },
+      // The scene as it was before the pass (copy_sun_fog_scene()), for HD's fog in linear light (fs_sun_map_fog).
+      wgpu::BindGroupLayoutEntry{
+          .binding = 11,
           .visibility = wgpu::ShaderStage::Fragment,
           .texture = {.sampleType = wgpu::TextureSampleType::UnfilterableFloat,
                       .viewDimension = wgpu::TextureViewDimension::e2D},
@@ -4991,6 +5059,8 @@ void shutdown() {
   g_sunMapPass = {};
   g_sunMapDirect = {};
   g_sunMapLow = {};
+  g_sunFogScene = {};
+  g_sunFogSceneView = {};
   g_sunCopy = {};
   g_actorLowView = {};
   g_actorLow = {};

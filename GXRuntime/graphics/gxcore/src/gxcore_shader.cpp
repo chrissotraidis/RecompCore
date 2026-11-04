@@ -213,6 +213,16 @@ std::string tev_compare(bool vec, std::uint8_t comparison,
   return "(" + d + " + select(" + zero + ", " + cval + ", " + cond + "))";
 }
 
+// Wind Waker HD's fog mix, in linear light by the sRGB curve (emit_fog() with HD's curve; the ubershader's alike).
+constexpr const char* kHdFogLinearMix =
+    "    let fog_p = vec3f(clamp(prev.rgb, vec3i(0), vec3i(255))) / 255.0;\n"
+    "    let fog_c = vec3f(psc.fogcolor.rgb) / 255.0;\n"
+    "    let fog_lin = mix(select(pow((fog_p + 0.055) / 1.055, vec3f(2.4)), fog_p / 12.92, fog_p <= vec3f(0.04045)),\n"
+    "                      select(pow((fog_c + 0.055) / 1.055, vec3f(2.4)), fog_c / 12.92, fog_c <= vec3f(0.04045)),\n"
+    "                      fogv); // Wind Waker HD: in linear light\n"
+    "    let fog_out = select(1.055 * pow(fog_lin, vec3f(1.0 / 2.4)) - 0.055, fog_lin * 12.92, fog_lin <= vec3f(0.0031308));\n"
+    "    prev = vec4i(vec3i(round(fog_out * 255.0)), prev.a);\n";
+
 // Fog (Dolphin PixelShaderGen WriteFog + PixelShaderManager fog constants).
 // Applied to prev.rgb after the alpha test, exactly Dolphin's order. GC zCoord
 // is the 24-bit screen depth (0=near, 0xFFFFFF=far); our substrate runs
@@ -247,6 +257,7 @@ void emit_fog(std::string& out, const ShaderKey& key) {
          "    ze = ze * x_adjust;\n");
   }
   emit(out, "    var fogv = clamp(ze - psc.fogf.y, 0.0, 1.0);\n");
+  bool hd_curve = false;
   switch (fsel) {
   case FogType::Exp:
     emit(out, "    fogv = 1.0 - exp2(-8.0 * fogv);\n");
@@ -265,9 +276,19 @@ void emit_fog(std::string& out, const ShaderKey& key) {
   default:
     // linear: fogv unchanged, or Wind Waker HD's curve, its square (HD's own
     // fog distances, retuned for it, are what the game then holds).
-    if (key.hd_fog != 0u)
+    if (key.hd_fog != 0u) {
       emit(out, "    fogv = fogv * fogv; // Wind Waker HD's fog curve\n");
+      hd_curve = true;
+    }
     break;
+  }
+  // Wind Waker HD mixes its fog in linear light (its shaders: mix(lit colour, fog colour, f), both linear, shown
+  // through an sRGB output); in the game's gamma a dark wall far in the fog kept about half of HD's fog. The same mix,
+  // in linear light by the sRGB curve (the frame's colours are HD's linear light, sRGB-encoded, as HD's sRGB textures
+  // are read by the GameCube's TEV).
+  if (hd_curve) {
+    emit(out, kHdFogLinearMix);
+    return;
   }
   // Integer blend: prev.rgb = (prev.rgb*(256-ifog) + fogcolor*ifog) >> 8.
   emit(out, "    let ifog = i32(round(fogv * 256.0));\n"
