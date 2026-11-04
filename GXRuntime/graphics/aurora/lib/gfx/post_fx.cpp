@@ -189,9 +189,11 @@ float g_sunFacingMul = 10.f;         // DOL_AURORA_SUN_SHADOW_FACING_MUL: fully 
 // (DOL_AURORA_SUN_SHADOW_FACING_DEPTH_MUL, local test).
 float g_sunFacingDepthMul = 0.f;
 float g_sunFacingDepthBlur = 8.f; // DOL_AURORA_SUN_SHADOW_FACING_DEPTH_BLUR: its blur, pixels at 1080 lines (0 none)
-// Skinned scenery (a palm) takes its ambient's sky-to-ground mix from its smooth normal, as HD's per-vertex light
-// does, not from the depth's normal of a cut-out leaf card (DOL_AURORA_SUN_SHADOW_SMOOTH_AMBIENT=1, local test).
+// Scenery takes its ambient's sky-to-ground mix from its smooth normal, as HD's per-vertex light does, not from the
+// depth's normal (a face, or a palm's cut-out leaf card) (DOL_AURORA_SUN_SHADOW_SMOOTH_AMBIENT=1, local test;
+// =skinned: skinned scenery only, the rest by the depth's normal, as before Nov 3, for comparison).
 bool g_sunSmoothAmbient = false;
+bool g_sunSmoothAmbientSkinned = false;
 // HD's pre-pass takes the farthest of the four depths under each of its pixels (agl's shadow_pre_pass.sh, USE_FETCH_4):
 // on a palm's lacy crown that is often what lies behind a leaf, so its leaves barely shade each other
 // (DOL_AURORA_SUN_SHADOW_PREPASS_FAR=1, local test; HD's pass only).
@@ -2198,16 +2200,30 @@ fn sun_map_shade(in: VertexOutput) -> vec4<f32> {
         // scene's gamma, is what a shaded pixel is multiplied by.
         var nv = depth_normal(in.uv, p, tx, ty);
         var up = dot(vec3(view.rows[1].x, view.rows[1].y, view.rows[1].z), nv);
-        // Skinned scenery with smooth normals (a palm): by them, as HD's per-vertex light, either side of a leaf
-        // as up as the side seen (the mask's pass turned the normal to it; HD's leaf normals point off the top).
+        // Scenery with smooth normals: by them, as HD's per-vertex light (its terrain VS takes the hemisphere from
+        // its own vertex normals, blended across each triangle), not by the depth's face. HD's ground normals lean
+        // where the ground meets a slope or a wall, so its shade there takes some of the ambient from the side (at
+        // Windfall's spawn 7 path 0.5 + 0.5 N.y is 0.94-0.96, not 1); by the depth's face the ground took the sky's
+        // colour alone, bluer than HD's. Skinned scenery (a palm): either side of a leaf as up as the side seen (the
+        // mask's pass turned the normal to it; HD's leaf normals point off the top). smooth_ambient 2: skinned only.
         if (smooth_ambient > 0.5 && view.facing.x > 0.5 && view.facing.z > 0.5) {
             let asize = vec2<f32>(textureDimensions(mask));
             let ap = clamp(vec2<i32>(in.uv * asize), vec2<i32>(0), vec2<i32>(asize) - vec2<i32>(1));
             let sn = textureLoad(normals, ap, 0);
             let am = textureLoad(mask, ap, 0);
-            if (sn.a > 0.5 && am.r < 0.5 && am.g > 0.3 && am.g < character_g) {
-                nv = normalize(sn.xyz * 2.0 - 1.0);
-                up = abs(dot(vec3(view.rows[1].x, view.rows[1].y, view.rows[1].z), nv));
+            if (sn.a > 0.5 && am.r < 0.5 && am.g < character_g) {
+                let row = vec3(view.rows[1].x, view.rows[1].y, view.rows[1].z);
+                let snv = normalize(sn.xyz * 2.0 - 1.0);
+                if (am.g > 0.3) {
+                    nv = snv;
+                    up = abs(dot(row, nv));
+                } else if (smooth_ambient < 1.5) {
+                    // HD's hemisphere is per vertex (0.5 + 0.5 N.y at each, blended linearly), so the blended
+                    // normal's y as written, not renormalized: renormalizing leans it up between vertices whose
+                    // normals differ (Windfall's spawn 7 path: (-0.93, 0, -0.37) to (-0.60, 0.80, 0.05)).
+                    nv = snv;
+                    up = dot(row, sn.xyz * 2.0 - 1.0);
+                }
             }
         }
         let ambient = mix(view.palette.rgb, view.shade.rgb, 0.5 + 0.5 * up);
@@ -2841,7 +2857,7 @@ wgpu::RenderPipeline make_sun_map_pipeline(wgpu::TextureFormat format, bool dire
       wgpu::ConstantEntry{.key = "facing_mul", .value = g_sunFacingMul},
       wgpu::ConstantEntry{.key = "facing_depth_mul", .value = g_sunFacingDepthMul},
       wgpu::ConstantEntry{.key = "facing_depth_blur", .value = g_sunFacingDepthBlur},
-      wgpu::ConstantEntry{.key = "smooth_ambient", .value = g_sunSmoothAmbient ? 1.0 : 0.0},
+      wgpu::ConstantEntry{.key = "smooth_ambient", .value = g_sunSmoothAmbient ? (g_sunSmoothAmbientSkinned ? 2.0 : 1.0) : 0.0},
       wgpu::ConstantEntry{.key = "prepass_far", .value = g_sunPrepassFar ? 1.0 : 0.0},
       wgpu::ConstantEntry{.key = "facing_far_start", .value = facing_far(false)},
       wgpu::ConstantEntry{.key = "facing_far_end", .value = facing_far(true)},
@@ -4659,7 +4675,7 @@ void initialize() {
   g_sunFacingDepthMul = env_float("DOL_AURORA_SUN_SHADOW_FACING_DEPTH_MUL", g_sunFacingDepthMul, 0.f, 1000.f);
   g_sunFacingDepthBlur = env_float("DOL_AURORA_SUN_SHADOW_FACING_DEPTH_BLUR", g_sunFacingDepthBlur, 0.f, 200.f);
   if (const char* ambient = std::getenv("DOL_AURORA_SUN_SHADOW_SMOOTH_AMBIENT"))
-    g_sunSmoothAmbient = ambient[0] == '1';
+    g_sunSmoothAmbient = ambient[0] == '1' || ambient[0] == 's', g_sunSmoothAmbientSkinned = ambient[0] == 's';
   if (const char* prepassFar = std::getenv("DOL_AURORA_SUN_SHADOW_PREPASS_FAR"))
     g_sunPrepassFar = prepassFar[0] == '1';
   g_sunFacingFarStart = env_float("DOL_AURORA_SUN_SHADOW_FACING_FAR_START", g_sunFacingFarStart, 0.f, 1e7f);

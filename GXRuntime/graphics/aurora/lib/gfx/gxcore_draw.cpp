@@ -2001,7 +2001,10 @@ fn smooth_out(p0: vec4f, p1: vec4f, p2: vec4f, in: VertexInN) -> VertexOutN {
     out.pos = to_clip(p0, p1, p2, in.rawpos);
     let pos4 = vec4f(in.rawpos, 1.0);
     out.viewpos = vec3f(dot(p0, pos4), dot(p1, pos4), dot(p2, pos4));
-    out.normal = vec3f(dot(p0.xyz, in.normal), dot(p1.xyz, in.normal), dot(p2.xyz, in.normal));
+    // Unit at each vertex, as HD's VS normalizes its turned normal: blended across the triangle, its y is then HD's
+    // per-vertex N.y blended (its hemisphere colour is per vertex, so linear across the triangle).
+    let nv = vec3f(dot(p0.xyz, in.normal), dot(p1.xyz, in.normal), dot(p2.xyz, in.normal));
+    out.normal = select(vec3f(0.0), nv / max(length(nv), 1e-12), length(nv) > 1e-6);
     out.glow = select(0.0, clamp(-in.glow.a - 1.0, 0.0, 1.0), in.glow.a < -0.5);
     return out;
 }
@@ -2015,7 +2018,8 @@ fn vs_indexed_n(in: VertexInN) -> VertexOutN {
     return smooth_out(vsc.transformmatrices[i], vsc.transformmatrices[i + 1], vsc.transformmatrices[i + 2], in);
 }
 // The normal turned to the side the camera sees, by the triangle's own facing (a model's winding isn't known
-// here); alpha 0 where the draw gives none.
+// here); alpha 0 where the draw gives none. Left as blended, not renormalized (its users normalize it): the sun
+// pass's hemisphere takes its y as is, HD's per-vertex N.y blended across the triangle.
 fn seen_normal(in: VertexOutN) -> vec4f {
     var face = cross(dpdx(in.viewpos), dpdy(in.viewpos));
     if (dot(face, -in.viewpos) < 0.0) {
@@ -2026,7 +2030,6 @@ fn seen_normal(in: VertexOutN) -> vec4f {
     if (len < 1e-6) {
         return vec4f(0.0);
     }
-    n = n / len;
     if (dot(n, face) < 0.0) {
         n = -n;
     }
