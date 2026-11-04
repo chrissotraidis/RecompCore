@@ -3065,6 +3065,15 @@ void test_fog() {
   CHECK(plan.pixel_constants.fogrange[0][1] == 8.0f);
   CHECK(plan.pixel_constants.fogrange[2][1] == 8.0f); // index 9 (K[4].HI)
   CHECK(counters.fog_ignored == 0);
+  // The host's draw list mark (kDrawListRegister): unmarked and BG lists cast in every sun cascade, any other list
+  // only in the first two; the mark stays until written again.
+  CHECK(plan.far_caster);
+  state.apply(bp(gxc::GxCoreState::kDrawListRegister, 1u));
+  CHECK(!state.build_draw_plan(draw, counters).far_caster);
+  state.forget_draw_tag();
+  CHECK(!state.build_draw_plan(draw, counters).far_caster);
+  state.apply(bp(gxc::GxCoreState::kDrawListRegister, 0u));
+  CHECK(state.build_draw_plan(draw, counters).far_caster);
 }
 
 // Wind Waker HD's fog start before the camera (gxc::fog_start_before_camera()): a draw fogged from a start of 0 to

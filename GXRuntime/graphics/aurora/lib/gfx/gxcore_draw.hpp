@@ -76,6 +76,9 @@ struct DrawData {
   bool posMtxIdx = false;
   // The draw's own cull mode (gxc::CullMode), for the map's casters while post_fx::sun_caster_cull() is on.
   uint8_t sunCasterCull = 0;
+  // It casts in the cascades past the second too (gxc::DrawPlan::far_caster: the stage's BG lists, as Wind Waker
+  // HD's far cascades draw only its BG model list).
+  bool farCaster = true;
   // Alpha-tested solid scenery (a roof, an awning, leaves, a fence): drawn
   // into the map with its texture's cutout (sun_caster_alpha()).
   bool sunCasterAlpha = false;

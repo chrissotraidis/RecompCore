@@ -585,6 +585,9 @@ struct DrawPlanFields {
   // the draw's place among them (from 1). 0: none.
   std::uint32_t draw_scope = 0;
   std::uint32_t draw_scope_part = 0;
+  // Drawn from one of the stage's BG lists, or unmarked (GxCoreState::kDrawListRegister): the sun shadows' cascades
+  // past the second take only these casters, as Wind Waker HD's take only its BG model list there.
+  bool far_caster = true;
   // Viewport, raw XF values (wd/2, -ht/2, zmax*2^24, xorig+342, yorig+342,
   // farz*2^24) — the submission layer maps these through the substrate's
   // logical-viewport scaling.

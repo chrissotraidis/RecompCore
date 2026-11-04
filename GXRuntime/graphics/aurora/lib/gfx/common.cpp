@@ -2116,9 +2116,19 @@ static void encode_sun_map(const wgpu::CommandEncoder& cmd, const RenderPass& pa
     };
     auto pass = cmd.BeginRenderPass(&descriptor);
     if (casters != 0) {
+      // Past the second cascade only the stage's BG lists cast (gxcore::DrawData::farCaster), as in Wind Waker HD
+      // (hd_layer_shadow.cpp drawShadowCascade: from cascade 2 on only mpModelList). The objects and characters'
+      // shadows there (the Tower of the Gods' pillars on its far face) are HD's to leave out.
+      // DOL_AURORA_SUN_SHADOW_FAR_CASTERS=all: every caster in every cascade, as before.
+      static const bool allFar = [] {
+        const char* env = std::getenv("DOL_AURORA_SUN_SHADOW_FAR_CASTERS");
+        return env != nullptr && std::strcmp(env, "all") == 0;
+      }();
+      const bool bgOnly = cascade >= 2 && !allFar;
       gxcore::begin_sun_casters(pass, map.caster[cascade].data());
       for (const auto& command : passInfo.commands)
-        if (command.type == CommandType::Draw && command.data.draw.type == ShaderType::GXCore && !command.flat)
+        if (command.type == CommandType::Draw && command.data.draw.type == ShaderType::GXCore && !command.flat &&
+            (!bgOnly || command.data.draw.gxcore.farCaster))
           gxcore::render_sun_caster(command.data.draw.gxcore, pass);
     }
     pass.End();
@@ -3473,14 +3483,6 @@ float calculate_fps() noexcept {
   return static_cast<float>(g_presentTimes.size() - 1) / elapsed;
 }
 
-static void apply_viewport(const wgpu::RenderPassEncoder& pass, const Command& command) {
-  const auto& vp = command.data.setViewport;
-  const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
-  const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
-  const float k = g_softScale;
-  pass.SetViewport(vp.left * k, vp.top * k, vp.width * k, vp.height * k, minDepth, maxDepth);
-}
-
 static void apply_scissor(const wgpu::RenderPassEncoder& pass, const Command& command, const wgpu::Extent3D& size) {
   const auto& sc = command.data.setScissor;
   const auto x = std::clamp(static_cast<uint32_t>(sc.x), 0u, size.width);
@@ -3530,7 +3532,9 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
   float vpScale = depthScale;
   const auto setViewport = [&](float scale) {
     vpScale = scale;
-    pass.SetViewport(vpRect[0], vpRect[1], vpRect[2], vpRect[3], vpDepth[0] * scale, vpDepth[1] * scale);
+    // A run of soft effects in the half-size buffer (g_softScale) draws its rectangle there.
+    const float k = g_softScale;
+    pass.SetViewport(vpRect[0] * k, vpRect[1] * k, vpRect[2] * k, vpRect[3] * k, vpDepth[0] * scale, vpDepth[1] * scale);
   };
   if (effectsOnly)
     setViewport(depthScale);
