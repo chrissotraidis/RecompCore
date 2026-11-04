@@ -95,6 +95,12 @@ struct DrawData {
   // the HD look's shading from the depth buffer would take it for the scenery
   // behind it; drawn again into the effects' mask (post_fx.hpp effect_mask_target()).
   bool effect = false;
+  // An effect that writes depth (effect_draw(): one of the game's particles, a glow model): the effects' mask draws
+  // it at its own depth (not pushed back), and the sea mask leaves it out.
+  bool effectDepth = false;
+  // Drawn at its own depth into the effects' mask: an effect that writes depth, or a particle's colour draw over
+  // its own depth draw.
+  bool effectOwnDepth = false;
   // A character's draw (the sea mask's green; the sun shadows' facing term leaves it out): toon-shaded, a
   // texgen that reads a lit colour (GX_TG_SRTG, Wind Waker's characters' ramp), or skinned (per-vertex matrices).
   bool character = false;

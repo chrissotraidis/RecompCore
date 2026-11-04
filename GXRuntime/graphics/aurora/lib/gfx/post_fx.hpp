@@ -176,6 +176,12 @@ wgpu::TextureView effect_mask_target(const wgpu::Extent3D& sceneSize, wgpu::Text
 // How far back the effects are drawn into it, a share of their distance
 // (DOL_AURORA_EFFECT_MASK_PUSH, 0.05): what lies on a surface is left out.
 float effect_mask_push() noexcept;
+// The effects' mask has an effect that writes depth this frame (common.cpp render_pass(), DrawData::effectDepth):
+// the occlusion, the sun shadows and the cloud shadows then shade from the scenery's depth under it, the sea mask's.
+void note_effect_depth() noexcept;
+// The effects' mask's depth for a pass with effects drawn at their own depth (common.cpp encode_effect_mask()): a
+// copy of the sea mask's depth (the scenery's, without such effects), or none when it isn't this size.
+wgpu::TextureView effect_mask_depth(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& size);
 // The sun shadows' facing term is on: the scenery's smooth normals are wanted (made on the CPU for a draw
 // without normals of its own, gxcore_draw.cpp, and drawn by the sea mask's pass into sun_normal_target()).
 // Off, none of that work is done.

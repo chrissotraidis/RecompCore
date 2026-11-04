@@ -18,6 +18,7 @@
 #include <gxruntime/gxcore/texture_encode.hpp>
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 
 #include <algorithm>
 #include <array>
@@ -652,11 +653,35 @@ bool sea_mask_draw(const gxc::DrawPlan& plan) {
   return post_fx::sea_mask_wanted() && sea_draw(plan);
 }
 
+// A glow model (Dragon Roost Cavern's lava geysers): blended, and its colour from none of the stages' rasterized or
+// texture colours, only the registers and constants (its textures give the alpha alone): what the game lights or
+// paints, it isn't.
+static bool glow_model(const gxc::PipelineKey& key) {
+  const auto& sh = key.shader;
+  if (sh.tev_valid == 0u || sh.num_tev_stages == 0u)
+    return false;
+  for (uint32_t i = 0; i < sh.num_tev_stages && i < gxc::kMaxTevStages; ++i) {
+    const auto& t = sh.tev_stages[i];
+    for (const uint8_t arg : {t.cc_a, t.cc_b, t.cc_c, t.cc_d})
+      if (arg == 8u || arg == 10u || arg == 11u) // TEXC, RASC, RASA
+        return false;
+  }
+  return true;
+}
+
 // An effect, which the HD look's sun shadows, occlusion and cloud shadows leave
 // as it is (post_fx.hpp effect_mask_target()): a draw blended over what is
 // behind it that writes no depth (the spin attack's rings, the Master Sword's
 // glow, sparks, smoke), so the depth buffer under it is the scenery's behind,
 // whose shade it is not in. Wind Waker HD draws these after its lighting.
+// One that writes depth is an effect too when it is one of the game's particles (the host's tag: the dust a
+// shutting door raises, drawn alpha-tested into the depth and then in colour over it) or a glow model (glow_model());
+// its depth hides the scenery's under it, so the HD look shades there from the sea mask's depth, which it leaves out
+// (effect_depth_draw(), post_fx.hpp shading_depth()).
+static bool effect_draw_depth(const gxc::DrawPlan& plan) {
+  return plan.pipeline.depth_update == 0u || plan.draw_tag != 0u || glow_model(plan.pipeline);
+}
+
 bool effect_draw(const gxc::DrawPlan& plan) {
   const auto& key = plan.pipeline;
   // Left out: the GameCube's own shadows (drawn through the frame buffer's
@@ -665,7 +690,7 @@ bool effect_draw(const gxc::DrawPlan& plan) {
   // are those the draws after it leave, which the mask, drawn against the
   // finished depth, can't tell (the sky's clouds lit up shadows on the land
   // drawn over them).
-  if (key.blend_enable == 0u || key.blend_subtract != 0u || key.depth_update != 0u || key.depth_test == 0u ||
+  if (key.blend_enable == 0u || key.blend_subtract != 0u || !effect_draw_depth(plan) || key.depth_test == 0u ||
       key.color_update == 0u || key.src_factor == 6u || key.src_factor == 7u ||
       plan.constants.projection[3][3] == 1.f)
     return false;
@@ -680,6 +705,9 @@ bool effect_draw(const gxc::DrawPlan& plan) {
     return false;
   return true;
 }
+
+// An effect that writes depth (effect_draw()).
+bool effect_depth_draw(const gxc::DrawPlan& plan) { return plan.pipeline.depth_update != 0u && effect_draw(plan); }
 } // namespace
 
 // Toon-shaded: a texgen from a lit colour (GX_TG_SRTG: Wind Waker's characters' ramp, Link's hair included).
@@ -4384,6 +4412,23 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // it, the marks of what stood behind (Link's character and HD light, a palm's green and normals) showed through
   // the bush in the sun shadows. Only a shape the mask can draw: whole (no alpha test) or by its one texture's
   // cutout. A card cut out by more textures, drawn whole, would hide the marks of what shows through its holes.
+  // An effect that writes depth (effect_draw()) is left out: the sea mask's depth keeps the scenery's under it.
+  const bool effectDepth = effect_depth_draw(plan);
+  // A particle drawn alpha-tested into the depth alone and then in colour over it (Dragon Roost Cavern's dust: the
+  // emitter's depth draws first, then their colour draws): its colour draw, an effect that writes no depth, is drawn
+  // at its own depth into the effects' mask too, where pushed back it failed against the depth draw's depth.
+  static uint64_t s_depthParticlesFrame = UINT64_MAX;
+  static absl::flat_hash_set<uint32_t> s_depthParticles;
+  if (plan.draw_tag != 0u) {
+    if (s_depthParticlesFrame != frame_interp::game_frame_number()) {
+      s_depthParticlesFrame = frame_interp::game_frame_number();
+      s_depthParticles.clear();
+    }
+    if (plan.pipeline.depth_update != 0u && plan.pipeline.color_update == 0u)
+      s_depthParticles.insert(plan.draw_tag);
+  }
+  const bool effectOwnDepth = effectDepth || (plan.draw_tag != 0u && plan.pipeline.depth_test != 0u &&
+                                              s_depthParticles.contains(plan.draw_tag) && effect_draw(plan));
   const bool maskOccluderShape =
       alpha_test_always_passes(plan.pipeline.shader) ||
       (plan.texmap_mask == 0u && textureBindGroup != 0 && plan.pipeline.shader.textured != 0u);
@@ -4392,7 +4437,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                             plan.constants.projection[3][3] != 1.f && maskOccluderShape &&
                             !alpha_test_always_fails(plan.pipeline.shader) &&
                             !((sun_caster(plan.pipeline) || clothCaster || blendedCaster) ||
-                              alphaCaster || character_draw(plan.pipeline) || seaSurface);
+                              alphaCaster || character_draw(plan.pipeline) || seaSurface || effectDepth);
   push_draw_command(DrawData{
       .pipeline = pipeline,
       .depthPipeline = depthPipeline,
@@ -4427,6 +4472,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .softWritesAlpha = plan.pipeline.alpha_update != 0,
       .softPipeline = softPipeline,
       .effect = effect_draw(plan),
+      .effectDepth = effectDepth,
+      .effectOwnDepth = effectOwnDepth,
       .character = character_draw(plan.pipeline),
       .smoothNormal = smoothNormal,
       .maskCover = plan.pipeline.depth_update == 0u && plan.pipeline.color_update != 0u &&
