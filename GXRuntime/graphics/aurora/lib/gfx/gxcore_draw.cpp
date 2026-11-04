@@ -3609,6 +3609,16 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       tlut_data = nullptr;
       tlut_available = 0u;
     }
+    // The pack's replacements changed (an optional/ folder loaded or dropped as the HD look goes on or off): the
+    // decode cache holds lookups made before, a replacement that is gone or a decode a new one replaces.
+    static uint64_t s_replacementGeneration = texture_replacement::replacement_generation();
+    if (const uint64_t generation = texture_replacement::replacement_generation();
+        generation != s_replacementGeneration) {
+      s_replacementGeneration = generation;
+      g_textureCache.clear();
+      g_textureAwaitingReplacement.clear();
+      g_textureAddrKey.clear();
+    }
     auto efbIt = g_efbCopyTextures.find(address);
     if (efbIt != g_efbCopyTextures.end() && efbIt->second.handle) {
       uint64_t memoryEpoch = 0;

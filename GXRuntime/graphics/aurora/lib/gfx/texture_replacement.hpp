@@ -23,4 +23,7 @@ std::optional<TextureHandle> find_replacement_for_guest(uint32_t width, uint32_t
                                                         const uint8_t* tlut, uint32_t tlut_bytes,
                                                         bool* pending = nullptr) noexcept;
 bool has_source_replacements() noexcept;
+// Changes whenever a replacement is registered or unregistered (a pack's optional/ folder loaded or dropped while
+// running): a renderer's own cache of lookups made before it is stale.
+uint64_t replacement_generation() noexcept;
 } // namespace aurora::gfx::texture_replacement
