@@ -2952,6 +2952,58 @@ void test_fog() {
   CHECK(counters.fog_ignored == 0);
 }
 
+// Wind Waker HD's fog start before the camera (gxc::fog_start_before_camera()): a draw fogged from a start of 0 to
+// the given end gets GXSetFog's A and C for HD's start to the same end; other draws are left alone.
+void test_fog_start_before_camera() {
+  const float n = 1.f, f = 200000.f;
+  // GXSetFog's terms, as the SDK stores them (a = A / 2^shift, b = B x 2^23 / 2^(shift - 1)).
+  auto set_fog = [&](gxc::PixelShaderConstants& pc, float s, float e) {
+    const float A = (f * n) / ((f - n) * (e - s)), C = s / (e - s);
+    float B = f / (f - n);
+    int shift = 0;
+    while (B > 0.5f) {
+      B *= 0.5f;
+      ++shift;
+    }
+    pc.fogf[0] = A / static_cast<float>(1 << (shift + 1));
+    pc.fogf[1] = C;
+    pc.fogi[1] = static_cast<std::int32_t>(8.388638e6f * B);
+    pc.fogi[3] = shift + 1;
+  };
+  float proj[4][4]{};
+  proj[0][0] = 1.f;
+  proj[1][1] = 1.f;
+  proj[2][2] = -n / (f - n);
+  proj[2][3] = -(f * n) / (f - n);
+  proj[3][2] = -1.f;
+  gxc::ShaderKey key{};
+  key.fog_fsel = static_cast<std::uint8_t>(gxc::FogType::Linear);
+  key.fog_proj = static_cast<std::uint8_t>(gxc::FogProjection::Perspective);
+  gxc::PixelShaderConstants pc{}, want{};
+  set_fog(pc, 0.f, 8000.f);
+  set_fog(want, -1000.f, 8000.f);
+  CHECK(gxc::fog_start_before_camera(pc, key, proj, -1000.f, 8000.f));
+  CHECK(std::abs(pc.fogf[0] / want.fogf[0] - 1.f) < 1e-4f);
+  CHECK(std::abs(pc.fogf[1] - want.fogf[1]) < 1e-4f);
+  CHECK(pc.fogi[1] == want.fogi[1] && pc.fogi[3] == want.fogi[3]);
+  // Not taken: another end, a start already set, a start not below 0, other fog, an orthographic projection.
+  gxc::PixelShaderConstants other{};
+  set_fog(other, 0.f, 4000.f);
+  CHECK(!gxc::fog_start_before_camera(other, key, proj, -1000.f, 8000.f));
+  set_fog(other, 500.f, 8000.f);
+  CHECK(!gxc::fog_start_before_camera(other, key, proj, -1000.f, 8000.f));
+  set_fog(other, 0.f, 8000.f);
+  CHECK(!gxc::fog_start_before_camera(other, key, proj, 0.f, 8000.f));
+  gxc::ShaderKey exp_key = key;
+  exp_key.fog_fsel = static_cast<std::uint8_t>(gxc::FogType::Exp);
+  CHECK(!gxc::fog_start_before_camera(other, exp_key, proj, -1000.f, 8000.f));
+  float ortho[4][4]{};
+  ortho[3][3] = 1.f;
+  CHECK(!gxc::fog_start_before_camera(other, key, ortho, -1000.f, 8000.f));
+  set_fog(want, 0.f, 8000.f);
+  CHECK(other.fogf[0] == want.fogf[0] && other.fogf[1] == 0.f);
+}
+
 // S16 EFB copy: the GxCoreSink turns a resolved CopyDestination packet into an
 // EfbCopyCommand carrying the dest/rect/format + the copy-clear color/Z from
 // live BP state, and only when a copy observer is registered (else it counts
@@ -3071,6 +3123,7 @@ int main() {
   test_lighting_completeness();
   test_cached_normal();
   test_fog();
+  test_fog_start_before_camera();
   test_efb_copy_sink();
   test_draw_fusion();
   if (g_failures != 0) {

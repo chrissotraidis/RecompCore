@@ -266,7 +266,8 @@ void aurora_set_fog_hd(int on);
    the GameCube's palette blend (float_kankyo_color_ratio_set) clamps every blended value at 0, so the game's fog
    starts at 0 there and fogs far less than HD. The host gives the stage's HD palette entries with a start below 0
    (count pairs of start, end; at most 8; 0 or NULL: none): where the lit scenery's fog starts at 0 and ends at one
-   of those ends, the sun pass fogs it from that start instead, as HD does. */
+   of those ends, the sun pass fogs it from that start instead, as HD does; every other draw fogged from 0 to the
+   first pair's end (characters, plants, objects) takes that start in its own fog. */
 void aurora_set_fog_hd_starts(const float* start_end, int count);
 /* Wind Waker HD's own normals for the stage in play (the HD pack's optional/hd-normals/<stage>.bin, made by the
    importer from the player's HD dump), for the sun shadows' facing term; NULL or a missing file: none, and

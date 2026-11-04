@@ -751,6 +751,14 @@ ToonLightMatch toon_light_stage(const ShaderKey& key);
 // Gods' room materials). Not a toon draw (toon_light_stage()).
 bool hd_point_light_stage(const ShaderKey& key);
 
+// Wind Waker HD's fog start before the camera on a draw's own GX fog. HD's palettes start the fog below 0 in many
+// places (Ganon's Tower -5000, the Tower of the Gods -1000), where the GameCube's palette blend clamps the start at 0,
+// so a draw fogged from the game's palette (C 0) fogs far less than HD's shaders. For a draw with linear perspective
+// fog, C 0 and a perspective projection whose fog ends at `end` (within 1%: its end is the projection's near x B / A,
+// GXSetFog's terms), sets A and C to GXSetFog's for `start` to `end`: the same fog, from `start`. True if it did.
+bool fog_start_before_camera(PixelShaderConstants& pc, const ShaderKey& key, const float projection[4][4],
+                             float start, float end);
+
 // The uniform a ShaderKey::hd_actor_light shader reads at group(0) binding(2)
 // (binding 0 and 1 are the pass's static storage buffers; binding 3 the shadow
 // texture, 4 its sampler; 5 HD's cloud shadow texture, 6 its sampler). All

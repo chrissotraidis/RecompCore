@@ -5168,6 +5168,13 @@ void set_fog_hd_starts(const float* start_end, int count) noexcept {
   }
 }
 
+bool fog_hd_start(float& start, float& end) noexcept {
+  std::lock_guard lock{g_sceneFogMutex};
+  start = g_fogHdStarts[0];
+  end = g_fogHdStarts[1];
+  return end > 0.f && start < 0.f;
+}
+
 void note_scene_fog(float a, int b_magnitude, int b_shift, float c, const int colour[3], bool hd_square,
                     const float* range, float centre, float width) noexcept {
   std::lock_guard lock{g_sceneFogMutex};

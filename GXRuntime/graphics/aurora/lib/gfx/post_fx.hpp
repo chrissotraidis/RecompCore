@@ -90,6 +90,8 @@ bool fog_hd() noexcept;
 void set_fog_hd(bool on) noexcept;
 // Wind Waker HD's palette fog starts below 0, as start, end pairs (aurora_set_fog_hd_starts).
 void set_fog_hd_starts(const float* start_end, int count) noexcept;
+// The first of those pairs (the host gives one a frame, HD's start for the palette blend in play): false if none.
+bool fog_hd_start(float& start, float& end) noexcept;
 // The fog the lit scenery's draws took this frame (GX's: A, B's magnitude and shift, C, its colour 0-255, and HD's
 // square), for the sun pass to fog after the shade, by the distance from the eye, as Wind Waker HD's scenery
 // shaders do (DOL_AURORA_SUN_FOG_HD=0: as drawn). From the draw thread.

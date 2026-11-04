@@ -3256,6 +3256,21 @@ static const gxc::PixelShaderConstants& hd_light_constants(const gxc::DrawPlan& 
   return pc;
 }
 
+// A draw's pixel constants with Wind Waker HD's fog start before the camera (gxc::fog_start_before_camera()), while
+// the host has HD's fog in the game's palettes and a start below 0 for the frame; else `pc` itself.
+static const gxc::PixelShaderConstants& hd_fog_constants(const gxc::PixelShaderConstants& pc,
+                                                         const gxc::DrawPlan& plan) {
+  const gxc::ShaderKey& key = plan.pipeline.shader;
+  if (key.fog_fsel != static_cast<uint8_t>(gxc::FogType::Linear) || pc.fogf[1] != 0.f || !post_fx::fog_hd())
+    return pc;
+  float start = 0.f, end = 0.f;
+  if (!post_fx::fog_hd_start(start, end))
+    return pc;
+  static thread_local gxc::PixelShaderConstants out;
+  out = pc;
+  return gxc::fog_start_before_camera(out, key, plan.constants.projection, start, end) ? out : pc;
+}
+
 // Wind Waker HD's lava and fire rooms (GanonB, Cave01, MiniKaz, Ganon's Tower's lava parts): their materials with
 // a konst2 animation add the lava's light, albedo x lava K x 4 x the vertex red squared (Cemu, GanonB's PS 4345;
 // lava K the animation at the game frame, 0.453, 0.0415, 0.0005 at frame 23), outside the shade and before the fog.
@@ -4075,8 +4090,12 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const bool alphaCaster = cutoutBindGroup != 0 && (sun_caster_alpha(plan.pipeline) || blendedCutout);
   const bool smoothNormal = smooth_normal_draw(plan, seaSurface);
   // A palm with Wind Waker HD's light (apply_hd_colours()): its shade colour black.
-  const gxc::PixelShaderConstants& pixelConstants =
+  const gxc::PixelShaderConstants& lightConstants =
       smoothNormal && hd_light_draw(plan) ? hd_light_constants(plan) : plan.pixel_constants;
+  // Wind Waker HD's fog start before the camera (aurora_set_fog_hd_starts) on every draw fogged from the game's
+  // clamped start (C 0) to the same end: the characters, plants and objects as well as the lit scenery, all fogged
+  // from that start in HD's shaders. The lit scenery's fog the sun pass takes (note_scene_fog()) is these constants.
+  const gxc::PixelShaderConstants& pixelConstants = tev ? hd_fog_constants(lightConstants, plan) : lightConstants;
   Range pixelUniformRange{};
   bool pixelRepeats = false;
   if (tev) {
@@ -4132,7 +4151,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // its shade, as Wind Waker HD fogs its scenery (post_fx::note_scene_fog()).
   if (tev && key.shader.fog_fsel == static_cast<uint8_t>(gxc::FogType::Linear) &&
       key.shader.fog_proj == static_cast<uint8_t>(gxc::FogProjection::Perspective) && hd_light_draw(plan)) {
-    const auto& pc = plan.pixel_constants;
+    const auto& pc = pixelConstants;
     post_fx::note_scene_fog(pc.fogf[0], pc.fogi[1], pc.fogi[3], pc.fogf[1], pc.fogcolor, key.shader.hd_fog != 0u,
                             key.shader.fog_range != 0u ? &pc.fogrange[0][0] : nullptr, pc.fogf[2], pc.fogf[3]);
   }

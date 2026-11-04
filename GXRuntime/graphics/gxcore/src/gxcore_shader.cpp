@@ -1075,6 +1075,26 @@ ToonLightMatch toon_light_stage(const ShaderKey& key) {
   return match;
 }
 
+bool fog_start_before_camera(PixelShaderConstants& pc, const ShaderKey& key, const float projection[4][4],
+                             float start, float end) {
+  if (key.fog_fsel != static_cast<std::uint8_t>(FogType::Linear) ||
+      key.fog_proj != static_cast<std::uint8_t>(FogProjection::Perspective) || pc.fogf[1] != 0.f ||
+      !(pc.fogf[0] > 0.f) || pc.fogi[1] <= 0 || !(start < 0.f) || !(end > 0.f) || projection[3][2] != -1.f)
+    return false;
+  // GXSetFog: A = n f / ((f - n)(end - start)) and B = f / (f - n), held as a = A / 2^shift and
+  // b = B x 2^24 / 2^shift, so A / B = a 2^24 / b = n / (end - start). The projection's near: its z row is
+  // (-n / (f - n), -f n / (f - n)), so n = row[3] / (row[2] - 1).
+  const float near = projection[2][3] / (projection[2][2] - 1.f);
+  if (!(near > 0.f))
+    return false;
+  const float game_end = near * static_cast<float>(pc.fogi[1]) / (pc.fogf[0] * 16777216.f);
+  if (!(std::abs(game_end - end) <= 0.01f * end))
+    return false;
+  pc.fogf[0] *= game_end / (game_end - start);
+  pc.fogf[1] = start / (game_end - start);
+  return true;
+}
+
 bool hd_point_light_stage(const ShaderKey& key) {
   if (key.tev_valid == 0u || key.num_tev_stages < 2u || key.num_tev_stages > kMaxTevStages || key.num_ind_stages != 0u ||
       toon_light_stage(key).matched)
