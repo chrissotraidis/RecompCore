@@ -220,6 +220,12 @@ struct RenderPass {
   // Starts after it: the scene's effects and the monotone first, bloom after the player's lists.
   bool monotonePoint = false;
   post_fx::Monotone monotone;
+  // In the pass after the grey composite's copy (mark_monotone_copy()): the copy made again into this texture from
+  // the frame after the monotone, with the copy's uniform and format.
+  TextureHandle monotoneHaze;
+  Range monotoneHazeUniform;
+  GXTexFmt monotoneHazeFormat = GX_TF_I8;
+  ClipRect monotoneHazeRect;
   bool sealed = false;
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
 };
@@ -814,13 +820,15 @@ static bool g_nextDrawComposite = false;
 void set_next_draw_composite(bool composite) noexcept { g_nextDrawComposite = composite; }
 
 static post_fx::Monotone g_pendingMonotone; // the recording thread's, for the pass after a marked copy
+static TextureHandle g_pendingMonotoneHaze;
 
-void mark_monotone_copy(const post_fx::Monotone& monotone) noexcept {
+void mark_monotone_copy(const post_fx::Monotone& monotone, TextureHandle haze) noexcept {
   if (g_currentRenderPass == UINT32_MAX || g_inOffscreen)
     return;
   auto& pass = current_render_passes()[g_currentRenderPass];
   pass.monotoneCopy = true;
   g_pendingMonotone = monotone;
+  g_pendingMonotoneHaze = std::move(haze);
 }
 
 static inline void push_command(CommandType type, const Command::Data& data) {
@@ -938,7 +946,12 @@ void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool cl
       .monotoneFrame = prevPass.monotoneFrame,
       .monotonePoint = prevPass.monotoneCopy,
       .monotone = prevPass.monotoneCopy ? g_pendingMonotone : post_fx::Monotone{},
+      .monotoneHaze = prevPass.monotoneCopy ? g_pendingMonotoneHaze : TextureHandle{},
+      .monotoneHazeUniform = prevPass.resolveUniformRange,
+      .monotoneHazeFormat = resolveFormat,
+      .monotoneHazeRect = rect,
   };
+  g_pendingMonotoneHaze = {};
   newPass.commands.reserve(2048);
   current_render_passes().emplace_back(std::move(newPass));
   ++g_currentRenderPass;
@@ -2656,6 +2669,23 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
                     &passInfo.monotone);
     if (lateLight)
       post_fx::snapshot_monotone_depth(cmd, passInfo.copySourceDepthView, passInfo.targetSize);
+    // The grey composite's copy again, from the frame with HD's monotone in (the heat haze's): the copy keeps the
+    // colour (for the next frame's motion blur, laid back under the monotone), and the haze drawn from it after the
+    // monotone showed the colours in its quads over the sepia (Xboss0, the boss replays).
+    if (passInfo.monotoneHaze && passInfo.msaaSamples == 1) {
+      const auto& hazeSize = passInfo.monotoneHaze->size;
+      const bool scaled = hazeSize.width != static_cast<uint32_t>(passInfo.monotoneHazeRect.width) ||
+                          hazeSize.height != static_cast<uint32_t>(passInfo.monotoneHazeRect.height);
+      tex_copy_conv::run(cmd, tex_copy_conv::ConvRequest{
+                                  .fmt = passInfo.monotoneHazeFormat,
+                                  .srcView = passInfo.copySourceView,
+                                  .uniformRange = passInfo.monotoneHazeUniform,
+                                  .dst = passInfo.monotoneHaze,
+                                  .sampleFilter = scaled ? tex_copy_conv::SampleFilter::Linear
+                                                         : tex_copy_conv::SampleFilter::Nearest,
+                                  .keepColour = true,
+                              });
+    }
   }
   // DOL_AURORA_GPU_PROF_CHUNK=N (diagnostic): a pass of more than N commands is
   // encoded as timed sub-passes of N commands, "EFB 1 @0", "EFB 1 @N", ...,

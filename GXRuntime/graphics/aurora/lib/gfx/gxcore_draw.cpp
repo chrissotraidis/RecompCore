@@ -441,6 +441,15 @@ struct EfbCopyBinding {
   bool memory_epoch_valid = false;
 };
 absl::flat_hash_map<uint32_t, EfbCopyBinding> g_efbCopyTextures;
+// The grey composite's copy's second texture while monotone, per copy (copy_efb_to_texture()), and the bindings it
+// stands in for until the frame's end (note_frame_presented()).
+absl::flat_hash_map<EfbCopyKey, TextureHandle> g_monotoneHazeTextures;
+struct MonotoneHazeRestore {
+  uint32_t address = 0;
+  EfbCopyBinding copy;
+  TextureHandle haze;
+};
+std::vector<MonotoneHazeRestore> g_monotoneHazeRestore;
 
 } // namespace
 
@@ -2324,6 +2333,13 @@ void render_sea_mask(const DrawData& data, const wgpu::RenderPassEncoder& pass) 
 }
 
 void note_frame_presented() {
+  // The grey composite's copy back in place of its haze texture (copy_efb_to_texture()).
+  for (auto it = g_monotoneHazeRestore.rbegin(); it != g_monotoneHazeRestore.rend(); ++it) {
+    const auto found = g_efbCopyTextures.find(it->address);
+    if (found != g_efbCopyTextures.end() && found->second.handle == it->haze)
+      found->second = it->copy;
+  }
+  g_monotoneHazeRestore.clear();
   g_textureVerifyFrame.fetch_add(1u, std::memory_order_relaxed);
   frame_interp::end_game_frame();
 }
@@ -2334,6 +2350,8 @@ void reset_texture_cache() {
   g_textureAddrKey.clear();
   g_efbCopyCache.clear();
   g_efbCopyTextures.clear();
+  g_monotoneHazeTextures.clear();
+  g_monotoneHazeRestore.clear();
   g_textureCacheStats = {};
 }
 
@@ -2502,7 +2520,18 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
     const uint32_t dest = cmd.dest_address & 0x3FFFFFFFu;
     if (monotone.on && monotone.frameCopy != 0 && fmt == GX_TF_I8 && (g_lastCopyFormat & _GX_TF_ZTF) != 0u &&
         dest >= monotone.frameCopy && dest < monotone.frameCopy + 0x100000u) {
-      gfx::mark_monotone_copy(monotone);
+      // What samples the copy after it this frame (the heat haze, drawn after HD's monotone) takes a second texture
+      // the copy is made into again from the frame with the monotone in (common.cpp render()); the next frame's
+      // motion blur, laid back under the monotone, the copy itself (restored at the frame's end).
+      auto& haze = g_monotoneHazeTextures[key];
+      if (!haze)
+        haze = gfx::new_conv_texture(dstWidth, dstHeight, fmt, "GXCore Copy Conv (monotone haze)");
+      gfx::mark_monotone_copy(monotone, haze);
+      if (haze) {
+        auto& binding = g_efbCopyTextures[cmd.dest_address];
+        g_monotoneHazeRestore.push_back(MonotoneHazeRestore{cmd.dest_address, binding, haze});
+        binding.handle = haze;
+      }
       g_monotoneDrop = dest;
       static bool s_logged = false;
       if (!s_logged) {
