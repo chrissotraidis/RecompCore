@@ -4174,6 +4174,10 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   t_hdLavaDraw = smoothNormal && key.shader.hd_point_light != 0u && hd_lava_draw(plan);
   if (t_hdLavaDraw)
     key.shader.hd_point_light |= 4u;
+  // Wind Waker HD's water floor (gxc::hd_water_floor_stage()), its sum in linear light on HD's linear colours, while
+  // HD's palettes (whose colours it takes) and its light are in place.
+  if (tev && gxc::hd_water_floor_stage(key.shader) && post_fx::actor_light_wanted())
+    key.shader.hd_water = 1u;
   // Wind Waker HD's fog curve (aurora_set_fog_hd): while the host has HD's fog distances in the game's palettes,
   // linear fog is squared, as HD's shaders fog; on the GameCube's linear curve HD's distances (retuned for the
   // square) gave about twice HD's fog at mid range.

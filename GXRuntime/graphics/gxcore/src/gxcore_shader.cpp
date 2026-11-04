@@ -475,6 +475,24 @@ void emit_hd_lava(std::string& out) {
             "    }\n");
 }
 
+// Wind Waker HD's water floor (ShaderKey::hd_water): its sum in linear light, as HD's shader for it adds (Cemu, ToG
+// room 0, PS 27623): X = clamp(clamp(C x t0 + K) + clamp(K x t1) x (1 - a)), K and C the GameCube's colours made
+// linear (HD's constants are (c / 255)^2.2 in 8 bits), t0 and t1 the stages' texels, a = the vertex alpha x t0's
+// alpha; then back to gamma for the GX fog. HD then scales it by its light buffer's (1 + L) / 2, which is 1 where the
+// floor is lit and its shadow where not; the sun pass shades it here.
+void emit_hd_water(std::string& out, const ShaderKey& key) {
+  emitf(out,
+        "    {\n"
+        "        let hd_wk = round(pow(vec3f(%s & vec3i(255, 255, 255)) / 255.0, vec3f(2.2)) * 255.0) / 255.0;\n"
+        "        let hd_wc = round(pow(vec3f(psc.colors[1].rgb & vec3i(255, 255, 255)) / 255.0, vec3f(2.2)) * 255.0) / "
+        "255.0;\n"
+        "        let hd_wx = clamp(clamp(hd_wc * hd_wt0 + hd_wk, vec3f(0.0), vec3f(1.0)) + "
+        "clamp(hd_wk * hd_wt1, vec3f(0.0), vec3f(1.0)) * (1.0 - hd_wa), vec3f(0.0), vec3f(1.0));\n"
+        "        prev = vec4i(vec3i(round(pow(hd_wx, vec3f(1.0 / 2.2)) * 255.0)), prev.a);\n"
+        "    }\n",
+        kKselC[key.tev_stages[0].ksel_kc]);
+}
+
 bool hd_scenery_vertex_normal(const ShaderKey& key) {
   return hd_scenery_smooth_normal(key) ||
          (key.lit_valid != 0u && key.has_vertex_normal != 0u && key.raw_tex_hi_in_nbt == 0u &&
@@ -797,6 +815,12 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key, const ToonLightMa
                 "    }\n");
     if (n == 1u && key.num_tev_stages > 2u && hd_scenery_lava(key, hd))
       emit_hd_lava(out);
+    // HD's water floor keeps its stages' texels and stage 0's alpha (the vertex alpha x the texel's).
+    if (key.hd_water != 0u && n == 0u)
+      emit(out, "    let hd_wt0 = vec3f(textemp.rgb & vec3i(255, 255, 255)) / 255.0;\n"
+                "    let hd_wa = f32(rastemp.a & 255) * f32(textemp.a & 255) / 65025.0;\n");
+    if (key.hd_water != 0u && n == 1u)
+      emit(out, "    let hd_wt1 = vec3f(textemp.rgb & vec3i(255, 255, 255)) / 255.0;\n");
   }
 
   // The last stage's destination register is what reaches the framebuffer.
@@ -807,6 +831,8 @@ void emit_tev_fragment(std::string& out, const ShaderKey& key, const ToonLightMa
     emitf(out, "    prev = vec4i(prev.rgb, %s.a);\n", kTevOutput[last.ac_dest]);
   if (key.num_tev_stages <= 2u && hd_scenery_lava(key, hd))
     emit_hd_lava(out);
+  if (key.hd_water != 0u)
+    emit_hd_water(out, key);
 
   if (hd.matched && !hd_after_albedo(hd))
     emit_hd_actor_light(out, key, hd);
@@ -1121,6 +1147,36 @@ bool hd_point_light_stage(const ShaderKey& key) {
         return false;
   }
   return true;
+}
+
+bool hd_water_floor_stage(const ShaderKey& key) {
+  if (key.tev_valid == 0u || key.num_tev_stages != 3u || key.num_ind_stages != 0u || key.num_tex_gens < 2u ||
+      key.textured == 0u)
+    return false;
+  // Colour a, b, c, d, then alpha a, b, c, d (GX's input numbers), the destination and whether a texture is read.
+  struct Want {
+    std::uint8_t c[4], a[4], cdest, adest, tex;
+  };
+  static constexpr Want kWant[3] = {
+      {{15, 2, 8, 14}, {7, 5, 4, 7}, 3, 0, 1},  // KONST + C0 x TEXC into C2; RASA x TEXA into PREV
+      {{15, 14, 8, 15}, {7, 7, 7, 0}, 0, 0, 1}, // KONST x TEXC; APREV kept
+      {{0, 15, 1, 6}, {7, 6, 0, 7}, 0, 0, 0},   // PREV x (1 - APREV) + C2
+  };
+  for (std::uint32_t n = 0; n < 3u; ++n) {
+    const TevStageKey& t = key.tev_stages[n];
+    const Want& w = kWant[n];
+    if (t.cc_a != w.c[0] || t.cc_b != w.c[1] || t.cc_c != w.c[2] || t.cc_d != w.c[3] || t.cc_dest != w.cdest ||
+        t.cc_op != 0u || t.cc_bias != 0u || t.cc_scale != 0u || t.cc_clamp == 0u || t.tevorders_enable != w.tex)
+      return false;
+    // Stage 2's alpha is not used by the sum (its result is the draw's alpha, kept as the GX gives it).
+    if (n < 2u && (t.ac_a != w.a[0] || t.ac_b != w.a[1] || t.ac_c != w.a[2] || t.ac_d != w.a[3] ||
+                   t.ac_dest != w.adest || t.ac_op != 0u || t.ac_bias != 0u || t.ac_scale != 0u))
+      return false;
+  }
+  // Both texture stages take the same konst colour (HD's one K), stage 0 colour channel 0's alpha.
+  return key.tev_stages[0].ksel_kc == key.tev_stages[1].ksel_kc && key.tev_stages[0].ksel_kc >= 12u &&
+         key.tev_stages[0].ksel_kc <= 15u && key.tev_stages[0].tevorders_colorchan == 0u &&
+         key.tev_stages[0].ras_swap[3] == 3u;
 }
 
 HdActorLightPixel hd_actor_light_reference(const HdActorLightConstants& c, float s, float sh, float (*ramp)(float u),

@@ -1503,6 +1503,84 @@ void test_point_light_scenery() {
   CHECK(wv.find("hd_alb * in.hd_em.rgb", glow_at + 1) == std::string::npos);
 }
 
+// The Tower of the Gods' water floor (as BlueWake draws it in room 0): KONST + C0 x TEXC into C2 (alpha RASA x TEXA),
+// KONST x TEXC from the other texcoord, then PREV x (1 - APREV) + C2. Flagged (hd_water), Wind Waker HD's sum in
+// linear light on its 8-bit linear colours replaces the GX colour after the stages, before the alpha test and fog.
+gxc::ShaderKey water_key() {
+  auto key = scenery_key();
+  key.num_tex_gens = 2;
+  key.uv_mask = 3;
+  key.tex_gens[1] = key.tex_gens[0];
+  key.num_tev_stages = 3;
+  auto& s0 = key.tev_stages[0];
+  s0.cc_a = 15, s0.cc_b = 2, s0.cc_c = 8, s0.cc_d = 14, s0.cc_dest = 3;
+  s0.ac_a = 7, s0.ac_b = 5, s0.ac_c = 4, s0.ac_d = 7, s0.ac_dest = 0, s0.ac_clamp = 1;
+  s0.ksel_kc = 12;
+  auto& s1 = key.tev_stages[1];
+  s1 = s0;
+  s1.tevorders_texcoord = 1;
+  s1.tevorders_texmap = 1;
+  s1.tevorders_colorchan = 7;
+  s1.cc_a = 15, s1.cc_b = 14, s1.cc_c = 8, s1.cc_d = 15, s1.cc_dest = 0;
+  s1.ac_a = 7, s1.ac_b = 7, s1.ac_c = 7, s1.ac_d = 0;
+  auto& s2 = key.tev_stages[2];
+  s2 = s1;
+  s2.tevorders_enable = 0;
+  s2.tevorders_texmap = 7;
+  s2.cc_a = 0, s2.cc_b = 15, s2.cc_c = 1, s2.cc_d = 6;
+  s2.ac_a = 7, s2.ac_b = 6, s2.ac_c = 0, s2.ac_d = 7;
+  s2.ksel_ka = 31;
+  return key;
+}
+
+void test_water_floor() {
+  auto key = water_key();
+  CHECK(gxc::hd_water_floor_stage(key));
+  CHECK(!gxc::hd_point_light_stage(key));
+  {
+    auto other = key;
+    other.tev_stages[2].cc_d = 4; // + C1, not C2
+    CHECK(!gxc::hd_water_floor_stage(other));
+    auto two = key;
+    two.num_tev_stages = 2;
+    CHECK(!gxc::hd_water_floor_stage(two));
+    auto konst = key;
+    konst.tev_stages[1].ksel_kc = 13; // another konst colour for the second layer
+    CHECK(!gxc::hd_water_floor_stage(konst));
+    auto scaled = key;
+    scaled.tev_stages[0].cc_scale = 1;
+    CHECK(!gxc::hd_water_floor_stage(scaled));
+    auto alpha = key;
+    alpha.tev_stages[0].ac_b = 7; // a not from the vertex alpha
+    CHECK(!gxc::hd_water_floor_stage(alpha));
+  }
+  // Unflagged: the GameCube's sum as before.
+  const std::string gx = gxc::generate_wgsl(key);
+  CHECK(gx.find("hd_w") == std::string::npos);
+  key.hd_water = 1;
+  const std::string w = gxc::generate_wgsl(key);
+  if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
+    std::printf("%s\n", w.c_str());
+  const auto s1_at = w.find("// TEV stage 1");
+  const auto s2_at = w.find("// TEV stage 2");
+  const auto t0_at = w.find("let hd_wt0 = vec3f(textemp.rgb & vec3i(255, 255, 255)) / 255.0;");
+  const auto a_at = w.find("let hd_wa = f32(rastemp.a & 255) * f32(textemp.a & 255) / 65025.0;");
+  const auto t1_at = w.find("let hd_wt1 = vec3f(textemp.rgb & vec3i(255, 255, 255)) / 255.0;");
+  const auto k_at = w.find("let hd_wk = round(pow(vec3f(psc.kcolors[0].rgb & vec3i(255, 255, 255)) / 255.0, "
+                           "vec3f(2.2)) * 255.0) / 255.0;");
+  const auto sum_at = w.find("clamp(hd_wk * hd_wt1, vec3f(0.0), vec3f(1.0)) * (1.0 - hd_wa)");
+  const auto out_at = w.find("prev = vec4i(vec3i(round(pow(hd_wx, vec3f(1.0 / 2.2)) * 255.0)), prev.a);");
+  const auto discard_at = w.find("discard");
+  CHECK(s1_at != std::string::npos && s2_at != std::string::npos && t0_at != std::string::npos &&
+        a_at != std::string::npos && t1_at != std::string::npos && k_at != std::string::npos &&
+        sum_at != std::string::npos && out_at != std::string::npos && discard_at != std::string::npos);
+  CHECK(t0_at < s1_at && a_at < s1_at && s1_at < t1_at && t1_at < s2_at && s2_at < k_at && k_at < sum_at &&
+        sum_at < out_at && out_at < discard_at);
+  CHECK(w.find("hdp") == std::string::npos && w.find("hdl") == std::string::npos);
+  // Byte for byte the GameCube's module apart from the HD block.
+  CHECK(w.size() > gx.size());
+}
+
 // Dolphin VertexShaderGen SourceRow::Normal: use the raw normal only when the
 // vertex format provides one; otherwise preserve the initialized coordinate.
 void test_texgen_normal_source() {
@@ -3129,6 +3207,7 @@ int main() {
   test_toon_light_reference();
   test_point_light_reference();
   test_point_light_scenery();
+  test_water_floor();
   test_toon_light_extended();
   test_texgen_normal_source();
   test_five_texgens();
