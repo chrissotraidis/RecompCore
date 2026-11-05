@@ -19,6 +19,7 @@
 #include "post_fx.hpp"
 #include "render_worker.hpp"
 #include "staging_budget.hpp"
+#include "staging_copy_plan.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
 #include "texture_replacement.hpp"
@@ -1945,15 +1946,13 @@ static void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePack
 
 static bool needs_staging_copy(const FramePacket& frame, const FrameOp& op) {
   const auto& highWater = op.highWater;
-  if (!g_batchStagingCopies &&
-      (highWater.verts > frame.copied.verts || highWater.uniforms > frame.copied.uniforms ||
-       highWater.indices > frame.copied.indices || highWater.storage > frame.copied.storage)) {
-    return true;
-  }
+  const bool buffersPending = highWater.verts > frame.copied.verts || highWater.uniforms > frame.copied.uniforms ||
+                              highWater.indices > frame.copied.indices || highWater.storage > frame.copied.storage;
+  bool texturesPending = false;
   if constexpr (UseTextureBuffer) {
-    return op.textureUploads.size() > frame.copied.textureUploadCount;
+    texturesPending = op.textureUploads.size() > frame.copied.textureUploadCount;
   }
-  return false;
+  return needs_incremental_staging_copy(staging_copy_plan(g_batchStagingCopies), buffersPending, texturesPending);
 }
 
 static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
@@ -1964,7 +1963,7 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
   const auto& highWater = op.highWater;
   using webgpu::gpu_prof::CopyKind;
   const auto delta = [](uint64_t highWater, uint64_t copied) { return highWater > copied ? highWater - copied : 0; };
-  if (!g_batchStagingCopies) {
+  if (staging_copy_plan(g_batchStagingCopies).copyBuffersAtOperation) {
     webgpu::gpu_prof::count_copy(CopyKind::Vertices, delta(highWater.verts, frame.copied.verts));
     webgpu::gpu_prof::count_copy(CopyKind::Uniforms, delta(highWater.uniforms, frame.copied.uniforms));
     webgpu::gpu_prof::count_copy(CopyKind::Indices, delta(highWater.indices, frame.copied.indices));
@@ -1998,7 +1997,7 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
 }
 
 static void submit_batched_staging_copies(FramePacket& frame) {
-  if (!g_batchStagingCopies) {
+  if (!staging_copy_plan(g_batchStagingCopies).submitBuffersBeforeRender) {
     return;
   }
   // Passes are encoded while the game is still recording the frame, before
