@@ -8,6 +8,7 @@
 #include "pipeline_cache.hpp"
 #include "post_fx.hpp" // the sun shadow map
 #include "soft_effects.hpp"
+#include "smooth_normal_cache.hpp"
 #include "thread_cpu.hpp"
 #include "texture.hpp"
 #include "tex_copy_conv.hpp" // EFB-copy format conversion (63/S16)
@@ -3449,7 +3450,7 @@ static void apply_hd_colours(const gxc::DrawPlan& plan, std::vector<float>& vert
                  hits, count, c[0], c[1], c[2], k[0], k[1], k[2]);
 }
 
-static const std::vector<float>& with_smooth_normals(const gxc::DrawPlan& plan) {
+static const std::vector<float>& smooth_normals_uncached(const gxc::DrawPlan& plan) {
   using Vec = std::array<float, 3>;
   static thread_local std::vector<float> vertices;
   static thread_local std::vector<uint32_t> group;       // each vertex's position
@@ -3570,6 +3571,62 @@ static const std::vector<float>& with_smooth_normals(const gxc::DrawPlan& plan) 
   }
   apply_hd_colours(plan, vertices);
   return vertices;
+}
+
+// What smooth_normals_uncached() reads besides the draw's vertices and indices, for SmoothNormalCache's compare: the
+// stage's and the objects' tables (a new table is a new pointer; the entries hold the old one), and whether the draw
+// takes HD's light, with apply_hd_colours()'s shade and light colours if so.
+struct SmoothNormalInputs {
+  std::shared_ptr<const HdNormals> normals, objectNormals;
+  std::shared_ptr<const HdColours> colours, stageColours;
+  bool light = false;
+  std::array<int, 3> k{}, c{};
+  bool operator==(const SmoothNormalInputs& o) const {
+    return normals == o.normals && objectNormals == o.objectNormals && colours == o.colours &&
+           stageColours == o.stageColours && light == o.light && k == o.k && c == o.c;
+  }
+};
+
+// The draw's vertices with smooth normals, made once while the draw stays the same (smooth_normal_cache.hpp): a
+// still room's lit scenery made them every frame, Hyrule Castle's hall 66 draws and 47,000 vertices a game frame
+// (on an i5-6500, 7 ms of the GX worker's 20). Not for a lava draw (its glow follows the game frame).
+// DOL_AURORA_SUN_SHADOW_NORMAL_CACHE=0: made every frame, as before.
+// DOL_AURORA_SUN_SHADOW_NORMAL_CACHE_LOG=1 (local debug): draws, vertices and hits a game frame, every 600 frames.
+static const std::vector<float>& with_smooth_normals(const gxc::DrawPlan& plan) {
+  static const bool cacheOn = [] {
+    const char* env = std::getenv("DOL_AURORA_SUN_SHADOW_NORMAL_CACHE");
+    return env == nullptr || env[0] != '0';
+  }();
+  if (!cacheOn || t_hdLavaDraw)
+    return smooth_normals_uncached(plan);
+  static thread_local SmoothNormalCache<SmoothNormalInputs> cache;
+  const uint64_t frame = frame_interp::game_frame_number();
+  SmoothNormalInputs inputs{hd_normals(), hd_object_normals(), hd_colours(),
+                            hd_terrain_light() ? hd_stage_colours() : nullptr};
+  // apply_hd_colours()'s own tests and colours.
+  if ((inputs.colours != nullptr || inputs.stageColours != nullptr) && hd_light_draw(plan)) {
+    inputs.light = true;
+    const gxc::TevStageKey& s = plan.pipeline.shader.tev_stages[0];
+    inputs.k = konst_rgb(plan.pixel_constants, s.ksel_kc);
+    inputs.c = {plan.pixel_constants.colors[1][0], plan.pixel_constants.colors[1][1],
+                plan.pixel_constants.colors[1][2]};
+  }
+  static const bool log = std::getenv("DOL_AURORA_SUN_SHADOW_NORMAL_CACHE_LOG") != nullptr;
+  if (log) {
+    static thread_local uint64_t s_vertices = 0, s_frames = 0, s_logFrame = 0;
+    s_vertices += plan.vertices.size() / gxc::kVertexFloats;
+    if (frame != s_logFrame) {
+      s_logFrame = frame;
+      if (++s_frames % 600 == 0) {
+        const auto [draws, hits] = cache.take_counts();
+        std::fprintf(stderr, "[sun-normals] a game frame: %.0f draws, %.0f vertices, %.1f%% cache hits, %zu cached\n",
+                     draws / 600.0, s_vertices / 600.0, draws ? 100.0 * hits / draws : 0.0, cache.size());
+        s_vertices = 0;
+      }
+    }
+  }
+  return cache.get(plan.vertices, plan.indices, std::move(inputs), frame,
+                   [&]() -> const std::vector<float>& { return smooth_normals_uncached(plan); });
 }
 
 bool submit_draw_plan(const gxc::DrawPlan& plan) {
