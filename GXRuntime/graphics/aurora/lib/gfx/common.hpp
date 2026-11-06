@@ -254,7 +254,7 @@ void gpu_synchronize();
 void flush_deferred_presents();
 void after_present() noexcept;
 // Rendering fell behind: fewer in-between frames for a while (frame_interp::note_overload).
-void note_render_overload() noexcept;
+void note_render_overload(double waitMs) noexcept;
 float calculate_fps() noexcept;
 // Game frames finished a second (each one presents once, or twice with an
 // in-between frame); calculate_fps() counts every present.

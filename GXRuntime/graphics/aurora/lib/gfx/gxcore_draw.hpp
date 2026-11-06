@@ -78,6 +78,12 @@ struct DrawData {
   // It tests and writes depth (the sea mask's own depth: what stands in front
   // of the sea there covers it).
   bool depthWrite = false;
+  // Efficient soft effects (soft_effects.hpp): the draw's pipeline is a soft
+  // effect's, recorded while the setting was on, with its variant for the
+  // reduced-size buffer and whether it writes EFB alpha.
+  bool softEffect = false;
+  bool softWritesAlpha = false;
+  PipelineRef softPipeline = 0;
 };
 
 // Recording: the pass's last command, when it is a GXCore draw a following
@@ -100,13 +106,18 @@ DrawData* last_recorded_draw() noexcept;
 // texture-coordinate scales enlarge pixel constants and alter TEV WGSL.
 // v13: the hardware's eight texgens and sixteen TEV stages, and TEX5..7 in the
 // normal/binormal/tangent slots of a vertex with no normal (BlueWake #74).
-constexpr uint32_t GXCorePipelineConfigVersion = 13;
+// v14: softTarget, a soft effect's pipeline for the reduced-size buffer.
+constexpr uint32_t GXCorePipelineConfigVersion = 14;
 
 struct PipelineConfig {
   uint32_t version = GXCorePipelineConfigVersion;
   gxruntime::gxcore::PipelineKey key;
   uint32_t msaaSamples = 1;
   uint32_t depthOnly = 0;
+  // 1: drawn into the soft effects' buffer (soft_effects.hpp): one sample, no
+  // depth attachment, alpha blended (One, OneMinusSrcAlpha) so the buffer
+  // holds the run's coverage, colour and alpha always written.
+  uint32_t softTarget = 0;
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);
 
@@ -117,6 +128,11 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 // At a render pass's start, and after anything else draws in it: what
 // render() last bound is not known.
 void reset_pass_state();
+// Efficient soft effects: whether the setting is on (aurora_set_efficient_effects),
+// and, while a run is drawn into the reduced-size buffer, that draws bind their
+// soft variant (render()).
+bool efficient_effects() noexcept;
+void set_soft_target(bool on) noexcept;
 // The sun shadow map (post_fx.hpp): a depth-only pass drawing each caster again
 // from the sun. begin_sun_casters() binds `rows` (the camera's view space to
 // the map's clip space, three rows of a 3x4 matrix) for the pass;

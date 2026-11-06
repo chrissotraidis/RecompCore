@@ -156,6 +156,11 @@ void aurora_set_present_suppressed(bool suppressed);
    own sampler settings, 2-16 forces that many samples. Takes effect at the
    next draw. DOL_AURORA_FORCE_ANISO sets the starting value. */
 void aurora_set_forced_anisotropy(unsigned samples);
+/* Efficient soft effects: runs of large see-through quads drawn after the
+   scene (haze, smoke, fog, clouds) are drawn into a buffer of half the EFB's
+   size and blended over it once, at render scales of 2 and up. Off by default;
+   takes effect for draws recorded after the change. */
+void aurora_set_efficient_effects(bool on);
 /* In-between frames: each finished frame is drawn a second time with every
    draw's transforms blended halfway toward the previous frame and shown
    first, so a 30 FPS game presents 60 frames a second with its own logic

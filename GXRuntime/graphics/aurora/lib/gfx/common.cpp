@@ -10,6 +10,7 @@
 #include "../gx/pipeline.hpp"
 #ifdef AURORA_ENABLE_GXCORE
 #include "gxcore_draw.hpp"
+#include "soft_effects.hpp"
 #endif
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
@@ -30,8 +31,10 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <string_view>
 #include <deque>
 #include <mutex>
+#include <cstring>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -421,6 +424,7 @@ static bool note_game_frame_end();
 static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::CommandEncoder& encoder,
                                     const EndFrameCallback& callback);
 static void present_held(wgpu::CommandEncoder& encoder, const EndFrameCallback& callback, int steps);
+static void upload_interp_data(size_t frameSlot);
 static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEncoder& encoder,
                           const EndFrameCallback& callback, int steps);
 static void flush_presents_from(const webgpu::TextureWithSampler* first, const webgpu::TextureWithSampler* last);
@@ -641,6 +645,10 @@ static void seal_pass(FramePacket& frame, uint32_t passIndex) {
 
 static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op);
 static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex);
+// Efficient soft effects: while a run is drawn into the soft effects' buffer
+// (half the EFB's size), the pass's viewports and scissors are scaled to it.
+static float g_softScale = 1.f;
+
 static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, const RenderPass& passInfo,
                         size_t first = 0, size_t last = SIZE_MAX);
 static void expire_cached_bind_groups();
@@ -1099,6 +1107,24 @@ void push_draw_command(rmlui::DrawData data) {
 }
 #endif
 
+// DOL_AURORA_SKIP_DRAWS / DOL_AURORA_DRAW_LOG=PASS:FIRST-LAST (diagnostics):
+// the commands FIRST to LAST of the frame's pass PASS.
+struct PassRange {
+  bool set = false;
+  uint32_t pass = 0;
+  size_t first = 0, last = 0;
+};
+static PassRange pass_range(const char* name) {
+  PassRange range;
+  const char* env = std::getenv(name);
+  unsigned pass = 0;
+  unsigned long long first = 0, last = 0;
+  if (env != nullptr && std::sscanf(env, "%u:%llu-%llu", &pass, &first, &last) == 3 && first <= last)
+    range = {.set = true, .pass = pass, .first = static_cast<size_t>(first), .last = static_cast<size_t>(last)};
+  return range;
+}
+static const PassRange g_skipDraws = pass_range("DOL_AURORA_SKIP_DRAWS");
+static const PassRange g_drawLog = pass_range("DOL_AURORA_DRAW_LOG");
 #ifdef AURORA_ENABLE_GXCORE
 template <>
 void push_draw_command(gxcore::DrawData data) {
@@ -1120,6 +1146,11 @@ DrawData* last_recorded_draw() noexcept {
 }
 } // namespace gxcore
 
+// For DOL_AURORA_DRAW_LOG: each GXCore pipeline's state in a line, kept when
+// it is first looked up (recording thread), read when a draw is logged.
+static std::mutex g_pipelineDescMutex;
+static absl::flat_hash_map<PipelineRef, std::string> g_pipelineDesc;
+
 template <>
 PipelineRef pipeline_ref(const gxcore::PipelineConfig& config) {
   // Most draws use the pipeline of the draw before them (a draw with early
@@ -1140,6 +1171,18 @@ PipelineRef pipeline_ref(const gxcore::PipelineConfig& config) {
   if (m.valid && m.generation == generation && std::memcmp(&m.config, &config, sizeof config) == 0)
     return m.ref;
   m.ref = find_pipeline(ShaderType::GXCore, config, [=] { return gxcore::create_pipeline(config); });
+  if (g_drawLog.set) {
+    const auto& key = config.key;
+    std::lock_guard lock{g_pipelineDescMutex};
+    g_pipelineDesc.try_emplace(
+        m.ref, fmt::format("tev={} texgens={} ind={} blend={}{}({},{}) z=test{}/func{}/write{}/early{} "
+                           "alpha={},{},{} write=c{}a{} topo={} cull={} depthOnly={}",
+                           key.shader.num_tev_stages, key.shader.num_tex_gens, key.shader.num_ind_stages,
+                           key.blend_enable, key.blend_subtract ? "-" : "", key.src_factor, key.dst_factor,
+                           key.depth_test, key.depth_func, key.depth_update, key.early_depth_test,
+                           key.shader.alpha_comp0, key.shader.alpha_comp1, key.shader.alpha_logic, key.color_update,
+                           key.alpha_update, key.primitive_topology, key.cull_mode, config.depthOnly));
+  }
   m.config = config;
   m.generation = generation;
   m.valid = true;
@@ -1425,7 +1468,7 @@ static size_t acquire_frame_slot() {
       TracyPlot("aurora: frameSlotWaitMs", waitMs);
       // The game waited for the render worker: fewer in-between frames.
       if (waitMs >= 3.0 && !fastForward)
-        frame_interp::note_overload("the game waited for the render worker");
+        frame_interp::note_overload(frame_interp::OverloadCause::RenderWorker, waitMs);
       return *slot;
     }
     wait_for_gpu_progress(std::chrono::microseconds{100});
@@ -1439,8 +1482,10 @@ static std::optional<size_t> acquire_mapped_staging_buffer() {
     if (auto slot = g_stagingSlots.try_acquire()) {
       const bool mapped = wait_for_staging_buffer(*slot);
       // The game waited for the GPU.
-      if (PresentClock::now() - waitStart >= std::chrono::milliseconds{3})
-        frame_interp::note_overload("the game waited for the GPU");
+      const auto waited = PresentClock::now() - waitStart;
+      if (waited >= std::chrono::milliseconds{3})
+        frame_interp::note_overload(frame_interp::OverloadCause::GpuStaging,
+                                    std::chrono::duration<double, std::milli>{waited}.count());
       if (mapped) {
         return *slot;
       }
@@ -1502,7 +1547,8 @@ static void acquire_interp_staging(size_t frameSlot) {
   // processed its events (once a frame, at the end of each): one that looked
   // busy for that alone was taken for an overload and dropped 120 Hz to 60.
   // Up to 4 ms for it, with the worker asked to look.
-  const auto deadline = PresentClock::now() + std::chrono::milliseconds{4};
+  const auto waitStart = PresentClock::now();
+  const auto deadline = waitStart + std::chrono::milliseconds{4};
   while (true) {
     if ((slot.staging = take_interp_staging()) != nullptr)
       return;
@@ -1512,7 +1558,8 @@ static void acquire_interp_staging(size_t frameSlot) {
   }
   // All still on their way through the GPU: it is more than a game frame
   // behind. This frame shows none, and the next ones fewer.
-  frame_interp::note_overload("the GPU is a game frame behind");
+  frame_interp::note_overload(frame_interp::OverloadCause::GpuBehind,
+                              std::chrono::duration<double, std::milli>{PresentClock::now() - waitStart}.count());
 }
 
 // Render worker, after a frame's in-between frames are submitted (or it had
@@ -1710,8 +1757,10 @@ void end_frame(EndFrameCallback callback) {
   frame.stats.lastTextureUploadSize = frame.textureUpload.size();
   frame.presents = !g_segmentEnding;
   const auto& interpSlot = g_interpSlots[g_recordingFrameSlot];
-  frame.interpolate = frame.presents && !frame.continuation && interpSlot.staging != nullptr &&
-                      !interpSlot.overflowed && frame_interp::frame_verdict();
+  const bool staged = interpSlot.staging != nullptr && !interpSlot.overflowed;
+  if (frame.presents && !frame.continuation && !staged && frame_interp::enabled())
+    frame_interp::note_unstaged();
+  frame.interpolate = frame.presents && !frame.continuation && staged && frame_interp::frame_verdict();
   frame.interpSteps = frame_interp::frame_steps();
   if (frame.interpolate)
     frame_interp::camera_steps(frame.cameraSteps.data());
@@ -1785,6 +1834,25 @@ void end_frame(EndFrameCallback callback) {
       // In-between frames on, but nothing in this frame to blend (a still
       // scene, a menu, a cut): the same cadence (present_held).
       hold = !interpolate && callback && periodKnown && frame_interp::enabled();
+    }
+    // DOL_AURORA_FRAME_INTERP_ABLATE (diagnostic, for attributing Smooth
+    // Motion's cost): "match" keeps the helper's matching and blending but
+    // shows the real frame again where the in-between frame would go
+    // (present_held); "upload" also copies the in-between data to the GPU.
+    // Neither draws the in-between frame.
+    static const int ablate = [] {
+      const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_ABLATE");
+      if (env == nullptr)
+        return 0;
+      if (std::strcmp(env, "match") == 0)
+        return 1;
+      return std::strcmp(env, "upload") == 0 ? 2 : 0;
+    }();
+    if (interpolate && ablate != 0) {
+      if (ablate == 2)
+        upload_interp_data(frameSlot);
+      interpolate = false;
+      hold = true;
     }
     if (!interpolate) {
       packet = {};
@@ -2024,6 +2092,153 @@ static void encode_sun_map(const wgpu::CommandEncoder& cmd, const RenderPass& pa
 #endif
 
 #ifdef AURORA_ENABLE_GXCORE
+// Efficient soft effects (soft_effects.hpp): the buffer a run is drawn into,
+// half the EFB's size, and the pipelines that blend it over the EFB.
+namespace {
+struct SoftBuffer {
+  wgpu::Texture texture;
+  wgpu::TextureView view;
+  wgpu::BindGroup bindGroup;
+  uint32_t width = 0, height = 0;
+};
+SoftBuffer g_softBuffer;
+wgpu::BindGroupLayout g_softLayout;
+wgpu::Sampler g_softSampler;
+wgpu::ShaderModule g_softShader;
+absl::flat_hash_map<uint32_t, wgpu::RenderPipeline> g_softComposite; // by samples << 1 | writes alpha
+
+constexpr std::string_view kSoftCompositeWgsl = R"(
+@group(0) @binding(0) var buffer: texture_2d<f32>;
+@group(0) @binding(1) var bufferSampler: sampler;
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+  let corners = array(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+  return vec4f(corners[i], 0.0, 1.0);
+}
+@fragment fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
+  // EFB pixel centres to the buffer's (half the size): exact for any size.
+  let size = vec2f(textureDimensions(buffer));
+  return textureSampleLevel(buffer, bufferSampler, at.xy * 0.5 / size, 0.0);
+}
+)";
+
+void ensure_soft_buffer(const wgpu::Extent3D& efb) {
+  const uint32_t width = (efb.width + 1) / 2;
+  const uint32_t height = (efb.height + 1) / 2;
+  if (!g_softLayout) {
+    const std::array entries{
+        wgpu::BindGroupLayoutEntry{
+            .binding = 0,
+            .visibility = wgpu::ShaderStage::Fragment,
+            .texture = {.sampleType = wgpu::TextureSampleType::Float, .viewDimension = wgpu::TextureViewDimension::e2D},
+        },
+        wgpu::BindGroupLayoutEntry{
+            .binding = 1,
+            .visibility = wgpu::ShaderStage::Fragment,
+            .sampler = {.type = wgpu::SamplerBindingType::Filtering},
+        },
+    };
+    const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+        .label = "Soft effects composite layout", .entryCount = entries.size(), .entries = entries.data()};
+    g_softLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
+    const wgpu::SamplerDescriptor samplerDescriptor{
+        .label = "Soft effects sampler",
+        .addressModeU = wgpu::AddressMode::ClampToEdge,
+        .addressModeV = wgpu::AddressMode::ClampToEdge,
+        .magFilter = wgpu::FilterMode::Linear,
+        .minFilter = wgpu::FilterMode::Linear,
+    };
+    g_softSampler = g_device.CreateSampler(&samplerDescriptor);
+    wgpu::ShaderSourceWGSL source{};
+    source.code = kSoftCompositeWgsl.data();
+    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &source, .label = "Soft effects composite"};
+    g_softShader = g_device.CreateShaderModule(&moduleDescriptor);
+  }
+  if (g_softBuffer.texture && g_softBuffer.width == width && g_softBuffer.height == height)
+    return;
+  const wgpu::TextureDescriptor descriptor{
+      .label = "Soft effects buffer",
+      .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+      .size = {width, height, 1},
+      .format = webgpu::g_graphicsConfig.surfaceConfiguration.format,
+  };
+  g_softBuffer.texture = g_device.CreateTexture(&descriptor);
+  g_softBuffer.view = g_softBuffer.texture.CreateView();
+  g_softBuffer.width = width;
+  g_softBuffer.height = height;
+  const std::array groupEntries{
+      wgpu::BindGroupEntry{.binding = 0, .textureView = g_softBuffer.view},
+      wgpu::BindGroupEntry{.binding = 1, .sampler = g_softSampler},
+  };
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .label = "Soft effects buffer", .layout = g_softLayout, .entryCount = groupEntries.size(), .entries = groupEntries.data()};
+  g_softBuffer.bindGroup = g_device.CreateBindGroup(&groupDescriptor);
+}
+
+// The buffer over the EFB: colour (One, OneMinusSrcAlpha); alpha the same where
+// the run writes EFB alpha, untouched where it does not.
+const wgpu::RenderPipeline& soft_composite(uint32_t samples, bool writesAlpha) {
+  auto& pipeline = g_softComposite[samples << 1 | (writesAlpha ? 1u : 0u)];
+  if (pipeline)
+    return pipeline;
+  const wgpu::BlendState blend{
+      .color = {.operation = wgpu::BlendOperation::Add, .srcFactor = wgpu::BlendFactor::One,
+                .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha},
+      .alpha = {.operation = wgpu::BlendOperation::Add, .srcFactor = wgpu::BlendFactor::One,
+                .dstFactor = wgpu::BlendFactor::OneMinusSrcAlpha},
+  };
+  const wgpu::ColorTargetState target{
+      .format = webgpu::g_graphicsConfig.surfaceConfiguration.format,
+      .blend = &blend,
+      .writeMask = writesAlpha ? wgpu::ColorWriteMask::All
+                               : wgpu::ColorWriteMask::Red | wgpu::ColorWriteMask::Green | wgpu::ColorWriteMask::Blue,
+  };
+  const wgpu::FragmentState fragment{.module = g_softShader, .entryPoint = "fs_main", .targetCount = 1, .targets = &target};
+  const wgpu::PipelineLayoutDescriptor layoutDescriptor{
+      .label = "Soft effects composite", .bindGroupLayoutCount = 1, .bindGroupLayouts = &g_softLayout};
+  const auto layout = g_device.CreatePipelineLayout(&layoutDescriptor);
+  const wgpu::RenderPipelineDescriptor descriptor{
+      .label = "Soft effects composite",
+      .layout = layout,
+      .vertex = {.module = g_softShader, .entryPoint = "vs_main"},
+      .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+      .multisample = {.count = samples},
+      .fragment = &fragment,
+  };
+  pipeline = g_device.CreateRenderPipeline(&descriptor);
+  return pipeline;
+}
+
+// Which of a pass's commands are drawn into the buffer: runs of soft-effect
+// draws (soft_effects::find_runs), each with its variant compiled. Viewport
+// and scissor commands inside a run stay in it (scaled there).
+std::vector<soft_effects::Run> soft_runs(const RenderPass& passInfo, std::vector<bool>& writesAlpha) {
+  const size_t count = passInfo.commands.size();
+  std::vector<bool> soft(count, false);
+  writesAlpha.assign(count, false);
+  for (size_t i = 0; i < count; ++i) {
+    const auto& command = passInfo.commands[i];
+    if (command.type == CommandType::Draw) {
+      if (command.data.draw.type != ShaderType::GXCore)
+        continue;
+      const auto& draw = command.data.draw.gxcore;
+      soft[i] = draw.softEffect && draw.softPipeline != 0 &&
+                soft_effects::qualifies_size(draw.indexCount, draw.batchSize) && pipeline_ready(draw.softPipeline);
+      writesAlpha[i] = draw.softWritesAlpha;
+    } else if (i > 0 && soft[i - 1] &&
+               (command.type == CommandType::SetViewport || command.type == CommandType::SetScissor)) {
+      soft[i] = true;
+      writesAlpha[i] = writesAlpha[i - 1];
+    }
+  }
+  auto runs = soft_effects::find_runs(soft, writesAlpha);
+  // A run ends at its last draw (a state command after it belongs to what follows).
+  for (auto& run : runs)
+    while (run.count > 0 && passInfo.commands[run.first + run.count - 1].type != CommandType::Draw)
+      --run.count;
+  return runs;
+}
+} // namespace
+
 // The sea mask for the HD look's brightness (post_fx.hpp sea_mask_target()):
 // a scene pass's draws up to `end` again, with their own cameras and a depth
 // buffer of the mask's own, the sea's marking the mask and the rest that
@@ -2238,9 +2453,181 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
 #endif
   const post_fx::SunMap* frameSunMap = sunMapFrame == frameKey && sunMap.valid ? &sunMap : nullptr;
 
-  auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
-  render_pass(pass, frame, passInfo, 0, split);
-  pass.End();
+#ifdef AURORA_ENABLE_GXCORE
+  // DOL_AURORA_DRAW_LOG=PASS:FIRST-LAST: the draws of that range, once, in the
+  // 300th real frame: each one's pipeline state, indices, vertex bytes and
+  // textures (a texture bind group is the same textures where it repeats).
+  if (g_drawLog.set && passIndex == g_drawLog.pass && !frame_interp::encoding_interpolated()) {
+    static uint32_t frames = 0;
+    if (++frames == 300) {
+      std::lock_guard lock{g_pipelineDescMutex};
+      for (size_t i = g_drawLog.first; i <= g_drawLog.last && i < passInfo.commands.size(); ++i) {
+        const auto& command = passInfo.commands[i];
+        if (command.type != CommandType::Draw || command.data.draw.type != ShaderType::GXCore) {
+          std::fprintf(stderr, "[draw-log] pass=%u cmd=%zu type=%d\n", passIndex, i, static_cast<int>(command.type));
+          continue;
+        }
+        const auto& draw = command.data.draw.gxcore;
+        const auto desc = g_pipelineDesc.find(draw.pipeline);
+        std::fprintf(stderr,
+                     "[draw-log] pass=%u cmd=%zu pipeline=%016llx indices=%u vert_bytes=%u batch=%u textures=%016llx "
+                     "tev=%d flat=%d early_depth=%d %s\n",
+                     passIndex, i, static_cast<unsigned long long>(draw.pipeline), draw.indexCount,
+                     draw.vertRange.size, draw.batchSize, static_cast<unsigned long long>(draw.textureBindGroup),
+                     draw.tev ? 1 : 0, command.flat ? 1 : 0, draw.depthPipeline != 0 ? 1 : 0,
+                     desc != g_pipelineDesc.end() ? desc->second.c_str() : "(pipeline not described)");
+      }
+    }
+  }
+#endif
+
+  // DOL_AURORA_GPU_PROF_CHUNK=N (diagnostic): a pass of more than N commands is
+  // encoded as timed sub-passes of N commands, "EFB 1 @0", "EFB 1 @N", ...,
+  // each loading what the one before stored, the last resolving. The same
+  // picture, with [gpu-prof] (=2) saying which draws of the pass cost what.
+  static const size_t profChunk = [] {
+    const char* env = std::getenv("DOL_AURORA_GPU_PROF_CHUNK");
+    return env != nullptr ? static_cast<size_t>(std::strtoull(env, nullptr, 10)) : size_t{0};
+  }();
+  bool encodedSoft = false;
+#ifdef AURORA_ENABLE_GXCORE
+  // Efficient soft effects: the pass's runs of soft-effect draws go through the
+  // half-size buffer (soft_effects.hpp); what lies between them stays in the
+  // EFB, each part loading what the one before stored, the last resolving.
+  std::vector<bool> softAlpha;
+  std::vector<soft_effects::Run> softRuns;
+  if (gxcore::efficient_effects() && efbPass && split == SIZE_MAX && profChunk == 0 &&
+      !(g_skipDraws.set && passIndex == g_skipDraws.pass) &&
+      passInfo.targetSize.width >= soft_effects::kMinWidth)
+    softRuns = soft_runs(passInfo, softAlpha);
+  if (!softRuns.empty()) {
+    encodedSoft = true;
+    bool firstPart = true;
+    const auto efbPart = [&](size_t first, size_t last, bool lastPart) {
+      auto partAttachments = attachments;
+      auto partDepthStencil = depthStencilAttachment;
+      if (!firstPart) {
+        partAttachments[0].loadOp = wgpu::LoadOp::Load;
+        if (passInfo.hasDepth)
+          partDepthStencil.depthLoadOp = wgpu::LoadOp::Load;
+        if (passInfo.hasStencil)
+          partDepthStencil.stencilLoadOp = wgpu::LoadOp::Load;
+      }
+      if (!lastPart) {
+        partAttachments[0].resolveTarget = nullptr;
+        partAttachments[0].storeOp = wgpu::StoreOp::Store;
+        if (passInfo.hasDepth)
+          partDepthStencil.depthStoreOp = wgpu::StoreOp::Store;
+        if (passInfo.hasStencil)
+          partDepthStencil.stencilStoreOp = wgpu::StoreOp::Store;
+      }
+      const auto partLabel = fmt::format("{} @{}", label, first);
+      const wgpu::RenderPassDescriptor partDescriptor{
+          .label = partLabel.c_str(),
+          .colorAttachmentCount = partAttachments.size(),
+          .colorAttachments = partAttachments.data(),
+          .depthStencilAttachment = depthStencilAttachmentPtr != nullptr ? &partDepthStencil : nullptr,
+          .timestampWrites = webgpu::gpu_prof::pass_writes(partLabel),
+      };
+      auto part = cmd.BeginRenderPass(&partDescriptor);
+      render_pass(part, frame, passInfo, first, last);
+      part.End();
+      firstPart = false;
+    };
+    ensure_soft_buffer(passInfo.targetSize);
+    size_t at = 0;
+    for (const auto& run : softRuns) {
+      efbPart(at, run.first, false);
+      // The run, into the buffer from (0,0,0,0).
+      const std::array bufferAttachments{wgpu::RenderPassColorAttachment{
+          .view = g_softBuffer.view,
+          .loadOp = wgpu::LoadOp::Clear,
+          .storeOp = wgpu::StoreOp::Store,
+          .clearValue = {.r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0},
+      }};
+      const auto softLabel = fmt::format("{} soft @{}", label, run.first);
+      const wgpu::RenderPassDescriptor bufferDescriptor{
+          .label = softLabel.c_str(),
+          .colorAttachmentCount = bufferAttachments.size(),
+          .colorAttachments = bufferAttachments.data(),
+          .timestampWrites = webgpu::gpu_prof::pass_writes(softLabel),
+      };
+      auto softPass = cmd.BeginRenderPass(&bufferDescriptor);
+      g_softScale = 0.5f;
+      gxcore::set_soft_target(true);
+      render_pass(softPass, frame, passInfo, run.first, run.first + run.count);
+      gxcore::set_soft_target(false);
+      g_softScale = 1.f;
+      softPass.End();
+      // Blended over the EFB once.
+      const std::array compositeAttachments{wgpu::RenderPassColorAttachment{
+          .view = passInfo.colorView,
+          .loadOp = wgpu::LoadOp::Load,
+          .storeOp = wgpu::StoreOp::Store,
+      }};
+      const auto compositeLabel = fmt::format("{} soft composite @{}", label, run.first);
+      const wgpu::RenderPassDescriptor compositeDescriptor{
+          .label = compositeLabel.c_str(),
+          .colorAttachmentCount = compositeAttachments.size(),
+          .colorAttachments = compositeAttachments.data(),
+          .timestampWrites = webgpu::gpu_prof::pass_writes(compositeLabel),
+      };
+      auto composite = cmd.BeginRenderPass(&compositeDescriptor);
+      composite.SetPipeline(soft_composite(passInfo.msaaSamples, softAlpha[run.first]));
+      composite.SetBindGroup(0, g_softBuffer.bindGroup);
+      composite.Draw(3);
+      composite.End();
+      at = run.first + run.count;
+    }
+    efbPart(at, SIZE_MAX, true);
+  }
+#endif
+  if (encodedSoft) {
+    // Encoded above.
+  } else if (profChunk != 0 && split == SIZE_MAX && passInfo.commands.size() > profChunk) {
+    for (size_t first = 0; first < passInfo.commands.size(); first += profChunk) {
+      const bool last = first + profChunk >= passInfo.commands.size();
+      auto chunkAttachments = attachments;
+      auto chunkDepthStencil = depthStencilAttachment;
+      if (first != 0) {
+        chunkAttachments[0].loadOp = wgpu::LoadOp::Load;
+        if (passInfo.hasDepth)
+          chunkDepthStencil.depthLoadOp = wgpu::LoadOp::Load;
+        if (passInfo.hasStencil)
+          chunkDepthStencil.stencilLoadOp = wgpu::LoadOp::Load;
+      }
+      if (!last) {
+        chunkAttachments[0].resolveTarget = nullptr;
+        chunkAttachments[0].storeOp = wgpu::StoreOp::Store;
+        if (passInfo.hasDepth)
+          chunkDepthStencil.depthStoreOp = wgpu::StoreOp::Store;
+        if (passInfo.hasStencil)
+          chunkDepthStencil.stencilStoreOp = wgpu::StoreOp::Store;
+      }
+      const auto chunkLabel = fmt::format("{} @{}", label, first);
+      const wgpu::RenderPassDescriptor chunkDescriptor{
+          .label = chunkLabel.c_str(),
+          .colorAttachmentCount = chunkAttachments.size(),
+          .colorAttachments = chunkAttachments.data(),
+          .depthStencilAttachment = depthStencilAttachmentPtr != nullptr ? &chunkDepthStencil : nullptr,
+          .timestampWrites = webgpu::gpu_prof::pass_writes(chunkLabel),
+      };
+      auto chunk = cmd.BeginRenderPass(&chunkDescriptor);
+      render_pass(chunk, frame, passInfo, first, first + profChunk);
+      chunk.End();
+    }
+  } else if (g_skipDraws.set && passIndex == g_skipDraws.pass && split == SIZE_MAX) {
+    // DOL_AURORA_SKIP_DRAWS=PASS:FIRST-LAST (diagnostic): that range is left
+    // out, in real and in-between frames, to see what it draws and costs.
+    auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
+    render_pass(pass, frame, passInfo, 0, g_skipDraws.first);
+    render_pass(pass, frame, passInfo, g_skipDraws.last + 1, SIZE_MAX);
+    pass.End();
+  } else {
+    auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
+    render_pass(pass, frame, passInfo, 0, split);
+    pass.End();
+  }
 #ifdef AURORA_ENABLE_GXCORE
   if (efbPass)
     encode_sea_mask(cmd, passInfo, split == SIZE_MAX ? passInfo.commands.size() : split, frameKey);
@@ -2562,8 +2949,16 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
   auto between = g_device.CreateCommandEncoder(&EncoderDescriptor);
   g_replayFrameSlot = frameSlot;
   g_replayStep = 0;
-  frame_interp::set_encoding_interpolated(true);
+  // A [gpu-prof] frame of its own, closed by the present callback: the
+  // replay's passes nest in one zone, so its cost reads apart from the real
+  // frame's. Not when dumping passes: that finishes the encoder midway.
   static const bool dumpPasses = std::getenv("DOL_AURORA_FRAME_INTERP_DUMP_PASSES") != nullptr;
+  webgpu::gpu_prof::frame_begin(between);
+  std::optional<webgpu::gpu_prof::Zone> replayZone;
+  if (!(dump && dumpPasses))
+    replayZone.emplace(between, "In-between replay");
+  webgpu::gpu_prof::set_name_prefix("IB ");
+  frame_interp::set_encoding_interpolated(true);
   for (size_t i = 0; i < frame.ops.size(); ++i) {
     replay_op(between, frame, frame.ops[i]);
     if (dump && dumpPasses) {
@@ -2580,6 +2975,8 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
     }
   }
   frame_interp::set_encoding_interpolated(false);
+  webgpu::gpu_prof::set_name_prefix({});
+  replayZone.reset();
   log_present("in-between", frame.gameFrame, 0, {});
   callback(between);
   const auto shown = PresentClock::now();
@@ -2646,13 +3043,21 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
     auto between = g_device.CreateCommandEncoder(&EncoderDescriptor);
     g_replayStep = step;
     const auto encodeStart = PresentClock::now();
+    webgpu::gpu_prof::frame_begin(between);
     frame_interp::set_encoding_interpolated(true);
-    for (const auto& op : frame.ops)
-      replay_op(between, frame, op);
+    {
+      const webgpu::gpu_prof::Zone zone{between, "In-between replay"};
+      webgpu::gpu_prof::set_name_prefix("IB ");
+      for (const auto& op : frame.ops)
+        replay_op(between, frame, op);
+      webgpu::gpu_prof::set_name_prefix({});
+    }
     frame_interp::set_encoding_interpolated(false);
     keep(between, held[step]);
+    webgpu::gpu_prof::frame_end(between);
     const auto buffer = between.Finish();
     g_queue.Submit(1, &buffer);
+    webgpu::gpu_prof::after_submit();
     if (g_presentLog)
       std::fprintf(stderr, "[encode-took] step=%d %.2f\n", step,
                    std::chrono::duration<double, std::milli>(PresentClock::now() - encodeStart).count());
@@ -2771,7 +3176,9 @@ void gpu_synchronize() { render_worker::synchronize(); }
 
 void flush_deferred_presents() { run_deferred_present(); }
 
-void note_render_overload() noexcept { frame_interp::note_overload("a drawable came late"); }
+void note_render_overload(double waitMs) noexcept {
+  frame_interp::note_overload(frame_interp::OverloadCause::LateDrawable, waitMs);
+}
 
 static std::atomic<unsigned long long> g_shownFrames{0};
 
@@ -2811,6 +3218,34 @@ float calculate_fps() noexcept {
   return static_cast<float>(g_presentTimes.size() - 1) / elapsed;
 }
 
+static void apply_viewport(const wgpu::RenderPassEncoder& pass, const Command& command) {
+  const auto& vp = command.data.setViewport;
+  const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
+  const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
+  const float k = g_softScale;
+  pass.SetViewport(vp.left * k, vp.top * k, vp.width * k, vp.height * k, minDepth, maxDepth);
+}
+
+static void apply_scissor(const wgpu::RenderPassEncoder& pass, const Command& command, const wgpu::Extent3D& size) {
+  const auto& sc = command.data.setScissor;
+  const auto x = std::clamp(static_cast<uint32_t>(sc.x), 0u, size.width);
+  const auto y = std::clamp(static_cast<uint32_t>(sc.y), 0u, size.height);
+  const auto w = std::clamp(static_cast<uint32_t>(sc.width), 0u, size.width - x);
+  const auto h = std::clamp(static_cast<uint32_t>(sc.height), 0u, size.height - y);
+  if (g_softScale == 1.f) {
+    pass.SetScissorRect(x, y, w, h);
+    return;
+  }
+  const float k = g_softScale;
+  const auto limitW = static_cast<uint32_t>(std::ceil(size.width * k));
+  const auto limitH = static_cast<uint32_t>(std::ceil(size.height * k));
+  const auto x0 = std::min(static_cast<uint32_t>(std::floor(x * k)), limitW);
+  const auto y0 = std::min(static_cast<uint32_t>(std::floor(y * k)), limitH);
+  const auto x1 = std::min(static_cast<uint32_t>(std::ceil((x + w) * k)), limitW);
+  const auto y1 = std::min(static_cast<uint32_t>(std::ceil((y + h) * k)), limitH);
+  pass.SetScissorRect(x0, y0, x1 - x0, y1 - y0);
+}
+
 static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, const RenderPass& passInfo,
                         size_t first, size_t last) {
   ZoneScoped;
@@ -2838,21 +3273,10 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
       else if (passInfo.commands[i].type == CommandType::SetScissor)
         scissor = &passInfo.commands[i];
     }
-    if (viewport != nullptr) {
-      const auto& vp = viewport->data.setViewport;
-      const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
-      const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
-      pass.SetViewport(vp.left, vp.top, vp.width, vp.height, minDepth, maxDepth);
-    }
-    if (scissor != nullptr) {
-      const auto& sc = scissor->data.setScissor;
-      const auto& size = passInfo.targetSize;
-      const auto x = std::clamp(static_cast<uint32_t>(sc.x), 0u, size.width);
-      const auto y = std::clamp(static_cast<uint32_t>(sc.y), 0u, size.height);
-      const auto w = std::clamp(static_cast<uint32_t>(sc.width), 0u, size.width - x);
-      const auto h = std::clamp(static_cast<uint32_t>(sc.height), 0u, size.height - y);
-      pass.SetScissorRect(x, y, w, h);
-    }
+    if (viewport != nullptr)
+      apply_viewport(pass, *viewport);
+    if (scissor != nullptr)
+      apply_scissor(pass, *scissor, passInfo.targetSize);
   }
 
   size_t encoded = 0;
@@ -2883,21 +3307,12 @@ static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame,
     }
 #endif
     switch (cmd.type) {
-    case CommandType::SetViewport: {
-      const auto& vp = cmd.data.setViewport;
-      const float minDepth = gx::UseReversedZ ? 1.f - vp.zfar : vp.znear;
-      const float maxDepth = gx::UseReversedZ ? 1.f - vp.znear : vp.zfar;
-      pass.SetViewport(vp.left, vp.top, vp.width, vp.height, minDepth, maxDepth);
-    } break;
-    case CommandType::SetScissor: {
-      const auto& sc = cmd.data.setScissor;
-      const auto& size = passInfo.targetSize;
-      const auto x = std::clamp(static_cast<uint32_t>(sc.x), 0u, size.width);
-      const auto y = std::clamp(static_cast<uint32_t>(sc.y), 0u, size.height);
-      const auto w = std::clamp(static_cast<uint32_t>(sc.width), 0u, size.width - x);
-      const auto h = std::clamp(static_cast<uint32_t>(sc.height), 0u, size.height - y);
-      pass.SetScissorRect(x, y, w, h);
-    } break;
+    case CommandType::SetViewport:
+      apply_viewport(pass, cmd);
+      break;
+    case CommandType::SetScissor:
+      apply_scissor(pass, cmd, passInfo.targetSize);
+      break;
     case CommandType::Draw: {
       const auto& draw = cmd.data.draw;
       switch (draw.type) {

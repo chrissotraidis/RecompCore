@@ -434,7 +434,7 @@ void end_frame() noexcept {
         const bool newSwapchain = configures != g_configuresAtAcquire || retried;
         g_configuresAtAcquire = configures;
         if (acquireMs >= 20 && !newSwapchain)
-          gfx::note_render_overload();
+          gfx::note_render_overload(static_cast<double>(acquireMs));
         surfaceStatus = surfaceTexture.status;
         if (surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal ||
             surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessSuboptimal) {
