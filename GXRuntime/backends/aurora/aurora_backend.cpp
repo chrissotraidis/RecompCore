@@ -225,6 +225,9 @@ void install_platform_ops() {
         // records each write with its size.
         .gx_write_bytes = g_gx_core_enabled && !g_trace_armed ? aurora_backend_gx_write_bytes : nullptr,
         .gx_flush = aurora_backend_gx_flush,
+        .gx_position = aurora_backend_gx_position,
+        .gx_parsed = aurora_backend_gx_parsed,
+        .gx_service = aurora_backend_gx_service,
         .gx_read_draw_sync = aurora_backend_gx_read_draw_sync,
         .call_display_list = aurora_backend_call_display_list,
         .call_display_list_guest = aurora_backend_call_display_list_guest,
