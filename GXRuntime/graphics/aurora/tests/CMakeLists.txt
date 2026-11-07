@@ -125,4 +125,10 @@ if (TARGET GXRuntime::gxcore)
   target_link_libraries(gxcore_viewport_tests PRIVATE GXRuntime::gxcore gtest gtest_main
     fmt::fmt xxhash absl::flat_hash_map dawn::dawncpp_headers TracyClient ${AURORA_SDL3_TARGET})
   gtest_discover_tests(gxcore_viewport_tests)
+
+  add_executable(smooth_normal_cache_tests smooth_normal_cache_test.cpp)
+  target_include_directories(smooth_normal_cache_tests PRIVATE ../lib)
+  target_link_libraries(smooth_normal_cache_tests PRIVATE GXRuntime::gxcore gtest gtest_main xxhash
+    absl::flat_hash_map)
+  gtest_discover_tests(smooth_normal_cache_tests)
 endif()

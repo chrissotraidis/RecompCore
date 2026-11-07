@@ -138,6 +138,9 @@ public:
   static constexpr std::uint8_t kDrawTagAgeRegister = 0x7Du;
   static constexpr std::uint8_t kDrawScopeRegister = 0x7Cu;
   static constexpr std::uint8_t kDrawScopeCountRegister = 0x7Bu;
+  // The host's mark of the game's draw list the next draws are in: 0 (or never written) one of the stage's BG
+  // lists, 1 another (DrawPlan::far_caster). Kept until written again, so not forgotten with the tag.
+  static constexpr std::uint8_t kDrawListRegister = 0x7Au;
   // A register state put back from a save state takes a version no draw has
   // been derived from in this run (the saved one belongs to the run that saved
   // it).
