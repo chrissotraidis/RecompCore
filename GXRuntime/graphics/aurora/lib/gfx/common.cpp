@@ -19,6 +19,7 @@
 #include "post_fx.hpp"
 #include "render_worker.hpp"
 #include "staging_budget.hpp"
+#include "staging_copy_plan.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
 #include "texture_replacement.hpp"
@@ -72,6 +73,10 @@ constexpr uint64_t StagingBufferSize = UniformBufferSize + VertexBufferSize + In
                                        (UseTextureBuffer ? TextureUploadSize : 0);
 constexpr size_t FrameSlotCount = 2;
 constexpr size_t StagingBufferCount = FrameSlotCount + 3;
+const bool g_batchStagingCopies = [] {
+  const char* value = std::getenv("DOL_AURORA_BATCH_STAGING_COPIES");
+  return value != nullptr && value[0] == '1';
+}();
 
 struct StagingHighWater {
   uint32_t verts = 0;
@@ -252,6 +257,7 @@ struct FramePacket {
   uint32_t frameIndex = 0;
   size_t stagingBuffer = 0;
   StagingHighWater copied;
+  std::optional<webgpu::gpu_prof::DeferredZone> stagingCopyZone;
   AuroraStats stats{};
   // A later staging segment of a frame: its EFB starts from the previous one.
   bool continuation = false;
@@ -644,6 +650,7 @@ static void seal_pass(FramePacket& frame, uint32_t passIndex) {
 }
 
 static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op);
+static void submit_batched_staging_copies(FramePacket& frame);
 static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex);
 // Efficient soft effects: while a run is drawn into the soft effects' buffer
 // (half the EFB's size), the pass's viewports and scissors are scaled to it.
@@ -1662,6 +1669,8 @@ bool begin_frame(bool preserveEfb) {
     static constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "Redraw encoder"};
     g_framePackets[frameSlot].encoder = g_device.CreateCommandEncoder(&EncoderDescriptor);
     webgpu::gpu_prof::frame_begin(g_framePackets[frameSlot].encoder);
+    if (g_batchStagingCopies)
+      g_framePackets[frameSlot].stagingCopyZone.emplace("Staging copies");
   });
   g_cpuFrameStart = PresentClock::now();
   return true;
@@ -1822,6 +1831,7 @@ void end_frame(EndFrameCallback callback) {
     auto& packet = g_framePackets[frameSlot];
     g_stagingBuffers[stagingSlot].Unmap();
     s_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
+    submit_batched_staging_copies(packet);
     auto encoder = std::move(packet.encoder);
     const auto stats = packet.stats;
     const bool presents = packet.presents;
@@ -1936,33 +1946,35 @@ static void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePack
 
 static bool needs_staging_copy(const FramePacket& frame, const FrameOp& op) {
   const auto& highWater = op.highWater;
-  if (highWater.verts > frame.copied.verts || highWater.uniforms > frame.copied.uniforms ||
-      highWater.indices > frame.copied.indices || highWater.storage > frame.copied.storage) {
-    return true;
-  }
+  const bool buffersPending = highWater.verts > frame.copied.verts || highWater.uniforms > frame.copied.uniforms ||
+                              highWater.indices > frame.copied.indices || highWater.storage > frame.copied.storage;
+  bool texturesPending = false;
   if constexpr (UseTextureBuffer) {
-    return op.textureUploads.size() > frame.copied.textureUploadCount;
+    texturesPending = op.textureUploads.size() > frame.copied.textureUploadCount;
   }
-  return false;
+  return needs_incremental_staging_copy(staging_copy_plan(g_batchStagingCopies), buffersPending, texturesPending);
 }
 
 static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
   if (!needs_staging_copy(frame, op)) {
     return;
   }
-  const webgpu::gpu_prof::Zone zone{cmd, "Staging copies"};
+  const webgpu::gpu_prof::Zone zone{cmd, g_batchStagingCopies ? "Texture uploads" : "Staging copies"};
   const auto& highWater = op.highWater;
   using webgpu::gpu_prof::CopyKind;
   const auto delta = [](uint64_t highWater, uint64_t copied) { return highWater > copied ? highWater - copied : 0; };
-  webgpu::gpu_prof::count_copy(CopyKind::Vertices, delta(highWater.verts, frame.copied.verts));
-  webgpu::gpu_prof::count_copy(CopyKind::Uniforms, delta(highWater.uniforms, frame.copied.uniforms));
-  webgpu::gpu_prof::count_copy(CopyKind::Indices, delta(highWater.indices, frame.copied.indices));
-  webgpu::gpu_prof::count_copy(CopyKind::Storage, delta(highWater.storage, frame.copied.storage));
-  copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, g_vertexBuffer);
-  copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
-                            g_uniformBuffer);
-  copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, IndexStagingOffset, g_indexBuffer);
-  copy_staging_buffer_range(cmd, frame, frame.copied.storage, highWater.storage, StorageStagingOffset, g_storageBuffer);
+  if (staging_copy_plan(g_batchStagingCopies).copyBuffersAtOperation) {
+    webgpu::gpu_prof::count_copy(CopyKind::Vertices, delta(highWater.verts, frame.copied.verts));
+    webgpu::gpu_prof::count_copy(CopyKind::Uniforms, delta(highWater.uniforms, frame.copied.uniforms));
+    webgpu::gpu_prof::count_copy(CopyKind::Indices, delta(highWater.indices, frame.copied.indices));
+    webgpu::gpu_prof::count_copy(CopyKind::Storage, delta(highWater.storage, frame.copied.storage));
+    copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, g_vertexBuffer);
+    copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
+                              g_uniformBuffer);
+    copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, IndexStagingOffset, g_indexBuffer);
+    copy_staging_buffer_range(cmd, frame, frame.copied.storage, highWater.storage, StorageStagingOffset,
+                              g_storageBuffer);
+  }
 
   if constexpr (UseTextureBuffer) {
     for (size_t i = frame.copied.textureUploadCount; i < op.textureUploads.size(); ++i) {
@@ -1982,6 +1994,39 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
     frame.copied.textureUpload = highWater.textureUpload;
     frame.copied.textureUploadCount = op.textureUploads.size();
   }
+}
+
+static void submit_batched_staging_copies(FramePacket& frame) {
+  if (!staging_copy_plan(g_batchStagingCopies).submitBuffersBeforeRender) {
+    return;
+  }
+  // Passes are encoded while the game is still recording the frame, before
+  // its final high-water marks are known. Put the completed buffer arenas in
+  // a short command buffer now and submit it ahead of the already-encoded
+  // render buffer. Queue order preserves every draw's data while collapsing
+  // each arena's incremental copies to one. Texture uploads stay with their
+  // original ops: moving an overwrite ahead of an earlier pass can change
+  // what that pass samples.
+  const auto highWater = current_high_water(frame);
+  static constexpr wgpu::CommandEncoderDescriptor Descriptor{.label = "Batched staging copies"};
+  auto encoder = g_device.CreateCommandEncoder(&Descriptor);
+  if (frame.stagingCopyZone)
+    frame.stagingCopyZone->begin(encoder);
+  using webgpu::gpu_prof::CopyKind;
+  webgpu::gpu_prof::count_copy(CopyKind::Vertices, highWater.verts);
+  webgpu::gpu_prof::count_copy(CopyKind::Uniforms, highWater.uniforms);
+  webgpu::gpu_prof::count_copy(CopyKind::Indices, highWater.indices);
+  webgpu::gpu_prof::count_copy(CopyKind::Storage, highWater.storage);
+  copy_staging_buffer_range(encoder, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, g_vertexBuffer);
+  copy_staging_buffer_range(encoder, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
+                            g_uniformBuffer);
+  copy_staging_buffer_range(encoder, frame, frame.copied.indices, highWater.indices, IndexStagingOffset, g_indexBuffer);
+  copy_staging_buffer_range(encoder, frame, frame.copied.storage, highWater.storage, StorageStagingOffset,
+                            g_storageBuffer);
+  if (frame.stagingCopyZone)
+    frame.stagingCopyZone->end(encoder);
+  const auto commands = encoder.Finish();
+  g_queue.Submit(1, &commands);
 }
 
 static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
