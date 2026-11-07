@@ -426,6 +426,37 @@ int main() {
     fi::end_game_frame();
   }
 
+  // One model's parts, a key each and one matrix, close to the camera (Link
+  // rolling in a cave) between the room's draws: with object votes they weigh
+  // once, so the room's motion stays the camera's, and a sprite new in the
+  // frame (a torch's flame) is drawn where the in-between camera sees it, not
+  // carried along with Link.
+  {
+    fi::set_object_votes(true);
+    fi::end_game_frame();
+    fi::end_game_frame(); // no previous frame, no prediction
+    const Camera a{0.f, 0.f, 0.f}, b{0.f, 4.f, 0.f};
+    const auto frame = [](const Camera& c, float linkZ, float linkYaw) {
+      for (int room = 0; room < 5; ++room)
+        fi::blend_draw(1100 + room, 0, seen(c.yaw, c.x, c.z, room * 250.f - 500.f, -60.f, -900.f - room * 50.f));
+      for (int part = 0; part < 13; ++part)
+        fi::blend_draw(1200 + part, 0, draw_at(0.f, -10.f, linkZ, linkYaw));
+      for (int room = 5; room < 7; ++room)
+        fi::blend_draw(1100 + room, 0, seen(c.yaw, c.x, c.z, room * 250.f - 1500.f, -60.f, -1400.f));
+    };
+    frame(a, -430.f, 0.f);
+    fi::end_game_frame();
+    frame(b, -405.f, 8.f);
+    Result flame;
+    const auto* f = fi::blend_draw(1300, 0, seen(b.yaw, b.x, b.z, 100.f, 0.f, -800.f));
+    flame.blended = f != nullptr;
+    if (f != nullptr)
+      flame.constants = *f;
+    CHECK(halfway(flame, a, b, 100.f));
+    fi::end_game_frame();
+    fi::set_object_votes(false);
+  }
+
   // A model's parts repeat the constants of the part before them, and the
   // caller says so: the in-between block is reused, and it is the one blending
   // them again gives. A draw with per-vertex matrix indices has the matrices it
