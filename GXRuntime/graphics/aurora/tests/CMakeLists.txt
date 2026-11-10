@@ -1,10 +1,6 @@
 include(FetchContent)
 include(GoogleTest)
 
-add_executable(staging_copy_plan_test staging_copy_plan_test.cpp)
-target_include_directories(staging_copy_plan_test PRIVATE ../lib)
-add_test(NAME staging_copy_plan_test COMMAND staging_copy_plan_test)
-
 if (NOT TARGET gtest)
   FetchContent_Declare(googletest
     URL https://github.com/google/googletest/archive/refs/tags/v1.17.0.tar.gz

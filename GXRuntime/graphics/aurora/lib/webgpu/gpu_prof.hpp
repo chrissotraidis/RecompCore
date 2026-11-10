@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstdint>
 #include <string_view>
 
 #include <webgpu/webgpu_cpp.h>
@@ -34,25 +33,6 @@ public:
 private:
   const wgpu::CommandEncoder* m_encoder = nullptr;
   uint32_t m_endQuery = 0;
-};
-
-// Reserve a zone in encode order, then write its timestamps from a command
-// encoder made later. This keeps the event stream ordered when work that must
-// execute first cannot be recorded until the rest of a frame is complete.
-class DeferredZone {
-public:
-  explicit DeferredZone(std::string_view name);
-  DeferredZone(DeferredZone&&) = default;
-  DeferredZone& operator=(DeferredZone&&) = default;
-  DeferredZone(const DeferredZone&) = delete;
-  DeferredZone& operator=(const DeferredZone&) = delete;
-
-  void begin(const wgpu::CommandEncoder& encoder);
-  void end(const wgpu::CommandEncoder& encoder);
-
-private:
-  uint32_t m_beginQuery = UINT32_MAX;
-  uint32_t m_endQuery = UINT32_MAX;
 };
 
 } // namespace aurora::webgpu::gpu_prof

@@ -574,30 +574,4 @@ Zone::~Zone() {
   m_encoder->WriteTimestamp(g_querySet, m_endQuery);
 }
 
-DeferredZone::DeferredZone(std::string_view name) {
-  if (!g_timestampsEnabled) {
-    return;
-  }
-  const uint32_t index = alloc_zone();
-  if (index == UINT32_MAX) {
-    return;
-  }
-  m_beginQuery = index * 2;
-  m_endQuery = m_beginQuery + 1;
-  record_slot().events.push_back({prefixed_name(name), m_beginQuery, EventKind::ZoneBegin});
-  record_slot().events.push_back({nullptr, m_endQuery, EventKind::End});
-}
-
-void DeferredZone::begin(const wgpu::CommandEncoder& encoder) {
-  if (m_beginQuery != UINT32_MAX) {
-    encoder.WriteTimestamp(g_querySet, m_beginQuery);
-  }
-}
-
-void DeferredZone::end(const wgpu::CommandEncoder& encoder) {
-  if (m_endQuery != UINT32_MAX) {
-    encoder.WriteTimestamp(g_querySet, m_endQuery);
-  }
-}
-
 } // namespace aurora::webgpu::gpu_prof
