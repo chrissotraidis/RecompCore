@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -122,10 +121,6 @@ bool g_cloudDebug = false;
 // (fs_cloud_bake) around the camera, and baked again only when the camera or the clouds'
 // drift comes near its edge. It reaches 200,000 units out; the shadows fade out by 160,000.
 bool g_cloudNoiseTexture = false;
-// DOL_AURORA_FUSED_EFFECTS=1: the occlusion's apply, the edge light, the torch light and the cloud
-// shadows in one full-screen pass (kFusedShader) instead of four, each reading the depth and
-// blending into the full-size scene. One 8-bit rounding instead of one after each pass.
-bool g_fusedEffects = false;
 constexpr uint32_t kCloudNoiseTexels = 4096;
 constexpr float kCloudNoiseReach = 200000.f;
 constexpr float kCloudFadeEnd = 160000.f;  // fs_clouds' fade: smoothstep(60000, 160000, distance)
@@ -1494,285 +1489,6 @@ wgpu::PipelineLayout g_torchPipelineLayout;
 wgpu::RenderPipeline g_torchPass;
 uint32_t g_torchSamples = 0;
 constexpr size_t kTorchUniformSize = 20 * sizeof(float) + 4 * sizeof(float) + kMaxLights * 8 * sizeof(float);
-
-// The four per-pixel effects in one pass (DOL_AURORA_FUSED_EFFECTS=1): kAoShader's
-// fs_ao_upscale, kEdgeShader's fs_edge, kTorchShader's fs_torch and kCloudShader's clouds(),
-// each as a term, blended as scene * alpha + rgb, where alpha is the occlusion times the
-// cloud shadow and rgb the edge and torch light times the cloud shadow: what the four
-// passes compute, ((scene * ao + edge + torch) * cloud), rounded to 8 bits once.
-// The torch light's layout and uniform (the view, then the lights).
-constexpr const char* kFusedShader = R"""(
-override radius: f32 = 30.0;          // ambient occlusion (kAoShader)
-override packed: bool = false;
-override edge_strength: f32 = 0.4;     // edge light (kEdgeShader)
-override torch_strength: f32 = 0.35;   // torch light (kTorchShader)
-override torch_radius_scale: f32 = 3.0;
-override cloud_strength: f32 = 0.28;   // cloud shadows (kCloudShader)
-override cloud_scale: f32 = 7000.0;
-override cloud_baked: bool = false;
-override ao_on: bool = false;
-override edge_on: bool = false;
-override torch_on: bool = false;
-override cloud_on: bool = false;
-
-struct Light {
-    place: vec4<f32>,
-    color: vec4<f32>,
-};
-
-struct View {
-    rows: array<vec4<f32>, 3>,
-    lens: vec4<f32>,
-    time: vec4<f32>,
-    count: vec4<f32>,
-    lights: array<Light, 16>,
-};
-
-@group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var src: texture_2d<f32>;      // the quarter-size occlusion (fs_ao, blurred)
-@group(0) @binding(2) var depth: texture_depth_2d;
-@group(0) @binding(3) var<uniform> view: View;
-@group(0) @binding(5) var cloud_noise: texture_2d<f32>;
-@group(0) @binding(6) var<uniform> bake: vec4<f32>;
-
-struct VertexOutput {
-    @builtin(position) pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
-var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(vec2(0.0, 0.0), vec2(0.0, 2.0), vec2(2.0, 0.0));
-
-@vertex
-fn vs_main(@builtin(vertex_index) i: u32) -> VertexOutput {
-    var out: VertexOutput;
-    out.pos = vec4<f32>(pos[i], 0.0, 1.0);
-    out.uv = uvs[i];
-    return out;
-}
-
-fn distance_at(uv: vec2<f32>) -> f32 {
-    let size = vec2<f32>(textureDimensions(depth));
-    let p = clamp(vec2<i32>(uv * size), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
-    let d = textureLoad(depth, p, 0);
-    return select(1.0 / d, 0.0, d <= 0.0);
-}
-fn same_surface(dist: f32, other: f32) -> f32 {
-    let e = (other - dist) / (0.25 * dist + radius);
-    return select(exp(-e * e), 0.0, other <= 0.0);
-}
-fn texel_distance(t: vec2<i32>) -> f32 {
-    if (packed) {
-        return textureLoad(src, t, 0).g;
-    }
-    return distance_at((vec2<f32>(t) + 0.5) / vec2<f32>(textureDimensions(src)));
-}
-fn dither(pos: vec2<f32>) -> f32 {
-    return (fract(52.9829189 * fract(dot(pos, vec2(0.06711056, 0.00583715)))) - 0.5) * (1.5 / 255.0);
-}
-fn view_depth(p: vec2<i32>) -> f32 {
-    let size = vec2<i32>(textureDimensions(depth));
-    let d = textureLoad(depth, clamp(p, vec2<i32>(0), size - vec2<i32>(1)), 0);
-    return select(view.lens.z / d, 0.0, d <= 0.0);
-}
-fn gradient(p: vec2<f32>) -> vec2<f32> {
-    var q = bitcast<vec2<u32>>(vec2<i32>(p));
-    q = q * 1664525u + 1013904223u;
-    q.x += q.y * 1664525u;
-    q.y += q.x * 1664525u;
-    q = q ^ (q >> vec2(16u));
-    q.x += q.y * 1664525u;
-    q.y += q.x * 1664525u;
-    q = q ^ (q >> vec2(16u));
-    let a = f32(q.x) * (6.2831853 / 4294967296.0);
-    return vec2(cos(a), sin(a));
-}
-fn gradient_noise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    let u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
-    let a = dot(gradient(i), f);
-    let b = dot(gradient(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0));
-    let c = dot(gradient(i + vec2(0.0, 1.0)), f - vec2(0.0, 1.0));
-    let e = dot(gradient(i + vec2(1.0, 1.0)), f - vec2(1.0, 1.0));
-    return 0.5 + 0.9 * mix(mix(a, b, u.x), mix(c, e, u.x), u.y);
-}
-fn fbm(p0: vec2<f32>) -> f32 {
-    // Each octave turned by about 37 degrees, so no two line up.
-    let turn = mat2x2<f32>(0.8, 0.6, -0.6, 0.8);
-    var p = p0;
-    var v = 0.0;
-    var a = 0.5;
-    for (var i = 0; i < 4; i++) {
-        v += a * gradient_noise(p);
-        p = turn * p * 2.03 + vec2(17.0, 9.0);
-        a *= 0.5;
-    }
-    return v;
-}
-fn fbm_baked(p: vec2<f32>) -> f32 {
-    let t = (p - bake.xy) / bake.z - 0.5;
-    let i = floor(t);
-    let last = bake.w - 1.0;
-    if (i.x < 0.0 || i.y < 0.0 || i.x >= last || i.y >= last) {
-        return fbm(p);
-    }
-    let f = t - i;
-    let c = vec2<i32>(i);
-    let a = textureLoad(cloud_noise, c, 0).r;
-    let b = textureLoad(cloud_noise, c + vec2(1, 0), 0).r;
-    let e = textureLoad(cloud_noise, c + vec2(0, 1), 0).r;
-    let g = textureLoad(cloud_noise, c + vec2(1, 1), 0).r;
-    return mix(mix(a, b, f.x), mix(e, g, f.x), f.y);
-}
-
-fn ao_term(in: VertexOutput) -> f32 {
-    let dist = distance_at(in.uv);
-    if (dist <= 0.0) {
-        return 1.0;
-    }
-    let f = in.uv * vec2<f32>(textureDimensions(src)) - 0.5;
-    let base = vec2<i32>(floor(f));
-    let within = f - floor(f);
-    let last = vec2<i32>(textureDimensions(src)) - vec2<i32>(1);
-    var sum = 0.0;
-    var total = 0.0;
-    var closest = 1.0;
-    var gap = 3.4e38;
-    for (var i = 0; i < 4; i++) {
-        let o = vec2(i % 2, i / 2);
-        let t = clamp(base + o, vec2<i32>(0), last);
-        let shade = textureLoad(src, t, 0).r;
-        let other = texel_distance(t);
-        let bilinear = select(1.0 - within.x, within.x, o.x == 1) * select(1.0 - within.y, within.y, o.y == 1);
-        let w = bilinear * same_surface(dist, other);
-        sum += shade * w;
-        total += w;
-        if (other > 0.0 && abs(other - dist) < gap) {
-            gap = abs(other - dist);
-            closest = shade;
-        }
-    }
-    let shade = select(closest, sum / total, total > 1e-3);
-    return shade + select(0.0, dither(in.pos.xy), shade < 0.999);
-}
-
-fn edge_term(in: VertexOutput) -> vec3<f32> {
-    let here = vec2<i32>(in.pos.xy);
-    let z = view_depth(here);
-    let sun = view.time.yzw;
-    if (z <= 0.0 || z > 1500.0 || sun.y < 0.05) {
-        return vec3(0.0);
-    }
-    // The sun's direction in view space, then on screen (y down).
-    let l = vec3(dot(vec3(view.rows[0].x, view.rows[1].x, view.rows[2].x), sun),
-                 dot(vec3(view.rows[0].y, view.rows[1].y, view.rows[2].y), sun),
-                 dot(vec3(view.rows[0].z, view.rows[1].z, view.rows[2].z), sun));
-    var dir = vec2(l.x, -l.y);
-    if (length(dir) < 0.05) {
-        dir = vec2(0.0, -1.0);
-    }
-    dir = normalize(dir);
-    let scale = f32(textureDimensions(depth).y) / 1080.0;
-    var rim = 0.0;
-    for (var i = 1; i <= 3; i++) {
-        let n = view_depth(here + vec2<i32>(round(dir * f32(i) * 1.5 * scale)));
-        if (n <= 0.0 || n > z * 1.5 + 100.0) {
-            rim = max(rim, 1.0 - f32(i - 1) / 3.0);
-        }
-    }
-    let fade = 1.0 - smoothstep(800.0, 1500.0, z);
-    return vec3(1.0, 0.95, 0.82) * rim * edge_strength * fade;
-}
-
-fn torch_term(in: VertexOutput) -> vec3<f32> {
-    let d = textureLoad(depth, vec2<i32>(in.pos.xy), 0);
-    if (d <= 0.0) {
-        return vec3(0.0);
-    }
-    let ndc = vec2(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
-    let ray = vec3(ndc.x * view.lens.x * view.lens.y, ndc.y * view.lens.x, -1.0);
-    let dir = vec3(dot(view.rows[0].xyz, ray), dot(view.rows[1].xyz, ray), dot(view.rows[2].xyz, ray));
-    let eye = vec3(view.rows[0].w, view.rows[1].w, view.rows[2].w);
-    let world = eye + dir * (view.lens.z / d);
-    var glow = vec3(0.0);
-    let n = u32(view.count.x);
-    for (var i = 0u; i < 16u; i++) {
-        if (i >= n) {
-            break;
-        }
-        let light = view.lights[i];
-        let falloff = clamp(1.0 - length(world - light.place.xyz) / (light.place.w * torch_radius_scale), 0.0, 1.0);
-        let flicker = 1.0 + light.color.w * 0.15 * sin(view.time.x * 9.0 + f32(i) * 1.7);
-        glow += light.color.rgb * falloff * falloff * flicker;
-    }
-    return glow * torch_strength;
-}
-
-fn cloud_term(in: VertexOutput) -> f32 {
-    let d = textureLoad(depth, vec2<i32>(in.pos.xy), 0);
-    let ndc = vec2(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
-    let ray = vec3(ndc.x * view.lens.x * view.lens.y, ndc.y * view.lens.x, -1.0);
-    let dir = vec3(dot(view.rows[0].xyz, ray), dot(view.rows[1].xyz, ray), dot(view.rows[2].xyz, ray));
-    let eye = vec3(view.rows[0].w, view.rows[1].w, view.rows[2].w);
-    // Where the view ray meets the sea, if it does.
-    var sea = -1.0;
-    if (dir.y < -1e-4) {
-        sea = (view.lens.w - eye.y) / dir.y;
-    }
-    var world = eye;
-    if (d > 0.0 && (sea <= 0.0 || view.lens.z / d < 0.9 * sea)) {
-        // Something in front of the sea (an island, a boat): its place from depth.
-        world = eye + dir * (view.lens.z / d);
-    } else {
-        // The sea, also where it has no depth: its place from its plane. Taking
-        // the sea's distance from depth too gave straight-edged steps far out
-        // wherever depth is less precise (seen on Vulkan).
-        if (sea <= 0.0) {
-            return 1.0;
-        }
-        world = eye + dir * sea;
-    }
-    let distance = length(world - eye);
-    let drift = vec2(0.6, 0.25) * view.time.x * 0.02;
-    let at = world.xz / cloud_scale + drift;
-    var n: f32;
-    if (cloud_baked) {
-        n = fbm_baked(at);
-    } else {
-        n = fbm(at);
-    }
-    let shade = smoothstep(0.42, 0.6, n) * cloud_strength * (1.0 - smoothstep(60000.0, 160000.0, distance));
-    return 1.0 - shade + select(0.0, dither(in.pos.xy), shade > 0.0);
-}
-
-// The four per-pixel effects in one pass, blended as colour * alpha + rgb: the occlusion and
-// the cloud shadows multiply (alpha), the edge and torch light add (rgb), in the order the
-// separate passes take them: ((scene * ao + edge + torch) * cloud). One 8-bit rounding
-// instead of one after each pass.
-@fragment
-fn fs_fused(in: VertexOutput) -> @location(0) vec4<f32> {
-    var ao = 1.0;
-    if (ao_on) {
-        ao = ao_term(in);
-    }
-    var light = vec3(0.0);
-    if (edge_on) {
-        light += edge_term(in);
-    }
-    if (torch_on) {
-        light += torch_term(in);
-    }
-    var cloud = 1.0;
-    if (cloud_on) {
-        cloud = cloud_term(in);
-    }
-    return vec4(light * cloud, ao * cloud);
-}
-)""";
-wgpu::ShaderModule g_fusedModule;
-wgpu::RenderPipeline g_fusedPass;
-uint32_t g_fusedKey = UINT32_MAX;
 wgpu::RenderPipeline g_edgePass;
 uint32_t g_edgeSamples = 0;
 wgpu::RenderPipeline g_sunPass;
@@ -2105,51 +1821,6 @@ wgpu::RenderPipeline make_torch_pipeline(wgpu::TextureFormat format, uint32_t sa
       .label = "Torch light",
       .layout = g_torchPipelineLayout,
       .vertex = {.module = g_torchModule, .entryPoint = "vs_main"},
-      .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
-      .multisample = {.count = samples, .mask = UINT32_MAX},
-      .fragment = &fragment,
-  };
-  return g_device.CreateRenderPipeline(&descriptor);
-}
-
-// The fused pass for the effects on (bits: 1 occlusion, 2 edge, 4 torch, 8 clouds).
-wgpu::RenderPipeline make_fused_pipeline(wgpu::TextureFormat format, uint32_t samples, uint32_t effects) {
-  const std::array constants{
-      wgpu::ConstantEntry{.key = "radius", .value = g_aoRadius},
-      wgpu::ConstantEntry{.key = "packed", .value = g_aoPacked ? 1.0 : 0.0},
-      wgpu::ConstantEntry{.key = "edge_strength", .value = g_edgeStrength},
-      wgpu::ConstantEntry{.key = "torch_strength", .value = g_torchStrength},
-      wgpu::ConstantEntry{.key = "torch_radius_scale", .value = g_torchRadiusScale},
-      wgpu::ConstantEntry{.key = "cloud_strength", .value = g_cloudStrength},
-      wgpu::ConstantEntry{.key = "cloud_scale", .value = g_cloudScale},
-      wgpu::ConstantEntry{.key = "cloud_baked", .value = g_cloudNoiseTexture ? 1.0 : 0.0},
-      wgpu::ConstantEntry{.key = "ao_on", .value = (effects & 1u) != 0 ? 1.0 : 0.0},
-      wgpu::ConstantEntry{.key = "edge_on", .value = (effects & 2u) != 0 ? 1.0 : 0.0},
-      wgpu::ConstantEntry{.key = "torch_on", .value = (effects & 4u) != 0 ? 1.0 : 0.0},
-      wgpu::ConstantEntry{.key = "cloud_on", .value = (effects & 8u) != 0 ? 1.0 : 0.0},
-  };
-  // scene * alpha + rgb
-  const wgpu::BlendState fused{
-      .color = {.operation = wgpu::BlendOperation::Add,
-                .srcFactor = wgpu::BlendFactor::One,
-                .dstFactor = wgpu::BlendFactor::SrcAlpha},
-      .alpha = {.operation = wgpu::BlendOperation::Add,
-                .srcFactor = wgpu::BlendFactor::Zero,
-                .dstFactor = wgpu::BlendFactor::One},
-  };
-  const std::array targets{wgpu::ColorTargetState{.format = format, .blend = &fused, .writeMask = wgpu::ColorWriteMask::All}};
-  const wgpu::FragmentState fragment{
-      .module = g_fusedModule,
-      .entryPoint = "fs_fused",
-      .constantCount = constants.size(),
-      .constants = constants.data(),
-      .targetCount = targets.size(),
-      .targets = targets.data(),
-  };
-  const wgpu::RenderPipelineDescriptor descriptor{
-      .label = "HD effects (fused)",
-      .layout = g_torchPipelineLayout,
-      .vertex = {.module = g_fusedModule, .entryPoint = "vs_main"},
       .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
       .multisample = {.count = samples, .mask = UINT32_MAX},
       .fragment = &fragment,
@@ -2570,8 +2241,6 @@ void initialize() {
   g_aoPacked = aoPacked != nullptr && aoPacked[0] == '1';
   const char* cloudNoise = std::getenv("DOL_AURORA_CLOUD_NOISE_TEXTURE");
   g_cloudNoiseTexture = cloudNoise != nullptr && cloudNoise[0] == '1';
-  const char* fusedEffects = std::getenv("DOL_AURORA_FUSED_EFFECTS");
-  g_fusedEffects = fusedEffects != nullptr && fusedEffects[0] == '1';
   g_sunStrength = env_float("DOL_AURORA_SUN_SHADOWS_STRENGTH", g_sunStrength, 0.f, 1.f);
   if (const char* colour = std::getenv("DOL_AURORA_SUN_SHADOWS_COLOUR")) {
     float c[3];
@@ -2690,10 +2359,6 @@ void initialize() {
   torchSource.code = kTorchShader;
   const wgpu::ShaderModuleDescriptor torchModuleDescriptor{.nextInChain = &torchSource, .label = "Torch light"};
   g_torchModule = g_device.CreateShaderModule(&torchModuleDescriptor);
-  wgpu::ShaderSourceWGSL fusedSource{};
-  fusedSource.code = kFusedShader;
-  const wgpu::ShaderModuleDescriptor fusedModuleDescriptor{.nextInChain = &fusedSource, .label = "HD effects (fused)"};
-  g_fusedModule = g_device.CreateShaderModule(&fusedModuleDescriptor);
   const std::array depthEntries{
       layoutEntries[0],
       layoutEntries[1],
@@ -2854,9 +2519,6 @@ void shutdown() {
   g_torchPipelineLayout = {};
   g_torchLayout = {};
   g_torchModule = {};
-  g_fusedPass = {};
-  g_fusedKey = UINT32_MAX;
-  g_fusedModule = {};
   g_cloudPipelineLayout = {};
   g_cloudLayout = {};
   g_cloudModule = {};
@@ -3185,18 +2847,7 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
                              size.width >= 4 && size.height >= 4 && copy_exposure_scene(cmd, size, dst);
   // Ambient occlusion and the far blur need single-sample depth (the depth
   // buffer is multisampled with MSAA).
-  const bool single = g_module && depthView && msaaSamples == 1;
-  const bool aoHere = ambient_occlusion_enabled() && single && size.width >= 4 && size.height >= 4;
-  const bool edgeHere = edge_light_enabled() && single && camera.valid;
-  const bool torchHere = torch_light_enabled() && single && camera.valid && camera.lightCount > 0;
-  const bool cloudHere = cloud_shadows_enabled() && single && camera.valid;
-  const bool sunHere = sun_shadows_enabled() && single && camera.valid;
-  // DOL_AURORA_FUSED_EFFECTS=1: two or more of the four in one pass (kFusedShader). Not with the
-  // sun shadows (they go between the occlusion and the edge light) or a debug view.
-  const uint32_t fusedEffects = (aoHere ? 1u : 0u) | (edgeHere ? 2u : 0u) | (torchHere ? 4u : 0u) | (cloudHere ? 8u : 0u);
-  const bool fuse = g_fusedEffects && g_fusedModule && !sunHere && g_aoDebug == 0 && !g_cloudDebug &&
-                    std::popcount(fusedEffects) >= 2;
-  if (aoHere) {
+  if (ambient_occlusion_enabled() && g_module && depthView && msaaSamples == 1 && size.width >= 4 && size.height >= 4) {
     const webgpu::gpu_prof::Zone zone{cmd, "Ambient occlusion"};
     ensure_targets(size, format, msaaSamples);
     const auto& ao = g_aoPacked ? g_aoPackedView : g_aoView;
@@ -3204,28 +2855,7 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
     draw_depth(cmd, "Ambient occlusion blur (horizontal)", g_aoBlurH, ao[0], depthView, ao[1], nullptr, false);
     draw_depth(cmd, "Ambient occlusion blur (vertical)", g_aoBlurV, ao[1], depthView, ao[0], nullptr, false);
     // With DOL_AURORA_AO_DEBUG=1 the occlusion replaces the scene; with 2 it tints it.
-    if (!fuse)
-      draw_depth(cmd, "Ambient occlusion apply", g_aoUpscale, ao[0], depthView, dst, resolve, true);
-  }
-  if (fuse) {
-    const webgpu::gpu_prof::Zone zone{cmd, "HD effects (fused)"};
-    ensure_targets(size, format, msaaSamples);
-    if (cloudHere && g_cloudNoiseTexture)
-      ensure_cloud_noise(cmd, camera, depthView);
-    const uint32_t key = fusedEffects | (msaaSamples << 4) | (static_cast<uint32_t>(format) << 12);
-    if (!g_fusedPass || key != g_fusedKey) {
-      g_fusedPass = make_fused_pipeline(format, msaaSamples, fusedEffects);
-      g_fusedKey = key;
-    }
-    std::array<float, kTorchUniformSize / sizeof(float)> uniform{};
-    std::memcpy(uniform.data(), camera.view.data(), sizeof(camera.view));
-    uniform[20] = static_cast<float>(torchHere ? camera.lightCount : 0);
-    std::memcpy(uniform.data() + 24, camera.lights.data(), sizeof(camera.lights));
-    const auto& ao = g_aoPacked ? g_aoPackedView : g_aoView;
-    // The occlusion's texture where it is on; else a stand-in it doesn't read.
-    const wgpu::TextureView& aoTexture = aoHere ? ao[0] : g_farView[0];
-    draw_with_uniform(cmd, "HD effects (fused)", g_fusedPass, g_torchLayout, uniform.data(), sizeof(uniform),
-                      depthView, dst, resolve, &aoTexture);
+    draw_depth(cmd, "Ambient occlusion apply", g_aoUpscale, ao[0], depthView, dst, resolve, true);
   }
   if (sun_shadows_enabled() && g_module && depthView && msaaSamples == 1) {
     if (camera.valid) {
@@ -3249,14 +2879,14 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
       }
     }
   }
-  if (!fuse && edge_light_enabled() && g_module && depthView && msaaSamples == 1) {
+  if (edge_light_enabled() && g_module && depthView && msaaSamples == 1) {
     if (camera.valid) {
       const webgpu::gpu_prof::Zone zone{cmd, "Edge light"};
       ensure_targets(size, format, msaaSamples);
       draw_with_view(cmd, "Edge light", g_edgePass, camera.view, depthView, dst, resolve);
     }
   }
-  if (!fuse && torch_light_enabled() && g_module && depthView && msaaSamples == 1) {
+  if (torch_light_enabled() && g_module && depthView && msaaSamples == 1) {
     if (camera.valid && camera.lightCount > 0) {
       std::array<float, kTorchUniformSize / sizeof(float)> uniform{};
       std::memcpy(uniform.data(), camera.view.data(), sizeof(camera.view));
@@ -3268,7 +2898,7 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
                         dst, resolve);
     }
   }
-  if (!fuse && cloud_shadows_enabled() && g_module && depthView && msaaSamples == 1) {
+  if (cloud_shadows_enabled() && g_module && depthView && msaaSamples == 1) {
     if (camera.valid) {
       const webgpu::gpu_prof::Zone zone{cmd, "Cloud shadows"};
       ensure_targets(size, format, msaaSamples);
