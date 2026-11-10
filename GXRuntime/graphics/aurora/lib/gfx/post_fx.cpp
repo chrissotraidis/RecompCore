@@ -173,8 +173,6 @@ std::array<wgpu::TextureView, 2> g_aoView;
 // texel's distance together (kAoShader's `packed`). Apart from g_aoTex, which the sun shadows'
 // fallback also draws into at the scene's format.
 bool g_aoPacked = false;
-// DOL_AURORA_POST_SKIP_IDENTITY=1: the full-size effects discard pixels they leave unchanged.
-bool g_postSkipIdentity = false;
 std::array<wgpu::Texture, 2> g_aoPackedTex;
 std::array<wgpu::TextureView, 2> g_aoPackedView;
 uint32_t g_farSamples = 0;
@@ -290,9 +288,6 @@ override far_end: f32 = 30000.0;
 override amount: f32 = 0.8;
 override background: f32 = 0.35;
 override debug_view: bool = false;
-// DOL_AURORA_POST_SKIP_IDENTITY=1: a pixel whose result leaves the scene exactly as it is under
-// this pass's blend is discarded, so its colour is neither read nor written. The picture is the same.
-override skip_identity: bool = false;
 
 @group(0) @binding(0) var samp: sampler;
 @group(0) @binding(1) var blurred: texture_2d<f32>;
@@ -314,17 +309,8 @@ fn vs_main(@builtin(vertex_index) i: u32) -> VertexOutput {
     return out;
 }
 
-// Blended over the scene by its alpha: none changes nothing.
 @fragment
 fn fs_far(in: VertexOutput) -> @location(0) vec4<f32> {
-    let r = far(in);
-    if (skip_identity && !debug_view && r.a == 0.0) {
-        discard;
-    }
-    return r;
-}
-
-fn far(in: VertexOutput) -> vec4<f32> {
     let d = textureLoad(depth, vec2<i32>(in.pos.xy), 0);
     // No depth: what the game draws behind the scene without it (the sky, the
     // sea toward the horizon, the islands' far models).
@@ -378,9 +364,6 @@ override debug_view: f32 = 0.0;
 // (RG16Float: r the shade, rounded to 8-bit steps as the 8-bit target stored it; g the
 // distance), so the blurs and the upscale read it there instead of from the full-size depth.
 override packed: bool = false;
-// DOL_AURORA_POST_SKIP_IDENTITY=1: a pixel whose result leaves the scene exactly as it is under
-// this pass's blend is discarded, so its colour is neither read nor written. The picture is the same.
-override skip_identity: bool = false;
 
 fn q8(x: f32) -> f32 {
     return round(clamp(x, 0.0, 1.0) * 255.0) / 255.0;
@@ -568,17 +551,8 @@ fn dither(pos: vec2<f32>) -> f32 {
 // To the scene's size: the four nearest texels, as a bilinear filter weighs
 // them, each by how near its distance is to the pixel's. Where none is on the
 // pixel's surface (a thin edge), the nearest in distance.
-// Multiplied into the scene: white changes nothing (DOL_AURORA_AO_DEBUG=1 replaces it instead).
 @fragment
 fn fs_ao_upscale(in: VertexOutput) -> @location(0) vec4<f32> {
-    let r = ao_upscale(in);
-    if (skip_identity && debug_view == 0.0 && all(r.rgb == vec3(1.0))) {
-        discard;
-    }
-    return r;
-}
-
-fn ao_upscale(in: VertexOutput) -> vec4<f32> {
     let dist = distance_at(in.uv);
     if (dist <= 0.0) {
         return vec4(1.0);
@@ -623,9 +597,6 @@ constexpr const char* kCloudShader = R"""(
 override strength: f32 = 0.28;
 override scale: f32 = 7000.0;
 override debug_view: bool = false;
-// DOL_AURORA_POST_SKIP_IDENTITY=1: a pixel whose result leaves the scene exactly as it is under
-// this pass's blend is discarded, so its colour is neither read nor written. The picture is the same.
-override skip_identity: bool = false;
 
 struct View {
     rows: array<vec4<f32>, 3>,  // the inverse view matrix (view to world), by rows
@@ -733,22 +704,14 @@ fn fs_cloud_bake(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4(fbm(bake.xy + in.pos.xy * bake.z), 0.0, 0.0, 1.0);
 }
 
-// Multiplied into the scene: white changes nothing.
-fn keep_clouds(r: vec4<f32>) -> vec4<f32> {
-    if (skip_identity && !debug_view && all(r.rgb == vec3(1.0))) {
-        discard;
-    }
-    return r;
-}
-
 @fragment
 fn fs_clouds(in: VertexOutput) -> @location(0) vec4<f32> {
-    return keep_clouds(clouds(in, false));
+    return clouds(in, false);
 }
 
 @fragment
 fn fs_clouds_baked(in: VertexOutput) -> @location(0) vec4<f32> {
-    return keep_clouds(clouds(in, true));
+    return clouds(in, true);
 }
 
 fn clouds(in: VertexOutput, baked: bool) -> vec4<f32> {
@@ -1389,9 +1352,6 @@ std::array<wgpu::TextureView, kSunMapCascades> g_sunMapLayers;
 // toward the sun on screen, the depth jumps far behind it or there is none.
 constexpr const char* kEdgeShader = R"""(
 override strength: f32 = 0.4;
-// DOL_AURORA_POST_SKIP_IDENTITY=1: a pixel whose result leaves the scene exactly as it is under
-// this pass's blend is discarded, so its colour is neither read nor written. The picture is the same.
-override skip_identity: bool = false;
 
 struct View {
     rows: array<vec4<f32>, 3>,
@@ -1426,17 +1386,8 @@ fn view_depth(p: vec2<i32>) -> f32 {
     return select(view.lens.z / d, 0.0, d <= 0.0);
 }
 
-// Added to the scene: black changes nothing.
 @fragment
 fn fs_edge(in: VertexOutput) -> @location(0) vec4<f32> {
-    let r = edge(in);
-    if (skip_identity && all(r.rgb == vec3(0.0))) {
-        discard;
-    }
-    return r;
-}
-
-fn edge(in: VertexOutput) -> vec4<f32> {
     let here = vec2<i32>(in.pos.xy);
     let z = view_depth(here);
     let sun = view.time.yzw;
@@ -1472,9 +1423,6 @@ wgpu::ShaderModule g_edgeModule;
 constexpr const char* kTorchShader = R"""(
 override strength: f32 = 0.35;
 override radius_scale: f32 = 3.0;
-// DOL_AURORA_POST_SKIP_IDENTITY=1: a pixel whose result leaves the scene exactly as it is under
-// this pass's blend is discarded, so its colour is neither read nor written. The picture is the same.
-override skip_identity: bool = false;
 
 struct Light {
     place: vec4<f32>,  // x, y, z, radius
@@ -1510,17 +1458,8 @@ fn vs_main(@builtin(vertex_index) i: u32) -> VertexOutput {
     return out;
 }
 
-// Added to the scene: black changes nothing.
 @fragment
 fn fs_torch(in: VertexOutput) -> @location(0) vec4<f32> {
-    let r = torch(in);
-    if (skip_identity && all(r.rgb == vec3(0.0))) {
-        discard;
-    }
-    return r;
-}
-
-fn torch(in: VertexOutput) -> vec4<f32> {
     let d = textureLoad(depth, vec2<i32>(in.pos.xy), 0);
     if (d <= 0.0) {
         return vec4(0.0);
@@ -1631,7 +1570,6 @@ wgpu::RenderPipeline make_ao_pipeline(const char* label, const char* entry, wgpu
       wgpu::ConstantEntry{.key = "fade_end", .value = g_aoFadeEnd},
       wgpu::ConstantEntry{.key = "debug_view", .value = static_cast<double>(g_aoDebug)},
       wgpu::ConstantEntry{.key = "packed", .value = g_aoPacked ? 1.0 : 0.0},
-      wgpu::ConstantEntry{.key = "skip_identity", .value = g_postSkipIdentity ? 1.0 : 0.0},
   };
   const wgpu::BlendState multiply{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -1667,7 +1605,6 @@ wgpu::RenderPipeline make_cloud_pipeline(wgpu::TextureFormat format, uint32_t sa
       wgpu::ConstantEntry{.key = "strength", .value = g_cloudStrength},
       wgpu::ConstantEntry{.key = "scale", .value = g_cloudScale},
       wgpu::ConstantEntry{.key = "debug_view", .value = g_cloudDebug ? 1.0 : 0.0},
-      wgpu::ConstantEntry{.key = "skip_identity", .value = g_postSkipIdentity ? 1.0 : 0.0},
   };
   const wgpu::BlendState boost{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -1829,8 +1766,7 @@ wgpu::RenderPipeline make_sun_map_pipeline(wgpu::TextureFormat format, bool dire
 }
 
 wgpu::RenderPipeline make_edge_pipeline(wgpu::TextureFormat format, uint32_t samples) {
-  const std::array constants{wgpu::ConstantEntry{.key = "strength", .value = g_edgeStrength},
-                             wgpu::ConstantEntry{.key = "skip_identity", .value = g_postSkipIdentity ? 1.0 : 0.0}};
+  const std::array constants{wgpu::ConstantEntry{.key = "strength", .value = g_edgeStrength}};
   const wgpu::BlendState add{
       .color = {.operation = wgpu::BlendOperation::Add,
                 .srcFactor = wgpu::BlendFactor::One,
@@ -1863,7 +1799,6 @@ wgpu::RenderPipeline make_torch_pipeline(wgpu::TextureFormat format, uint32_t sa
   const std::array constants{
       wgpu::ConstantEntry{.key = "strength", .value = g_torchStrength},
       wgpu::ConstantEntry{.key = "radius_scale", .value = g_torchRadiusScale},
-      wgpu::ConstantEntry{.key = "skip_identity", .value = g_postSkipIdentity ? 1.0 : 0.0},
   };
   const wgpu::BlendState add{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -1900,7 +1835,6 @@ wgpu::RenderPipeline make_far_pipeline(wgpu::TextureFormat format, uint32_t samp
       wgpu::ConstantEntry{.key = "amount", .value = g_farAmount},
       wgpu::ConstantEntry{.key = "background", .value = g_farBackground},
       wgpu::ConstantEntry{.key = "debug_view", .value = g_farDebug ? 1.0 : 0.0},
-      wgpu::ConstantEntry{.key = "skip_identity", .value = g_postSkipIdentity ? 1.0 : 0.0},
   };
   const wgpu::BlendState over{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -2303,8 +2237,6 @@ void initialize() {
   g_aoFadeEnd = env_float("DOL_AURORA_AO_FADE_END", g_aoFadeEnd, g_aoFadeStart + 1.f, 1e9f);
   g_cloudStrength = env_float("DOL_AURORA_CLOUD_SHADOWS_STRENGTH", g_cloudStrength, 0.f, 1.f);
   g_cloudScale = env_float("DOL_AURORA_CLOUD_SHADOWS_SCALE", g_cloudScale, 1.f, 1e7f);
-  const char* skipIdentity = std::getenv("DOL_AURORA_POST_SKIP_IDENTITY");
-  g_postSkipIdentity = skipIdentity != nullptr && skipIdentity[0] == '1';
   const char* aoPacked = std::getenv("DOL_AURORA_AO_PACKED");
   g_aoPacked = aoPacked != nullptr && aoPacked[0] == '1';
   const char* cloudNoise = std::getenv("DOL_AURORA_CLOUD_NOISE_TEXTURE");
