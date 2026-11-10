@@ -2967,7 +2967,13 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
     replayZone.emplace(between, "In-between replay");
   webgpu::gpu_prof::set_name_prefix("IB ");
   frame_interp::set_encoding_interpolated(true);
-  for (size_t i = 0; i < frame.ops.size(); ++i) {
+  // DOL_AURORA_FRAME_INTERP_REPEAT=1 (diagnostic: the in-between frame repeats the real one):
+  // no replay at all, to measure the most a cheaper in-between frame could save.
+  static const bool repeatFrame = [] {
+    const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_REPEAT");
+    return env != nullptr && env[0] == '1';
+  }();
+  for (size_t i = 0; i < (repeatFrame ? 0 : frame.ops.size()); ++i) {
     replay_op(between, frame, frame.ops[i]);
     if (dump && dumpPasses) {
       const auto commands = between.Finish();
