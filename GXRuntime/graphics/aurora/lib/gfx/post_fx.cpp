@@ -1,5 +1,4 @@
 #include "post_fx.hpp"
-#include "frame_interp.hpp"
 
 #include <aurora/aurora.h>
 
@@ -174,14 +173,6 @@ std::array<wgpu::TextureView, 2> g_aoView;
 // texel's distance together (kAoShader's `packed`). Apart from g_aoTex, which the sun shadows'
 // fallback also draws into at the scene's format.
 bool g_aoPacked = false;
-// DOL_AURORA_INTERP_REUSE_SOFT=1: a Smooth Motion in-between frame composites the real frame's
-// blurred far background and bloom (g_farView[0], g_view[0]) instead of downsampling and blurring
-// its own picture again. Both are soft; they lag half a game frame on in-between frames. Fresh:
-// the real frame made them at the current size (ensure_targets clears it when it makes new ones).
-bool g_interpReuseSoft = false;
-bool g_farFresh = false;
-bool g_bloomFresh = false;
-bool reuse_soft() { return g_interpReuseSoft && frame_interp::encoding_interpolated(); }
 std::array<wgpu::Texture, 2> g_aoPackedTex;
 std::array<wgpu::TextureView, 2> g_aoPackedView;
 uint32_t g_farSamples = 0;
@@ -1986,7 +1977,6 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
     g_farView[i] = g_farTex[i].CreateView();
     g_aoTex[i] = g_device.CreateTexture(&descriptor);
     g_aoView[i] = g_aoTex[i].CreateView();
-    g_farFresh = g_bloomFresh = false;
     if (g_aoPacked) {
       auto packedDescriptor = descriptor;
       packedDescriptor.label = "Ambient occlusion (packed)";
@@ -2251,8 +2241,6 @@ void initialize() {
   g_aoFadeEnd = env_float("DOL_AURORA_AO_FADE_END", g_aoFadeEnd, g_aoFadeStart + 1.f, 1e9f);
   g_cloudStrength = env_float("DOL_AURORA_CLOUD_SHADOWS_STRENGTH", g_cloudStrength, 0.f, 1.f);
   g_cloudScale = env_float("DOL_AURORA_CLOUD_SHADOWS_SCALE", g_cloudScale, 1.f, 1e7f);
-  const char* reuseSoft = std::getenv("DOL_AURORA_INTERP_REUSE_SOFT");
-  g_interpReuseSoft = reuseSoft != nullptr && reuseSoft[0] == '1';
   const char* aoPacked = std::getenv("DOL_AURORA_AO_PACKED");
   g_aoPacked = aoPacked != nullptr && aoPacked[0] == '1';
   const char* cloudNoise = std::getenv("DOL_AURORA_CLOUD_NOISE_TEXTURE");
@@ -2926,13 +2914,10 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
   if (far_blur_enabled() && g_module && depthView && msaaSamples == 1 && size.width >= 4 && size.height >= 4) {
     const webgpu::gpu_prof::Zone zone{cmd, "Far blur"};
     ensure_targets(size, format, msaaSamples);
-    if (!(reuse_soft() && g_farFresh)) {
-      draw(cmd, "Far blur downsample", g_down, scene, g_farView[0], false);
-      for (int i = 0; i < 2; ++i) {
-        draw(cmd, "Far blur (horizontal)", g_blurH, g_farView[0], g_farView[1], false);
-        draw(cmd, "Far blur (vertical)", g_blurV, g_farView[1], g_farView[0], false);
-      }
-      g_farFresh = !frame_interp::encoding_interpolated();
+    draw(cmd, "Far blur downsample", g_down, scene, g_farView[0], false);
+    for (int i = 0; i < 2; ++i) {
+      draw(cmd, "Far blur (horizontal)", g_blurH, g_farView[0], g_farView[1], false);
+      draw(cmd, "Far blur (vertical)", g_blurV, g_farView[1], g_farView[0], false);
     }
     draw_depth(cmd, "Far blur composite", g_farComposite, g_farView[0], depthView, dst, resolve, true);
   }
@@ -2960,13 +2945,10 @@ void encode_bloom(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scen
   }
   const webgpu::gpu_prof::Zone zone{cmd, "Bloom"};
   ensure_targets(size, format, msaaSamples);
-  if (!(reuse_soft() && g_bloomFresh)) {
-    draw(cmd, "Bloom bright pass", g_bright, scene, g_view[0], false);
-    for (int i = 0; i < 2; ++i) {
-      draw(cmd, "Bloom blur (horizontal)", g_blurH, g_view[0], g_view[1], false);
-      draw(cmd, "Bloom blur (vertical)", g_blurV, g_view[1], g_view[0], false);
-    }
-    g_bloomFresh = !frame_interp::encoding_interpolated();
+  draw(cmd, "Bloom bright pass", g_bright, scene, g_view[0], false);
+  for (int i = 0; i < 2; ++i) {
+    draw(cmd, "Bloom blur (horizontal)", g_blurH, g_view[0], g_view[1], false);
+    draw(cmd, "Bloom blur (vertical)", g_blurV, g_view[1], g_view[0], false);
   }
   draw(cmd, "Bloom composite", g_composite, g_view[0], dst, true, resolve);
 }
