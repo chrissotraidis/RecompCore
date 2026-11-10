@@ -169,6 +169,12 @@ wgpu::RenderPipeline g_aoApply;        // multiplied into the EFB (sun shadows)
 uint32_t g_aoSamples = 0;
 std::array<wgpu::Texture, 2> g_aoTex;
 std::array<wgpu::TextureView, 2> g_aoView;
+// DOL_AURORA_AO_PACKED=1: the occlusion's quarter-size targets as RG16Float, the shade and its
+// texel's distance together (kAoShader's `packed`). Apart from g_aoTex, which the sun shadows'
+// fallback also draws into at the scene's format.
+bool g_aoPacked = false;
+std::array<wgpu::Texture, 2> g_aoPackedTex;
+std::array<wgpu::TextureView, 2> g_aoPackedView;
 uint32_t g_farSamples = 0;
 wgpu::BindGroupLayout g_depthLayout;
 wgpu::PipelineLayout g_depthPipelineLayout;
@@ -354,6 +360,14 @@ override strength: f32 = 0.6;
 override fade_start: f32 = 1000.0;
 override fade_end: f32 = 2500.0;
 override debug_view: f32 = 0.0;
+// DOL_AURORA_AO_PACKED=1: the quarter-size occlusion keeps its texel's distance beside it
+// (RG16Float: r the shade, rounded to 8-bit steps as the 8-bit target stored it; g the
+// distance), so the blurs and the upscale read it there instead of from the full-size depth.
+override packed: bool = false;
+
+fn q8(x: f32) -> f32 {
+    return round(clamp(x, 0.0, 1.0) * 255.0) / 255.0;
+}
 
 @group(0) @binding(0) var samp: sampler;
 @group(0) @binding(1) var src: texture_2d<f32>;
@@ -408,7 +422,7 @@ fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
     // and the sea's swells darkened it in a band toward the horizon.
     let fade = 1.0 - smoothstep(fade_start, fade_end, dist);
     if (dist <= 0.0 || fade <= 0.0) {
-        return vec4(1.0);
+        return select(vec4(1.0), vec4(1.0, max(dist, 0.0), 0.0, 1.0), packed);
     }
     // About a 60-degree view: a radius r at distance z covers 0.87 r / z of the height.
     let reach = vec2(size.y / size.x, 1.0) * (0.87 * radius / dist);
@@ -438,6 +452,9 @@ fn fs_ao(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
     let ao = 1.0 - strength * fade * clamp(occluded / 4.0, 0.0, 1.0);
+    if (packed) {
+        return vec4(q8(ao), dist, 0.0, 1.0);
+    }
     return vec4(vec3(ao), 1.0);
 }
 
@@ -487,13 +504,16 @@ fn same_surface(dist: f32, other: f32) -> f32 {
 
 // The quarter-size texel's distance: where fs_ao read it.
 fn texel_distance(t: vec2<i32>) -> f32 {
+    if (packed) {
+        return textureLoad(src, t, 0).g;
+    }
     return distance_at((vec2<f32>(t) + 0.5) / vec2<f32>(textureDimensions(src)));
 }
 
 fn blur(p: vec2<i32>, dir: vec2<i32>) -> vec4<f32> {
     let dist = texel_distance(p);
     if (dist <= 0.0) {
-        return vec4(1.0);
+        return select(vec4(1.0), vec4(1.0, 0.0, 0.0, 1.0), packed);
     }
     let last = vec2<i32>(textureDimensions(src)) - vec2<i32>(1);
     var sum = textureLoad(src, p, 0).r * weights[0];
@@ -505,6 +525,9 @@ fn blur(p: vec2<i32>, dir: vec2<i32>) -> vec4<f32> {
             sum += textureLoad(src, t, 0).r * w;
             total += w;
         }
+    }
+    if (packed) {
+        return vec4(q8(sum / total), dist, 0.0, 1.0);
     }
     return vec4(vec3(sum / total), 1.0);
 }
@@ -1546,6 +1569,7 @@ wgpu::RenderPipeline make_ao_pipeline(const char* label, const char* entry, wgpu
       wgpu::ConstantEntry{.key = "fade_start", .value = g_aoFadeStart},
       wgpu::ConstantEntry{.key = "fade_end", .value = g_aoFadeEnd},
       wgpu::ConstantEntry{.key = "debug_view", .value = static_cast<double>(g_aoDebug)},
+      wgpu::ConstantEntry{.key = "packed", .value = g_aoPacked ? 1.0 : 0.0},
   };
   const wgpu::BlendState multiply{
       .color = {.operation = wgpu::BlendOperation::Add,
@@ -1876,9 +1900,10 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
     g_blurH = make_pipeline("Bloom blur (horizontal)", "fs_blur_h", format, 1, kReplace);
     g_blurV = make_pipeline("Bloom blur (vertical)", "fs_blur_v", format, 1, kReplace);
     g_down = make_pipeline("Far blur downsample", "fs_down", format, 1, kReplace);
-    g_aoPass = make_ao_pipeline("Ambient occlusion", "fs_ao", format, 1, kReplace);
-    g_aoBlurH = make_ao_pipeline("Ambient occlusion blur (horizontal)", "fs_ao_blur_h", format, 1, kReplace);
-    g_aoBlurV = make_ao_pipeline("Ambient occlusion blur (vertical)", "fs_ao_blur_v", format, 1, kReplace);
+    const auto aoFormat = g_aoPacked ? wgpu::TextureFormat::RG16Float : format;
+    g_aoPass = make_ao_pipeline("Ambient occlusion", "fs_ao", aoFormat, 1, kReplace);
+    g_aoBlurH = make_ao_pipeline("Ambient occlusion blur (horizontal)", "fs_ao_blur_h", aoFormat, 1, kReplace);
+    g_aoBlurV = make_ao_pipeline("Ambient occlusion blur (vertical)", "fs_ao_blur_v", aoFormat, 1, kReplace);
     g_cloudPass = {};
     g_sunPass = {};
     g_sunMapPass = {};
@@ -1948,6 +1973,13 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
     g_farView[i] = g_farTex[i].CreateView();
     g_aoTex[i] = g_device.CreateTexture(&descriptor);
     g_aoView[i] = g_aoTex[i].CreateView();
+    if (g_aoPacked) {
+      auto packedDescriptor = descriptor;
+      packedDescriptor.label = "Ambient occlusion (packed)";
+      packedDescriptor.format = wgpu::TextureFormat::RG16Float;
+      g_aoPackedTex[i] = g_device.CreateTexture(&packedDescriptor);
+      g_aoPackedView[i] = g_aoPackedTex[i].CreateView();
+    }
   }
 }
 
@@ -2205,6 +2237,8 @@ void initialize() {
   g_aoFadeEnd = env_float("DOL_AURORA_AO_FADE_END", g_aoFadeEnd, g_aoFadeStart + 1.f, 1e9f);
   g_cloudStrength = env_float("DOL_AURORA_CLOUD_SHADOWS_STRENGTH", g_cloudStrength, 0.f, 1.f);
   g_cloudScale = env_float("DOL_AURORA_CLOUD_SHADOWS_SCALE", g_cloudScale, 1.f, 1e7f);
+  const char* aoPacked = std::getenv("DOL_AURORA_AO_PACKED");
+  g_aoPacked = aoPacked != nullptr && aoPacked[0] == '1';
   const char* cloudNoise = std::getenv("DOL_AURORA_CLOUD_NOISE_TEXTURE");
   g_cloudNoiseTexture = cloudNoise != nullptr && cloudNoise[0] == '1';
   g_sunStrength = env_float("DOL_AURORA_SUN_SHADOWS_STRENGTH", g_sunStrength, 0.f, 1.f);
@@ -2454,6 +2488,8 @@ void shutdown() {
   g_aoBlurH = g_aoBlurV = g_aoUpscale = {};
   g_aoTex = {};
   g_aoView = {};
+  g_aoPackedTex = {};
+  g_aoPackedView = {};
   g_aoSamples = 0;
   g_aoModule = {};
   g_cloudPass = {};
@@ -2814,13 +2850,12 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
   if (ambient_occlusion_enabled() && g_module && depthView && msaaSamples == 1 && size.width >= 4 && size.height >= 4) {
     const webgpu::gpu_prof::Zone zone{cmd, "Ambient occlusion"};
     ensure_targets(size, format, msaaSamples);
-    draw_depth(cmd, "Ambient occlusion", g_aoPass, g_aoView[1], depthView, g_aoView[0], nullptr, false);
-    draw_depth(cmd, "Ambient occlusion blur (horizontal)", g_aoBlurH, g_aoView[0], depthView, g_aoView[1], nullptr,
-               false);
-    draw_depth(cmd, "Ambient occlusion blur (vertical)", g_aoBlurV, g_aoView[1], depthView, g_aoView[0], nullptr,
-               false);
+    const auto& ao = g_aoPacked ? g_aoPackedView : g_aoView;
+    draw_depth(cmd, "Ambient occlusion", g_aoPass, ao[1], depthView, ao[0], nullptr, false);
+    draw_depth(cmd, "Ambient occlusion blur (horizontal)", g_aoBlurH, ao[0], depthView, ao[1], nullptr, false);
+    draw_depth(cmd, "Ambient occlusion blur (vertical)", g_aoBlurV, ao[1], depthView, ao[0], nullptr, false);
     // With DOL_AURORA_AO_DEBUG=1 the occlusion replaces the scene; with 2 it tints it.
-    draw_depth(cmd, "Ambient occlusion apply", g_aoUpscale, g_aoView[0], depthView, dst, resolve, true);
+    draw_depth(cmd, "Ambient occlusion apply", g_aoUpscale, ao[0], depthView, dst, resolve, true);
   }
   if (sun_shadows_enabled() && g_module && depthView && msaaSamples == 1) {
     if (camera.valid) {
