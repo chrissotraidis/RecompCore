@@ -13,7 +13,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
-#include <optional>
 
 namespace aurora::gfx::post_fx {
 using webgpu::g_device;
@@ -1988,62 +1987,6 @@ void ensure_targets(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format,
   }
 }
 
-// DOL_AURORA_POST_SHARED_PASS=1: the full-size effects drawn one after another into the scene
-// (the occlusion's apply, sun shadows' apply, edge light, torch light, cloud shadows, the far
-// blur's composite, the exposure, bloom's composite) share one render pass instead of each
-// opening its own: the same draws, in the same order, with the same blends, so the same picture.
-// A draw into anything else, a copy or a timestamp ends the shared pass first. Not with
-// DOL_AURORA_GPU_PROF, whose zones write timestamps between the effects.
-bool g_postSharedPass = false;
-bool g_shareMode = false;
-struct SharedPass {
-  wgpu::RenderPassEncoder pass;
-  WGPUTextureView target = nullptr;
-  WGPUTextureView resolve = nullptr;
-};
-std::optional<SharedPass> g_shared;
-
-void close_shared() {
-  if (g_shared) {
-    g_shared->pass.End();
-    g_shared.reset();
-  }
-}
-
-// A render pass for one full-screen draw into target: the open shared pass when it draws
-// into the same target and keeps what is there; else a pass of its own (shared from here
-// on when it keeps what is there). End it after the draw only when `own` comes back true.
-wgpu::RenderPassEncoder post_pass(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::TextureView& target,
-                                  const wgpu::TextureView& resolve, bool load, const wgpu::Color& clear, bool& own) {
-  if (g_shareMode && load && g_shared && g_shared->target == target.Get() && g_shared->resolve == resolve.Get()) {
-    own = false;
-    return g_shared->pass;
-  }
-  close_shared();
-  const std::array attachments{wgpu::RenderPassColorAttachment{
-      .view = target,
-      .resolveTarget = resolve,
-      .loadOp = load ? wgpu::LoadOp::Load : wgpu::LoadOp::Clear,
-      .storeOp = wgpu::StoreOp::Store,
-      .clearValue = clear,
-  }};
-  const bool share = g_shareMode && load;
-  const wgpu::RenderPassDescriptor descriptor{
-      .label = share ? "Post effects (one pass)" : label,
-      .colorAttachmentCount = attachments.size(),
-      .colorAttachments = attachments.data(),
-      .timestampWrites = webgpu::gpu_prof::pass_writes(share ? "Post effects (one pass)" : label),
-  };
-  auto pass = cmd.BeginRenderPass(&descriptor);
-  if (share) {
-    g_shared = SharedPass{pass, target.Get(), resolve.Get()};
-    own = false;
-  } else {
-    own = true;
-  }
-  return pass;
-}
-
 void draw(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::RenderPipeline& pipeline,
           const wgpu::TextureView& source, const wgpu::TextureView& target, bool load,
           const wgpu::TextureView& resolve = nullptr) {
@@ -2057,13 +2000,24 @@ void draw(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::Render
       .entries = entries.data(),
   };
   const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
-  bool own = false;
-  const auto pass = post_pass(cmd, label, target, resolve, load, wgpu::Color{0.0, 0.0, 0.0, 0.0}, own);
+  const std::array attachments{wgpu::RenderPassColorAttachment{
+      .view = target,
+      .resolveTarget = resolve,
+      .loadOp = load ? wgpu::LoadOp::Load : wgpu::LoadOp::Clear,
+      .storeOp = wgpu::StoreOp::Store,
+      .clearValue = {0.0, 0.0, 0.0, 0.0},
+  }};
+  const wgpu::RenderPassDescriptor descriptor{
+      .label = label,
+      .colorAttachmentCount = attachments.size(),
+      .colorAttachments = attachments.data(),
+      .timestampWrites = webgpu::gpu_prof::pass_writes(label),
+  };
+  const auto pass = cmd.BeginRenderPass(&descriptor);
   pass.SetPipeline(pipeline);
   pass.SetBindGroup(0, bindGroup, 0, nullptr);
   pass.Draw(3);
-  if (own)
-    pass.End();
+  pass.End();
 }
 void draw_depth(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::RenderPipeline& pipeline,
                 const wgpu::TextureView& source, const wgpu::TextureView& depthView, const wgpu::TextureView& target,
@@ -2079,13 +2033,24 @@ void draw_depth(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::
       .entries = entries.data(),
   };
   const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
-  bool own = false;
-  const auto pass = post_pass(cmd, label, target, resolve, load, wgpu::Color{1.0, 1.0, 1.0, 1.0}, own);
+  const std::array attachments{wgpu::RenderPassColorAttachment{
+      .view = target,
+      .resolveTarget = resolve,
+      .loadOp = load ? wgpu::LoadOp::Load : wgpu::LoadOp::Clear,
+      .storeOp = wgpu::StoreOp::Store,
+      .clearValue = {1.0, 1.0, 1.0, 1.0},
+  }};
+  const wgpu::RenderPassDescriptor descriptor{
+      .label = label,
+      .colorAttachmentCount = attachments.size(),
+      .colorAttachments = attachments.data(),
+      .timestampWrites = webgpu::gpu_prof::pass_writes(label),
+  };
+  const auto pass = cmd.BeginRenderPass(&descriptor);
   pass.SetPipeline(pipeline);
   pass.SetBindGroup(0, bindGroup, 0, nullptr);
   pass.Draw(3);
-  if (own)
-    pass.End();
+  pass.End();
 }
 void draw_with_uniform(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::RenderPipeline& pipeline,
                        const wgpu::BindGroupLayout& layout, const void* uniform, size_t uniformSize,
@@ -2132,13 +2097,23 @@ void draw_with_uniform(const wgpu::CommandEncoder& cmd, const char* label, const
       .entries = entries.data(),
   };
   const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
-  bool own = false;
-  const auto pass = post_pass(cmd, label, target, resolve, true, wgpu::Color{}, own);
+  const std::array attachments{wgpu::RenderPassColorAttachment{
+      .view = target,
+      .resolveTarget = resolve,
+      .loadOp = wgpu::LoadOp::Load,
+      .storeOp = wgpu::StoreOp::Store,
+  }};
+  const wgpu::RenderPassDescriptor descriptor{
+      .label = label,
+      .colorAttachmentCount = attachments.size(),
+      .colorAttachments = attachments.data(),
+      .timestampWrites = webgpu::gpu_prof::pass_writes(label),
+  };
+  const auto pass = cmd.BeginRenderPass(&descriptor);
   pass.SetPipeline(pipeline);
   pass.SetBindGroup(0, bindGroup, 0, nullptr);
   pass.Draw(3);
-  if (own)
-    pass.End();
+  pass.End();
 }
 // The sun shadows from the shadow map (kSunMapShader) into `target`.
 // direct: multiplied into `target`, the scene (with `resolve`), else drawn into a target of its own.
@@ -2200,7 +2175,6 @@ void draw_sun_map(const wgpu::CommandEncoder& cmd, const Camera& camera, const S
       .colorAttachments = attachments.data(),
       .timestampWrites = webgpu::gpu_prof::pass_writes("Sun shadows (shadow map)"),
   };
-  close_shared();
   const auto pass = cmd.BeginRenderPass(&descriptor);
   pass.SetPipeline(direct ? g_sunMapDirect : g_sunMapPass);
   pass.SetBindGroup(0, bindGroup, 0, nullptr);
@@ -2267,8 +2241,6 @@ void initialize() {
   g_aoFadeEnd = env_float("DOL_AURORA_AO_FADE_END", g_aoFadeEnd, g_aoFadeStart + 1.f, 1e9f);
   g_cloudStrength = env_float("DOL_AURORA_CLOUD_SHADOWS_STRENGTH", g_cloudStrength, 0.f, 1.f);
   g_cloudScale = env_float("DOL_AURORA_CLOUD_SHADOWS_SCALE", g_cloudScale, 1.f, 1e7f);
-  const char* sharedPass = std::getenv("DOL_AURORA_POST_SHARED_PASS");
-  g_postSharedPass = sharedPass != nullptr && sharedPass[0] == '1';
   const char* aoPacked = std::getenv("DOL_AURORA_AO_PACKED");
   g_aoPacked = aoPacked != nullptr && aoPacked[0] == '1';
   const char* cloudNoise = std::getenv("DOL_AURORA_CLOUD_NOISE_TEXTURE");
@@ -2868,7 +2840,6 @@ bool copy_exposure_scene(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& 
   const wgpu::TexelCopyTextureInfo from{.texture = frame.texture};
   const wgpu::TexelCopyTextureInfo to{.texture = g_exposureScene};
   const wgpu::Extent3D extent{size.width, size.height, 1};
-  close_shared();
   cmd.CopyTextureToTexture(&from, &to, &extent);
   return true;
 }
@@ -2876,14 +2847,6 @@ bool copy_exposure_scene(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& 
 void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
             const wgpu::Extent3D& size, wgpu::TextureFormat format, const wgpu::TextureView& dst,
             const wgpu::TextureView& resolve, uint32_t msaaSamples, const Camera& camera, const SunMap* sunMap) {
-  static const bool profiling = std::getenv("DOL_AURORA_GPU_PROF") != nullptr;
-  g_shareMode = g_postSharedPass && !profiling;
-  struct EndShared {
-    ~EndShared() {
-      close_shared();
-      g_shareMode = false;
-    }
-  } endShared;
   const bool exposureScene = camera.exposure > 1.f && g_module && msaaSamples == 1 && camera.valid &&
                              size.width >= 4 && size.height >= 4 && copy_exposure_scene(cmd, size, dst);
   // Ambient occlusion and the far blur need single-sample depth (the depth
