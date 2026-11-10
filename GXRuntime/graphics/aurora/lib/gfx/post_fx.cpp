@@ -288,9 +288,6 @@ override far_end: f32 = 30000.0;
 override amount: f32 = 0.8;
 override background: f32 = 0.35;
 override debug_view: bool = false;
-// DOL_AURORA_FAR_NO_SKY_PROBE=1 (diagnostic: changes the picture): leaves out the check for sky near
-// each pixel, to measure what it costs.
-override no_sky_probe: bool = false;
 
 @group(0) @binding(0) var samp: sampler;
 @group(0) @binding(1) var blurred: texture_2d<f32>;
@@ -323,7 +320,7 @@ fn fs_far(in: VertexOutput) -> @location(0) vec4<f32> {
     // and with the sky sharp the sea along the horizon took a bright band and
     // a distant lightning strike (it has depth) spread into a wide grey column
     // from the sea to the clouds. Wind Waker HD keeps the line sharp.
-    if (d > 0.0 && background < amount && !no_sky_probe) {
+    if (d > 0.0 && background < amount) {
         let size = vec2<i32>(textureDimensions(depth));
         var sky = 0.0;
         for (var r = 1; r <= 3; r++) {
@@ -1838,7 +1835,6 @@ wgpu::RenderPipeline make_far_pipeline(wgpu::TextureFormat format, uint32_t samp
       wgpu::ConstantEntry{.key = "amount", .value = g_farAmount},
       wgpu::ConstantEntry{.key = "background", .value = g_farBackground},
       wgpu::ConstantEntry{.key = "debug_view", .value = g_farDebug ? 1.0 : 0.0},
-      wgpu::ConstantEntry{.key = "no_sky_probe", .value = std::getenv("DOL_AURORA_FAR_NO_SKY_PROBE") != nullptr ? 1.0 : 0.0},
   };
   const wgpu::BlendState over{
       .color = {.operation = wgpu::BlendOperation::Add,
