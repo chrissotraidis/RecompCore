@@ -122,10 +122,9 @@ bool g_cloudDebug = false;
 // (fs_cloud_bake) around the camera, and baked again only when the camera or the clouds'
 // drift comes near its edge. It reaches 200,000 units out; the shadows fade out by 160,000.
 bool g_cloudNoiseTexture = false;
-// DOL_AURORA_FUSED_EFFECTS=1: the occlusion's apply, the edge light and the torch light in one
-// full-screen pass (kFusedShader) instead of three, each reading the depth and blending into the
-// full-size scene: scene * ao + edge + torch, the same sum the target clamps once either way,
-// with one 8-bit rounding instead of one after the occlusion.
+// DOL_AURORA_FUSED_EFFECTS=1: the occlusion's apply, the edge light, the torch light and the cloud
+// shadows in one full-screen pass (kFusedShader) instead of four, each reading the depth and
+// blending into the full-size scene. One 8-bit rounding instead of one after each pass.
 bool g_fusedEffects = false;
 constexpr uint32_t kCloudNoiseTexels = 4096;
 constexpr float kCloudNoiseReach = 200000.f;
@@ -3190,12 +3189,11 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
   const bool aoHere = ambient_occlusion_enabled() && single && size.width >= 4 && size.height >= 4;
   const bool edgeHere = edge_light_enabled() && single && camera.valid;
   const bool torchHere = torch_light_enabled() && single && camera.valid && camera.lightCount > 0;
+  const bool cloudHere = cloud_shadows_enabled() && single && camera.valid;
   const bool sunHere = sun_shadows_enabled() && single && camera.valid;
-  // DOL_AURORA_FUSED_EFFECTS=1: two or more of the three in one pass (kFusedShader). Not with the
+  // DOL_AURORA_FUSED_EFFECTS=1: two or more of the four in one pass (kFusedShader). Not with the
   // sun shadows (they go between the occlusion and the edge light) or a debug view.
-  // The cloud shadows stay a pass of their own: they darken what the edge light lit and the
-  // target clamped (a sunlit rim at white under a cloud), which one blend can't repeat.
-  const uint32_t fusedEffects = (aoHere ? 1u : 0u) | (edgeHere ? 2u : 0u) | (torchHere ? 4u : 0u);
+  const uint32_t fusedEffects = (aoHere ? 1u : 0u) | (edgeHere ? 2u : 0u) | (torchHere ? 4u : 0u) | (cloudHere ? 8u : 0u);
   const bool fuse = g_fusedEffects && g_fusedModule && !sunHere && g_aoDebug == 0 && !g_cloudDebug &&
                     std::popcount(fusedEffects) >= 2;
   if (aoHere) {
@@ -3212,6 +3210,8 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
   if (fuse) {
     const webgpu::gpu_prof::Zone zone{cmd, "HD effects (fused)"};
     ensure_targets(size, format, msaaSamples);
+    if (cloudHere && g_cloudNoiseTexture)
+      ensure_cloud_noise(cmd, camera, depthView);
     const uint32_t key = fusedEffects | (msaaSamples << 4) | (static_cast<uint32_t>(format) << 12);
     if (!g_fusedPass || key != g_fusedKey) {
       g_fusedPass = make_fused_pipeline(format, msaaSamples, fusedEffects);
@@ -3268,7 +3268,7 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
                         dst, resolve);
     }
   }
-  if (cloud_shadows_enabled() && g_module && depthView && msaaSamples == 1) {
+  if (!fuse && cloud_shadows_enabled() && g_module && depthView && msaaSamples == 1) {
     if (camera.valid) {
       const webgpu::gpu_prof::Zone zone{cmd, "Cloud shadows"};
       ensure_targets(size, format, msaaSamples);
