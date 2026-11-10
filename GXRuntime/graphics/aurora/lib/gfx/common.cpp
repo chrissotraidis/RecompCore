@@ -3062,8 +3062,14 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
     {
       const webgpu::gpu_prof::Zone zone{between, "In-between replay"};
       webgpu::gpu_prof::set_name_prefix("IB ");
-      for (const auto& op : frame.ops)
-        replay_op(between, frame, op);
+      // DOL_AURORA_FRAME_INTERP_REPEAT=1 (diagnostic, as in present_with_in_between): no replay.
+      static const bool repeatFrame = [] {
+        const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_REPEAT");
+        return env != nullptr && env[0] == '1';
+      }();
+      if (!repeatFrame)
+        for (const auto& op : frame.ops)
+          replay_op(between, frame, op);
       webgpu::gpu_prof::set_name_prefix({});
     }
     frame_interp::set_encoding_interpolated(false);
