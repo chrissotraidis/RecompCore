@@ -2633,16 +2633,24 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
     encode_sea_mask(cmd, passInfo, split == SIZE_MAX ? passInfo.commands.size() : split, frameKey);
 #endif
 
-  if (bloomBeforeCopy) {
+  // DOL_AURORA_FRAME_INTERP_NO_HD=1 (diagnostic: changes the in-between frame's picture): the
+  // in-between frame skips the HD look's effects, to measure what they cost it.
+  static const bool interpNoHd = [] {
+    const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_NO_HD");
+    return env != nullptr && env[0] == '1';
+  }();
+  const bool hdHere = !(interpNoHd && frame_interp::encoding_interpolated());
+  if (bloomBeforeCopy && hdHere) {
     post_fx::encode(cmd, passInfo.copySourceView, passInfo.copySourceDepthView, passInfo.targetSize,
                     webgpu::g_frameBuffer.texture.GetFormat(), passInfo.colorView, passInfo.resolveView,
                     passInfo.msaaSamples, frame_camera(frame, frameKey), frameSunMap);
     bloomedFrame = frameKey;
   }
   if (split != SIZE_MAX) {
-    post_fx::encode(cmd, passInfo.copySourceView, passInfo.copySourceDepthView, passInfo.targetSize,
-                    webgpu::g_frameBuffer.texture.GetFormat(), passInfo.colorView, passInfo.resolveView,
-                    passInfo.msaaSamples, frame_camera(frame, frameKey), frameSunMap);
+    if (hdHere)
+      post_fx::encode(cmd, passInfo.copySourceView, passInfo.copySourceDepthView, passInfo.targetSize,
+                      webgpu::g_frameBuffer.texture.GetFormat(), passInfo.colorView, passInfo.resolveView,
+                      passInfo.msaaSamples, frame_camera(frame, frameKey), frameSunMap);
     bloomedFrame = frameKey;
     if (split < passInfo.commands.size()) {
       auto attachmentsAfter = attachments;
@@ -2959,7 +2967,13 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
     replayZone.emplace(between, "In-between replay");
   webgpu::gpu_prof::set_name_prefix("IB ");
   frame_interp::set_encoding_interpolated(true);
-  for (size_t i = 0; i < frame.ops.size(); ++i) {
+  // DOL_AURORA_FRAME_INTERP_REPEAT=1 (diagnostic: the in-between frame repeats the real one):
+  // no replay at all, to measure the most a cheaper in-between frame could save.
+  static const bool repeatFrame = [] {
+    const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_REPEAT");
+    return env != nullptr && env[0] == '1';
+  }();
+  for (size_t i = 0; i < (repeatFrame ? 0 : frame.ops.size()); ++i) {
     replay_op(between, frame, frame.ops[i]);
     if (dump && dumpPasses) {
       const auto commands = between.Finish();
