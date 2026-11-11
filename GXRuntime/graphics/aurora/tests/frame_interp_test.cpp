@@ -108,8 +108,9 @@ static const gxc::VertexShaderConstants* blend_plan(const gxc::DrawPlan& plan, c
 }
 
 int main() {
-  // Pacing at 120 Hz as well, for its checks (unset, 120 Hz is never lowered).
-  setenv("DOL_AURORA_FRAME_INTERP_PACING", "1", 1);
+  // Stepped pacing (the menu's "Step down"), for its checks: 120 Hz and up go down one in-between frame at a time,
+  // 60 and 90 Hz by their rule (unset, 120 Hz is never lowered).
+  setenv("DOL_AURORA_FRAME_INTERP_PACING", "step", 1);
   fi::set_enabled(true);
   const uint64_t kShip = 11, kTree = 22, kHud = 33;
 
@@ -1397,10 +1398,10 @@ int main() {
     CHECK(fi::draw_key(plan) == 0);
   }
 
-  // Pacing: overloads in 3 of 8 game frames take 120 Hz to 60, and more after
-  // the frames in flight to none; one now and then does nothing. 3 s of calm
-  // brings a level back, and an overload soon after coming back makes the
-  // next wait twice as long.
+  // Pacing at 90 Hz (2 in-between frames, below stepping): overloads in 3 of 8
+  // game frames take it to 60, and more after the frames in flight to none; one
+  // now and then does nothing. 3 s of calm brings a level back, and an overload
+  // soon after coming back makes the next wait twice as long.
   {
     const auto overload_frames = [](int n) {
       for (int i = 0; i < n; ++i) {
@@ -1408,18 +1409,18 @@ int main() {
         fi::end_game_frame();
       }
     };
-    fi::set_steps(3);
+    fi::set_steps(2);
     fi::end_game_frame();
-    CHECK(fi::frame_steps() == 3 && !fi::frame_skipped());
+    CHECK(fi::frame_steps() == 2 && !fi::frame_skipped());
     // Now and then: never a drop.
     for (int i = 0; i < 40; ++i) {
       overload_frames(1);
       for (int j = 0; j < 8; ++j)
         fi::end_game_frame();
     }
-    CHECK(fi::frame_steps() == 3);
+    CHECK(fi::frame_steps() == 2);
     overload_frames(2);
-    CHECK(fi::frame_steps() == 3);
+    CHECK(fi::frame_steps() == 2);
     overload_frames(1);
     CHECK(fi::frame_steps() == 1 && !fi::frame_skipped());
     overload_frames(3); // still the frames in flight: no second drop
@@ -1433,7 +1434,7 @@ int main() {
     CHECK(!fi::frame_skipped() && fi::frame_steps() == 1);
     for (int i = 0; i < 90; ++i)
       fi::end_game_frame();
-    CHECK(fi::frame_steps() == 3);
+    CHECK(fi::frame_steps() == 2);
     overload_frames(3);
     CHECK(fi::frame_steps() == 1);
     for (int i = 0; i < 90; ++i)
@@ -1441,13 +1442,46 @@ int main() {
     CHECK(fi::frame_steps() == 1);
     for (int i = 0; i < 90; ++i)
       fi::end_game_frame();
-    CHECK(fi::frame_steps() == 3);
+    CHECK(fi::frame_steps() == 2);
     // A new setting starts over at it.
     overload_frames(3);
     CHECK(fi::frame_steps() == 1);
     fi::set_steps(1);
     fi::end_game_frame();
     CHECK(fi::frame_steps() == 1 && !fi::frame_skipped());
+  }
+
+  // Pacing at 180 Hz (5 in-between frames): one fewer at a time, a second drop only after two settles (the frames
+  // in flight still report the first), and 3 s of calm bringing one back at a time.
+  {
+    const auto overload_frames = [](int n) {
+      for (int i = 0; i < n; ++i) {
+        fi::note_overload(fi::OverloadCause::RenderWorker, 50.0);
+        fi::end_game_frame();
+      }
+    };
+    fi::set_steps(5);
+    fi::end_game_frame();
+    CHECK(fi::frame_steps() == 5);
+    overload_frames(3);
+    CHECK(fi::frame_steps() == 4 && !fi::frame_skipped());
+    overload_frames(3); // the frames in flight: no second drop yet
+    CHECK(fi::frame_steps() == 4);
+    overload_frames(5); // eight frames after the first drop: the next
+    CHECK(fi::frame_steps() == 3);
+    for (int i = 0; i < 90; ++i)
+      fi::end_game_frame();
+    CHECK(fi::frame_steps() == 4);
+    for (int i = 0; i < 90; ++i)
+      fi::end_game_frame();
+    CHECK(fi::frame_steps() == 5);
+    // 120 Hz (3 in-between frames) steps too: one fewer, not down to 60.
+    fi::set_steps(3);
+    fi::end_game_frame();
+    overload_frames(3);
+    CHECK(fi::frame_steps() == 2 && !fi::frame_skipped());
+    fi::set_steps(1);
+    fi::end_game_frame();
   }
 
   // Stats: each overload counted under its cause with its wait, and pacing's
