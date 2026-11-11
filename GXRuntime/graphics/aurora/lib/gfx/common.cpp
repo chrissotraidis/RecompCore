@@ -1457,17 +1457,41 @@ static size_t acquire_frame_slot() {
   ZoneScopedN("Acquire frame slot");
   const auto waitStart = PresentClock::now();
   // Frames coming faster than the game's own rate (a load's fast-forward)
-  // outrun the presents by design; waiting for them is no overload.
+  // outrun the presents by design; waiting for them is no overload. With
+  // stepped pacing (frame_interp::stepped_pacing(), experimental), judged over
+  // the last 8 frames' starts (under 20 ms apart on average), not the last
+  // one's: after a long wait the game starts its next frame soon, to catch up,
+  // and a render worker falling behind read as fast-forward at every wait that
+  // mattered (Hyrule at 180 Hz with the HD look's shadows: 50 ms waits, each
+  // frame started 12-16 ms after the one before).
+  static const bool stepped = frame_interp::stepped_pacing();
   static PresentClock::time_point lastStart{};
-  const bool fastForward = waitStart - lastStart < std::chrono::milliseconds{20};
+  static std::array<PresentClock::time_point, 8> starts{};
+  static size_t nextStart = 0;
+  const auto eightAgo = starts[nextStart];
+  starts[nextStart] = waitStart;
+  nextStart = (nextStart + 1) % starts.size();
+  const bool fastForward =
+      stepped ? eightAgo != PresentClock::time_point{} && waitStart - eightAgo < std::chrono::milliseconds{20 * 8}
+              : waitStart - lastStart < std::chrono::milliseconds{20};
   lastStart = waitStart;
+  // With it, nor is a wait while pipelines compile (a new area, a first effect): the worker stalls on them once, and
+  // that isn't the scene too heavy. Counted as overloads, the compiles on arriving somewhere took 180 Hz to 120 for the
+  // next 15 s with nothing overloaded (Hyrule at the window's own size, Nov 10). Pipelines queued now, or made over
+  // the last two frames (the worker runs a frame or two behind the game), leave the wait out.
+  static uint32_t lastCreated = 0;
+  static int quietFrames = 0;
+  const uint32_t created = __atomic_load_n(&g_stats.createdPipelines, __ATOMIC_RELAXED);
+  const bool compiling = created != lastCreated || __atomic_load_n(&g_stats.queuedPipelines, __ATOMIC_RELAXED) != 0;
+  lastCreated = created;
+  quietFrames = !stepped ? 2 : compiling ? 0 : std::min(quietFrames + 1, 2);
   while (true) {
     if (const auto slot = g_frameSlots.try_acquire()) {
       const auto waitDuration = PresentClock::now() - waitStart;
       const double waitMs = std::chrono::duration<double, std::milli>{waitDuration}.count();
       TracyPlot("aurora: frameSlotWaitMs", waitMs);
       // The game waited for the render worker: fewer in-between frames.
-      if (waitMs >= 3.0 && !fastForward)
+      if (waitMs >= 3.0 && !fastForward && quietFrames >= 2)
         frame_interp::note_overload(frame_interp::OverloadCause::RenderWorker, waitMs);
       return *slot;
     }
