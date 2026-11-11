@@ -147,7 +147,7 @@ void GxCoreState::apply(const ar::RenderStatePacket& state) {
     if (state.index < 256u) {
       // The draw tag registers change at nearly every particle draw and feed
       // no derived state, so they leave the version alone.
-      const bool tag = state.index >= kDrawScopeCountRegister && state.index <= kDrawTagRegister;
+      const bool tag = state.index >= kDrawListRegister && state.index <= kDrawTagRegister;
       if (!tag && (!bp_valid_[state.index] || bp_regs_[state.index] != state.value))
         version_ = next_version();
       bp_regs_[state.index] = state.value;
@@ -652,6 +652,7 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   // the sky) and found that particle's tag, a different particle every frame,
   // so it never had a counterpart and moved at 30 FPS.
   constexpr std::uint32_t kParticleVertices = 8;
+  plan.far_caster = !bp_valid_[kDrawListRegister] || (bp_regs_[kDrawListRegister] & 1u) == 0u;
   if (bp_valid_[kDrawTagRegister] && draw.vertex_count <= kParticleVertices) {
     plan.draw_tag = bp_regs_[kDrawTagRegister];
     plan.draw_tag_age = bp_valid_[kDrawTagAgeRegister] ? bp_regs_[kDrawTagAgeRegister] : 0u;

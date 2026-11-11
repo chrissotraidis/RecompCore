@@ -17,6 +17,7 @@ struct ConvRequest {
   Range uniformRange;        // UV transform uniform (offset + scale)
   TextureHandle dst;         // Destination texture
   SampleFilter sampleFilter = SampleFilter::Nearest;
+  bool keepColour = false;   // GX_TF_I8 only: the colour beside the intensity (Wind Waker HD's monotone)
 };
 
 bool needs_conversion(GXTexFmt fmt);

@@ -175,6 +175,10 @@ void aurora_set_bloom(bool enabled);
    sharp, before bloom. Takes effect at the next frame. DOL_AURORA_FAR_BLUR=1
    sets the starting value. */
 void aurora_set_far_blur(bool enabled);
+/* Wind Waker HD's far blur level for the hour (its DOF presets: wwHD_basic 1.2 by day, wwHD_night 0.65, blended
+   over 06:00-08:00 and 18:00-20:00), used with DOL_AURORA_FAR_BLUR_HD=1: the blend is clamp(level x (distance -
+   start) / (end - start)) times DOL_AURORA_FAR_BLUR_AMOUNT. 1.2 until set. Takes effect at the next frame. */
+void aurora_set_far_blur_level(float level);
 /* Ambient occlusion: creases and contact areas darkened, from the scene's
    depth, before the far blur and bloom. Takes effect at the next frame.
    DOL_AURORA_AO=1 sets the starting value. */
@@ -201,11 +205,94 @@ void aurora_set_sun_shadow_quality(int quality);
    Waker HD's): the full shadow's colour is blended in by this much, the
    moon's shadows too. Takes effect at the next frame. */
 void aurora_set_sun_shadow_strength(float strength);
+/* Wind Waker HD's shadow cascade splits for this frame, from the game's camera (HD sets them each frame from the
+   camera's distance to what it looks at and its field of view): the distances from the camera where the "HD" shadow
+   quality moves to its second and third cascade, whose first two cascades are sized with them. 0 goes back to the
+   fixed ones (420 and 1395, HD's at Outset's bridge). Takes effect at the next frame. */
+void aurora_set_sun_cascade_splits(float middle, float far);
+/* Wind Waker HD's light for the sun shadow map's shade, the hour's (linear RGB): `sky`, the light from the sky
+   its shade takes from above (its palette's shadow colour), `ground`, the ambient it takes from the side (the
+   scenery's C0 times its factor), and `lit`, the sun's light (the scenery's K0 times its factor). A shaded pixel
+   is multiplied by (their ambient over `lit`) in the scene's gamma. `on` 0 goes back to the fixed shadow colour.
+   Takes effect at the next frame. */
+void aurora_set_sun_palette(int on, const float sky[3], const float ground[3], const float lit[3]);
+/* Wind Waker HD's character light for the hour (linear RGB): `c0`, the hemisphere's lower colour (actor_c0 times
+   its factor), `shadow`, its upper colour (the palette's shadow colour), and `k`, the lit colour (actor_k0 times its
+   factor: 2.75 at noon). Toon-shaded characters then take HD's light in place of the GameCube's ramp, when the
+   renderer's switch DOL_AURORA_ACTOR_LIGHT_HD=1 is on (read at startup). `on` 0 goes back to the GameCube shading.
+   Takes effect at the next frame. */
+void aurora_set_actor_light_hd(int on, const float c0[3], const float shadow[3], const float k[3]);
+/* Each character's own palettes on Wind Waker HD's light (its setLightTevColorType: a character's colours are its
+   own tevstr's, from the floor under it, times the intensities of the global light, Link's): `c0` and `k0`, the
+   GameCube's global actor C0 and K0 (g_env_light's, linear: bytes / 255 to the 2.2). A character draw whose own toon
+   registers (C0 and KONST) differ from them takes HD's colours from aurora_set_actor_light_hd times the ratio, in
+   linear light: an islander in the sun keeps the sun's light while Link stands under a roof whose floor names a
+   darker palette. `on` 0: every character on the global colours. */
+void aurora_set_actor_light_hd_own(int on, const float c0[3], const float k0[3]);
+/* Wind Waker HD's light rule for the sun shadow map (its setLightPosHD): with `on`, the direction given by
+   aurora_set_sun_direction is HD's light already (the sun by day, the moon's side by night, its height held as
+   HD holds it), `night` says which, and `fade` (0 to 1) is HD's day/night switch fade, which takes the lit side
+   down to the shade before the light changes sides. `on` 0 goes back to BlueWake's own rule. */
+void aurora_set_sun_hd_light(int on, int night, float fade);
+/* Wind Waker HD's cloud shadow floor (cCloudShadowPower, cloud = clamp(texel + floor)) from the game's clock, as HD
+   works it out in setSunpos: 1 - max(0.25, -0.9 cos(time - 15 degrees)), 0.364 at 10:00, 0.131 at noon, 0.75 from
+   a low sun through the night. Used by the cloud shadows on HD's rule, on the scenery and the characters. A negative
+   value, the default, goes back to the renderer's own (from the shadow light's height), which is HD's only for a
+   true sun: with HD's light rule the light is held at 40,000 high at dawn and dusk. DOL_AURORA_CLOUD_SHADOWS_HD_POWER
+   still overrides both. Takes effect at the next frame. */
+void aurora_set_cloud_hd_floor(float floor);
+/* Wind Waker HD's caster culling: with `on`, the scenery draws into the sun shadow map with its own cull mode (as HD
+   draws its map's casters: back faces culled for most), so what faces away from the light casts nothing, as a closed
+   room's ceiling seen from below. Characters keep their own. `on` 0, the default, draws every caster's both sides.
+   DOL_AURORA_SUN_SHADOW_CASTER_CULL=1 or 0 (local test) overrides it. Takes effect at the next frame. */
+void aurora_set_sun_caster_cull(int on);
+/* Wind Waker HD's monotone (Frozen Hyrule's sepia, its DOF pass while the game's mMonotone is set). With `on`, at the
+   game's grey composite (its I8 copy of the frame to `frame_copy`, mDoGph_gInf_c::mFrameBufferTex, and the quad that
+   lays it back, which is left out), the scene's effects run and then HD's pass: the scene's grey (HD's weights) at
+   half size, `saturate` of the way, times `mul`, over the scene by clamp(level x clamp((distance - start) / (end -
+   start))), all of it beyond `start` when start == end; what the game draws after the composite (the player's
+   lists, Link and his things) stays in colour, and bloom goes over all of it, as in HD. `on` 0, the default, leaves
+   the game's own grey. Single-sampled only (aurora_monotone_hd_supported()); DOL_AURORA_MONOTONE_HD=0 turns it off.
+   Takes effect at the next frame the game records. */
+void aurora_set_monotone_hd(int on, float level, float start, float end, const float mul[3], float saturate,
+                            uint32_t frame_copy);
+int aurora_monotone_hd_supported(void);
+/* Wind Waker HD's fog curve: with `on`, the game's linear fog is squared (clamp((d - start) / (end - start))^2, as
+   HD's shaders fog), for while the game's palettes hold HD's fog distances, which HD retuned for that curve (on the
+   GameCube's linear one they give about twice HD's fog at mid range). `on` 0, the default, keeps the GameCube's
+   curve. Takes effect at the next draw. */
+void aurora_set_fog_hd(int on);
+/* Wind Waker HD's fog starts before the camera in many places (Ganon's Tower -5000, the Tower of the Gods -1000), and
+   the GameCube's palette blend (float_kankyo_color_ratio_set) clamps every blended value at 0, so the game's fog
+   starts at 0 there and fogs far less than HD. The host gives the stage's HD palette entries with a start below 0
+   (count pairs of start, end; at most 8; 0 or NULL: none): where the lit scenery's fog starts at 0 and ends at one
+   of those ends, the sun pass fogs it from that start instead, as HD does; every other draw fogged from 0 to the
+   first pair's end (characters, plants, objects) takes that start in its own fog. */
+void aurora_set_fog_hd_starts(const float* start_end, int count);
+/* Wind Waker HD's own normals for the stage in play (the HD pack's optional/hd-normals/<stage>.bin, made by the
+   importer from the player's HD dump), for the sun shadows' facing term; NULL or a missing file: none, and
+   the facing term makes its own. Loaded at once; call it as the stage changes. */
+void aurora_set_hd_normals(const char* path);
+/* Wind Waker HD's own vertex colours for the stage in play's rooms (the HD pack's optional/hd-colours/<stage>.bin,
+   made by the importer): HD remade its rooms' colours, so the draws with HD's light take HD's (in the game's gamma)
+   where a position has one, before the objects' table. A version 2 table also has HD's lava glow (its lava rooms'
+   konst2 animation and each vertex's glow), which the lit room draws add outside the shade. NULL or a missing file:
+   none. Call it as the stage changes. */
+void aurora_set_hd_stage_colours(const char* path);
+/* Wind Waker HD's normals and vertex colours for the game's object models (the HD pack's
+   optional/hd-normals/objects.bin and optional/hd-colours/objects.bin, made by the importer from the player's HD
+   dump): the normals are looked up after the stage's, the colours light draws as HD lights its palms. NULL or a
+   missing file: none. Loaded at once; call it once. */
+void aurora_set_hd_object_tables(const char* normals_path, const char* colours_path);
+/* Wind Waker HD's cloud shadow texture for the cloud shadows on HD's rule (the HD pack's
+   optional/hd-cloud-shadow/ww_shadow_clouds.dds, made by the importer from the player's HD dump); NULL or a
+   missing file: none, and BlueWake's own noise. Loaded by the render thread at its next frame. */
+void aurora_set_hd_cloud_texture(const char* path);
 /* Edge light: a warm rim on the sunlit outline of what is near the camera,
    from the same sun and camera. Takes effect at the next frame. */
 void aurora_set_edge_light(bool enabled);
 /* Torch and fire light: the point lights last passed to aurora_set_point_lights
-   (up to 16, each x, y, z, radius, then r, g, b from 0 to 1 and a flicker
+   (up to 32, each x, y, z, radius, then r, g, b from 0 to 1 and a flicker
    amount, in world space) glow on the surfaces around them, with the camera
    last passed to aurora_set_world_view. Takes effect at the next frame. */
 void aurora_set_torch_light(bool enabled);

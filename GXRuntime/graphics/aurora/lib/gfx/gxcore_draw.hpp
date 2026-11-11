@@ -6,6 +6,7 @@
 // descriptor, bind groups, buffer pushes, draw submission).
 
 #include "common.hpp"
+#include "post_fx.hpp"
 
 #include <gxruntime/gxcore/shader.hpp>
 
@@ -47,6 +48,10 @@ struct DrawData {
   Range pixelUniformRange;  // PixelShaderConstants (group 2), TEV path only
   uint32_t indexCount;
   BindGroupRef textureBindGroup; // 0 when untextured
+  // The one texture an alpha-tested draw's cutout comes from, in the single-texmap layout (the sun map's cutout
+  // casters and the sea mask's cutout bind it at group 2): the draw's own group when it has one texmap, else a
+  // group of the texmap its alpha is read from (gxc::cutout_alpha_texmap()); 0 when there is none.
+  BindGroupRef cutoutBindGroup = 0;
   bool tev = false; // TEV path: PS uniform at group 2, texture at group 3
   // A tagged particle's, whose in-between vertices are its own (interpVertRange).
   bool ownVertices = false;
@@ -69,6 +74,11 @@ struct DrawData {
   // per-vertex matrices (a skinned model) or the current one.
   bool sunCaster = false;
   bool posMtxIdx = false;
+  // The draw's own cull mode (gxc::CullMode), for the map's casters while post_fx::sun_caster_cull() is on.
+  uint8_t sunCasterCull = 0;
+  // It casts in the cascades past the second too (gxc::DrawPlan::far_caster: the stage's BG lists, as Wind Waker
+  // HD's far cascades draw only its BG model list).
+  bool farCaster = true;
   // Alpha-tested solid scenery (a roof, an awning, leaves, a fence): drawn
   // into the map with its texture's cutout (sun_caster_alpha()).
   bool sunCasterAlpha = false;
@@ -84,6 +94,44 @@ struct DrawData {
   bool softEffect = false;
   bool softWritesAlpha = false;
   PipelineRef softPipeline = 0;
+  // An effect (effect_draw()): blended over the scene and writing no depth, so
+  // the HD look's shading from the depth buffer would take it for the scenery
+  // behind it; drawn again into the effects' mask (post_fx.hpp effect_mask_target()).
+  bool effect = false;
+  // An effect that writes depth (effect_draw(): one of the game's particles, a glow model): the effects' mask draws
+  // it at its own depth (not pushed back), and the sea mask leaves it out.
+  bool effectDepth = false;
+  // Drawn at its own depth into the effects' mask: an effect that writes depth, or a particle's colour draw over
+  // its own depth draw.
+  bool effectOwnDepth = false;
+  // A character's draw (the sea mask's green; the sun shadows' facing term leaves it out): toon-shaded, a
+  // texgen that reads a lit colour (GX_TG_SRTG, Wind Waker's characters' ramp), or skinned (per-vertex matrices).
+  bool character = false;
+  // Scenery with no normals of its own, given smooth ones in its vertices' normal slot (made on the CPU while
+  // the sun shadows' facing term is on, post_fx::sun_normals_wanted()): the sea mask's pass draws them.
+  bool smoothNormal = false;
+  // Solid and not blended but writing no depth (the sky's layers): with Wind Waker HD's bloom mask
+  // (post_fx::bloom_mask_wanted()) drawn into the sea mask, where it may glow.
+  bool maskCover = false;
+  // It writes depth and colour but is none of the above: blended scenery that writes depth (a bush fading as
+  // the camera nears, alpha-tested), which the sea mask's pass draws too so what it hides marks nothing. Only
+  // whole (no alpha test) or with one texture's cutout (maskOccluderCutout, as sunCasterAlpha).
+  bool maskOccluder = false;
+  bool maskOccluderCutout = false;
+  // Lit by the game (a bush): not the sea, so it clears the sea's mark under it as well. An unlit one (the
+  // waves' crests and the horizon's wave sheets over the sea) keeps it.
+  bool maskOccluderLit = false;
+  // Its vertices carry their own normals (the rim light takes a character's from the sea mask's pass).
+  bool hasNormal = false;
+  // Toon-shaded (a texgen from a lit colour): Wind Waker HD's rim light takes these characters, not a skinned
+  // palm's leaves.
+  bool toon = false;
+  // Its pipeline is the shader with Wind Waker HD's character light (gxc ShaderKey::hd_actor_light): group 0 is
+  // the pass's actor light group (begin_actor_light_pass()).
+  bool actorLight = false;
+  // Its pipeline is the lit scenery's with Wind Waker HD's light buffer (gxc ShaderKey::hd_point_light): group 0 is
+  // the pass's actor light group, for its lights.
+  bool pointLight = false;
 };
 
 // Recording: the pass's last command, when it is a GXCore draw a following
@@ -107,7 +155,14 @@ DrawData* last_recorded_draw() noexcept;
 // v13: the hardware's eight texgens and sixteen TEV stages, and TEX5..7 in the
 // normal/binormal/tangent slots of a vertex with no normal (BlueWake #74).
 // v14: softTarget, a soft effect's pipeline for the reduced-size buffer.
-constexpr uint32_t GXCorePipelineConfigVersion = 14;
+// v15: Wind Waker HD's character light (ShaderKey::hd_actor_light: a longer key, and a flagged key's WGSL and group
+// 0 layout).
+// v16: its cloud term (HD's cloud shadow texture and sampler at group 0 bindings 5 and 6, a longer uniform).
+// v17: HD's light buffer on the characters (its point and effect lights at group 0 binding 7).
+// v18: and on the lit scenery (ShaderKey::hd_point_light: a key byte, its WGSL and group 0).
+// v19: each character's own palettes on HD's character light (HdActorLightConstants::own_c0, own_k: a longer
+// uniform, and the flagged WGSL).
+constexpr uint32_t GXCorePipelineConfigVersion = 19;
 
 struct PipelineConfig {
   uint32_t version = GXCorePipelineConfigVersion;
@@ -133,6 +188,14 @@ void reset_pass_state();
 // soft variant (render()).
 bool efficient_effects() noexcept;
 void set_soft_target(bool on) noexcept;
+// Wind Waker HD's character light (gxc ShaderKey::hd_actor_light, DOL_AURORA_ACTOR_LIGHT_HD=1) for the pass about
+// to be encoded (common.cpp render()): `camera` the frame's camera, null for a pass that keeps the GameCube shading
+// (MSAA, offscreen, an EFB copy's pass of another size); `sunMap` this frame's shadow map or null; `size` the
+// target's. The flagged draws take HD's light when the switch is on and the host has given the hour's colours
+// (post_fx::actor_light_palette()): returns whether they do. end_actor_light_pass() after the pass: any other
+// pass's flagged draws keep the GameCube result.
+bool begin_actor_light_pass(const post_fx::Camera* camera, const post_fx::SunMap* sunMap, const wgpu::Extent3D& size);
+void end_actor_light_pass();
 // The sun shadow map (post_fx.hpp): a depth-only pass drawing each caster again
 // from the sun. begin_sun_casters() binds `rows` (the camera's view space to
 // the map's clip space, three rows of a 3x4 matrix) for the pass;
@@ -145,8 +208,10 @@ void render_sun_caster(const DrawData& data, const wgpu::RenderPassEncoder& pass
 // own: the sea 1, what the sun map takes as solid 0 (an alpha-tested draw
 // with its texture's cutout), so the sea is marked where it is the nearest.
 // A sea draw that writes no depth tests it without writing it.
-// begin_sea_mask() sets up a pass; render_sea_mask() draws one draw.
-void begin_sea_mask(const wgpu::RenderPassEncoder& pass);
+// begin_sea_mask() sets up a pass; render_sea_mask() draws one draw. With `normals` the pass has a second
+// target, the scenery's smooth normals (post_fx::sun_normal_target()), and smooth-normal draws fill it (and, for
+// Wind Waker HD's rim light, the characters' own normals). With HD's bloom mask the mask's blue marks what may glow.
+void begin_sea_mask(const wgpu::RenderPassEncoder& pass, bool normals);
 void render_sea_mask(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 
 // Perform one EFB copy-to-texture (63/S16): resolve the current EFB region into

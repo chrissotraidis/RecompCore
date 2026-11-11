@@ -134,6 +134,16 @@ static constexpr std::string_view FragI8 = R"(
 }
 )"sv;
 
+// GX_TF_I8, keeping the colour beside the intensity: Wind Waker's grey composite copy while Wind Waker HD's monotone
+// is drawn (ConvRequest::keepColour). HD doesn't turn that copy grey, so what samples it (the heat haze, the next
+// frame's motion blur) keeps the colour; the alpha is the intensity, as the game's.
+static constexpr std::string_view FragI8Colour = R"(
+@fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
+    let rgb = textureSample(src, src_samp, in.uv).rgb;
+    return vec4f(rgb, intensity(rgb));
+}
+)"sv;
+
 // GX_TF_IA4: 4-bit intensity + 4-bit alpha -> RG8Unorm
 static constexpr std::string_view FragIA4 = R"(
 @fragment fn fs_main(in: VertexOutput) -> @location(0) vec4f {
@@ -341,6 +351,7 @@ static wgpu::Sampler g_nearestSampler;
 static wgpu::Sampler g_linearSampler;
 static absl::flat_hash_map<GXTexFmt, wgpu::RenderPipeline> g_pipelines;
 static wgpu::RenderPipeline g_blitPipeline;
+static wgpu::RenderPipeline g_i8ColourPipeline;
 
 static wgpu::RenderPipeline create_pipeline(const ConvPipeline& conv, const std::string_view shaderPreamble,
                                             const wgpu::BindGroupLayout& bindGroupLayout) {
@@ -491,6 +502,7 @@ void initialize() {
 void shutdown() {
   g_pipelines.clear();
   g_blitPipeline = {};
+  g_i8ColourPipeline = {};
   g_bindGroupLayout = {};
   g_depthBindGroupLayout = {};
   g_nearestSampler = {};
@@ -573,6 +585,14 @@ static void execute(const wgpu::CommandEncoder& cmd, const ConvRequest& req, con
 }
 
 void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
+  if (req.keepColour && req.fmt == GX_TF_I8) {
+    if (!g_i8ColourPipeline)
+      g_i8ColourPipeline = create_pipeline(
+          ConvPipeline{GX_TF_I8, FragI8Colour, wgpu::TextureFormat::RGBA8Unorm, "TexCopyConv I8 (colour)"},
+          ShaderPreamble, g_bindGroupLayout);
+    execute(cmd, req, g_i8ColourPipeline);
+    return;
+  }
   const auto it = g_pipelines.find(req.fmt);
   if (it == g_pipelines.end()) {
     Log.fatal("No copy conversion pipeline for format {}", static_cast<int>(req.fmt));

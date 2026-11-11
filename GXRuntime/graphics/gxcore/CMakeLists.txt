@@ -33,4 +33,8 @@ if(BUILD_TESTING)
     )
     target_link_libraries(gxcore_texture_decode_tests PRIVATE GXRuntime::gxcore)
     add_test(NAME gxcore_texture_decode_tests COMMAND gxcore_texture_decode_tests)
+
+    add_executable(gxcore_cutout_tests tests/gxcore_cutout_test.cpp)
+    target_link_libraries(gxcore_cutout_tests PRIVATE GXRuntime::gxcore)
+    add_test(NAME gxcore_cutout_tests COMMAND gxcore_cutout_tests)
 endif()
