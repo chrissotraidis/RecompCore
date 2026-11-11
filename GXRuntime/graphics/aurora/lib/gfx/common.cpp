@@ -1604,6 +1604,14 @@ bool begin_frame(bool preserveEfb) {
   frame.frameIndex = g_frameIndex;
   frame.stagingBuffer = *stagingSlot;
   frame.continuation = preserveEfb;
+  // The camera its draws are made with, taken as it begins recording (post_camera()).
+  {
+    static float lastSeconds = 0.f;
+    frame.postCamera = post_fx::current_camera();
+    frame.havePostCamera = true;
+    frame.previousSeconds = lastSeconds;
+    lastSeconds = frame.postCamera.view[16];
+  }
   // A real frame starts empty. A continuation (the picto id-buffer read splits
   // the frame) keeps the snapshot just taken of this frame's EFB.
   if (!preserveEfb)
@@ -2002,18 +2010,23 @@ static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const Frame
 }
 
 // The camera the HD look's effects are drawn from (post_fx). The real frame
-// takes the one the game set last and keeps it; an in-between frame takes
-// that one moved where its matrices put the scenery (frame_interp's
-// CameraStep), at its own time between the two frames'. Drawn from the latest
-// camera instead, an in-between frame's shadows sat where the next frame's
-// camera sees them, and slid against the scenery as the camera turned.
+// takes the one the game had set when the frame began recording (begin_frame),
+// the camera its draws are made with; an in-between frame takes that one moved
+// where its matrices put the scenery (frame_interp's CameraStep), at its own
+// time between the two frames'. Drawn from the latest camera instead, an
+// in-between frame's shadows sat where the next frame's camera sees them, and
+// slid against the scenery as the camera turned. Taken when the frame was
+// encoded, a real frame drawn while the render worker ran behind (Smooth
+// Motion's in-between frames keep it busy) was shaded from the next frame's
+// camera: its depth read back to the wrong places, and shadows and light
+// jumped for a frame wherever the camera's speed changed (Hyrule Castle's
+// hall: 15 to 17 levels of 255, gone with the camera taken here).
 static post_fx::Camera post_camera(FramePacket& frame) {
   if (!frame_interp::encoding_interpolated()) {
-    static float lastSeconds = 0.f;
-    frame.postCamera = post_fx::current_camera();
-    frame.havePostCamera = true;
-    frame.previousSeconds = lastSeconds;
-    lastSeconds = frame.postCamera.view[16];
+    if (!frame.havePostCamera) {
+      frame.postCamera = post_fx::current_camera();
+      frame.havePostCamera = true;
+    }
     return frame.postCamera;
   }
   if (!frame.havePostCamera)
