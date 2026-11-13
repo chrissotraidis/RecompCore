@@ -2531,6 +2531,7 @@ static bool submit_draw_plan_as_is(const gxc::DrawPlan& plan) {
     // The handle is cached under the same content key as a decode would be,
     // so later draws of the same texture never repeat the lookup.
     bool replacementPending = false;
+    std::string missingName; // a pack miss being reported (DOL_AURORA_TEXTURE_REPORT_MISSING)
     if (texture_replacement::has_source_replacements()) {
       static unsigned long long s_lookups;
       static const bool s_log_misses = std::getenv("DOL_TEXREP_LOG_MISSES") != nullptr;
@@ -2561,6 +2562,7 @@ static bool submit_draw_plan_as_is(const gxc::DrawPlan& plan) {
           return it->second;
       } else {
         g_textureAwaitingReplacement.erase(key);
+        missingName = texture_replacement::take_reported_miss();
       }
     }
     // gxcore owns the decode for every format: produce tightly-packed RGBA8 and
@@ -2607,6 +2609,8 @@ static bool submit_draw_plan_as_is(const gxc::DrawPlan& plan) {
         }
       }
     }
+    if (!missingName.empty() && !decoded.empty())
+      texture_replacement::dump_missing_rgba(missingName, width, height, decoded.data());
     TextureHandle handle;
     if (!decoded.empty()) {
       handle = new_static_texture_2d(
