@@ -25,5 +25,8 @@ void initialize();
 void shutdown();
 void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req);
 void blit(const wgpu::CommandEncoder& cmd, const ConvRequest& req);
+// Blur a colour copy in place: a Gaussian of `sigma` of its pixels, across then
+// down, and `mix` of the blurred result over the sharp copy (1 replaces it).
+void blur(const wgpu::CommandEncoder& cmd, const TextureHandle& texture, float sigma, float mix);
 
 } // namespace aurora::gfx::tex_copy_conv
