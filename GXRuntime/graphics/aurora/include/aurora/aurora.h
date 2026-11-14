@@ -161,6 +161,20 @@ void aurora_set_forced_anisotropy(unsigned samples);
    size and blended over it once, at render scales of 2 and up. Off by default;
    takes effect for draws recorded after the change. */
 void aurora_set_efficient_effects(bool on);
+/* The game's own depth of field (a half-size copy of the whole EFB drawn back
+   over the distance, as Wind Waker's): how soft it is. 0 no blur (a full-size
+   copy), 1 half the default's blur, 2 the default (the copy at half the render
+   size, as every copy), 3 between, 4 the game's own blur at 1x at any render
+   scale (the copy blurred on the GPU). Takes effect at the next copy.
+   DOL_AURORA_GAME_DOF sets the starting step. */
+void aurora_set_game_dof(int step);
+/* How much farther out that blur starts, 0 to 100: 0 leaves it where the game
+   puts it (its room's setting or the camera's focus, whichever is farther);
+   each step moves it farther by the same factor, twice as far at about 29 and
+   about 11 times at 100. As the game's own start follows the
+   camera, so does this. Takes effect at the next frame.
+   DOL_AURORA_GAME_DOF_START sets the starting value. */
+void aurora_set_game_dof_start(int start);
 /* In-between frames: each finished frame is drawn a second time with every
    draw's transforms blended halfway toward the previous frame and shown
    first, so a 30 FPS game presents 60 frames a second with its own logic

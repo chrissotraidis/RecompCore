@@ -260,7 +260,8 @@ float calculate_fps() noexcept;
 // in-between frame); calculate_fps() counts every present.
 float calculate_game_fps() noexcept;
 void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
-                  Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat = GX_TF_RGBA8);
+                  Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat = GX_TF_RGBA8,
+                  float blurSigma = 0.f, float blurMix = 1.f);
 
 struct ColorPassDescriptor {
   const char* label = nullptr;
