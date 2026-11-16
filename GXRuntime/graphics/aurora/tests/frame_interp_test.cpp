@@ -310,6 +310,45 @@ int main() {
     fi::end_game_frame();
   }
 
+  // The heat haze: a texgen projecting the position onto the screen (S * P *
+  // M_now) projects what the in-between matrix draws, S * P * M_step; a
+  // projector's (a light's, its q row not the view's depth) is blended as any
+  // texture matrix.
+  {
+    const float screen[3][4] = {{0.75f, 0, -0.5f, 0}, {0, -1.f, -0.5f, 0}, {0, 0, -1.f, 0}};
+    const float light[3][4] = {{0.01f, 0, 0, 0.5f}, {0, 0, 0.01f, 0.5f}, {0.3f, 0, 0.9f, 5.f}};
+    const auto with_texgens = [&](float x) {
+      auto c = draw_at(x, 0, -300, x);
+      for (int r = 0; r < 3; ++r)
+        for (int k = 0; k < 4; ++k) {
+          c.texmatrices[r][k] = screen[r][0] * c.posnormalmatrix[0][k] + screen[r][1] * c.posnormalmatrix[1][k] +
+                                screen[r][2] * c.posnormalmatrix[2][k] + (k == 3 ? screen[r][3] : 0.f);
+          c.texmatrices[3 + r][k] = light[r][k] + x * 0.01f;
+        }
+      return c;
+    };
+    fi::DrawInput haze;
+    haze.key = 4242;
+    haze.positionTexgens = 0b11;
+    fi::blend_draw(haze, with_texgens(0.f));
+    fi::end_game_frame();
+    const auto now = with_texgens(10.f);
+    const auto* blended = fi::blend_draw(haze, now);
+    CHECK(blended != nullptr);
+    if (blended != nullptr) {
+      CHECK(near(blended->posnormalmatrix[0][3], 5.f));
+      for (int r = 0; r < 3; ++r)
+        for (int k = 0; k < 4; ++k) {
+          const float expected = screen[r][0] * blended->posnormalmatrix[0][k] +
+                                 screen[r][1] * blended->posnormalmatrix[1][k] +
+                                 screen[r][2] * blended->posnormalmatrix[2][k] + (k == 3 ? screen[r][3] : 0.f);
+          CHECK(std::fabs(blended->texmatrices[r][k] - expected) < 1e-3f);
+          CHECK(near(blended->texmatrices[3 + r][k], light[r][k] + 0.05f));
+        }
+    }
+    fi::end_game_frame();
+  }
+
   // A collapsed (hidden) object is not grown halfway.
   {
     auto shown = draw_at(0, 0, -300);

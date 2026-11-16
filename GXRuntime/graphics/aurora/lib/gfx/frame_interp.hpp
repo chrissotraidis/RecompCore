@@ -126,6 +126,10 @@ struct DrawInput {
   // A night star (camera_anchored() in frame_interp.cpp): its centre is kept
   // from the camera's eye, and its in-between frames go with the camera.
   bool cameraAnchored = false;
+  // Bit per texgen that maps the vertex's position through its own texture
+  // matrix (position_texgens() in frame_interp.cpp): one that projects onto
+  // the screen follows the in-between position matrix (the heat haze).
+  uint8_t positionTexgens = 0;
 };
 // `positionsWritten`: whether the game wrote an indexed draw's position array
 // this frame or the one before (gxcore_draw's positions_written()). Only such
