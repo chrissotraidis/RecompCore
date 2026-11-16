@@ -367,6 +367,10 @@ struct EfbCopyBinding {
   uint32_t byte_size = 0;
   uint64_t memory_epoch = 0;
   bool memory_epoch_valid = false;
+  // The copy's format and size in the guest's texels.
+  uint32_t format = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
 };
 absl::flat_hash_map<uint32_t, EfbCopyBinding> g_efbCopyTextures;
 
@@ -1731,12 +1735,43 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
   if (!it->second) {
     return;
   }
+  // A copy into the middle of an earlier copy's buffer, of its format and
+  // width: Wind Waker's drawDepth, its viewport above the screen (the Picto
+  // Box's), copies the rest of the frame that many rows into its 320x240
+  // buffer, whose start the heat haze samples (the Picto Box's window showed
+  // the frame from before the Picto Box under it). Into memory, the copy
+  // changes those rows of the buffer; so it goes into the earlier copy's
+  // texture there too.
+  TextureHandle within;
+  uint32_t withinY = 0;
+  uint32_t withinAddress = 0;
+  const gxc::EfbCopyExtent extent{cmd.dest_address, cmd.byte_size, cmd.format, cmd.destination_width,
+                                  cmd.destination_height};
+  for (const auto& [address, binding] : g_efbCopyTextures) {
+    const int64_t rows = binding.handle ? gxc::efb_copy_row_within(
+                                              {address, binding.byte_size, binding.format, binding.width,
+                                               binding.height},
+                                              extent)
+                                        : -1;
+    if (rows < 0)
+      continue;
+    within = binding.handle;
+    withinY = static_cast<uint32_t>(std::lround(double(rows) * binding.handle->size.height / binding.height));
+    withinAddress = address;
+    break;
+  }
   uint64_t memoryEpoch = 0;
   const bool memoryEpochValid =
       cmd.byte_size != 0u && efb_copy_epoch(cmd.dest_address, cmd.byte_size, &memoryEpoch);
   g_efbCopyTextures.insert_or_assign(
       cmd.dest_address,
-      EfbCopyBinding{it->second, cmd.byte_size, memoryEpoch, memoryEpochValid});
+      EfbCopyBinding{it->second, cmd.byte_size, memoryEpoch, memoryEpochValid, cmd.format, cmd.destination_width,
+                     cmd.destination_height});
+  if (within) {
+    // The earlier copy's texture is current again: its memory as it is now.
+    auto& binding = g_efbCopyTextures[withinAddress];
+    binding.memory_epoch_valid = efb_copy_epoch(withinAddress, binding.byte_size, &binding.memory_epoch);
+  }
   float clearDepthValue = static_cast<float>(cmd.clear_z) / 16777215.f;
   if (gx::UseReversedZ) {
     clearDepthValue = 1.f - clearDepthValue;
@@ -1748,7 +1783,7 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
                                 static_cast<float>(cmd.clear_g) / 255.f,
                                 static_cast<float>(cmd.clear_b) / 255.f,
                                 static_cast<float>(cmd.clear_a) / 255.f},
-                    clearDepthValue, fmt, blurSigma, blurMix);
+                    clearDepthValue, fmt, blurSigma, blurMix, std::move(within), withinY);
 }
 
 // Uniform de-duplication across consecutive draws.

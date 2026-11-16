@@ -199,6 +199,9 @@ struct RenderPass {
   // much of it replaces the sharp copy (the game's depth of field steps).
   float resolveBlurSigma = 0.f;
   float resolveBlurMix = 1.f;
+  // The earlier copy's texture the resolved copy also goes into, and where.
+  TextureHandle resolveWithin;
+  uint32_t resolveWithinY = 0;
   Vec4<float> clearColorValue{0.f, 0.f, 0.f, 0.f};
   float clearDepthValue = gx::UseReversedZ ? 0.f : 1.f;
   wgpu::LoadOp colorLoadOp = wgpu::LoadOp::Undefined;
@@ -885,7 +888,7 @@ PipelineRef pipeline_ref(const clear::PipelineConfig& config) {
 
 void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                   Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat, float blurSigma,
-                  float blurMix) {
+                  float blurMix, TextureHandle within, uint32_t withinY) {
   // Resolve current render pass
   auto& prevPass = current_render_passes()[g_currentRenderPass];
   prevPass.resolveTarget = std::move(texture);
@@ -893,6 +896,8 @@ void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool cl
   prevPass.resolveFormat = resolveFormat;
   prevPass.resolveBlurSigma = blurSigma;
   prevPass.resolveBlurMix = blurMix;
+  prevPass.resolveWithin = std::move(within);
+  prevPass.resolveWithinY = withinY;
   // Push UV transform uniform for tex_copy_conv (crop region in UV space)
   const auto srcW = static_cast<float>(prevPass.targetSize.width);
   const auto srcH = static_cast<float>(prevPass.targetSize.height);
@@ -2721,6 +2726,21 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
     }
     if (!isDepth && (passInfo.resolveBlurSigma > 0.f || passInfo.resolveBlurMix < 1.f)) {
       tex_copy_conv::blur(cmd, passInfo.resolveTarget, passInfo.resolveBlurSigma, passInfo.resolveBlurMix);
+    }
+    const auto& within = passInfo.resolveWithin;
+    if (within && within->texture && within->format == passInfo.resolveTarget->format &&
+        within->size.width == dstSize.width && passInfo.resolveWithinY < within->size.height) {
+      const wgpu::TexelCopyTextureInfo src{.texture = passInfo.resolveTarget->texture};
+      const wgpu::TexelCopyTextureInfo dst{
+          .texture = within->texture,
+          .origin = wgpu::Origin3D{.x = 0, .y = passInfo.resolveWithinY},
+      };
+      const wgpu::Extent3D size{
+          .width = dstSize.width,
+          .height = std::min(dstSize.height, within->size.height - passInfo.resolveWithinY),
+          .depthOrArrayLayers = 1,
+      };
+      cmd.CopyTextureToTexture(&src, &dst, &size);
     }
   }
 }
