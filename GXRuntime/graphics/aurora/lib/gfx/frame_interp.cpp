@@ -2512,35 +2512,54 @@ static bool slow_game(Pacing& p) {
   return p.slowChecks >= 2;
 }
 
+// DOL_AURORA_FRAME_INTERP_PACING, read once: -1 unset (automatic), 0 never, 1 lowers 120 Hz's too, 2 "step".
+static int pacing_setting() {
+  static const int setting = [] {
+    const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_PACING");
+    if (env == nullptr || env[0] == '\0')
+      return -1;
+    return std::strcmp(env, "step") == 0 ? 2 : env[0] != '0' ? 1 : 0;
+  }();
+  return setting;
+}
+
+bool stepped_pacing() noexcept { return pacing_setting() == 2; }
+
 // Recording thread, between game frames: the next frame's in-between frames.
 // Overloads (the GPU a frame behind, or the game waiting on rendering) in 3 of
-// the last 8 game frames take 60 Hz to none (and 120 Hz to 60, when pacing
-// is asked for there); one now and then (a texture loading, a late drawable)
-// is not a scene too heavy, and dropping on each one put 120 Hz at 60 most
-// times it did not need to be. The frames in
-// flight still report the overload a drop answers, so a second drop waits a
-// few frames. Calm for 3 s brings one level back, and a level that overloads
-// again soon after coming back waits twice as long the next time (up to 30 s),
-// so a scene just too heavy for 120 settles at 60 instead of stuttering
-// between them.
+// the last 8 game frames take 60 and 90 Hz to one in-between frame and then
+// none, and 120 Hz and up (3 in-between frames or more) to one fewer at a
+// time; one now and then (a texture loading, a late drawable) is not a scene
+// too heavy, and dropping on each one put 120 Hz at 60 most times it did not
+// need to be (nor do waits while pipelines compile count: acquire_frame_slot()).
+// The frames in flight still report the overload a drop answers, so a second
+// drop waits a few frames. Calm for 3 s brings one level back, and a level that
+// overloads again soon after coming back waits twice as long the next time (up
+// to 30 s), so a scene just too heavy for a level settles below it instead of
+// stuttering between them.
 static void pace_steps() {
   static constexpr int kCalmStart = 90;  // game frames, 3 s
   static constexpr int kCalmMost = 900;  // 30 s
   static constexpr int kCalmMostSlow = 3600; // 2 min, after the game itself ran slow
   static constexpr uint64_t kSettle = 4; // game frames between drops
   static constexpr uint64_t kSoon = 300; // an overload within 10 s of coming back
-  // DOL_AURORA_FRAME_INTERP_PACING: 0 never lowers them, 1 lowers 120 Hz's
-  // too. Unset, only 60 Hz's are: 120 Hz stays 120, where a drop to 60 for a
-  // stall of a few frames, over by the time it dropped, was felt more than the
-  // stall.
-  static const int setting = [] {
-    const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_PACING");
-    return env != nullptr && env[0] != '\0' ? (env[0] != '0' ? 1 : 0) : -1;
-  }();
+  // DOL_AURORA_FRAME_INTERP_PACING (pacing_setting()): 0 never lowers them (the
+  // menu's "Never pause"), 1 lowers 120 Hz's too. Unset, 120 Hz's aren't: 120 Hz
+  // stays 120, where a drop to 60 for a stall of a few frames, over by the time
+  // it dropped, was felt more than the stall. "step" (the menu's "Step down",
+  // experimental) paces every rate, and three or more (120 Hz and up; 180 Hz's
+  // are 5) go down one at a time, so a drop shows one display refresh in a few
+  // held, not half the rate. Unpaced, a render worker that couldn't keep up
+  // held the game 50-70 ms at a time and never caught up: 180 Hz at render
+  // scale 4 (Hyrule, 26 game frames a second) and 120 Hz at scale 6 and 8
+  // (about 400 hitches a minute, 18-27 game frames a second; stepped, none and
+  // 30).
+  static const int setting = pacing_setting();
   auto& p = g_pacing;
   ++p.frame;
   const int wanted = g_steps.load(std::memory_order_relaxed);
-  const bool pacing = setting == 1 || (setting < 0 && wanted < 3);
+  const bool stepped = setting == 2 && wanted >= 3;
+  const bool pacing = setting >= 1 || (setting < 0 && wanted < 3);
   // The game running slow counts at any number of in-between frames (slow
   // motion is worse than fewer of them) unless pacing is off altogether, or
   // the CPU has threads to spare. The slow-game rule was measured on four
@@ -2567,11 +2586,12 @@ static void pace_steps() {
                .lastEnd = p.lastEnd};
   } else if (sustained) {
     p.calm = 0;
-    if (p.budget > 0 && p.frame - p.lastDrop >= kSettle) {
+    // A step down answers less of the backlog than a drop to one: twice the settle before the next.
+    if (p.budget > 0 && p.frame - p.lastDrop >= (stepped ? 2 * kSettle : kSettle)) {
       if (p.lastRaise != 0 && p.frame - p.lastRaise < kSoon)
         p.calmNeeded = std::min(p.calmNeeded * 2, slow ? kCalmMostSlow : kCalmMost);
       const int before = p.budget;
-      p.budget = p.budget > 1 ? 1 : 0;
+      p.budget = stepped ? p.budget - 1 : p.budget > 1 ? 1 : 0;
       p.lastDrop = p.frame;
       p.recent = 0;
       const int why = g_overloadWhy.load(std::memory_order_relaxed);
@@ -2593,7 +2613,7 @@ static void pace_steps() {
   } else if (p.budget < wanted) {
     if (++p.calm >= p.calmNeeded) {
       const int before = p.budget;
-      p.budget = p.budget == 0 ? 1 : wanted;
+      p.budget = stepped ? p.budget + 1 : p.budget == 0 ? 1 : wanted;
       p.calm = 0;
       p.lastRaise = p.frame;
       bump(g_raises);
