@@ -65,6 +65,18 @@ void dol_platform_gx_flush(void) {
         g_ops.gx_flush();
 }
 
+u32 dol_platform_gx_position(void) {
+    return g_ops.gx_position != NULL ? g_ops.gx_position() : 0u;
+}
+
+u32 dol_platform_gx_parsed(void) {
+    return g_ops.gx_parsed != NULL ? g_ops.gx_parsed() : 0u;
+}
+
+bool dol_platform_gx_service(void) {
+    return g_ops.gx_service != NULL && g_ops.gx_service();
+}
+
 bool dol_platform_gx_read_draw_sync(u16* token) {
     return token != NULL && g_ops.gx_read_draw_sync != NULL &&
            g_ops.gx_read_draw_sync(token);

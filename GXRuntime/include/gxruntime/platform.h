@@ -37,6 +37,16 @@ typedef struct DolPlatformOps {
     // matter to it). NULL where they do: the host then sends writes one by one.
     void (*gx_write_bytes)(const u8* bytes, u32 size);
     void (*gx_flush)(void);
+    // The FIFO stream position a draw-done may be deferred to, and how much
+    // of it the backend has parsed: a backend with a translation worker
+    // publishes what the write path has buffered as its position, and reports
+    // its parsed count per turn. Zero from either means there is no worker to
+    // defer to, and the host keeps the drain it would otherwise take.
+    u32 (*gx_position)(void);
+    u32 (*gx_parsed)(void);
+    // Serve the present the worker stopped at, once per turn. False when
+    // nothing is waiting.
+    bool (*gx_service)(void);
     bool (*gx_read_draw_sync)(u16* token);
     void (*call_display_list)(const void* data, u32 size);
     // The same with the list's guest address, for a backend that needs to
@@ -93,6 +103,15 @@ void dol_platform_gx_write_bytes(const u8* bytes, u32 size);
 // guest is about to observe GPU progress - the draw-done commit - so the
 // translation is never behind a wait it is supposed to satisfy.
 void dol_platform_gx_flush(void);
+// The stream position to defer a draw-done to, and the parsed count a turn
+// compares it against. dol_platform_gx_position publishes what the FIFO write
+// path has buffered, so a backend with a worker has the frame to translate;
+// zero means none of them can (no worker, a traced frame, a headless build)
+// and the host must keep its drain.
+u32 dol_platform_gx_position(void);
+u32 dol_platform_gx_parsed(void);
+// The present the worker stopped at, served once per turn.
+bool dol_platform_gx_service(void);
 // Drain submitted commands and read the last decoded interrupt token.
 // False means no token was decoded or the backend cannot provide it.
 bool dol_platform_gx_read_draw_sync(u16* token);
