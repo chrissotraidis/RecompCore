@@ -1755,6 +1755,15 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
     // The nearest matching screen rectangle, consumed once. Occurrence can
     // change when a counter reuses a glyph or a heart adds an animated copy.
     // A newly visible digit must not borrow a distant rupee/heart sprite.
+    // Nor one of another size: the last heart beats with a copy of itself
+    // behind it that grows to 1.65 times its size and fades. When the next
+    // beat starts, that copy is drawn at the heart's size again and, drawn
+    // first, takes the heart's own counterpart; the heart was then paired
+    // with the grown copy and its in-between frames drew it that big, once a
+    // beat. A sprite that really grows does it by 1.25 times a frame at most
+    // (the HUD's growing icons), so past 1.4 there is no counterpart: the
+    // sprite is drawn as it is.
+    constexpr double kScreenGrowLimit = 1.4;
     size_t best = candidates;
     double score = HUGE_VAL;
     for (size_t i = 0; i < candidates; ++i) {
@@ -1763,6 +1772,9 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
       const double width = std::min(screenSprite->screenExtent[0], copies[i].screenExtent[0]);
       const double height = std::min(screenSprite->screenExtent[1], copies[i].screenExtent[1]);
       if (!(width > 0.0 && height > 0.0))
+        continue;
+      if (std::max(screenSprite->screenExtent[0], copies[i].screenExtent[0]) > kScreenGrowLimit * width ||
+          std::max(screenSprite->screenExtent[1], copies[i].screenExtent[1]) > kScreenGrowLimit * height)
         continue;
       const double reach = std::max(2.0, 0.2 * std::min(width, height));
       const double dx = screenSprite->screenCenter[0] - copies[i].position[0];
