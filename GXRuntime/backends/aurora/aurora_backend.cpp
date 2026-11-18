@@ -37,6 +37,9 @@ void* g_host_event_user = nullptr;
 DolAuroraHoldFn g_host_hold = nullptr;
 bool g_hold_redraw = false;
 void* g_host_hold_user = nullptr;
+// Replacements the texture pack registered at start (DOL_AURORA_TEXTURE_PACK,
+// with its optional folders, less any skipped), -1 with no pack.
+long g_texture_pack_replacements = -1;
 bool g_graphics_log = false;
 bool g_force_untextured = false;
 bool g_gx_core_enabled = true;
@@ -415,6 +418,41 @@ bool dol_aurora_initialize(int argc, char** argv,
                              s_optional.back().registrations.size());
             }
         }
+        long registered = static_cast<long>(s_texture_pack.registrations.size());
+        for (const auto& group : s_optional)
+            registered += static_cast<long>(group.registrations.size());
+        // DOL_AURORA_TEXTURE_PACK_SKIP: comma-separated replacement names
+        // (tex1_WxH_hash[_tlut]_fmt) whose files are not used, so the game's
+        // own texture stays: lookup tables a pack should not have replaced
+        // (a game's toon ramps, which shading reads as data, not as a picture).
+        if (const char* skip = std::getenv("DOL_AURORA_TEXTURE_PACK_SKIP"); skip != nullptr && skip[0] != '\0') {
+            std::string list = skip;
+            size_t skipped = 0;
+            for (size_t start = 0; start <= list.size();) {
+                const size_t end = std::min(list.find(',', start), list.size());
+                const std::string name = list.substr(start, end - start);
+                start = end + 1;
+                const auto key = aurora::texture::parse_replacement_name(name);
+                if (!key.has_value())
+                    continue;
+                const aurora::texture::ReplacementKey replacementKey{*key};
+                size_t files = 0;
+                const auto count = [&](const aurora::texture::ReplacementGroup& group) {
+                    for (const auto& registration : group.registrations)
+                        files += registration.key == replacementKey ? 1 : 0;
+                };
+                count(s_texture_pack);
+                for (const auto& group : s_optional)
+                    count(group);
+                if (files == 0)
+                    continue;
+                aurora::texture::unregister_replacements(replacementKey);
+                skipped += files;
+            }
+            registered -= static_cast<long>(skipped);
+            std::fprintf(stderr, "[mods] texture-pack skipped=%zu\n", skipped);
+        }
+        gx_aurora::g_texture_pack_replacements = registered;
     }
 
     gx_aurora::g_graphics_log = backend_config->graphics_logging;
@@ -601,6 +639,8 @@ void dol_aurora_set_hold(DolAuroraHoldFn should_hold, void* user) {
     gx_aurora::g_host_hold = should_hold;
     gx_aurora::g_host_hold_user = user;
 }
+
+long dol_aurora_texture_pack_replacements(void) { return gx_aurora::g_texture_pack_replacements; }
 
 const char* dol_aurora_backend_name(void) {
     switch (gx_aurora::g_backend) {

@@ -1117,6 +1117,15 @@ void unregister_replacements(std::span<const ReplacementRegistration> registrati
 
 void unregister_replacements(const ReplacementGroup& group) { unregister_replacements(group.registrations); }
 
+std::optional<TextureSourceKey> parse_replacement_name(std::string_view name) {
+  if (name.ends_with(".dds") || name.ends_with(".png") || name.ends_with(".DDS") || name.ends_with(".PNG")) {
+    return parse_replacement_filename(name);
+  }
+  std::string withExtension{name};
+  withExtension += ".dds";
+  return parse_replacement_filename(withExtension);
+}
+
 void unregister_replacements(const ReplacementKey& key) {
   std::lock_guard lk(s_registryMutex);
   const auto it = s_entriesByKey.find(key);
