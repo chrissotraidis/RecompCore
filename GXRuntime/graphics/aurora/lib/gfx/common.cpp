@@ -195,6 +195,10 @@ struct RenderPass {
   GXTexFmt resolveFormat = GX_TF_RGBA8;
   ClipRect resolveRect;
   Range resolveUniformRange;
+  // A blur of the resolved copy (tex_copy_conv::blur), in its pixels, and how
+  // much of it replaces the sharp copy (the game's depth of field steps).
+  float resolveBlurSigma = 0.f;
+  float resolveBlurMix = 1.f;
   Vec4<float> clearColorValue{0.f, 0.f, 0.f, 0.f};
   float clearDepthValue = gx::UseReversedZ ? 0.f : 1.f;
   wgpu::LoadOp colorLoadOp = wgpu::LoadOp::Undefined;
@@ -880,12 +884,15 @@ PipelineRef pipeline_ref(const clear::PipelineConfig& config) {
 }
 
 void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
-                  Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat) {
+                  Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat, float blurSigma,
+                  float blurMix) {
   // Resolve current render pass
   auto& prevPass = current_render_passes()[g_currentRenderPass];
   prevPass.resolveTarget = std::move(texture);
   prevPass.resolveRect = rect;
   prevPass.resolveFormat = resolveFormat;
+  prevPass.resolveBlurSigma = blurSigma;
+  prevPass.resolveBlurMix = blurMix;
   // Push UV transform uniform for tex_copy_conv (crop region in UV space)
   const auto srcW = static_cast<float>(prevPass.targetSize.width);
   const auto srcH = static_cast<float>(prevPass.targetSize.height);
@@ -2711,6 +2718,9 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
           .depthOrArrayLayers = 1,
       };
       cmd.CopyTextureToTexture(&src, &dst, &size);
+    }
+    if (!isDepth && (passInfo.resolveBlurSigma > 0.f || passInfo.resolveBlurMix < 1.f)) {
+      tex_copy_conv::blur(cmd, passInfo.resolveTarget, passInfo.resolveBlurSigma, passInfo.resolveBlurMix);
     }
   }
 }

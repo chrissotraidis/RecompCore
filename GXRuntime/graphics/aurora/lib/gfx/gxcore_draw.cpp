@@ -1623,6 +1623,17 @@ std::vector<uint8_t> read_efb_copy(const gxc::EfbCopyCommand& cmd) {
       cmd.destination_height, rgba, texture->size.width, texture->size.height);
 }
 
+// The game's depth of field step, 0 to 4 (copy_efb_to_texture); 2 leaves it as
+// every copy. DOL_AURORA_GAME_DOF sets the starting step.
+std::atomic<int> g_gameDofStep{[] {
+  const char* env = std::getenv("DOL_AURORA_GAME_DOF");
+  return env != nullptr && env[0] >= '0' && env[0] <= '4' && env[1] == '\0' ? env[0] - '0' : 2;
+}()};
+
+int game_dof_step() { return g_gameDofStep.load(std::memory_order_relaxed); }
+
+void set_game_dof_step(int step) { g_gameDofStep.store(std::clamp(step, 0, 4), std::memory_order_relaxed); }
+
 void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
   // Mirror the copy-clear color/Z (BP 0x4F-0x51 at this copy) into the gx
   // state GXSetCopyClear would have written: begin_frame's pass-0 EFB clear
@@ -1660,6 +1671,8 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
   // so a larger texture needs nothing else.
   uint32_t dstWidth = std::max(cmd.destination_width, static_cast<uint32_t>(1));
   uint32_t dstHeight = std::max(cmd.destination_height, static_cast<uint32_t>(1));
+  float blurSigma = 0.f; // the game's depth of field steps (below)
+  float blurMix = 1.f;
   static const bool scale_copies = [] {
     const char* env = std::getenv("DOL_GXCORE_COPY_SCALE");
     return env == nullptr || env[0] != '0';
@@ -1670,8 +1683,34 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
     if (logicalW != 0 && logicalH != 0 && targetW != 0 && targetH != 0) {
       const float sx = static_cast<float>(targetW) / static_cast<float>(logicalW);
       const float sy = static_cast<float>(targetH) / static_cast<float>(logicalH);
-      dstWidth = std::max<uint32_t>(static_cast<uint32_t>(std::lround(dstWidth * sx)), 1u);
-      dstHeight = std::max<uint32_t>(static_cast<uint32_t>(std::lround(dstHeight * sy)), 1u);
+      // The game's depth of field (Wind Waker's drawDepth) is a colour copy of
+      // the whole EFB at half its size, drawn back over the distance: the blur
+      // is that copy's lower resolution. Scaled as every copy, its pixels are
+      // half the render's, so the blur shrinks as the scale grows. The step
+      // (aurora_set_game_dof): 0 a full-size copy (sharp, no blur); 1 a
+      // full-size copy blurred about as the default and mixed half in; 2 as
+      // every copy (the default); 3 and 4 the half-size copy blurred further,
+      // to the game's own blur at 1x for 4 (half a pixel of its 320-wide copy,
+      // as box filter and bilinear stretch give) and halfway in scale for 3.
+      const int dofStep = game_dof_step();
+      const bool halfColour = (cmd.format & 0x10u) == 0u && cmd.width >= 512u &&
+                              cmd.destination_width * 2u == cmd.width && cmd.destination_height * 2u == cmd.height;
+      const float scale = std::max(1.f, std::min(sx, sy));
+      if (halfColour && dofStep <= 1) {
+        dstWidth = std::max<uint32_t>(static_cast<uint32_t>(std::lround(cmd.width * sx)), 1u);
+        dstHeight = std::max<uint32_t>(static_cast<uint32_t>(std::lround(cmd.height * sy)), 1u);
+        if (dofStep == 1) {
+          blurSigma = 1.f;
+          blurMix = 0.5f;
+        }
+      } else {
+        dstWidth = std::max<uint32_t>(static_cast<uint32_t>(std::lround(dstWidth * sx)), 1u);
+        dstHeight = std::max<uint32_t>(static_cast<uint32_t>(std::lround(dstHeight * sy)), 1u);
+        if (halfColour && dofStep >= 3) {
+          const float target = dofStep == 4 ? scale : 0.5f * (1.f + scale);
+          blurSigma = 0.5f * std::sqrt(std::max(target * target - 1.f, 0.f));
+        }
+      }
     }
   }
 
@@ -1709,7 +1748,7 @@ void copy_efb_to_texture(const gxc::EfbCopyCommand& cmd) {
                                 static_cast<float>(cmd.clear_g) / 255.f,
                                 static_cast<float>(cmd.clear_b) / 255.f,
                                 static_cast<float>(cmd.clear_a) / 255.f},
-                    clearDepthValue, fmt);
+                    clearDepthValue, fmt, blurSigma, blurMix);
 }
 
 // Uniform de-duplication across consecutive draws.
@@ -2223,10 +2262,63 @@ static void dump_draw(const gxc::DrawPlan& plan) {
                  plan.pixel_constants.kcolors[i][2], plan.pixel_constants.kcolors[i][3]);
 }
 
+// The game's depth of field blends its blurred copy in over a short band of
+// depth: its second TEV stage takes the depth byte (TEXA) plus a negative
+// offset (A0), times 4 (Wind Waker's drawDepth). Whether a draw is that blend:
+// a ZERO, b APREV, c TEXA, d A0, add, times 4 (TevScale 2), after a compare
+// stage.
+bool game_dof_blend(const gxc::DrawPlan& plan) {
+  const auto& shader = plan.pipeline.shader;
+  if (shader.tev_valid == 0u || shader.num_tev_stages != 3u) {
+    return false;
+  }
+  const auto& blend = shader.tev_stages[1];
+  return blend.ac_a == 7u && blend.ac_b == 0u && blend.ac_c == 4u && blend.ac_d == 1u && blend.ac_bias == 0u &&
+         blend.ac_op == 0u && blend.ac_scale == 2u && shader.tev_stages[0].ac_bias == 3u;
+}
+
+// How much farther out the blur starts (0 to 100; aurora_set_game_dof_start).
+// The game starts it at its room's PhotoDepth or the camera's focus, whichever
+// is farther (drawDepth, with auto-focus in play), as minus the depth's second
+// byte m there (A0); past the depth's first byte reaching 255 the depth is
+// about 1 - near/distance, so the distance goes as 1 / (256 - m), and moving
+// the start k times as far out is m' = 256 - (256 - m) / k, with no near plane
+// needed. k doubles every 100/3.5 steps, to about 11 at 100 (farther made no
+// visible difference at a full-screen 1x picture). The full blur follows
+// the start out by the game's band. DOL_AURORA_GAME_DOF_START sets the
+// starting value.
+std::atomic<int> g_gameDofStart{[] {
+  const char* env = std::getenv("DOL_AURORA_GAME_DOF_START");
+  return env != nullptr ? std::clamp(std::atoi(env), 0, 100) : 0;
+}()};
+
+void set_game_dof_start(int start) { g_gameDofStart.store(std::clamp(start, 0, 100), std::memory_order_relaxed); }
+
+// The game's start (A0, minus the depth's second byte) moved `start` steps farther out.
+int pushed_dof_start(int a0, int start) {
+  const int m = std::clamp(-a0, 0, 256);
+  const double k = std::exp2(start * 3.5 / 100.0);
+  const int pushed = 256 - static_cast<int>(std::lround((256 - m) / k));
+  return -std::clamp(pushed, m, 256);
+}
+
+static bool submit_draw_plan_as_is(const gxc::DrawPlan& plan);
+
 bool submit_draw_plan(const gxc::DrawPlan& plan) {
   if (!plan.ok || plan.vertex_count == 0 || plan.indices.empty()) {
     return false;
   }
+  const int start = g_gameDofStart.load(std::memory_order_relaxed);
+  if (start == 0 || !game_dof_blend(plan)) {
+    return submit_draw_plan_as_is(plan);
+  }
+  gxc::DrawPlan later = plan;
+  auto& a0 = later.pixel_constants.colors[1][3]; // TEVREG0 alpha: minus where the blur starts
+  a0 = pushed_dof_start(a0, start);
+  return submit_draw_plan_as_is(later);
+}
+
+static bool submit_draw_plan_as_is(const gxc::DrawPlan& plan) {
   dump_draw(plan);
 
   if (plan.viewport_valid) {
@@ -3012,6 +3104,10 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
 void aurora_set_efficient_effects(bool on) {
   aurora::gfx::gxcore::g_efficientEffects.store(on, std::memory_order_relaxed);
 }
+
+void aurora_set_game_dof(int step) { aurora::gfx::gxcore::set_game_dof_step(step); }
+
+void aurora_set_game_dof_start(int start) { aurora::gfx::gxcore::set_game_dof_start(start); }
 
 void aurora_set_forced_anisotropy(unsigned samples) {
   aurora::gfx::gxcore::g_forcedAnisotropy.store(

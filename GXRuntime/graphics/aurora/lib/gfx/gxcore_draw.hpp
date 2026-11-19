@@ -154,6 +154,11 @@ void render_sea_mask(const DrawData& data, const wgpu::RenderPassEncoder& pass);
 // address samples the copied EFB instead of stale guest memory. Called by the
 // GxCoreSink copy observer at the copy's stream position (pending draw flushed).
 void copy_efb_to_texture(const gxruntime::gxcore::EfbCopyCommand& cmd);
+// The game's depth of field step (aurora_set_game_dof), 0 to 4.
+int game_dof_step();
+void set_game_dof_step(int step);
+// Where its blur starts at the nearest (aurora_set_game_dof_start), 0 to 255.
+void set_game_dof_start(int start);
 // Submit a preserving frame segment, read the exact captured texture, and
 // encode guest tiles. Recording thread only, with the FIFO worker drained.
 std::vector<uint8_t> read_efb_copy(const gxruntime::gxcore::EfbCopyCommand& cmd);

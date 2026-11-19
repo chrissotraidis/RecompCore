@@ -186,6 +186,7 @@ std::uint32_t copy_trigger_texture_format(std::uint32_t value, bool is_depth) {
     case 0x8:
       return 0x11; // GX_TF_Z8 (top 8 bits)
     case 0x3:
+    case 0xB: // GXSetTexCopyDst writes GX_TF_Z16 as target 0xB (RG8)
       return 0x13; // GX_TF_Z16
     case 0x9:
       return 0x39; // GX_CTF_Z8M (middle 8 bits)

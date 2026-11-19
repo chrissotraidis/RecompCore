@@ -947,6 +947,9 @@ int main() {
   push_bp(display_list, DOL_GX_BP_REG_TRIGGER_EFB_COPY, 14u << 3u);
   push_bp(display_list, DOL_GX_BP_REG_PE_CONTROL, 0x3u);
   push_bp(display_list, DOL_GX_BP_REG_TRIGGER_EFB_COPY, 12u << 3u);
+  // GXSetTexCopyDst writes GX_TF_Z16 as target 7 (format 0xB): Wind Waker's
+  // depth of field (drawDepth) copies its depth so.
+  push_bp(display_list, DOL_GX_BP_REG_TRIGGER_EFB_COPY, 7u << 3u);
   push_u8(display_list, DOL_GX_CMD_INVL_VC);
   push_xf(display_list, 0x1008u, 0x12345678u);
   push_indexed_xf(display_list, 0x20u, 1u, 0x0000u, 12u);
@@ -1003,7 +1006,8 @@ int main() {
   {
     // Copy formats reconstructed from the three triggers: target 2 ->
     // GX_CTF_R8 (0x28), target 14 -> GX_CTF_A8 (0x27, EFB alpha channel),
-    // target 12 under PE_CONTROL Z24 -> GX_TF_Z24X8 (0x16, depth source).
+    // target 12 under PE_CONTROL Z24 -> GX_TF_Z24X8 (0x16, depth source),
+    // target 7 under Z24 -> GX_TF_Z16 (0x13).
     std::vector<std::uint32_t> copy_formats;
     std::vector<std::uint32_t> copy_dimensions;
     std::vector<std::uint32_t> copy_source_dimensions;
@@ -1015,12 +1019,13 @@ int main() {
                                          ev.copy_src_height);
       }
     }
-    assert(copy_formats.size() == 5u);
+    assert(copy_formats.size() == 6u);
     assert(copy_formats[0] == 0x28u);
     assert(copy_formats[1] == 0x28u);
     assert(copy_formats[2] == 0x28u);
     assert(copy_formats[3] == 0x27u);
     assert(copy_formats[4] == 0x16u);
+    assert(copy_formats[5] == 0x13u);
     assert(copy_dimensions[0] == ((8u << 16u) | 8u));
     assert(copy_dimensions[1] == ((4u << 16u) | 4u));
     assert(copy_dimensions[2] == ((4u << 16u) | 4u));
@@ -1095,7 +1100,7 @@ int main() {
     assert(consume_sink.bound_texture().size == 128u);
 
     assert(consume_sink.texture_count() == 1u);
-    assert(consume_sink.copy_count() == 5u); // R8 x3 + A8 + Z24X8 triggers
+    assert(consume_sink.copy_count() == 6u); // R8 x3 + A8 + Z24X8 + Z16 triggers
     assert(consume_sink.indexed_span_count() == 1u);
     assert(consume_sink.tlut_count() >= 1u);
 

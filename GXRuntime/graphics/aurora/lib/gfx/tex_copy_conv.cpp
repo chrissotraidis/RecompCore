@@ -9,6 +9,9 @@
 
 #include <absl/container/flat_hash_map.h>
 
+#include <algorithm>
+#include <cstring>
+
 #include "texture_convert.hpp"
 
 using namespace std::string_literals;
@@ -488,7 +491,10 @@ void initialize() {
   g_linearSampler = g_device.CreateSampler(&linearSamplerDescriptor);
 }
 
+static void blur_shutdown();
+
 void shutdown() {
+  blur_shutdown();
   g_pipelines.clear();
   g_blitPipeline = {};
   g_bindGroupLayout = {};
@@ -581,5 +587,214 @@ void run(const wgpu::CommandEncoder& cmd, const ConvRequest& req) {
 }
 
 void blit(const wgpu::CommandEncoder& cmd, const ConvRequest& req) { execute(cmd, req, g_blitPipeline); }
+
+// --- Blur of a colour copy (the game's depth of field steps) ------------------
+// Two passes over a whole-texture triangle, reading texels by position: across
+// into one scratch texture, then down into another, mixed there with the sharp
+// copy; the result is copied back over the copy.
+static constexpr std::string_view BlurShader = R"(
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var sharp: texture_2d<f32>;
+struct BlurParams {
+    sigma: f32,
+    mix_amount: f32,
+    dir_x: i32,
+    dir_y: i32,
+};
+@group(0) @binding(2) var<uniform> params: BlurParams;
+
+var<private> positions: array<vec2f, 3> = array(
+    vec2f(-1.0, 1.0),
+    vec2f(-1.0, -3.0),
+    vec2f(3.0, 1.0),
+);
+
+@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+    return vec4f(positions[vi], 0.0, 1.0);
+}
+
+@fragment fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+    let size = vec2i(textureDimensions(src));
+    let p = vec2i(pos.xy);
+    let dir = vec2i(params.dir_x, params.dir_y);
+    let radius = min(i32(ceil(params.sigma * 3.0)), 48);
+    let k = -0.5 / (params.sigma * params.sigma);
+    var sum = vec4f(0.0);
+    var weights = 0.0;
+    for (var i = -radius; i <= radius; i++) {
+        let w = exp(f32(i * i) * k);
+        sum += textureLoad(src, clamp(p + dir * i, vec2i(0), size - vec2i(1)), 0) * w;
+        weights += w;
+    }
+    var c = sum / weights;
+    if (params.dir_y == 1) {
+        c = mix(textureLoad(sharp, p, 0), c, params.mix_amount);
+    }
+    return c;
+}
+)"sv;
+
+namespace {
+struct BlurScratch {
+  wgpu::Texture across;
+  wgpu::TextureView acrossView;
+  wgpu::Texture down;
+  wgpu::TextureView downView;
+  wgpu::Extent3D size;
+  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+};
+wgpu::BindGroupLayout g_blurLayout;
+absl::flat_hash_map<uint32_t, wgpu::RenderPipeline> g_blurPipelines; // by wgpu::TextureFormat
+BlurScratch g_blurScratch;
+
+const wgpu::RenderPipeline& blur_pipeline(wgpu::TextureFormat format) {
+  auto& pipeline = g_blurPipelines[static_cast<uint32_t>(format)];
+  if (pipeline) {
+    return pipeline;
+  }
+  if (!g_blurLayout) {
+    const std::array entries{
+        wgpu::BindGroupLayoutEntry{
+            .binding = 0,
+            .visibility = wgpu::ShaderStage::Fragment,
+            .texture = wgpu::TextureBindingLayout{.sampleType = wgpu::TextureSampleType::UnfilterableFloat,
+                                                  .viewDimension = wgpu::TextureViewDimension::e2D},
+        },
+        wgpu::BindGroupLayoutEntry{
+            .binding = 1,
+            .visibility = wgpu::ShaderStage::Fragment,
+            .texture = wgpu::TextureBindingLayout{.sampleType = wgpu::TextureSampleType::UnfilterableFloat,
+                                                  .viewDimension = wgpu::TextureViewDimension::e2D},
+        },
+        wgpu::BindGroupLayoutEntry{
+            .binding = 2,
+            .visibility = wgpu::ShaderStage::Fragment,
+            .buffer = wgpu::BufferBindingLayout{.type = wgpu::BufferBindingType::Uniform},
+        },
+    };
+    const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+        .label = "Copy Blur Bind Group Layout",
+        .entryCount = entries.size(),
+        .entries = entries.data(),
+    };
+    g_blurLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
+  }
+  const wgpu::ShaderSourceWGSL wgslSource{wgpu::ShaderSourceWGSL::Init{.code = BlurShader.data()}};
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgslSource, .label = "Copy Blur"};
+  const auto module = g_device.CreateShaderModule(&moduleDescriptor);
+  const std::array colorTargets{wgpu::ColorTargetState{.format = format}};
+  const wgpu::FragmentState fragmentState{
+      .module = module,
+      .entryPoint = "fs_main",
+      .targetCount = colorTargets.size(),
+      .targets = colorTargets.data(),
+  };
+  const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{
+      .bindGroupLayoutCount = 1,
+      .bindGroupLayouts = &g_blurLayout,
+  };
+  const wgpu::RenderPipelineDescriptor pipelineDescriptor{
+      .label = "Copy Blur",
+      .layout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor),
+      .vertex = wgpu::VertexState{.module = module, .entryPoint = "vs_main"},
+      .primitive = wgpu::PrimitiveState{.topology = wgpu::PrimitiveTopology::TriangleList},
+      .fragment = &fragmentState,
+  };
+  pipeline = g_device.CreateRenderPipeline(&pipelineDescriptor);
+  return pipeline;
+}
+
+void blur_scratch(const wgpu::Extent3D& size, wgpu::TextureFormat format) {
+  if (g_blurScratch.format == format && g_blurScratch.size.width == size.width &&
+      g_blurScratch.size.height == size.height) {
+    return;
+  }
+  const wgpu::TextureDescriptor descriptor{
+      .label = "Copy Blur Scratch",
+      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = {size.width, size.height, 1},
+      .format = format,
+      .mipLevelCount = 1,
+      .sampleCount = 1,
+  };
+  g_blurScratch.across = g_device.CreateTexture(&descriptor);
+  g_blurScratch.acrossView = g_blurScratch.across.CreateView();
+  g_blurScratch.down = g_device.CreateTexture(&descriptor);
+  g_blurScratch.downView = g_blurScratch.down.CreateView();
+  g_blurScratch.size = {size.width, size.height, 1};
+  g_blurScratch.format = format;
+}
+
+void blur_pass(const wgpu::CommandEncoder& cmd, const wgpu::RenderPipeline& pipeline, const wgpu::TextureView& src,
+               const wgpu::TextureView& sharp, const wgpu::TextureView& target, float sigma, float mix, bool down) {
+  struct Params {
+    float sigma;
+    float mix;
+    int32_t dirX;
+    int32_t dirY;
+  } const params{sigma, mix, down ? 0 : 1, down ? 1 : 0};
+  const wgpu::BufferDescriptor bufferDescriptor{
+      .label = "Copy Blur Params",
+      .usage = wgpu::BufferUsage::Uniform,
+      .size = sizeof(Params),
+      .mappedAtCreation = true,
+  };
+  const auto buffer = g_device.CreateBuffer(&bufferDescriptor);
+  std::memcpy(buffer.GetMappedRange(), &params, sizeof(Params));
+  buffer.Unmap();
+  const std::array entries{
+      wgpu::BindGroupEntry{.binding = 0, .textureView = src},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = sharp},
+      wgpu::BindGroupEntry{.binding = 2, .buffer = buffer, .size = sizeof(Params)},
+  };
+  const wgpu::BindGroupDescriptor bindGroupDescriptor{
+      .layout = g_blurLayout,
+      .entryCount = entries.size(),
+      .entries = entries.data(),
+  };
+  const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+  const std::array colorAttachments{wgpu::RenderPassColorAttachment{
+      .view = target,
+      .loadOp = wgpu::LoadOp::Clear,
+      .storeOp = wgpu::StoreOp::Store,
+      .clearValue = {0.0, 0.0, 0.0, 0.0},
+  }};
+  const wgpu::RenderPassDescriptor passDescriptor{
+      .label = "Copy Blur Pass",
+      .colorAttachmentCount = colorAttachments.size(),
+      .colorAttachments = colorAttachments.data(),
+  };
+  const auto pass = cmd.BeginRenderPass(&passDescriptor);
+  pass.SetPipeline(pipeline);
+  pass.SetBindGroup(0, bindGroup);
+  pass.Draw(3);
+  pass.End();
+}
+} // namespace
+
+static void blur_shutdown() {
+  g_blurPipelines.clear();
+  g_blurLayout = {};
+  g_blurScratch = {};
+}
+
+void blur(const wgpu::CommandEncoder& cmd, const TextureHandle& texture, float sigma, float mix) {
+  if (!texture || !texture->texture) {
+    return;
+  }
+  const webgpu::gpu_prof::Zone zone{cmd, "EFB copy blur"};
+  sigma = std::max(sigma, 0.05f);
+  const auto& pipeline = blur_pipeline(texture->format);
+  blur_scratch(texture->size, texture->format);
+  blur_pass(cmd, pipeline, texture->sampleTextureView, texture->sampleTextureView, g_blurScratch.acrossView, sigma,
+            mix, false);
+  blur_pass(cmd, pipeline, g_blurScratch.acrossView, texture->sampleTextureView, g_blurScratch.downView, sigma, mix,
+            true);
+  const wgpu::TexelCopyTextureInfo from{.texture = g_blurScratch.down};
+  const wgpu::TexelCopyTextureInfo to{.texture = texture->texture};
+  const wgpu::Extent3D extent{texture->size.width, texture->size.height, 1};
+  cmd.CopyTextureToTexture(&from, &to, &extent);
+}
 
 } // namespace aurora::gfx::tex_copy_conv
