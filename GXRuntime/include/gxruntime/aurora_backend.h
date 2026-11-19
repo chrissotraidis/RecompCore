@@ -111,6 +111,12 @@ void dol_aurora_gx_drain(void);
 // Request recovery on the audio-owning host thread after an OS interruption.
 void dol_aurora_audio_resume(void);
 
+/* The texture replacements Aurora registered from DOL_AURORA_TEXTURE_PACK at
+   start (with the optional folders it loaded, less the files
+   DOL_AURORA_TEXTURE_PACK_SKIP left out), so a menu can say whether a pack
+   really loaded; -1 when no pack was set. Fixed until the app starts again. */
+long dol_aurora_texture_pack_replacements(void);
+
 /* The graphics API Aurora actually chose ("Vulkan", "D3D12", "Metal", "OpenGL",
    "OpenGL ES", ...), or NULL before it started. What was asked for is usually
    "auto", so this is how a host tells a slow fallback (OpenGL ES where Vulkan
