@@ -259,9 +259,12 @@ float calculate_fps() noexcept;
 // Game frames finished a second (each one presents once, or twice with an
 // in-between frame); calculate_fps() counts every present.
 float calculate_game_fps() noexcept;
+// `within`: the texture of an earlier, larger copy whose buffer this copy
+// lands in, `withinY` rows down (its pixels): the copy goes there too, as it
+// would into that buffer's memory.
 void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                   Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat = GX_TF_RGBA8,
-                  float blurSigma = 0.f, float blurMix = 1.f);
+                  float blurSigma = 0.f, float blurMix = 1.f, TextureHandle within = {}, uint32_t withinY = 0);
 
 struct ColorPassDescriptor {
   const char* label = nullptr;
