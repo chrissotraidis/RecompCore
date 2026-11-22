@@ -8,7 +8,9 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -680,6 +682,903 @@ void test_texgen_color() {
   // color1 lives at @location(1); the two texcoords shift to 2 and 3.
   CHECK(w.find("@location(2) uv0: vec3f,") != std::string::npos);
   CHECK(w.find("@location(3) uv1: vec3f,") != std::string::npos);
+}
+
+// Wind Waker HD's actor light (ShaderKey::hd_actor_light): a Link-like toon
+// key as the step-1 log saw it (stage 0 C0,K,TEXC*,0 through an SRTG texgen of
+// a lit colour; stage 1 0,TEXC,PREV,0 the albedo; optional stage 2
+// 0,K,TEXC*,PREV), the classifier, the flagged WGSL's shape, and the formula's
+// reference against the pixels traced in Cemu (LINK-LIGHT.md).
+gxc::ShaderKey toon_key(bool highlight) {
+  gxc::ShaderKey key{};
+  key.num_tex_gens = 2;
+  key.has_pos_mtx_idx = 1;
+  key.uv_mask = 1;
+  key.textured = 1;
+  key.tev_valid = 1;
+  key.num_tev_stages = highlight ? 3 : 2;
+  key.lit_valid = 1;
+  key.num_color_chans = 1;
+  key.chan_captured_mask = 0x5;
+  key.has_vertex_normal = 1;
+  key.litchan[0].enablelighting = 1;
+  key.litchan[0].diffusefunc = static_cast<std::uint8_t>(gxc::DiffuseFunc::Clamp);
+  key.litchan[0].attnfunc = static_cast<std::uint8_t>(gxc::AttenuationFunc::Spot);
+  key.litchan[0].light_mask = 1;
+  key.tex_gens[0].enabled = 1;
+  key.tex_gens[0].texgentype = static_cast<std::uint8_t>(gxc::TexGenType::Color0);
+  key.tex_gens[0].sourcerow = static_cast<std::uint8_t>(gxc::TexSourceRow::Colors);
+  key.tex_gens[1].enabled = 1;
+  key.tex_gens[1].texgentype = static_cast<std::uint8_t>(gxc::TexGenType::Regular);
+  key.tex_gens[1].sourcerow = static_cast<std::uint8_t>(gxc::TexSourceRow::Tex0);
+  auto& s0 = key.tev_stages[0];
+  s0.cc_a = 2; s0.cc_b = 14; s0.cc_c = 8; s0.cc_d = 15; s0.cc_clamp = 1;
+  s0.ac_a = 7; s0.ac_b = 7; s0.ac_c = 7; s0.ac_d = 1; s0.ac_clamp = 1;
+  s0.ksel_kc = 12;
+  s0.tevorders_texcoord = 0; s0.tevorders_texmap = 0; s0.tevorders_enable = 1; s0.tevorders_colorchan = 7;
+  for (int i = 0; i < 4; ++i)
+    s0.ras_swap[i] = s0.tex_swap[i] = static_cast<std::uint8_t>(i);
+  auto& s1 = key.tev_stages[1];
+  s1 = s0;
+  s1.cc_a = 15; s1.cc_b = 8; s1.cc_c = 0; s1.cc_d = 15;
+  s1.ac_a = 7; s1.ac_b = 4; s1.ac_c = 0; s1.ac_d = 7;
+  s1.tevorders_texcoord = 1; s1.tevorders_texmap = 1;
+  if (highlight) {
+    auto& s2 = key.tev_stages[2];
+    s2 = s0;
+    s2.cc_a = 15; s2.cc_b = 14; s2.cc_c = 8; s2.cc_d = 0;
+    s2.ac_a = 7; s2.ac_b = 7; s2.ac_c = 7; s2.ac_d = 0;
+    s2.ksel_kc = 13;
+    s2.tevorders_texmap = 2;
+  }
+  return key;
+}
+
+void test_toon_light_classifier() {
+  {
+    const auto m = gxc::toon_light_stage(toon_key(false));
+    CHECK(m.matched);
+    CHECK(m.ramp_stage == 0 && m.albedo_stage == 1 && m.highlight_stage == 0xFF);
+    CHECK(m.ramp_texcoord == 0 && m.ramp_channel == 0);
+  }
+  {
+    const auto m = gxc::toon_light_stage(toon_key(true));
+    CHECK(m.matched);
+    CHECK(m.highlight_stage == 2);
+  }
+  // A Color1 ramp texgen reads the lit color1.
+  {
+    auto key = toon_key(false);
+    key.tex_gens[0].texgentype = static_cast<std::uint8_t>(gxc::TexGenType::Color1);
+    key.num_color_chans = 2;
+    key.chan_captured_mask = 0xF;
+    key.litchan[1] = key.litchan[0];
+    const auto m = gxc::toon_light_stage(key);
+    CHECK(m.matched && m.ramp_channel == 1);
+    key.litchan[1].enablelighting = 0; // an unlit channel isn't a ramp coordinate
+    CHECK(!gxc::toon_light_stage(key).matched);
+  }
+  // Outliers keep the GameCube shading.
+  const auto rejects = [](void (*change)(gxc::ShaderKey&)) {
+    auto key = toon_key(false);
+    change(key);
+    return !gxc::toon_light_stage(key).matched;
+  };
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[0].cc_a = 4; }));                    // C1 in place of C0
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[0].cc_a = 12; k.tev_stages[0].cc_b = 12; })); // ONE, ONE
+  CHECK(rejects([](gxc::ShaderKey& k) { std::swap(k.tev_stages[0], k.tev_stages[1]); })); // ramp stage second
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[0].tevorders_texcoord = 1; }));      // ramp from a regular texgen
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].tevorders_texcoord = 0; }));      // albedo from the ramp
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[0].cc_scale = 1; }));                // scale 2
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[0].cc_bias = 1; }));
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_op = 1; }));
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[0].cc_dest = 1; }));                 // into C0
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_c = 2; }));                    // x C0, not PREV
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[0].tevorders_enable = 0; }));
+  CHECK(rejects([](gxc::ShaderKey& k) { k.litchan[0].enablelighting = 0; }));
+  CHECK(rejects([](gxc::ShaderKey& k) { k.lit_valid = 0; }));
+  CHECK(rejects([](gxc::ShaderKey& k) { k.num_tev_stages = 1; }));
+  CHECK(rejects([](gxc::ShaderKey& k) { k.num_ind_stages = 1; }));
+  // The main pattern's stages then more (G): matched, the light after the albedo stage, the rest run on it.
+  const auto later = [](void (*change)(gxc::ShaderKey&)) {
+    auto key = toon_key(false);
+    change(key);
+    return gxc::toon_light_stage(key);
+  };
+  {
+    const auto m = later([](gxc::ShaderKey& k) {
+      k.num_tev_stages = 3; // a third stage that isn't the highlight
+      k.tev_stages[2] = k.tev_stages[1];
+    });
+    CHECK(m.matched && m.after_albedo && m.highlight_stage == 0xFF && m.effect_stages == 0u);
+    CHECK(m.rim && !m.albedo_c1);
+  }
+  {
+    const auto m = later([](gxc::ShaderKey& k) {
+      k.num_tev_stages = 3; // K x a texel added (not the ramp: not the effect light, kept)
+      k.tev_stages[2] = k.tev_stages[0];
+      k.tev_stages[2].cc_a = 15; k.tev_stages[2].cc_d = 0; k.tev_stages[2].tevorders_texcoord = 1;
+    });
+    CHECK(m.matched && m.after_albedo && m.effect_stages == 0u);
+  }
+  // A later stage must write PREV and read it, or the light wouldn't reach the output.
+  CHECK(rejects([](gxc::ShaderKey& k) {
+    k.num_tev_stages = 3;
+    k.tev_stages[2] = k.tev_stages[1];
+    k.tev_stages[2].cc_c = 2; // ZERO, TEXC, C0, ZERO: no PREV
+  }));
+  CHECK(rejects([](gxc::ShaderKey& k) {
+    k.num_tev_stages = 3;
+    k.tev_stages[2] = k.tev_stages[1];
+    k.tev_stages[2].cc_dest = 2; // into C1
+  }));
+  CHECK(rejects([](gxc::ShaderKey& k) {
+    k.num_tev_stages = 4; // the fourth into C2
+    k.tev_stages[2] = k.tev_stages[1];
+    k.tev_stages[3] = k.tev_stages[1];
+    k.tev_stages[3].cc_dest = 3;
+  }));
+  // Stage 1's d: a register (F) but not another input.
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_d = 8; }));  // + TEXC
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_d = 10; })); // + RASC
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_d = 2; }));  // + C0
+  // The colour-register albedo is C1 only.
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_b = 6; }));  // C2
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_b = 2; }));  // C0
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_b = 4; k.tev_stages[1].cc_d = 4; })); // C1 + C1
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_b = 4; k.tev_stages[1].cc_scale = 1; }));
+  // F with the albedo read through the ramp, or a scale: no.
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_d = 4; k.tev_stages[1].tevorders_texcoord = 0; }));
+  CHECK(rejects([](gxc::ShaderKey& k) { k.tev_stages[1].cc_d = 4; k.tev_stages[1].cc_scale = 3; }));
+}
+
+// The ramp's value for the reference: fixed per pixel, the value traced (LINK-LIGHT.md section 3).
+float g_traced_ramp = 0.f;
+float traced_ramp(float) { return g_traced_ramp; }
+
+// The patterns past the main one, as the GameCube's materials have them (CLASSIFIER-EXT.md).
+// E, the Mirror Shield's SHMSBMAT (and the Master Sword's grip, ice arrows, ice): RAMP(C0,K,TEXC,ZERO) |
+// tex(ZERO,C1,PREV,ZERO), an environment map through a normal texgen read for its alpha | -(ZERO,K,APREV,PREV) K3.r:
+// PREV + K x APREV, the glint (the '-' is "no texture", not a subtraction).
+gxc::ShaderKey mirror_shield_key() {
+  auto key = toon_key(false);
+  key.num_tex_gens = 3;
+  key.num_tev_stages = 3;
+  key.tex_gens[2].enabled = 1;
+  key.tex_gens[2].texgentype = static_cast<std::uint8_t>(gxc::TexGenType::Regular);
+  key.tex_gens[2].sourcerow = static_cast<std::uint8_t>(gxc::TexSourceRow::Normal);
+  auto& s1 = key.tev_stages[1];
+  s1.cc_a = 15; s1.cc_b = 4; s1.cc_c = 0; s1.cc_d = 15;
+  s1.ac_a = 7; s1.ac_b = 7; s1.ac_c = 7; s1.ac_d = 4; // alpha = the environment texel's
+  s1.tevorders_texcoord = 2;
+  auto& s2 = key.tev_stages[2];
+  s2 = key.tev_stages[0];
+  s2.cc_a = 15; s2.cc_b = 14; s2.cc_c = 1; s2.cc_d = 0; // PREV + K x APREV
+  s2.ac_a = 7; s2.ac_b = 7; s2.ac_c = 7; s2.ac_d = 0;
+  s2.ksel_kc = 19;
+  s2.tevorders_enable = 0;
+  s2.tevorders_texcoord = 0; s2.tevorders_texmap = 0;
+  return key;
+}
+// E, Chus (vchul/SC_VchuL): -(ZERO,C1,PREV,ZERO), no texture | tex(ZERO,K,TEXC,PREV) a sheen texel.
+gxc::ShaderKey chu_key() {
+  auto key = mirror_shield_key();
+  auto& s1 = key.tev_stages[1];
+  s1.tevorders_enable = 0;
+  auto& s2 = key.tev_stages[2];
+  s2.cc_a = 15; s2.cc_b = 14; s2.cc_c = 8; s2.cc_d = 0;
+  s2.tevorders_enable = 1; s2.tevorders_texcoord = 2; s2.tevorders_texmap = 2;
+  return key;
+}
+// F, the bomb (Link/bomb/Bom1): tex(ZERO,TEXC,PREV,C1), C1 the flash before it goes off | the effect light.
+gxc::ShaderKey bomb_key() {
+  auto key = toon_key(true);
+  key.tev_stages[1].cc_d = 4;
+  return key;
+}
+// G, the treasure chests (Dalways/boxa/BoxA1): the main two | tex(PREV,TEXC,A1,ZERO), a decal mixed by A1.
+gxc::ShaderKey chest_key() {
+  auto key = toon_key(false);
+  key.num_tev_stages = 3;
+  auto& s2 = key.tev_stages[2];
+  s2 = key.tev_stages[1];
+  s2.cc_a = 0; s2.cc_b = 8; s2.cc_c = 5; s2.cc_d = 15;
+  s2.tevorders_texmap = 2;
+  return key;
+}
+
+void test_toon_light_extended() {
+  {
+    const auto m = gxc::toon_light_stage(mirror_shield_key());
+    CHECK(m.matched && m.after_albedo && m.albedo_c1 && !m.rim);
+    CHECK(m.albedo_stage == 1 && m.ramp_stage == 0 && m.effect_stages == 0u && m.highlight_stage == 0xFF);
+    CHECK(m.sheen_stage == 2); // the glint, added in linear in HD's block
+  }
+  {
+    // The glint only for E: the main pattern's later K x APREV (G) stays a GX stage.
+    auto key = toon_key(false);
+    key.num_tev_stages = 3;
+    key.tev_stages[2] = mirror_shield_key().tev_stages[2];
+    const auto g = gxc::toon_light_stage(key);
+    CHECK(g.matched && g.after_albedo && !g.albedo_c1 && g.sheen_stage == 0xFF);
+    // K x APREV with a scale, or into the sum's other side: not the glint.
+    auto scaled = mirror_shield_key();
+    scaled.tev_stages[2].cc_scale = 1;
+    CHECK(gxc::toon_light_stage(scaled).sheen_stage == 0xFF);
+    auto other = mirror_shield_key();
+    other.tev_stages[2].cc_c = 8; // K x TEXC: the Chus' texel sheen
+    CHECK(gxc::toon_light_stage(other).sheen_stage == 0xFF);
+  }
+  {
+    auto key = mirror_shield_key(); // the same with no texture on stage 1 (Stalfos' body_lambert3) and the effect light
+    key.tev_stages[1].tevorders_enable = 0;
+    key.tev_stages[2] = toon_key(true).tev_stages[2];
+    const auto m = gxc::toon_light_stage(key);
+    CHECK(m.matched && m.albedo_c1 && m.effect_stages == (1u << 2));
+  }
+  {
+    const auto m = gxc::toon_light_stage(chu_key());
+    CHECK(m.matched && m.albedo_c1 && !m.rim && m.effect_stages == 0u && m.sheen_stage == 0xFF);
+  }
+  {
+    const auto m = gxc::toon_light_stage(bomb_key());
+    CHECK(m.matched && m.after_albedo && !m.albedo_c1 && !m.rim && m.effect_stages == (1u << 2));
+    CHECK(m.highlight_stage == 0xFF);
+    // F with C2 or K added: no rim either; the main pattern and G keep theirs.
+    for (const std::uint8_t d : {std::uint8_t{6}, std::uint8_t{14}}) {
+      auto key = bomb_key();
+      key.tev_stages[1].cc_d = d;
+      const auto f = gxc::toon_light_stage(key);
+      CHECK(f.matched && f.after_albedo && !f.rim);
+    }
+    CHECK(gxc::toon_light_stage(toon_key(true)).rim);
+  }
+  {
+    const auto m = gxc::toon_light_stage(chest_key());
+    CHECK(m.matched && m.after_albedo && m.rim && m.effect_stages == 0u);
+  }
+  {
+    auto key = toon_key(false); // Link in the tree (T_Tree/cl): the main two then two stages passing PREV on
+    key.num_tev_stages = 4;
+    for (int n = 2; n < 4; ++n) {
+      key.tev_stages[n] = key.tev_stages[1];
+      key.tev_stages[n].cc_a = 15; key.tev_stages[n].cc_b = 15; key.tev_stages[n].cc_c = 15; key.tev_stages[n].cc_d = 0;
+    }
+    const auto m = gxc::toon_light_stage(key);
+    CHECK(m.matched && m.after_albedo);
+  }
+  {
+    auto key = toon_key(false); // Ganondorf's gnd_ken_tx: + K0 x the ramp's alpha (kept), + K1 x the ramp (dropped)
+    key.num_tev_stages = 4;
+    key.tev_stages[2] = toon_key(true).tev_stages[2];
+    key.tev_stages[2].cc_c = 9; key.tev_stages[2].ksel_kc = 12;
+    key.tev_stages[3] = toon_key(true).tev_stages[2];
+    const auto m = gxc::toon_light_stage(key);
+    CHECK(m.matched && m.after_albedo && m.effect_stages == (1u << 3));
+  }
+
+  // The WGSL. E: the albedo is C1, the light right after stage 1, no rim, the sheen stage on HD's colour.
+  {
+    auto key = mirror_shield_key();
+    const std::string before = gxc::generate_wgsl(key);
+    key.hd_actor_light = 1;
+    const std::string w = gxc::generate_wgsl(key);
+    if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
+      std::printf("%s\n", w.c_str());
+    CHECK(w != before);
+    CHECK(w.find("let hd_albedo = c1.rgb & vec3i(255, 255, 255);") != std::string::npos);
+    CHECK(w.find("textemp.rgb & vec3i(255, 255, 255)") == std::string::npos);
+    // The glint: K3.r linearised times stage 1's alpha, added to HD's light before the clip.
+    CHECK(w.find("let hd_sheen = pow(vec3f(psc.kcolors[3].rrr) / 255.0, vec3f(2.2)) * "
+                 "clamp(f32(prev.a) / 255.0, 0.0, 1.0);") != std::string::npos);
+    CHECK(w.find("var hd_out = pow(clamp(hd_l * hd_alb + hd_sheen, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));") !=
+          std::string::npos);
+    CHECK(w.find("hdl.rim.x * hd_rim") == std::string::npos);
+    const auto st1 = w.find("    // TEV stage 1\n");
+    const auto hd_at = w.find("if (hdl.params.x > 0.5) {");
+    const auto st2 = w.find("    // TEV stage 2\n");
+    CHECK(st1 != std::string::npos && st1 < hd_at && hd_at < st2);
+    CHECK(w.find("if (hdl.params.x > 0.5) {\n", hd_at + 1) == std::string::npos); // once
+    CHECK(w.find("prev = vec4i(vec3i(round(clamp(hd_out, vec3f(0.0), vec3f(1.0)) * 255.0)), prev.a);") > hd_at);
+    // Stage 2 (GX's PREV + K x APREV, in gamma) runs, then HD's colour comes back: the glint isn't added twice.
+    const auto keep = w.find("let hd_sheen_keep2 = prev.rgb;");
+    const auto back = w.find("if (hdl.params.x > 0.5) { prev = vec4i(hd_sheen_keep2, prev.a); }");
+    CHECK(st2 < keep && keep < back && back < w.find("if (!("));
+    CHECK(w.find("hd_keep2") == std::string::npos); // not the effect light's switch
+    // The ramp still in tex0, its coordinate uv0; no added register.
+    CHECK(w.find("hd_ramp_sample(tex0, ") != std::string::npos);
+    CHECK(w.find("tevin_d.rgb, vec3<i32>") == std::string::npos);
+    // The cloud's derivatives still before any branch.
+    CHECK(w.find("let hd_cloud_lod") < w.find("    // TEV stage 0\n"));
+    // Unflagged: the GX module.
+    CHECK(before.find("hd_") == std::string::npos);
+  }
+  // E without the glint (the Chus' K x texel sheen): no linear add, its stage runs on HD's colour as before.
+  {
+    auto key = chu_key();
+    key.hd_actor_light = 1;
+    const std::string w = gxc::generate_wgsl(key);
+    CHECK(w.find("hd_sheen") == std::string::npos);
+    CHECK(w.find("var hd_out = pow(clamp(hd_l * hd_alb, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));") !=
+          std::string::npos);
+  }
+  // F: stage 1's register added after the light, clamped as the stage clamps; the effect light skipped.
+  {
+    auto key = bomb_key();
+    key.hd_actor_light = 1;
+    const std::string w = gxc::generate_wgsl(key);
+    CHECK(w.find("let hd_albedo = textemp.rgb & vec3i(255, 255, 255);") != std::string::npos);
+    CHECK(w.find("prev = vec4i(clamp(vec3i(round(clamp(hd_out, vec3f(0.0), vec3f(1.0)) * 255.0)) + tevin_d.rgb, "
+                 "vec3<i32>(0), vec3<i32>(255)), prev.a);") != std::string::npos);
+    CHECK(w.find("hdl.rim.x * hd_rim") == std::string::npos); // rim-only in HD: no rim
+    CHECK(w.find("var hd_out = pow(clamp(hd_l * hd_alb, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.2));") !=
+          std::string::npos);
+    const auto keep = w.find("let hd_keep2 = prev.rgb;");
+    const auto st2 = w.find("    // TEV stage 2\n");
+    const auto back = w.find("if (hdl.params.x > 0.5 && hdl.screen.z < 0.5) { prev = vec4i(hd_keep2, prev.a); }");
+    CHECK(st2 < keep && keep < back && back < w.find("if (!("));
+    // Unclamped stage: the TEV's 10-bit range.
+    key.tev_stages[1].cc_clamp = 0;
+    CHECK(gxc::generate_wgsl(key).find("tevin_d.rgb, vec3<i32>(-1024), vec3<i32>(1023)), prev.a);") !=
+          std::string::npos);
+  }
+  // G: the chest's decal stage after the light, nothing skipped.
+  {
+    auto key = chest_key();
+    key.hd_actor_light = 1;
+    const std::string w = gxc::generate_wgsl(key);
+    const auto hd_at = w.find("if (hdl.params.x > 0.5) {");
+    CHECK(hd_at != std::string::npos && hd_at < w.find("    // TEV stage 2\n"));
+    CHECK(w.find("hd_keep") == std::string::npos);
+    CHECK(w.find("tevin_d.rgb, vec3<i32>") == std::string::npos);
+  }
+  // The main pattern with the effect light: the block after the albedo stage, the effect light's stage (there only
+  // while an effect light reaches the model) run on HD's colour, or left out with hdl.screen.z 0.
+  {
+    auto key = toon_key(true);
+    key.hd_actor_light = 1;
+    const std::string w = gxc::generate_wgsl(key);
+    const auto hd_at = w.find("if (hdl.params.x > 0.5) {");
+    const auto st2 = w.find("    // TEV stage 2\n");
+    CHECK(w.find("    // TEV stage 1\n") < hd_at && hd_at < st2);
+    CHECK(w.find("if (hdl.params.x > 0.5) {", hd_at + 1) == std::string::npos); // once
+    const auto keep = w.find("let hd_keep2 = prev.rgb;");
+    const auto back = w.find("if (hdl.params.x > 0.5 && hdl.screen.z < 0.5) { prev = vec4i(hd_keep2, prev.a); }");
+    CHECK(st2 < keep && keep < back && back < w.find("if (!("));
+    // Stage 1 adds nothing (d ZERO): HD's colour as it was, then the stage.
+    CHECK(w.find("tevin_d.rgb, vec3<i32>") == std::string::npos);
+  }
+  // Without the effect light the main pattern keeps its block after the last stage.
+  {
+    auto key = toon_key(false);
+    key.hd_actor_light = 1;
+    const std::string w = gxc::generate_wgsl(key);
+    CHECK(w.find("if (hdl.params.x > 0.5) {") > w.find("    // TEV stage 1\n"));
+    CHECK(w.find("hd_keep") == std::string::npos);
+  }
+
+  // The reference without the rim: K x albedo where lit, whatever the rim.
+  {
+    gxc::HdActorLightConstants c{};
+    for (int i = 0; i < 3; ++i) {
+      c.c0[i] = 0.494f; c.shadow[i] = 0.106f; c.k[i] = 0.9f;
+    }
+    c.params[0] = 1.f; c.params[3] = 1.f;
+    c.rim[0] = 2.f; c.rim[1] = 5.f; c.rim[2] = 0.75f;
+    const float alb[3] = {0.5f, 0.6f, 0.7f};
+    g_traced_ramp = 1.f;
+    const auto with = gxc::hd_actor_light_reference(c, 0.9f, 1.f, traced_ramp, 0.f, -0.2f, 1.f, alb, 1.f, true);
+    const auto without = gxc::hd_actor_light_reference(c, 0.9f, 1.f, traced_ramp, 0.f, -0.2f, 1.f, alb, 1.f, false);
+    CHECK(with.rim > 0.f);
+    for (int i = 0; i < 3; ++i) {
+      CHECK(std::fabs(without.out[i] - std::pow(0.9f * std::pow(alb[i], 2.2f), 1.f / 2.2f)) < 1e-5f);
+      CHECK(with.out[i] > without.out[i]);
+    }
+  }
+}
+
+void test_toon_light_wgsl() {
+  // Unflagged: what it always was; the flag on a key that doesn't match changes nothing either.
+  const auto plain = toon_key(false);
+  const std::string gx = gxc::generate_wgsl(plain);
+  CHECK(gx.find("hdl") == std::string::npos && gx.find("hd_") == std::string::npos);
+  {
+    auto odd = plain;
+    odd.tev_stages[0].cc_a = 4;
+    const std::string before = gxc::generate_wgsl(odd);
+    odd.hd_actor_light = 1;
+    CHECK(gxc::generate_wgsl(odd) == before);
+  }
+  auto key = plain;
+  key.hd_actor_light = 1;
+  const std::string w = gxc::generate_wgsl(key);
+  if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
+    std::printf("%s\n", w.c_str());
+  // Group 0: the uniform, the shadow and its sampler beside the pass's buffers.
+  CHECK(w.find("@group(0) @binding(2) var<uniform> hdl: HdActorLight;") != std::string::npos);
+  CHECK(w.find("@group(0) @binding(3) var hdl_shadow: texture_2d<f32>;") != std::string::npos);
+  CHECK(w.find("@group(0) @binding(4) var hdl_samp: sampler;") != std::string::npos);
+  CHECK(w.find("fn hd_ramp_sample(t: texture_2d<f32>, uv: vec2f) -> vec4f {") != std::string::npos);
+  // Varyings after the two texgens (color0 0, color1 1, uv 2 and 3).
+  CHECK(w.find("@location(4) hd_nv: vec3f,") != std::string::npos);
+  CHECK(w.find("@location(5) hd_pv: vec3f,") != std::string::npos);
+  CHECK(w.find("o.hd_nv = _normal;") != std::string::npos);
+  CHECK(w.find("o.hd_pv = viewpos.xyz;") != std::string::npos);
+  // The albedo is stage 1's texel; the ramp is looked up again in the ramp's texmap (0 of two).
+  CHECK(w.find("let hd_albedo = textemp.rgb & vec3i(255, 255, 255);") != std::string::npos);
+  CHECK(w.find("hd_ramp_sample(tex0, vec2f(hd_u, hd_v)).rgba.rgb") != std::string::npos);
+  CHECK(w.find("let hd_s = in.uv0.x;") != std::string::npos);
+  CHECK(w.find("textureSampleLevel(hdl_shadow, hdl_samp, in.pos.xy * hdl.screen.xy, hdl.params.z).r") !=
+        std::string::npos);
+  // Clipped before the gamma.
+  CHECK(w.find("var hd_out = pow(clamp(hd_l * (hd_alb + hd_hemi * (hdl.rim.x * hd_rim)), vec3f(0.0), vec3f(1.0)), "
+               "vec3f(1.0 / 2.2));") != std::string::npos);
+  // HD's light replaces the colour before the alpha test; the GX result stays for params.x 0.
+  const auto hd_at = w.find("if (hdl.params.x > 0.5) {");
+  const auto alpha_at = w.find("if (!(");
+  CHECK(hd_at != std::string::npos && alpha_at != std::string::npos && hd_at < alpha_at);
+  CHECK(w.find("prev = vec4i(vec3i(round(clamp(hd_out, vec3f(0.0), vec3f(1.0)) * 255.0)), prev.a);") !=
+        std::string::npos);
+  // Without the HD block, the flagged module is the GX one plus the declarations and varyings.
+  CHECK(w.find("hd_hl_k") == std::string::npos);
+  // The cloud term: HD's cloud shadow texture and its sampler at bindings 5 and 6, the uniform's last vec4.
+  CHECK(w.find("@group(0) @binding(5) var hdl_cloud: texture_2d<f32>;") != std::string::npos);
+  CHECK(w.find("@group(0) @binding(6) var hdl_cloud_samp: sampler;") != std::string::npos);
+  CHECK(w.find("    screen: vec4f,\n    cloud: vec4f,\n    own_c0: vec4f,\n    own_k: vec4f,\n};") != std::string::npos);
+  // Its uv is the world position from above (the inverse view's x and z rows), its mip from the uv's derivatives,
+  // worked out at the top of fs_main, before any branch or discard (uniform control flow).
+  const auto main_at = w.find("fn fs_main(");
+  const auto uv_at = w.find("let hd_cloud_uv = vec2f(-dot(hdl.rows[0], hd_cloud_p), -dot(hdl.rows[2], hd_cloud_p)) * "
+                            "hdl.cloud.z + hdl.cloud.xy;");
+  const auto dpdx_at = w.find("let hd_cloud_span = max(length(dpdx(hd_cloud_texels)), length(dpdy(hd_cloud_texels)));");
+  CHECK(w.find("let hd_cloud_p = vec4f(in.hd_pv, 1.0);") != std::string::npos);
+  CHECK(w.find("let hd_cloud_lod = log2(max(hd_cloud_span, 1.0));") != std::string::npos);
+  CHECK(main_at != std::string::npos && uv_at != std::string::npos && dpdx_at != std::string::npos);
+  CHECK(main_at < uv_at && uv_at < dpdx_at && dpdx_at < hd_at);
+  {
+    const std::string head = w.substr(main_at, dpdx_at - main_at);
+    CHECK(head.find("if (") == std::string::npos && head.find("discard") == std::string::npos);
+  }
+  // Sampled at that mip, only with the term on (rim.w), clamp(texel + floor); it multiplies the ramp's value.
+  CHECK(w.find("        if (hdl.rim.w > 0.5) {\n"
+               "            hd_cloud = clamp(textureSampleLevel(hdl_cloud, hdl_cloud_samp, hd_cloud_uv, hd_cloud_lod).r "
+               "+ hdl.cloud.w, 0.0, 1.0);\n") != std::string::npos);
+  CHECK(w.find("let hd_l = mix(hd_hemi, hd_k, hd_ramp * hd_cloud) + hdp.count.y * hd_point_sum(in.hd_pv, hd_n);") !=
+        std::string::npos);
+  // Each character's own palettes: its toon registers (C0, the ramp stage's KONST) against the global ones, in linear.
+  CHECK(w.find("let hd_own_k = pow(clamp(vec3f(psc.kcolors[0].rgb) / 255.0, vec3f(0.0), vec3f(1.0)), vec3f(2.2));") !=
+        std::string::npos);
+  CHECK(w.find("hd_c0 = hd_c0 * select(vec3f(1.0), clamp(hd_own_c0 / max(hdl.own_c0.rgb, vec3f(1e-4)), vec3f(0.0), "
+               "vec3f(4.0)), hdl.own_c0.rgb > vec3f(1e-3));") != std::string::npos);
+  CHECK(w.find("let hd_hemi = mix(hd_c0, hdl.shadow.rgb, 0.5 + 0.5 * hd_up);") != std::string::npos);
+  // HD's light buffer: its lights at binding 7, summed per pixel with HD's falloff (exponent 1.5).
+  CHECK(w.find("@group(0) @binding(7) var<uniform> hdp: HdPointLights;") != std::string::npos);
+  CHECK(w.find("    pos_r: array<vec4f, 32>,\n    colour: array<vec4f, 32>,") != std::string::npos);
+  CHECK(w.find("sum += hdp.colour[i].rgb * (nl * fall * sqrt(fall));") != std::string::npos);
+  CHECK(w.find("hdl.rim.w)") == std::string::npos);
+  CHECK(w.find("if (hd_debug == 6) { hd_out = vec3f(hd_cloud); }") != std::string::npos);
+  CHECK(gx.find("dpdx") == std::string::npos);
+  // The effect-light stage (PREV + K1 x the ramp) is matched but left out of HD's light, as HD drops it.
+  auto hl = toon_key(true);
+  hl.hd_actor_light = 1;
+  const std::string wh = gxc::generate_wgsl(hl);
+  CHECK(wh.find("if (hdl.params.x > 0.5) {") != std::string::npos);
+  CHECK(wh.find("hd_hl_k") == std::string::npos);
+  // Three texmaps: the ramp in tex0, as its stage reads it.
+  CHECK(wh.find("hd_ramp_sample(tex0, ") != std::string::npos);
+}
+
+
+// HD's ramp (unit 5) as the capture's table, linear between its columns.
+float hd_ramp_table(float u) {
+  static const float us[] = {0.47f, 0.477f, 0.484f, 0.492f, 0.5f, 0.508f, 0.516f, 0.523f, 0.531f, 0.539f, 0.547f, 0.555f};
+  static const float rs[] = {0.f, 0.007f, 0.022f, 0.068f, 0.147f, 0.262f, 0.445f, 0.617f, 0.84f, 0.93f, 0.98f, 1.f};
+  if (u <= us[0])
+    return 0.f;
+  for (int i = 1; i < 12; ++i)
+    if (u <= us[i])
+      return rs[i - 1] + (rs[i] - rs[i - 1]) * (u - us[i - 1]) / (us[i] - us[i - 1]);
+  return 1.f;
+}
+
+void test_toon_light_reference() {
+  const auto near = [](float a, float b, float tol) { return std::fabs(a - b) <= tol; };
+  // The world normal's y that puts the hemisphere at `t` between C0 and the shadow colour.
+  const auto up_for = [](float t) { return 2.f * t - 1.f; };
+  const auto run = [](const gxc::HdActorLightConstants& c, float s, float sh, float (*ramp)(float), float up,
+                      float rim, const float albedo_linear[3], float cloud = 1.f) {
+    // rim = (1 + N.E)^5 x rev with rev 1 (the light straight ahead).
+    const float n_dot_e = std::pow(rim, 1.f / 5.f) - 1.f;
+    float gamma[3];
+    for (int i = 0; i < 3; ++i)
+      gamma[i] = std::pow(albedo_linear[i], 1.f / 2.2f);
+    auto px = gxc::hd_actor_light_reference(c, s, sh, ramp, up, n_dot_e, 1.f, gamma, cloud);
+    for (float& v : px.out)
+      v = std::pow(v, 2.2f); // back to linear, as the traces are
+    return px;
+  };
+  gxc::HdActorLightConstants day{};
+  const float day_c0[3] = {0.494f, 0.416f, 0.294f}, day_sh[3] = {0.106f, 0.384f, 0.710f},
+              day_k[3] = {2.75f, 2.588f, 1.801f};
+  for (int i = 0; i < 3; ++i) {
+    day.c0[i] = day_c0[i];
+    day.shadow[i] = day_sh[i];
+    day.k[i] = day_k[i];
+  }
+  day.params[0] = 1.f;
+  day.params[3] = 1.f; // full shadow strength
+  day.rim[0] = 2.f;
+  day.rim[1] = 5.f;
+  day.rim[2] = 0.75f;
+  day.rim[3] = 1.f; // the cloud term on (the shader's switch; the reference takes the cloud itself)
+  // 2500,1300 shirt back in shade: s 0.196 x sh 0.246 off the ramp, rim 0: hemi x albedo exactly.
+  {
+    const float shirt[3] = {0.063f, 0.175f, 0.387f};
+    const float t = (0.291f - 0.494f) / (0.106f - 0.494f);
+    const auto px = run(day, 0.196f, 0.246f, hd_ramp_table, up_for(t), 0.f, shirt);
+    CHECK(px.ramp == 0.f);
+    CHECK(near(px.hemi[1], 0.399f, 2e-3f) && near(px.hemi[2], 0.512f, 2e-3f));
+    CHECK(near(px.out[0], 0.0183f, 3e-4f));
+    CHECK(near(px.out[1], 0.0698f, 3e-4f));
+    CHECK(near(px.out[2], 0.1978f, 1e-3f));
+  }
+  // 2414,868 hair in the edge band: ramp 0.387, rim 0.517; clipped at 1 but blue (0.73).
+  {
+    const float hair[3] = {1.f, 0.863f, 0.005f};
+    const float t = (0.172f - 0.494f) / (0.106f - 0.494f);
+    g_traced_ramp = 0.387f;
+    const auto px = run(day, 0.643f, 0.8f, traced_ramp, up_for(t), 0.517f, hair);
+    CHECK(near(px.light[0], 1.17f, 0.01f) && near(px.light[1], 1.24f, 0.01f) && near(px.light[2], 1.09f, 0.01f));
+    CHECK(px.out[0] == 1.f && px.out[1] == 1.f);
+    CHECK(near(px.out[2], 0.725f, 0.01f));
+    // The table's ramp at s x sh = 0.514 is in the same band (the capture's 0.387 is the filtered texel).
+    CHECK(near(hd_ramp_table(0.643f * 0.8f), 0.387f, 0.03f));
+    // The cloud term: 1 (clear) is the traced pixel bit for bit; it scales the ramp's value, not s, so under a full
+    // cloud the light is hemi alone, and the noon floor (0.1307) leaves that share of the ramp.
+    const auto clear = run(day, 0.643f, 0.8f, traced_ramp, up_for(t), 0.517f, hair, 1.f);
+    for (int i = 0; i < 3; ++i)
+      CHECK(clear.out[i] == px.out[i] && clear.light[i] == px.light[i]);
+    const auto dark = run(day, 0.643f, 0.8f, traced_ramp, up_for(t), 0.517f, hair, 0.f);
+    CHECK(dark.ramp == px.ramp);
+    for (int i = 0; i < 3; ++i)
+      CHECK(dark.light[i] == dark.hemi[i]);
+    const float floor_noon = 0.1307f;
+    const auto noon = run(day, 0.643f, 0.8f, traced_ramp, up_for(t), 0.517f, hair, floor_noon);
+    for (int i = 0; i < 3; ++i)
+      CHECK(near(noon.light[i], noon.hemi[i] + (day.k[i] - noon.hemi[i]) * 0.387f * floor_noon, 1e-5f));
+    CHECK(noon.out[2] < px.out[2]);
+  }
+  // In shade (ramp 0) the cloud changes nothing: HD's clouds take away only the sun's light.
+  {
+    const float shirt[3] = {0.063f, 0.175f, 0.387f};
+    const float t = (0.291f - 0.494f) / (0.106f - 0.494f);
+    const auto lit = run(day, 0.196f, 0.246f, hd_ramp_table, up_for(t), 0.f, shirt, 1.f);
+    const auto cloudy = run(day, 0.196f, 0.246f, hd_ramp_table, up_for(t), 0.f, shirt, 0.364f);
+    for (int i = 0; i < 3; ++i)
+      CHECK(lit.out[i] == cloudy.out[i]);
+  }
+  // 2610,1140 hair underside: no light at all, the normal facing down (hemi toward C0).
+  {
+    const float hair[3] = {1.f, 0.863f, 0.005f};
+    const float t = (0.360f - 0.494f) / (0.106f - 0.494f);
+    const auto px = run(day, 0.157f, 0.f, hd_ramp_table, up_for(t), 0.f, hair);
+    CHECK(px.ramp == 0.f);
+    CHECK(near(px.out[0], 0.360f, 2e-3f) && near(px.out[1], 0.350f, 2e-3f) && near(px.out[2], 0.002f, 5e-4f));
+  }
+  // Night (Windfall 21:00): K = actor_k0 x 1.0.
+  gxc::HdActorLightConstants night = day;
+  const float night_c0[3] = {0.118f, 0.310f, 0.314f}, night_sh[3] = {0.f, 0.157f, 0.353f},
+              night_k[3] = {0.188f, 0.392f, 0.529f};
+  for (int i = 0; i < 3; ++i) {
+    night.c0[i] = night_c0[i];
+    night.shadow[i] = night_sh[i];
+    night.k[i] = night_k[i];
+  }
+  // 2570,1340 shirt back, lit: K x albedo exactly.
+  {
+    const float shirt[3] = {0.930f, 0.961f, 0.617f};
+    const auto px = run(night, 0.635f, 1.f, hd_ramp_table, 0.f, 0.f, shirt);
+    CHECK(px.ramp == 1.f);
+    CHECK(near(px.out[0], 0.175f, 1e-3f) && near(px.out[1], 0.377f, 1e-3f) && near(px.out[2], 0.327f, 1e-3f));
+  }
+  // 2340,1400 sleeve, lit at the silhouette: K x (albedo + hemi x 2 x 0.25), the rim at its least (the moon
+  // behind the camera: rev 0.25).
+  {
+    const float sleeve[3] = {0.063f, 0.175f, 0.387f};
+    const float t = (0.034f - 0.118f) / (0.f - 0.118f);
+    float gamma[3];
+    for (int i = 0; i < 3; ++i)
+      gamma[i] = std::pow(sleeve[i], 1.f / 2.2f);
+    auto px = gxc::hd_actor_light_reference(night, 0.909f, 1.f, hd_ramp_table, up_for(t), 0.f, -0.5f, gamma);
+    CHECK(near(px.rim, 0.25f, 1e-5f));
+    CHECK(near(std::pow(px.out[0], 2.2f), 0.0150f, 3e-4f));
+    CHECK(near(std::pow(px.out[1], 2.2f), 0.1079f, 1e-3f));
+    CHECK(near(std::pow(px.out[2], 2.2f), 0.2952f, 1e-3f));
+  }
+}
+
+// Wind Waker HD's light buffer (drafts/hd-look-remaining/CAPTURES-NOV3-READ-lights.md): its light pass's sum, and
+// the characters' 1.75 x it on the light, against Link's hair under a Windfall lamp at 21:00 (Cemu s07, event 4352,
+// pixel 2499,1017: ramp 0, hemi (0.0205, 0.1835, 0.3461), the buffer (0.2228, 0.1480, 0.0443), albedo
+// (1, 0.863, 0.005); stored (0.4105, 0.3831, 0.0043), the rim the rest).
+void test_point_light_reference() {
+  const auto near = [](float a, float b, float tol) { return std::fabs(a - b) <= tol; };
+  gxc::HdPointLights lights{};
+  // A lamp (600, 400, 120) / 255 at r 381.3, 200 units off along the normal, and one behind the surface.
+  lights.count[0] = 2.f;
+  lights.pos_r[0][0] = 0.f;
+  lights.pos_r[0][1] = 0.f;
+  lights.pos_r[0][2] = 200.f;
+  lights.pos_r[0][3] = 381.3f;
+  lights.colour[0][0] = 600.f / 255.f;
+  lights.colour[0][1] = 400.f / 255.f;
+  lights.colour[0][2] = 120.f / 255.f;
+  lights.pos_r[1][2] = -100.f;
+  lights.pos_r[1][3] = 1000.f;
+  lights.colour[1][0] = lights.colour[1][1] = lights.colour[1][2] = 1.f;
+  const float p[3] = {0.f, 0.f, 0.f}, n[3] = {0.f, 0.f, 1.f};
+  float sum[3];
+  gxc::hd_point_light_reference(lights, p, n, sum);
+  const float fall = std::pow(1.f - 200.f / 381.3f, 1.5f);
+  CHECK(near(sum[0], 600.f / 255.f * fall, 1e-5f) && near(sum[1], 400.f / 255.f * fall, 1e-5f) &&
+        near(sum[2], 120.f / 255.f * fall, 1e-5f));
+  // At 45 degrees, N.L 0.707; out of reach, nothing.
+  lights.count[0] = 1.f;
+  lights.pos_r[0][0] = 100.f;
+  lights.pos_r[0][2] = 100.f;
+  gxc::hd_point_light_reference(lights, p, n, sum);
+  CHECK(near(sum[0], 600.f / 255.f * std::sqrt(0.5f) * std::pow(1.f - std::sqrt(20000.f) / 381.3f, 1.5f), 1e-5f));
+  lights.pos_r[0][3] = 100.f;
+  gxc::hd_point_light_reference(lights, p, n, sum);
+  CHECK(sum[0] == 0.f && sum[1] == 0.f && sum[2] == 0.f);
+  // Link's hair: hemi (c0 at n_up -1), ramp 0, the buffer x 1.75 on the light; no rim at N.E -1.
+  gxc::HdActorLightConstants c{};
+  c.params[0] = 1.f;
+  const float hemi[3] = {0.0205f, 0.1835f, 0.3461f};
+  for (int i = 0; i < 3; ++i) {
+    c.c0[i] = hemi[i];
+    c.shadow[i] = 0.f;
+    c.k[i] = 1.f;
+  }
+  c.rim[0] = 2.f;
+  c.rim[1] = 5.f;
+  c.rim[2] = 0.75f;
+  const float buffer[3] = {0.2228f, 0.1480f, 0.0443f};
+  float gamma[3];
+  const float albedo[3] = {1.f, 0.863f, 0.005f};
+  for (int i = 0; i < 3; ++i)
+    gamma[i] = std::pow(albedo[i], 1.f / 2.2f);
+  const auto zero = [](float) { return 0.f; };
+  const auto px = gxc::hd_actor_light_reference(c, 0.f, 1.f, zero, -1.f, -1.f, 0.f, gamma, 1.f, true, buffer);
+  CHECK(near(px.light[0], 0.410f, 1e-3f) && near(px.light[1], 0.442f, 1e-3f) && near(px.light[2], 0.424f, 1e-3f));
+  CHECK(near(std::pow(px.out[0], 2.2f), 0.410f, 2e-3f) && near(std::pow(px.out[1], 2.2f), 0.383f, 2e-3f) &&
+        near(std::pow(px.out[2], 2.2f), 0.002f, 1e-3f));
+  // Without the buffer, the shade alone (0.02 in red).
+  const auto off = gxc::hd_actor_light_reference(c, 0.f, 1.f, zero, -1.f, -1.f, 0.f, gamma, 1.f, true);
+  CHECK(near(off.light[0], 0.0205f, 1e-4f));
+}
+
+// Wind Waker HD's light buffer on the lit scenery: the GameCube's stage 0 light, lerp(C0, KONST, RASC) from colour
+// channel 0, then the texture x PREV (the field terrain's and the dungeon rooms' materials).
+gxc::ShaderKey scenery_key() {
+  gxc::ShaderKey key{};
+  key.num_tex_gens = 1;
+  key.uv_mask = 1;
+  key.textured = 1;
+  key.tev_valid = 1;
+  key.num_tev_stages = 2;
+  key.num_color_chans = 1;
+  key.has_color0 = 1;
+  key.chan_captured_mask = 0x5;
+  key.tex_gens[0].enabled = 1;
+  key.tex_gens[0].texgentype = static_cast<std::uint8_t>(gxc::TexGenType::Regular);
+  key.tex_gens[0].sourcerow = 5;
+  auto& s0 = key.tev_stages[0];
+  s0.cc_a = 2;
+  s0.cc_b = 14;
+  s0.cc_c = 10;
+  s0.cc_d = 15;
+  s0.cc_clamp = 1;
+  s0.ac_a = 7;
+  s0.ac_b = 7;
+  s0.ac_c = 7;
+  s0.ac_d = 5;
+  s0.ksel_kc = 12;
+  s0.tevorders_enable = 1;
+  s0.tevorders_colorchan = 0;
+  for (int i = 0; i < 4; ++i)
+    s0.ras_swap[i] = s0.tex_swap[i] = static_cast<std::uint8_t>(i);
+  auto& s1 = key.tev_stages[1];
+  s1 = s0;
+  s1.cc_a = 15;
+  s1.cc_b = 8;
+  s1.cc_c = 0;
+  s1.cc_d = 15;
+  s1.ac_d = 0;
+  return key;
+}
+
+void test_point_light_scenery() {
+  auto key = scenery_key();
+  CHECK(gxc::hd_point_light_stage(key));
+  // Not when a later stage reads C0, nor for another stage 0.
+  {
+    auto c0 = key;
+    c0.tev_stages[1].cc_d = 2;
+    CHECK(!gxc::hd_point_light_stage(c0));
+    auto other = key;
+    other.tev_stages[0].cc_c = 8;
+    CHECK(!gxc::hd_point_light_stage(other));
+    auto chan1 = key;
+    chan1.tev_stages[0].tevorders_colorchan = 1;
+    CHECK(!gxc::hd_point_light_stage(chan1));
+  }
+  // Unflagged: no lights in the module.
+  const std::string gx = gxc::generate_wgsl(key);
+  CHECK(gx.find("hdp") == std::string::npos);
+  key.hd_point_light = 1;
+  const std::string w = gxc::generate_wgsl(key);
+  if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
+    std::printf("%s\n", w.c_str());
+  CHECK(w.find("@group(0) @binding(7) var<uniform> hdp: HdPointLights;") != std::string::npos);
+  CHECK(w.find("hdl") == std::string::npos);
+  // The view-space position after the texcoord (color0 0, color1 1, uv 2); no vertex normal: the triangle's, worked
+  // out before any branch.
+  CHECK(w.find("@location(3) hd_pv: vec3f,") != std::string::npos);
+  CHECK(w.find("hd_nv") == std::string::npos);
+  CHECK(w.find("o.hd_pv = viewpos.xyz;") != std::string::npos);
+  const auto main_at = w.find("fn fs_main(");
+  const auto n_at = w.find("var hd_sn = normalize(cross(dpdy(in.hd_pv), dpdx(in.hd_pv)));");
+  const auto stage1_at = w.find("// TEV stage 1");
+  const auto add_at = w.find("let hd_pl = hdp.count.z * hd_point_sum(in.hd_pv, hd_sn);");
+  CHECK(main_at != std::string::npos && n_at != std::string::npos && stage1_at != std::string::npos &&
+        add_at != std::string::npos);
+  CHECK(main_at < n_at && n_at < add_at && add_at < stage1_at);
+  {
+    const std::string head = w.substr(main_at, n_at - main_at);
+    CHECK(head.find("if (") == std::string::npos && head.find("discard") == std::string::npos);
+  }
+  // In linear, on stage 0's light, clipped at the channel's 8 bits.
+  CHECK(w.find("let hd_lit = pow(clamp(vec3f(prev.rgb) / 255.0, vec3f(0.0), vec3f(1.0)), vec3f(2.2)) + hd_pl;") !=
+        std::string::npos);
+  // A lit channel with a vertex normal: that normal.
+  auto lit = key;
+  lit.lit_valid = 1;
+  lit.has_vertex_normal = 1;
+  lit.litchan[0].enablelighting = 1;
+  lit.litchan[0].light_mask = 1;
+  const std::string wl = gxc::generate_wgsl(lit);
+  CHECK(wl.find("@location(4) hd_nv: vec3f,") != std::string::npos);
+  CHECK(wl.find("o.hd_nv = _normal;") != std::string::npos);
+  CHECK(wl.find("let hd_sn = normalize(in.hd_nv);") != std::string::npos);
+  CHECK(wl.find("dpdy(in.hd_pv)") == std::string::npos);
+  // The smooth normals made for the sun shadows (2): the vertex's normal slot, turned by the position matrix.
+  auto smooth = key;
+  smooth.hd_point_light = 2;
+  const std::string ws = gxc::generate_wgsl(smooth);
+  CHECK(ws.find("@location(8) rawnormal: vec3f,") != std::string::npos);
+  CHECK(ws.find("o.hd_nv = vec3f(dot(p0.xyz, in.rawnormal), dot(p1.xyz, in.rawnormal), dot(p2.xyz, in.rawnormal));") !=
+        std::string::npos);
+  CHECK(ws.find("let hd_sn = normalize(in.hd_nv);") != std::string::npos);
+  CHECK(ws.find("hd_em") == std::string::npos);
+  // Wind Waker HD's lava glow (4, with the smooth normals): colour 1 passed on after the normal, and its light times
+  // the last stage's texel added after the stages, in linear, where its alpha marks it.
+  auto lava = smooth;
+  lava.hd_point_light = 6;
+  const std::string wv = gxc::generate_wgsl(lava);
+  if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
+    std::printf("%s\n", wv.c_str());
+  CHECK(wv.find("@location(5) hd_em: vec4f,") != std::string::npos);
+  CHECK(wv.find("o.hd_em = in.rawcolor1;") != std::string::npos);
+  CHECK(wv.find("o.hd_nv = vec3f(dot(p0.xyz, in.rawnormal)") != std::string::npos);
+  const auto glow_at = wv.find("hd_alb * in.hd_em.rgb");
+  const auto last_at = wv.find("// TEV stage 1");
+  const auto alpha_at = wv.find("discard");
+  CHECK(glow_at != std::string::npos && last_at != std::string::npos && alpha_at != std::string::npos);
+  CHECK(last_at < glow_at && glow_at < alpha_at);
+  CHECK(wv.find("if (in.hd_em.a < -0.5) {") != std::string::npos);
+  // Dragon Roost Cavern's three stages (a third PREV + C1 x APREV, the GameCube's own glow, untextured): the glow
+  // once, after stage 1, on its texel, before stage 2 (whose texel is white).
+  auto lava3 = lava;
+  lava3.num_tev_stages = 3;
+  auto& s2 = lava3.tev_stages[2];
+  s2 = lava3.tev_stages[1];
+  s2.cc_a = 15;
+  s2.cc_b = 4;
+  s2.cc_c = 1;
+  s2.cc_d = 0;
+  s2.tevorders_enable = 0;
+  CHECK(gxc::hd_point_light_stage(lava3));
+  const std::string w3 = gxc::generate_wgsl(lava3);
+  if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
+    std::printf("%s\n", w3.c_str());
+  const auto glow3_at = w3.find("hd_alb * in.hd_em.rgb");
+  const auto s1_at = w3.find("// TEV stage 1");
+  const auto s2_at = w3.find("// TEV stage 2");
+  CHECK(glow3_at != std::string::npos && s1_at != std::string::npos && s2_at != std::string::npos);
+  CHECK(s1_at < glow3_at && glow3_at < s2_at);
+  CHECK(w3.find("hd_alb * in.hd_em.rgb", glow3_at + 1) == std::string::npos);
+  CHECK(w3.find("textemp = vec4i(255,255,255,255);", s2_at) != std::string::npos);
+  // Two stages: still after the last.
+  CHECK(wv.find("hd_alb * in.hd_em.rgb", glow_at + 1) == std::string::npos);
+}
+
+// The Tower of the Gods' water floor (as BlueWake draws it in room 0): KONST + C0 x TEXC into C2 (alpha RASA x TEXA),
+// KONST x TEXC from the other texcoord, then PREV x (1 - APREV) + C2. Flagged (hd_water), Wind Waker HD's sum in
+// linear light on its 8-bit linear colours replaces the GX colour after the stages, before the alpha test and fog.
+gxc::ShaderKey water_key() {
+  auto key = scenery_key();
+  key.num_tex_gens = 2;
+  key.uv_mask = 3;
+  key.tex_gens[1] = key.tex_gens[0];
+  key.num_tev_stages = 3;
+  auto& s0 = key.tev_stages[0];
+  s0.cc_a = 15, s0.cc_b = 2, s0.cc_c = 8, s0.cc_d = 14, s0.cc_dest = 3;
+  s0.ac_a = 7, s0.ac_b = 5, s0.ac_c = 4, s0.ac_d = 7, s0.ac_dest = 0, s0.ac_clamp = 1;
+  s0.ksel_kc = 12;
+  auto& s1 = key.tev_stages[1];
+  s1 = s0;
+  s1.tevorders_texcoord = 1;
+  s1.tevorders_texmap = 1;
+  s1.tevorders_colorchan = 7;
+  s1.cc_a = 15, s1.cc_b = 14, s1.cc_c = 8, s1.cc_d = 15, s1.cc_dest = 0;
+  s1.ac_a = 7, s1.ac_b = 7, s1.ac_c = 7, s1.ac_d = 0;
+  auto& s2 = key.tev_stages[2];
+  s2 = s1;
+  s2.tevorders_enable = 0;
+  s2.tevorders_texmap = 7;
+  s2.cc_a = 0, s2.cc_b = 15, s2.cc_c = 1, s2.cc_d = 6;
+  s2.ac_a = 7, s2.ac_b = 6, s2.ac_c = 0, s2.ac_d = 7;
+  s2.ksel_ka = 31;
+  return key;
+}
+
+void test_water_floor() {
+  auto key = water_key();
+  CHECK(gxc::hd_water_floor_stage(key));
+  CHECK(!gxc::hd_point_light_stage(key));
+  {
+    auto other = key;
+    other.tev_stages[2].cc_d = 4; // + C1, not C2
+    CHECK(!gxc::hd_water_floor_stage(other));
+    auto two = key;
+    two.num_tev_stages = 2;
+    CHECK(!gxc::hd_water_floor_stage(two));
+    auto konst = key;
+    konst.tev_stages[1].ksel_kc = 13; // another konst colour for the second layer
+    CHECK(!gxc::hd_water_floor_stage(konst));
+    auto scaled = key;
+    scaled.tev_stages[0].cc_scale = 1;
+    CHECK(!gxc::hd_water_floor_stage(scaled));
+    auto alpha = key;
+    alpha.tev_stages[0].ac_b = 7; // a not from the vertex alpha
+    CHECK(!gxc::hd_water_floor_stage(alpha));
+  }
+  // Unflagged: the GameCube's sum as before.
+  const std::string gx = gxc::generate_wgsl(key);
+  CHECK(gx.find("hd_w") == std::string::npos);
+  key.hd_water = 1;
+  const std::string w = gxc::generate_wgsl(key);
+  if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
+    std::printf("%s\n", w.c_str());
+  const auto s1_at = w.find("// TEV stage 1");
+  const auto s2_at = w.find("// TEV stage 2");
+  const auto t0_at = w.find("let hd_wt0 = vec3f(textemp.rgb & vec3i(255, 255, 255)) / 255.0;");
+  const auto a_at = w.find("let hd_wa = f32(rastemp.a & 255) * f32(textemp.a & 255) / 65025.0;");
+  const auto t1_at = w.find("let hd_wt1 = vec3f(textemp.rgb & vec3i(255, 255, 255)) / 255.0;");
+  const auto k_at = w.find("let hd_wk = round(pow(vec3f(psc.kcolors[0].rgb & vec3i(255, 255, 255)) / 255.0, "
+                           "vec3f(2.2)) * 255.0) / 255.0;");
+  const auto sum_at = w.find("clamp(hd_wk * hd_wt1, vec3f(0.0), vec3f(1.0)) * (1.0 - hd_wa)");
+  const auto out_at = w.find("prev = vec4i(vec3i(round(pow(hd_wx, vec3f(1.0 / 2.2)) * 255.0)), prev.a);");
+  const auto discard_at = w.find("discard");
+  CHECK(s1_at != std::string::npos && s2_at != std::string::npos && t0_at != std::string::npos &&
+        a_at != std::string::npos && t1_at != std::string::npos && k_at != std::string::npos &&
+        sum_at != std::string::npos && out_at != std::string::npos && discard_at != std::string::npos);
+  CHECK(t0_at < s1_at && a_at < s1_at && s1_at < t1_at && t1_at < s2_at && s2_at < k_at && k_at < sum_at &&
+        sum_at < out_at && out_at < discard_at);
+  CHECK(w.find("hdp") == std::string::npos && w.find("hdl") == std::string::npos);
+  // Byte for byte the GameCube's module apart from the HD block.
+  CHECK(w.size() > gx.size());
 }
 
 // Dolphin VertexShaderGen SourceRow::Normal: use the raw normal only when the
@@ -2034,6 +2933,48 @@ void test_fog() {
                                    gxc::FogProjection::Perspective, false))
             .find("// Fog (Dolphin WriteFog)") == std::string::npos);
 
+  // Wind Waker HD's fog curve (hd_fog): linear fog squared after the clamp,
+  // then mixed in linear light in place of the integer blend; unflagged, the
+  // module is as it was; the other curves keep theirs.
+  {
+    auto key = fog_key(gxc::FogType::Linear, gxc::FogProjection::Perspective, true);
+    const std::string gc = gxc::generate_wgsl(key);
+    key.hd_fog = 1;
+    const std::string hd = gxc::generate_wgsl(key);
+    const char* square = "    fogv = fogv * fogv; // Wind Waker HD's fog curve\n";
+    CHECK(gc.find("fogv * fogv") == std::string::npos);
+    CHECK(hd != gc);
+    const auto clamp_at = hd.find("var fogv = clamp(ze - psc.fogf.y, 0.0, 1.0);");
+    const auto square_at = hd.find(square);
+    CHECK(clamp_at != std::string::npos && square_at != std::string::npos && clamp_at < square_at);
+    const char* mix_lin = "    let fog_p = vec3f(clamp(prev.rgb, vec3i(0), vec3i(255))) / 255.0;\n";
+    const char* mix_end = "    prev = vec4i(vec3i(round(fog_out * 255.0)), prev.a);\n";
+    const char* blend = "    let ifog = i32(round(fogv * 256.0));\n"
+                        "    prev = vec4i((prev.rgb * (256 - ifog) + psc.fogcolor.rgb * ifog) >> vec3u(8u), prev.a);\n";
+    const auto mix_at = hd.find(mix_lin);
+    const auto end_at = hd.find(mix_end);
+    CHECK(mix_at != std::string::npos && square_at < mix_at && mix_at < end_at && end_at != std::string::npos);
+    CHECK(hd.find("let fog_lin = mix(select(pow((fog_p + 0.055) / 1.055, vec3f(2.4))", mix_at) < end_at);
+    CHECK(hd.find("1.055 * pow(fog_lin, vec3f(1.0 / 2.4)) - 0.055", mix_at) < end_at);
+    CHECK(hd.find("let ifog = i32(round(fogv * 256.0));") == std::string::npos);
+    // Only those lines differ: the square, and the linear mix in place of the integer blend.
+    std::string back = hd;
+    back.replace(mix_at, end_at + std::strlen(mix_end) - mix_at, blend);
+    back.erase(square_at, std::strlen(square));
+    CHECK(back == gc);
+    auto exp = fog_key(gxc::FogType::Exp, gxc::FogProjection::Perspective, false);
+    const std::string exp_gc = gxc::generate_wgsl(exp);
+    exp.hd_fog = 1;
+    CHECK(gxc::generate_wgsl(exp) == exp_gc);
+    // The ubershader reads the bit from the key.
+    const std::string uber = gxc::generate_uber_wgsl(false);
+    CHECK(uber.find("const K_hd_fog: u32 = ") != std::string::npos);
+    const auto uber_hd = uber.find("else if (kb(K_hd_fog) != 0u) {");
+    CHECK(uber_hd != std::string::npos);
+    CHECK(uber.find("fogv = fogv * fogv;", uber_hd) < uber.find("let fog_lin = mix(", uber_hd));
+    CHECK(uber.find("return vec4i(vec3i(round(fog_out * 255.0)), prev.a);", uber_hd) != std::string::npos);
+  }
+
   // --- Plan uniforms decoded from BP fog registers (state path) ------------
   gxc::GxCoreState state;
   state.reset();
@@ -2124,6 +3065,67 @@ void test_fog() {
   CHECK(plan.pixel_constants.fogrange[0][1] == 8.0f);
   CHECK(plan.pixel_constants.fogrange[2][1] == 8.0f); // index 9 (K[4].HI)
   CHECK(counters.fog_ignored == 0);
+  // The host's draw list mark (kDrawListRegister): unmarked and BG lists cast in every sun cascade, any other list
+  // only in the first two; the mark stays until written again.
+  CHECK(plan.far_caster);
+  state.apply(bp(gxc::GxCoreState::kDrawListRegister, 1u));
+  CHECK(!state.build_draw_plan(draw, counters).far_caster);
+  state.forget_draw_tag();
+  CHECK(!state.build_draw_plan(draw, counters).far_caster);
+  state.apply(bp(gxc::GxCoreState::kDrawListRegister, 0u));
+  CHECK(state.build_draw_plan(draw, counters).far_caster);
+}
+
+// Wind Waker HD's fog start before the camera (gxc::fog_start_before_camera()): a draw fogged from a start of 0 to
+// the given end gets GXSetFog's A and C for HD's start to the same end; other draws are left alone.
+void test_fog_start_before_camera() {
+  const float n = 1.f, f = 200000.f;
+  // GXSetFog's terms, as the SDK stores them (a = A / 2^shift, b = B x 2^23 / 2^(shift - 1)).
+  auto set_fog = [&](gxc::PixelShaderConstants& pc, float s, float e) {
+    const float A = (f * n) / ((f - n) * (e - s)), C = s / (e - s);
+    float B = f / (f - n);
+    int shift = 0;
+    while (B > 0.5f) {
+      B *= 0.5f;
+      ++shift;
+    }
+    pc.fogf[0] = A / static_cast<float>(1 << (shift + 1));
+    pc.fogf[1] = C;
+    pc.fogi[1] = static_cast<std::int32_t>(8.388638e6f * B);
+    pc.fogi[3] = shift + 1;
+  };
+  float proj[4][4]{};
+  proj[0][0] = 1.f;
+  proj[1][1] = 1.f;
+  proj[2][2] = -n / (f - n);
+  proj[2][3] = -(f * n) / (f - n);
+  proj[3][2] = -1.f;
+  gxc::ShaderKey key{};
+  key.fog_fsel = static_cast<std::uint8_t>(gxc::FogType::Linear);
+  key.fog_proj = static_cast<std::uint8_t>(gxc::FogProjection::Perspective);
+  gxc::PixelShaderConstants pc{}, want{};
+  set_fog(pc, 0.f, 8000.f);
+  set_fog(want, -1000.f, 8000.f);
+  CHECK(gxc::fog_start_before_camera(pc, key, proj, -1000.f, 8000.f));
+  CHECK(std::abs(pc.fogf[0] / want.fogf[0] - 1.f) < 1e-4f);
+  CHECK(std::abs(pc.fogf[1] - want.fogf[1]) < 1e-4f);
+  CHECK(pc.fogi[1] == want.fogi[1] && pc.fogi[3] == want.fogi[3]);
+  // Not taken: another end, a start already set, a start not below 0, other fog, an orthographic projection.
+  gxc::PixelShaderConstants other{};
+  set_fog(other, 0.f, 4000.f);
+  CHECK(!gxc::fog_start_before_camera(other, key, proj, -1000.f, 8000.f));
+  set_fog(other, 500.f, 8000.f);
+  CHECK(!gxc::fog_start_before_camera(other, key, proj, -1000.f, 8000.f));
+  set_fog(other, 0.f, 8000.f);
+  CHECK(!gxc::fog_start_before_camera(other, key, proj, 0.f, 8000.f));
+  gxc::ShaderKey exp_key = key;
+  exp_key.fog_fsel = static_cast<std::uint8_t>(gxc::FogType::Exp);
+  CHECK(!gxc::fog_start_before_camera(other, exp_key, proj, -1000.f, 8000.f));
+  float ortho[4][4]{};
+  ortho[3][3] = 1.f;
+  CHECK(!gxc::fog_start_before_camera(other, key, ortho, -1000.f, 8000.f));
+  set_fog(want, 0.f, 8000.f);
+  CHECK(other.fogf[0] == want.fogf[0] && other.fogf[1] == 0.f);
 }
 
 // S16 EFB copy: the GxCoreSink turns a resolved CopyDestination packet into an
@@ -2222,6 +3224,13 @@ int main() {
   test_truncated_vertex_payload();
   test_untextured_defaults();
   test_texgen_color();
+  test_toon_light_classifier();
+  test_toon_light_wgsl();
+  test_toon_light_reference();
+  test_point_light_reference();
+  test_point_light_scenery();
+  test_water_floor();
+  test_toon_light_extended();
   test_texgen_normal_source();
   test_five_texgens();
   test_eight_texgens_dungeon_map();
@@ -2239,6 +3248,7 @@ int main() {
   test_lighting_completeness();
   test_cached_normal();
   test_fog();
+  test_fog_start_before_camera();
   test_efb_copy_sink();
   test_draw_fusion();
   if (g_failures != 0) {

@@ -24,6 +24,9 @@ std::optional<TextureHandle> find_replacement_for_guest(uint32_t width, uint32_t
                                                         const uint8_t* tlut, uint32_t tlut_bytes,
                                                         bool* pending = nullptr) noexcept;
 bool has_source_replacements() noexcept;
+// Changes whenever a replacement is registered or unregistered (a pack's optional/ folder loaded or dropped while
+// running): a renderer's own cache of lookups made before it is stale.
+uint64_t replacement_generation() noexcept;
 // DOL_AURORA_TEXTURE_REPORT_MISSING / texture dumps (testing): the pack file name of a texture the
 // last find_replacement_for_guest call on this thread reported missing (once per texture), else empty.
 std::string take_reported_miss() noexcept;

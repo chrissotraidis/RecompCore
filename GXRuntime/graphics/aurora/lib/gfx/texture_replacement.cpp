@@ -17,6 +17,7 @@
 #include <absl/hash/hash.h>
 
 #include <algorithm>
+#include <atomic>
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
@@ -104,6 +105,16 @@ struct ReplacementKeyHash {
 };
 
 std::mutex s_registryMutex;
+// Bumped by every change to the registered replacements (replacement_generation()).
+std::atomic<uint64_t> s_registryGeneration{0};
+
+// The registered replacements changed: the converted textures cached by GX object (gx.cpp) and by the guest's
+// bytes (gxcore's decode cache, which holds a replacement or the decode it stood for) both go.
+void registry_changed() noexcept {
+  s_registryGeneration.fetch_add(1, std::memory_order_acq_rel);
+  clear_static_texture_cache();
+}
+
 absl::flat_hash_map<aurora::texture::ReplacementKey, std::vector<ReplacementEntry>, ReplacementKeyHash> s_entriesByKey;
 absl::flat_hash_map<aurora::texture::ReplacementKey, SelectedCache, ReplacementKeyHash> s_cacheByKey;
 absl::flat_hash_set<uint64_t> s_failedIds;
@@ -851,8 +862,13 @@ std::mutex s_decodeMutex;
 std::condition_variable s_decodeCv;
 std::deque<DecodeJob> s_decodeQueue;
 absl::flat_hash_set<aurora::texture::ReplacementKey, ReplacementKeyHash> s_decodePending;
-absl::flat_hash_map<aurora::texture::ReplacementKey, std::optional<aurora::gfx::ConvertedTexture>, ReplacementKeyHash>
-    s_decoded;
+// Each decode with the id of the entry it was made from: a key's entry can change while it decodes (an optional/
+// folder dropped or loaded), and the old entry's pixels must not stand for the new one.
+struct Decoded {
+  uint64_t id = 0;
+  std::optional<aurora::gfx::ConvertedTexture> texture;
+};
+absl::flat_hash_map<aurora::texture::ReplacementKey, Decoded, ReplacementKeyHash> s_decoded;
 bool s_decoderStarted = false;
 bool s_decoderStop = false;
 
@@ -869,7 +885,7 @@ void decoder_main() noexcept {
     }
     auto converted = load_file_replacement(job.entry);
     std::lock_guard lk(s_decodeMutex);
-    s_decoded.insert_or_assign(job.key, std::move(converted));
+    s_decoded.insert_or_assign(job.key, Decoded{job.entry.id, std::move(converted)});
   }
 }
 
@@ -1040,7 +1056,7 @@ aurora::texture::ReplacementRegistration register_file_replacement(aurora::textu
   });
   ++s_sourceEntryCount;
   erase_cache_locked(replacementKey);
-  clear_static_texture_cache();
+  registry_changed();
   return registration;
 }
 } // namespace
@@ -1078,7 +1094,7 @@ ReplacementRegistration register_replacement(ReplacementKey key, RawTextureRepla
     ++s_sourceEntryCount;
   }
   erase_cache_locked(key);
-  clear_static_texture_cache();
+  registry_changed();
   return registration;
 }
 
@@ -1106,7 +1122,7 @@ void unregister_replacement(const ReplacementRegistration& registration) {
   if (entries.empty()) {
     s_entriesByKey.erase(it);
   }
-  clear_static_texture_cache();
+  registry_changed();
 }
 
 void unregister_replacements(std::span<const ReplacementRegistration> registrations) {
@@ -1141,13 +1157,13 @@ void unregister_replacements(const ReplacementKey& key) {
   }
   erase_cache_locked(key);
   s_entriesByKey.erase(it);
-  clear_static_texture_cache();
+  registry_changed();
 }
 
 void clear_replacements() {
   std::lock_guard lk(s_registryMutex);
   clear_replacement_runtime_state_locked();
-  clear_static_texture_cache();
+  registry_changed();
 }
 
 ReplacementGroup load_replacement_directory(const std::filesystem::path& root, ReplacementOptions options) {
@@ -1347,6 +1363,8 @@ std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept {
   return format_replacement_filename(key);
 }
 
+uint64_t replacement_generation() noexcept { return s_registryGeneration.load(std::memory_order_acquire); }
+
 bool has_source_replacements() noexcept {
   std::lock_guard lk(s_registryMutex);
   return s_sourceEntryCount != 0;
@@ -1446,11 +1464,14 @@ std::optional<TextureHandle> find_replacement_for_guest(uint32_t width, uint32_t
   {
     std::lock_guard dlk(s_decodeMutex);
     if (auto it = s_decoded.find(*replacementKey); it != s_decoded.end()) {
-      decoded = std::move(it->second);
+      const bool current = it->second.id == entry->id;
+      if (current)
+        decoded = std::move(it->second.texture);
       s_decoded.erase(it);
       s_decodePending.erase(*replacementKey);
-      ready = true;
-    } else if (!s_decodePending.contains(*replacementKey)) {
+      ready = current;
+    }
+    if (!ready && !s_decodePending.contains(*replacementKey)) {
       s_decodePending.insert(*replacementKey);
       s_decodeQueue.push_back(DecodeJob{*replacementKey, *entry});
       if (!s_decoderStarted) {
