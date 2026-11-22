@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <variant>
@@ -58,6 +59,11 @@ void unregister_replacements(std::span<const ReplacementRegistration> registrati
 void unregister_replacements(const ReplacementGroup& group);
 void unregister_replacements(const ReplacementKey& key);
 void clear_replacements();
+
+// The source key a Dolphin-format replacement name stands for
+// ("tex1_WxH[_m]_hash[_tlut]_fmt", with or without .png/.dds), or nothing if
+// the name does not follow that form.
+std::optional<TextureSourceKey> parse_replacement_name(std::string_view name);
 
 ReplacementGroup load_replacement_directory(const std::filesystem::path& root, ReplacementOptions options = {});
 void reload_replacement_directory(const std::filesystem::path& root, ReplacementGroup& group,
