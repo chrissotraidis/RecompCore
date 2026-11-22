@@ -410,8 +410,8 @@ bool dol_aurora_initialize(int argc, char** argv,
             }
         }
         long registered = static_cast<long>(s_texture_pack.registrations.size());
-        for (const auto& group : s_optional)
-            registered += static_cast<long>(group.registrations.size());
+        for (const auto& folder : gx_aurora::g_texture_pack_optional)
+            registered += static_cast<long>(folder.second.registrations.size());
         // DOL_AURORA_TEXTURE_PACK_SKIP: comma-separated replacement names
         // (tex1_WxH_hash[_tlut]_fmt) whose files are not used, so the game's
         // own texture stays: lookup tables a pack should not have replaced
@@ -433,8 +433,8 @@ bool dol_aurora_initialize(int argc, char** argv,
                         files += registration.key == replacementKey ? 1 : 0;
                 };
                 count(s_texture_pack);
-                for (const auto& group : s_optional)
-                    count(group);
+                for (const auto& folder : gx_aurora::g_texture_pack_optional)
+                    count(folder.second);
                 if (files == 0)
                     continue;
                 aurora::texture::unregister_replacements(replacementKey);
