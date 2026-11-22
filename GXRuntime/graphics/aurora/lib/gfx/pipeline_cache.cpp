@@ -1335,7 +1335,12 @@ PipelineRef find_pipeline(ShaderType type, const rmlui::PipelineConfig& config, 
 template <>
 PipelineRef find_pipeline(ShaderType type, const gxcore::PipelineConfig& config, NewPipelineCallback&& cb) {
   bool queuedNew = false;
-  const PipelineRef ref = find_pipeline_impl(type, config, std::move(cb), PipelinePriority::Normal, std::nullopt,
+  // Alpha-only passes can carry data the guest reads back immediately (the
+  // Picto Box's actor ids and their clear). Skipping them on a cold cache
+  // changes gameplay, so wait for these pipelines before recording the draw.
+  const bool alphaOnly = config.key.color_update == 0 && config.key.alpha_update != 0;
+  const auto priority = alphaOnly ? PipelinePriority::Blocking : PipelinePriority::Normal;
+  const PipelineRef ref = find_pipeline_impl(type, config, std::move(cb), priority, std::nullopt,
                                              &queuedNew);
   if (queuedNew) {
     note_gxcore_shader(config, true);
