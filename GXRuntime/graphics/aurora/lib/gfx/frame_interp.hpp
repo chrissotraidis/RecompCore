@@ -34,6 +34,9 @@ namespace aurora::gfx::frame_interp {
 
 bool enabled() noexcept;
 void set_enabled(bool enabled) noexcept;
+// A model's parts, drawn with one matrix, weigh once in the vote for the
+// camera's motion (DOL_AURORA_FRAME_INTERP_OBJECT_VOTES=1; off by default).
+void set_object_votes(bool on) noexcept;
 
 // In-between frames per game frame: 1 (60 Hz from 30) or 3 (120 Hz), at
 // t = step / (steps + 1). A change takes effect at the next game frame;
