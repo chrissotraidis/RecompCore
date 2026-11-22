@@ -49,4 +49,15 @@ int main() {
   assert(encode_efb_copy(1, 0, 1, rgba, 6, 3).empty());
   assert(encode_efb_copy(1, 2, 1, rgba, 7, 3).empty());
   assert(encode_efb_copy(1, UINT32_MAX, UINT32_MAX, rgba, 6, 3).empty());
+
+  // Wind Waker's drawDepth with the Picto Box up: 320x216 RGBA8 24 rows into
+  // its 320x240 buffer.
+  const EfbCopyExtent buffer{0x00624F20u, 307200u, 6u, 320u, 240u};
+  assert(efb_copy_row_within(buffer, {0x0062C720u, 276480u, 6u, 320u, 216u}) == 24);
+  assert(efb_copy_row_within(buffer, buffer) == -1);                                  // the same buffer again
+  assert(efb_copy_row_within(buffer, {0x0062C720u, 276480u, 1u, 320u, 216u}) == -1);  // another format
+  assert(efb_copy_row_within(buffer, {0x0062C720u, 138240u, 6u, 160u, 216u}) == -1);  // another width
+  assert(efb_copy_row_within(buffer, {0x0062C730u, 276480u, 6u, 320u, 216u}) == -1);  // not at a row
+  assert(efb_copy_row_within(buffer, {0x0062C720u, 307200u, 6u, 320u, 240u}) == -1);  // past its end
+  assert(efb_copy_row_within(buffer, {0x0061D720u, 276480u, 6u, 320u, 216u}) == -1);  // before it
 }

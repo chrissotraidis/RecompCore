@@ -54,6 +54,10 @@ void dol_aurora_set_hold_redraw(bool redraw);
 // dropped, so neither the display nor the audio queue holds the guest to real
 // time. The screen keeps the last presented frame.
 void dol_aurora_set_fast_forward(bool on);
+// One of the texture pack's optional/ folders (DOL_AURORA_TEXTURE_PACK_OPTIONAL), loaded over the pack (on) or
+// dropped from it (off) while running, so a look that brings it can be turned off and on in a session. Nothing
+// happens without a pack, for a missing folder, or when it is already as asked.
+void dol_aurora_set_texture_pack_optional(const char* name, bool on);
 
 /* Cumulative main-thread frame timing, for per-second diagnostics: time spent
    waiting for the FIFO translation worker at the guest's GX barriers, time in
@@ -110,6 +114,12 @@ void dol_aurora_gx_drain(void);
 
 // Request recovery on the audio-owning host thread after an OS interruption.
 void dol_aurora_audio_resume(void);
+
+/* The texture replacements Aurora registered from DOL_AURORA_TEXTURE_PACK at
+   start (with the optional folders it loaded, less the files
+   DOL_AURORA_TEXTURE_PACK_SKIP left out), so a menu can say whether a pack
+   really loaded; -1 when no pack was set. Fixed until the app starts again. */
+long dol_aurora_texture_pack_replacements(void);
 
 /* The graphics API Aurora actually chose ("Vulkan", "D3D12", "Metal", "OpenGL",
    "OpenGL ES", ...), or NULL before it started. What was asked for is usually

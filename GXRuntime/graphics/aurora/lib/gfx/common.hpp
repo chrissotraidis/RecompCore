@@ -259,9 +259,12 @@ float calculate_fps() noexcept;
 // Game frames finished a second (each one presents once, or twice with an
 // in-between frame); calculate_fps() counts every present.
 float calculate_game_fps() noexcept;
+// `within`: the texture of an earlier, larger copy whose buffer this copy
+// lands in, `withinY` rows down (its pixels): the copy goes there too, as it
+// would into that buffer's memory.
 void resolve_pass(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                   Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat = GX_TF_RGBA8,
-                  float blurSigma = 0.f, float blurMix = 1.f);
+                  float blurSigma = 0.f, float blurMix = 1.f, TextureHandle within = {}, uint32_t withinY = 0);
 
 struct ColorPassDescriptor {
   const char* label = nullptr;
@@ -381,6 +384,15 @@ const State& get_state();
 void set_next_draw_flat(bool flat) noexcept;
 // Whether the next draw lays a copy of the frame back over it (gxcore_draw).
 void set_next_draw_composite(bool composite) noexcept;
+namespace post_fx {
+struct Monotone;
+}
+// The copy that ends the current pass is the game's grey composite's frame copy in a monotone frame
+// (gxcore_draw.cpp copy_efb_to_texture(), before it calls resolve_pass): the scene's effects and Wind Waker HD's
+// monotone go in at the start of the pass after it, with these parameters, and its bloom after the player's lists.
+// haze: a second texture of the copy's size and format, which the copy is made into again from the frame after the
+// monotone (the draws after it that sample the copy, the heat haze, take it: the frame as it is then), or none.
+void mark_monotone_copy(const post_fx::Monotone& monotone, TextureHandle haze = {}) noexcept;
 
 template <typename DrawData>
 void push_draw_command(DrawData data);

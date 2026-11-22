@@ -17,11 +17,13 @@
 #include <absl/hash/hash.h>
 
 #include <algorithm>
+#include <atomic>
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #endif
 #include <array>
 #include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <list>
@@ -103,6 +105,16 @@ struct ReplacementKeyHash {
 };
 
 std::mutex s_registryMutex;
+// Bumped by every change to the registered replacements (replacement_generation()).
+std::atomic<uint64_t> s_registryGeneration{0};
+
+// The registered replacements changed: the converted textures cached by GX object (gx.cpp) and by the guest's
+// bytes (gxcore's decode cache, which holds a replacement or the decode it stood for) both go.
+void registry_changed() noexcept {
+  s_registryGeneration.fetch_add(1, std::memory_order_acq_rel);
+  clear_static_texture_cache();
+}
+
 absl::flat_hash_map<aurora::texture::ReplacementKey, std::vector<ReplacementEntry>, ReplacementKeyHash> s_entriesByKey;
 absl::flat_hash_map<aurora::texture::ReplacementKey, SelectedCache, ReplacementKeyHash> s_cacheByKey;
 absl::flat_hash_set<uint64_t> s_failedIds;
@@ -850,8 +862,13 @@ std::mutex s_decodeMutex;
 std::condition_variable s_decodeCv;
 std::deque<DecodeJob> s_decodeQueue;
 absl::flat_hash_set<aurora::texture::ReplacementKey, ReplacementKeyHash> s_decodePending;
-absl::flat_hash_map<aurora::texture::ReplacementKey, std::optional<aurora::gfx::ConvertedTexture>, ReplacementKeyHash>
-    s_decoded;
+// Each decode with the id of the entry it was made from: a key's entry can change while it decodes (an optional/
+// folder dropped or loaded), and the old entry's pixels must not stand for the new one.
+struct Decoded {
+  uint64_t id = 0;
+  std::optional<aurora::gfx::ConvertedTexture> texture;
+};
+absl::flat_hash_map<aurora::texture::ReplacementKey, Decoded, ReplacementKeyHash> s_decoded;
 bool s_decoderStarted = false;
 bool s_decoderStop = false;
 
@@ -868,7 +885,7 @@ void decoder_main() noexcept {
     }
     auto converted = load_file_replacement(job.entry);
     std::lock_guard lk(s_decodeMutex);
-    s_decoded.insert_or_assign(job.key, std::move(converted));
+    s_decoded.insert_or_assign(job.key, Decoded{job.entry.id, std::move(converted)});
   }
 }
 
@@ -935,12 +952,30 @@ bool dump_editable_texture_dds(const aurora::texture::TextureSourceKey& key, con
   return aurora::gfx::dds::write_rgba8_dds(path, texWidth, texHeight, pixels.data);
 }
 
+// The pack file name of the texture this thread's last guest lookup reported missing.
+thread_local std::string t_reportedMiss;
+
+int report_missing_level() noexcept {
+  static const int level = [] {
+    const char* env = std::getenv("DOL_AURORA_TEXTURE_REPORT_MISSING");
+    return env != nullptr && env[0] != '\0' ? std::atoi(env) : 0;
+  }();
+  return level;
+}
+
 bool report_missing_key(const aurora::texture::TextureSourceKey& key, const GXTexObj_& obj) noexcept {
   if (!s_reportedMisses.insert(key).second) {
     return false;
   }
 
-  Log.warn("texture_replacement: missing runtime key {}", format_source_key_for_log(key));
+  Log.warn("texture_replacement: missing runtime key {} file={}", format_source_key_for_log(key),
+           format_replacement_filename(key));
+  if (report_missing_level() < 2) {
+    if (aurora::g_config.allowTextureDumps) {
+      dump_editable_texture_dds(key, obj);
+    }
+    return true;
+  }
 
   size_t loggedCandidates = 0;
   size_t omittedCandidates = 0;
@@ -1021,7 +1056,7 @@ aurora::texture::ReplacementRegistration register_file_replacement(aurora::textu
   });
   ++s_sourceEntryCount;
   erase_cache_locked(replacementKey);
-  clear_static_texture_cache();
+  registry_changed();
   return registration;
 }
 } // namespace
@@ -1059,7 +1094,7 @@ ReplacementRegistration register_replacement(ReplacementKey key, RawTextureRepla
     ++s_sourceEntryCount;
   }
   erase_cache_locked(key);
-  clear_static_texture_cache();
+  registry_changed();
   return registration;
 }
 
@@ -1087,7 +1122,7 @@ void unregister_replacement(const ReplacementRegistration& registration) {
   if (entries.empty()) {
     s_entriesByKey.erase(it);
   }
-  clear_static_texture_cache();
+  registry_changed();
 }
 
 void unregister_replacements(std::span<const ReplacementRegistration> registrations) {
@@ -1097,6 +1132,15 @@ void unregister_replacements(std::span<const ReplacementRegistration> registrati
 }
 
 void unregister_replacements(const ReplacementGroup& group) { unregister_replacements(group.registrations); }
+
+std::optional<TextureSourceKey> parse_replacement_name(std::string_view name) {
+  if (name.ends_with(".dds") || name.ends_with(".png") || name.ends_with(".DDS") || name.ends_with(".PNG")) {
+    return parse_replacement_filename(name);
+  }
+  std::string withExtension{name};
+  withExtension += ".dds";
+  return parse_replacement_filename(withExtension);
+}
 
 void unregister_replacements(const ReplacementKey& key) {
   std::lock_guard lk(s_registryMutex);
@@ -1113,13 +1157,13 @@ void unregister_replacements(const ReplacementKey& key) {
   }
   erase_cache_locked(key);
   s_entriesByKey.erase(it);
-  clear_static_texture_cache();
+  registry_changed();
 }
 
 void clear_replacements() {
   std::lock_guard lk(s_registryMutex);
   clear_replacement_runtime_state_locked();
-  clear_static_texture_cache();
+  registry_changed();
 }
 
 ReplacementGroup load_replacement_directory(const std::filesystem::path& root, ReplacementOptions options) {
@@ -1256,8 +1300,12 @@ std::optional<TextureHandle> find_source_replacement_locked(const GXTexObj_& obj
                                                             const texture::TextureSourceKey& sourceKey) noexcept {
   const auto replacementKey = find_source_replacement_key_locked(sourceKey);
   if (!replacementKey.has_value()) {
-    // Enable for debugging
-    // report_missing_key(sourceKey, obj);
+    // DOL_AURORA_TEXTURE_REPORT_MISSING=1 logs each texture the pack has no
+    // replacement for, once (2 adds the pack's nearest candidates); texture
+    // dumps write the missing ones as editable DDS files.
+    if (report_missing_level() != 0 || g_config.allowTextureDumps) {
+      report_missing_key(sourceKey, obj);
+    }
     return std::nullopt;
   }
 
@@ -1315,9 +1363,28 @@ std::string build_texture_replacement_name(const GXTexObj_& obj) noexcept {
   return format_replacement_filename(key);
 }
 
+uint64_t replacement_generation() noexcept { return s_registryGeneration.load(std::memory_order_acquire); }
+
 bool has_source_replacements() noexcept {
   std::lock_guard lk(s_registryMutex);
   return s_sourceEntryCount != 0;
+}
+
+std::string take_reported_miss() noexcept {
+  std::string name;
+  name.swap(t_reportedMiss);
+  return name;
+}
+
+bool dump_missing_rgba(const std::string& name, uint32_t width, uint32_t height, const uint8_t* rgba) noexcept {
+  if (!g_config.allowTextureDumps || name.empty() || rgba == nullptr) {
+    return false;
+  }
+  const auto dumpRoot = std::filesystem::path{reinterpret_cast<const char8_t*>(g_config.cachePath)} / "texture_dumps";
+  std::error_code ec;
+  std::filesystem::create_directories(dumpRoot, ec);
+  return aurora::gfx::dds::write_rgba8_dds(dumpRoot / name, width, height,
+                                           {rgba, size_t(width) * height * 4});
 }
 
 std::optional<TextureHandle> find_replacement_for_guest(uint32_t width, uint32_t height, uint32_t format,
@@ -1373,6 +1440,10 @@ std::optional<TextureHandle> find_replacement_for_guest(uint32_t width, uint32_t
   }
   const auto replacementKey = find_source_replacement_key_locked(key);
   if (!replacementKey.has_value()) {
+    if ((report_missing_level() != 0 || g_config.allowTextureDumps) && s_reportedMisses.insert(key).second) {
+      t_reportedMiss = format_replacement_filename(key);
+      Log.warn("texture_replacement: missing runtime key {} file={}", format_source_key_for_log(key), t_reportedMiss);
+    }
     return std::nullopt;
   }
   static const bool s_sync = std::getenv("DOL_TEXREP_SYNC") != nullptr;
@@ -1393,11 +1464,14 @@ std::optional<TextureHandle> find_replacement_for_guest(uint32_t width, uint32_t
   {
     std::lock_guard dlk(s_decodeMutex);
     if (auto it = s_decoded.find(*replacementKey); it != s_decoded.end()) {
-      decoded = std::move(it->second);
+      const bool current = it->second.id == entry->id;
+      if (current)
+        decoded = std::move(it->second.texture);
       s_decoded.erase(it);
       s_decodePending.erase(*replacementKey);
-      ready = true;
-    } else if (!s_decodePending.contains(*replacementKey)) {
+      ready = current;
+    }
+    if (!ready && !s_decodePending.contains(*replacementKey)) {
       s_decodePending.insert(*replacementKey);
       s_decodeQueue.push_back(DecodeJob{*replacementKey, *entry});
       if (!s_decoderStarted) {

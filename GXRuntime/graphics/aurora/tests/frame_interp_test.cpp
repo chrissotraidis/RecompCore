@@ -108,8 +108,9 @@ static const gxc::VertexShaderConstants* blend_plan(const gxc::DrawPlan& plan, c
 }
 
 int main() {
-  // Pacing at 120 Hz as well, for its checks (unset, 120 Hz is never lowered).
-  setenv("DOL_AURORA_FRAME_INTERP_PACING", "1", 1);
+  // Stepped pacing (the menu's "Step down"), for its checks: 120 Hz and up go down one in-between frame at a time,
+  // 60 and 90 Hz by their rule (unset, 120 Hz is never lowered).
+  setenv("DOL_AURORA_FRAME_INTERP_PACING", "step", 1);
   fi::set_enabled(true);
   const uint64_t kShip = 11, kTree = 22, kHud = 33;
 
@@ -225,6 +226,21 @@ int main() {
     CHECK(fi::frame_verdict());
     fi::end_game_frame();
 
+    // The last heart's beat: a copy behind it grows to 1.65 times its size and
+    // fades. At the next beat the copy is drawn at the heart's size again,
+    // first, and takes the heart's counterpart; the heart is not paired with
+    // the grown copy (its in-between frames drew it that big, once a beat).
+    quad(20.f, 30.f);
+    blend_plan(hud, at(170.f, 40.f)); // the heart
+    quad(33.f, 49.5f);
+    blend_plan(hud, at(163.5f, 30.25f)); // its copy, grown about the same centre
+    fi::end_game_frame();
+    quad(20.f, 30.f);
+    blend_plan(hud, at(170.f, 40.f)); // the copy, back at the heart's size
+    CHECK(blend_plan(hud, at(170.f, 40.f)) == nullptr); // the heart: no counterpart of its size left
+    CHECK(fi::blended_positions() == nullptr);
+    fi::end_game_frame();
+
     // Invalid bounds do not leave a stale interpolated vertex buffer behind.
     hud.constants = at(170.f, 40.f);
     hud.vertices[0] = INFINITY;
@@ -306,6 +322,45 @@ int main() {
       CHECK(near(blended->texmatrices[0][3], 0.02f));
       CHECK(near(blended->texmatrices[3][3], 0.15f));
       CHECK(near(blended->posnormalmatrix[0][3], 2.f));
+    }
+    fi::end_game_frame();
+  }
+
+  // The heat haze: a texgen projecting the position onto the screen (S * P *
+  // M_now) projects what the in-between matrix draws, S * P * M_step; a
+  // projector's (a light's, its q row not the view's depth) is blended as any
+  // texture matrix.
+  {
+    const float screen[3][4] = {{0.75f, 0, -0.5f, 0}, {0, -1.f, -0.5f, 0}, {0, 0, -1.f, 0}};
+    const float light[3][4] = {{0.01f, 0, 0, 0.5f}, {0, 0, 0.01f, 0.5f}, {0.3f, 0, 0.9f, 5.f}};
+    const auto with_texgens = [&](float x) {
+      auto c = draw_at(x, 0, -300, x);
+      for (int r = 0; r < 3; ++r)
+        for (int k = 0; k < 4; ++k) {
+          c.texmatrices[r][k] = screen[r][0] * c.posnormalmatrix[0][k] + screen[r][1] * c.posnormalmatrix[1][k] +
+                                screen[r][2] * c.posnormalmatrix[2][k] + (k == 3 ? screen[r][3] : 0.f);
+          c.texmatrices[3 + r][k] = light[r][k] + x * 0.01f;
+        }
+      return c;
+    };
+    fi::DrawInput haze;
+    haze.key = 4242;
+    haze.positionTexgens = 0b11;
+    fi::blend_draw(haze, with_texgens(0.f));
+    fi::end_game_frame();
+    const auto now = with_texgens(10.f);
+    const auto* blended = fi::blend_draw(haze, now);
+    CHECK(blended != nullptr);
+    if (blended != nullptr) {
+      CHECK(near(blended->posnormalmatrix[0][3], 5.f));
+      for (int r = 0; r < 3; ++r)
+        for (int k = 0; k < 4; ++k) {
+          const float expected = screen[r][0] * blended->posnormalmatrix[0][k] +
+                                 screen[r][1] * blended->posnormalmatrix[1][k] +
+                                 screen[r][2] * blended->posnormalmatrix[2][k] + (k == 3 ? screen[r][3] : 0.f);
+          CHECK(std::fabs(blended->texmatrices[r][k] - expected) < 1e-3f);
+          CHECK(near(blended->texmatrices[3 + r][k], light[r][k] + 0.05f));
+        }
     }
     fi::end_game_frame();
   }
@@ -1397,10 +1452,10 @@ int main() {
     CHECK(fi::draw_key(plan) == 0);
   }
 
-  // Pacing: overloads in 3 of 8 game frames take 120 Hz to 60, and more after
-  // the frames in flight to none; one now and then does nothing. 3 s of calm
-  // brings a level back, and an overload soon after coming back makes the
-  // next wait twice as long.
+  // Pacing at 90 Hz (2 in-between frames, below stepping): overloads in 3 of 8
+  // game frames take it to 60, and more after the frames in flight to none; one
+  // now and then does nothing. 3 s of calm brings a level back, and an overload
+  // soon after coming back makes the next wait twice as long.
   {
     const auto overload_frames = [](int n) {
       for (int i = 0; i < n; ++i) {
@@ -1408,18 +1463,18 @@ int main() {
         fi::end_game_frame();
       }
     };
-    fi::set_steps(3);
+    fi::set_steps(2);
     fi::end_game_frame();
-    CHECK(fi::frame_steps() == 3 && !fi::frame_skipped());
+    CHECK(fi::frame_steps() == 2 && !fi::frame_skipped());
     // Now and then: never a drop.
     for (int i = 0; i < 40; ++i) {
       overload_frames(1);
       for (int j = 0; j < 8; ++j)
         fi::end_game_frame();
     }
-    CHECK(fi::frame_steps() == 3);
+    CHECK(fi::frame_steps() == 2);
     overload_frames(2);
-    CHECK(fi::frame_steps() == 3);
+    CHECK(fi::frame_steps() == 2);
     overload_frames(1);
     CHECK(fi::frame_steps() == 1 && !fi::frame_skipped());
     overload_frames(3); // still the frames in flight: no second drop
@@ -1433,7 +1488,7 @@ int main() {
     CHECK(!fi::frame_skipped() && fi::frame_steps() == 1);
     for (int i = 0; i < 90; ++i)
       fi::end_game_frame();
-    CHECK(fi::frame_steps() == 3);
+    CHECK(fi::frame_steps() == 2);
     overload_frames(3);
     CHECK(fi::frame_steps() == 1);
     for (int i = 0; i < 90; ++i)
@@ -1441,13 +1496,46 @@ int main() {
     CHECK(fi::frame_steps() == 1);
     for (int i = 0; i < 90; ++i)
       fi::end_game_frame();
-    CHECK(fi::frame_steps() == 3);
+    CHECK(fi::frame_steps() == 2);
     // A new setting starts over at it.
     overload_frames(3);
     CHECK(fi::frame_steps() == 1);
     fi::set_steps(1);
     fi::end_game_frame();
     CHECK(fi::frame_steps() == 1 && !fi::frame_skipped());
+  }
+
+  // Pacing at 180 Hz (5 in-between frames): one fewer at a time, a second drop only after two settles (the frames
+  // in flight still report the first), and 3 s of calm bringing one back at a time.
+  {
+    const auto overload_frames = [](int n) {
+      for (int i = 0; i < n; ++i) {
+        fi::note_overload(fi::OverloadCause::RenderWorker, 50.0);
+        fi::end_game_frame();
+      }
+    };
+    fi::set_steps(5);
+    fi::end_game_frame();
+    CHECK(fi::frame_steps() == 5);
+    overload_frames(3);
+    CHECK(fi::frame_steps() == 4 && !fi::frame_skipped());
+    overload_frames(3); // the frames in flight: no second drop yet
+    CHECK(fi::frame_steps() == 4);
+    overload_frames(5); // eight frames after the first drop: the next
+    CHECK(fi::frame_steps() == 3);
+    for (int i = 0; i < 90; ++i)
+      fi::end_game_frame();
+    CHECK(fi::frame_steps() == 4);
+    for (int i = 0; i < 90; ++i)
+      fi::end_game_frame();
+    CHECK(fi::frame_steps() == 5);
+    // 120 Hz (3 in-between frames) steps too: one fewer, not down to 60.
+    fi::set_steps(3);
+    fi::end_game_frame();
+    overload_frames(3);
+    CHECK(fi::frame_steps() == 2 && !fi::frame_skipped());
+    fi::set_steps(1);
+    fi::end_game_frame();
   }
 
   // Stats: each overload counted under its cause with its wait, and pacing's

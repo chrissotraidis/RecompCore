@@ -58,6 +58,9 @@ enum class OverloadCause : uint8_t {
 void note_overload(OverloadCause cause, double waitMs) noexcept;
 const char* overload_reason(OverloadCause cause) noexcept;
 bool frame_skipped() noexcept;
+// DOL_AURORA_FRAME_INTERP_PACING=step (the menu's "Step down", experimental): 120 Hz and up drop one in-between
+// frame at a time, and common.cpp's overload checks leave out a catch-up frame and waits while pipelines compile.
+bool stepped_pacing() noexcept;
 
 // Counts since the start, for attributing missing in-between frames
 // (DOL_AURORA_FRAME_INTERP_STATS=1 logs them each second as [interp-stats]).
@@ -126,6 +129,10 @@ struct DrawInput {
   // A night star (camera_anchored() in frame_interp.cpp): its centre is kept
   // from the camera's eye, and its in-between frames go with the camera.
   bool cameraAnchored = false;
+  // Bit per texgen that maps the vertex's position through its own texture
+  // matrix (position_texgens() in frame_interp.cpp): one that projects onto
+  // the screen follows the in-between position matrix (the heat haze).
+  uint8_t positionTexgens = 0;
 };
 // `positionsWritten`: whether the game wrote an indexed draw's position array
 // this frame or the one before (gxcore_draw's positions_written()). Only such

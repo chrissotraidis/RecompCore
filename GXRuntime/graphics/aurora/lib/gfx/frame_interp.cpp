@@ -1472,8 +1472,25 @@ static bool view_eye(const float view[][4], double eye[3]) noexcept {
   return std::isfinite(eye[0]) && std::isfinite(eye[1]) && std::isfinite(eye[2]);
 }
 
+// Bit per texgen that maps the vertex's position (its source row Geom, a
+// regular texgen) through its own static texture matrix, not one picked per
+// vertex (follow_screen_texgens()).
+uint8_t position_texgens(const gxc::DrawPlan& plan) noexcept {
+  const auto& shader = plan.pipeline.shader;
+  uint8_t mask = 0;
+  for (unsigned i = 0; i < shader.num_tex_gens && i < gxc::kMaxTexGens; ++i) {
+    const auto& texgen = shader.tex_gens[i];
+    const bool perVertex = shader.has_tex_mtx_idx && ((shader.tex_mtx_idx_mask >> i) & 1u);
+    if (texgen.texgentype == static_cast<uint8_t>(gxc::TexGenType::Regular) &&
+        texgen.sourcerow == static_cast<uint8_t>(gxc::TexSourceRow::Geom) && !perVertex)
+      mask |= static_cast<uint8_t>(1u << i);
+  }
+  return mask;
+}
+
 void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritten) noexcept {
   out.key = draw_key_of(plan);
+  out.positionTexgens = position_texgens(plan);
   out.usedMatrixRows = used_matrix_rows(plan);
   out.haveSamples = false;
   out.positions.clear();
@@ -1755,6 +1772,15 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
     // The nearest matching screen rectangle, consumed once. Occurrence can
     // change when a counter reuses a glyph or a heart adds an animated copy.
     // A newly visible digit must not borrow a distant rupee/heart sprite.
+    // Nor one of another size: the last heart beats with a copy of itself
+    // behind it that grows to 1.65 times its size and fades. When the next
+    // beat starts, that copy is drawn at the heart's size again and, drawn
+    // first, takes the heart's own counterpart; the heart was then paired
+    // with the grown copy and its in-between frames drew it that big, once a
+    // beat. A sprite that really grows does it by 1.25 times a frame at most
+    // (the HUD's growing icons), so past 1.4 there is no counterpart: the
+    // sprite is drawn as it is.
+    constexpr double kScreenGrowLimit = 1.4;
     size_t best = candidates;
     double score = HUGE_VAL;
     for (size_t i = 0; i < candidates; ++i) {
@@ -1763,6 +1789,9 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
       const double width = std::min(screenSprite->screenExtent[0], copies[i].screenExtent[0]);
       const double height = std::min(screenSprite->screenExtent[1], copies[i].screenExtent[1]);
       if (!(width > 0.0 && height > 0.0))
+        continue;
+      if (std::max(screenSprite->screenExtent[0], copies[i].screenExtent[0]) > kScreenGrowLimit * width ||
+          std::max(screenSprite->screenExtent[1], copies[i].screenExtent[1]) > kScreenGrowLimit * height)
         continue;
       const double reach = std::max(2.0, 0.2 * std::min(width, height));
       const double dx = screenSprite->screenCenter[0] - copies[i].position[0];
@@ -2176,6 +2205,44 @@ static void blend_pixel(const gxc::PixelShaderConstants& pixel, size_t recorded)
   g_haveBlendedPixel = true;
 }
 
+// A texgen that projects the position onto the screen (its texture matrix T
+// is S * P * M_now for the draw's position matrix M_now: the heat haze's
+// particles read the frame's copy so) projects what the in-between matrix
+// M_step draws: T_step = T_now * M_now^-1 * M_step. Blended or kept as now,
+// the haze read the copy where the real frame's camera put the particle, a
+// step behind the scene it bends. Told apart from a projector's matrix (a
+// light's, the sun shadows') by its q row: S * P's divides by the depth along
+// the view, (0, 0, k, 0).
+void follow_screen_texgens(uint8_t texgens, const gxc::VertexShaderConstants& current,
+                           gxc::VertexShaderConstants& out) {
+  double nowInverse[3][4];
+  if (texgens == 0 || !affine_inverse(current.posnormalmatrix, nowInverse))
+    return;
+  double step[3][4];
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 4; ++c)
+      step[r][c] = out.posnormalmatrix[r][c];
+  for (int t = 0; t < 8; ++t) {
+    if (((texgens >> t) & 1u) == 0)
+      continue;
+    double now[3][4];
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 4; ++c)
+        now[r][c] = current.texmatrices[t * 3 + r][c];
+    double screen[3][4]; // S * P = T_now * M_now^-1
+    affine_multiply(now, nowInverse, screen);
+    const double k = screen[2][2];
+    if (!(std::fabs(k) > 1e-6) || std::fabs(screen[2][0]) > 1e-3 * std::fabs(k) ||
+        std::fabs(screen[2][1]) > 1e-3 * std::fabs(k) || std::fabs(screen[2][3]) > 1e-3 * std::fabs(k))
+      continue;
+    double moved[3][4];
+    affine_multiply(screen, step, moved);
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 4; ++c)
+        out.texmatrices[t * 3 + r][c] = static_cast<float>(moved[r][c]);
+  }
+}
+
 const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::VertexShaderConstants& current,
                                              bool repeatsLastDraw, const gxc::PixelShaderConstants* pixel) {
   g_haveBlendedPositions = false;
@@ -2192,8 +2259,12 @@ const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::
                                                         input.haveSamples ? &input.samples : nullptr,
                                                         input.screenSpace ? &input : nullptr,
                                                         input.haveCentre ? &input : nullptr, pixel);
-  if (result != nullptr)
+  if (result != nullptr) {
     bump(g_blendedBlocks);
+    if (input.usedMatrixRows == 0)
+      for (int step = 0; step < g_frameSteps; ++step)
+        follow_screen_texgens(input.positionTexgens, current, g_blended[step]);
+  }
   g_currentTagged = false;
   g_currentAge = 0;
   if (pixel != nullptr)
@@ -2512,35 +2583,54 @@ static bool slow_game(Pacing& p) {
   return p.slowChecks >= 2;
 }
 
+// DOL_AURORA_FRAME_INTERP_PACING, read once: -1 unset (automatic), 0 never, 1 lowers 120 Hz's too, 2 "step".
+static int pacing_setting() {
+  static const int setting = [] {
+    const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_PACING");
+    if (env == nullptr || env[0] == '\0')
+      return -1;
+    return std::strcmp(env, "step") == 0 ? 2 : env[0] != '0' ? 1 : 0;
+  }();
+  return setting;
+}
+
+bool stepped_pacing() noexcept { return pacing_setting() == 2; }
+
 // Recording thread, between game frames: the next frame's in-between frames.
 // Overloads (the GPU a frame behind, or the game waiting on rendering) in 3 of
-// the last 8 game frames take 60 Hz to none (and 120 Hz to 60, when pacing
-// is asked for there); one now and then (a texture loading, a late drawable)
-// is not a scene too heavy, and dropping on each one put 120 Hz at 60 most
-// times it did not need to be. The frames in
-// flight still report the overload a drop answers, so a second drop waits a
-// few frames. Calm for 3 s brings one level back, and a level that overloads
-// again soon after coming back waits twice as long the next time (up to 30 s),
-// so a scene just too heavy for 120 settles at 60 instead of stuttering
-// between them.
+// the last 8 game frames take 60 and 90 Hz to one in-between frame and then
+// none, and 120 Hz and up (3 in-between frames or more) to one fewer at a
+// time; one now and then (a texture loading, a late drawable) is not a scene
+// too heavy, and dropping on each one put 120 Hz at 60 most times it did not
+// need to be (nor do waits while pipelines compile count: acquire_frame_slot()).
+// The frames in flight still report the overload a drop answers, so a second
+// drop waits a few frames. Calm for 3 s brings one level back, and a level that
+// overloads again soon after coming back waits twice as long the next time (up
+// to 30 s), so a scene just too heavy for a level settles below it instead of
+// stuttering between them.
 static void pace_steps() {
   static constexpr int kCalmStart = 90;  // game frames, 3 s
   static constexpr int kCalmMost = 900;  // 30 s
   static constexpr int kCalmMostSlow = 3600; // 2 min, after the game itself ran slow
   static constexpr uint64_t kSettle = 4; // game frames between drops
   static constexpr uint64_t kSoon = 300; // an overload within 10 s of coming back
-  // DOL_AURORA_FRAME_INTERP_PACING: 0 never lowers them, 1 lowers 120 Hz's
-  // too. Unset, only 60 Hz's are: 120 Hz stays 120, where a drop to 60 for a
-  // stall of a few frames, over by the time it dropped, was felt more than the
-  // stall.
-  static const int setting = [] {
-    const char* env = std::getenv("DOL_AURORA_FRAME_INTERP_PACING");
-    return env != nullptr && env[0] != '\0' ? (env[0] != '0' ? 1 : 0) : -1;
-  }();
+  // DOL_AURORA_FRAME_INTERP_PACING (pacing_setting()): 0 never lowers them (the
+  // menu's "Never pause"), 1 lowers 120 Hz's too. Unset, 120 Hz's aren't: 120 Hz
+  // stays 120, where a drop to 60 for a stall of a few frames, over by the time
+  // it dropped, was felt more than the stall. "step" (the menu's "Step down",
+  // experimental) paces every rate, and three or more (120 Hz and up; 180 Hz's
+  // are 5) go down one at a time, so a drop shows one display refresh in a few
+  // held, not half the rate. Unpaced, a render worker that couldn't keep up
+  // held the game 50-70 ms at a time and never caught up: 180 Hz at render
+  // scale 4 (Hyrule, 26 game frames a second) and 120 Hz at scale 6 and 8
+  // (about 400 hitches a minute, 18-27 game frames a second; stepped, none and
+  // 30).
+  static const int setting = pacing_setting();
   auto& p = g_pacing;
   ++p.frame;
   const int wanted = g_steps.load(std::memory_order_relaxed);
-  const bool pacing = setting == 1 || (setting < 0 && wanted < 3);
+  const bool stepped = setting == 2 && wanted >= 3;
+  const bool pacing = setting >= 1 || (setting < 0 && wanted < 3);
   // The game running slow counts at any number of in-between frames (slow
   // motion is worse than fewer of them) unless pacing is off altogether, or
   // the CPU has threads to spare. The slow-game rule was measured on four
@@ -2567,11 +2657,12 @@ static void pace_steps() {
                .lastEnd = p.lastEnd};
   } else if (sustained) {
     p.calm = 0;
-    if (p.budget > 0 && p.frame - p.lastDrop >= kSettle) {
+    // A step down answers less of the backlog than a drop to one: twice the settle before the next.
+    if (p.budget > 0 && p.frame - p.lastDrop >= (stepped ? 2 * kSettle : kSettle)) {
       if (p.lastRaise != 0 && p.frame - p.lastRaise < kSoon)
         p.calmNeeded = std::min(p.calmNeeded * 2, slow ? kCalmMostSlow : kCalmMost);
       const int before = p.budget;
-      p.budget = p.budget > 1 ? 1 : 0;
+      p.budget = stepped ? p.budget - 1 : p.budget > 1 ? 1 : 0;
       p.lastDrop = p.frame;
       p.recent = 0;
       const int why = g_overloadWhy.load(std::memory_order_relaxed);
@@ -2593,7 +2684,7 @@ static void pace_steps() {
   } else if (p.budget < wanted) {
     if (++p.calm >= p.calmNeeded) {
       const int before = p.budget;
-      p.budget = p.budget == 0 ? 1 : wanted;
+      p.budget = stepped ? p.budget + 1 : p.budget == 0 ? 1 : wanted;
       p.calm = 0;
       p.lastRaise = p.frame;
       bump(g_raises);
