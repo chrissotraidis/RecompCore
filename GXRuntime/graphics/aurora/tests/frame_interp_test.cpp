@@ -226,6 +226,21 @@ int main() {
     CHECK(fi::frame_verdict());
     fi::end_game_frame();
 
+    // The last heart's beat: a copy behind it grows to 1.65 times its size and
+    // fades. At the next beat the copy is drawn at the heart's size again,
+    // first, and takes the heart's counterpart; the heart is not paired with
+    // the grown copy (its in-between frames drew it that big, once a beat).
+    quad(20.f, 30.f);
+    blend_plan(hud, at(170.f, 40.f)); // the heart
+    quad(33.f, 49.5f);
+    blend_plan(hud, at(163.5f, 30.25f)); // its copy, grown about the same centre
+    fi::end_game_frame();
+    quad(20.f, 30.f);
+    blend_plan(hud, at(170.f, 40.f)); // the copy, back at the heart's size
+    CHECK(blend_plan(hud, at(170.f, 40.f)) == nullptr); // the heart: no counterpart of its size left
+    CHECK(fi::blended_positions() == nullptr);
+    fi::end_game_frame();
+
     // Invalid bounds do not leave a stale interpolated vertex buffer behind.
     hud.constants = at(170.f, 40.f);
     hud.vertices[0] = INFINITY;
