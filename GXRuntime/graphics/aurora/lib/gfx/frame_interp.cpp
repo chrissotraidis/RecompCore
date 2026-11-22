@@ -1472,8 +1472,25 @@ static bool view_eye(const float view[][4], double eye[3]) noexcept {
   return std::isfinite(eye[0]) && std::isfinite(eye[1]) && std::isfinite(eye[2]);
 }
 
+// Bit per texgen that maps the vertex's position (its source row Geom, a
+// regular texgen) through its own static texture matrix, not one picked per
+// vertex (follow_screen_texgens()).
+uint8_t position_texgens(const gxc::DrawPlan& plan) noexcept {
+  const auto& shader = plan.pipeline.shader;
+  uint8_t mask = 0;
+  for (unsigned i = 0; i < shader.num_tex_gens && i < gxc::kMaxTexGens; ++i) {
+    const auto& texgen = shader.tex_gens[i];
+    const bool perVertex = shader.has_tex_mtx_idx && ((shader.tex_mtx_idx_mask >> i) & 1u);
+    if (texgen.texgentype == static_cast<uint8_t>(gxc::TexGenType::Regular) &&
+        texgen.sourcerow == static_cast<uint8_t>(gxc::TexSourceRow::Geom) && !perVertex)
+      mask |= static_cast<uint8_t>(1u << i);
+  }
+  return mask;
+}
+
 void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritten) noexcept {
   out.key = draw_key_of(plan);
+  out.positionTexgens = position_texgens(plan);
   out.usedMatrixRows = used_matrix_rows(plan);
   out.haveSamples = false;
   out.positions.clear();
@@ -2176,6 +2193,44 @@ static void blend_pixel(const gxc::PixelShaderConstants& pixel, size_t recorded)
   g_haveBlendedPixel = true;
 }
 
+// A texgen that projects the position onto the screen (its texture matrix T
+// is S * P * M_now for the draw's position matrix M_now: the heat haze's
+// particles read the frame's copy so) projects what the in-between matrix
+// M_step draws: T_step = T_now * M_now^-1 * M_step. Blended or kept as now,
+// the haze read the copy where the real frame's camera put the particle, a
+// step behind the scene it bends. Told apart from a projector's matrix (a
+// light's, the sun shadows') by its q row: S * P's divides by the depth along
+// the view, (0, 0, k, 0).
+void follow_screen_texgens(uint8_t texgens, const gxc::VertexShaderConstants& current,
+                           gxc::VertexShaderConstants& out) {
+  double nowInverse[3][4];
+  if (texgens == 0 || !affine_inverse(current.posnormalmatrix, nowInverse))
+    return;
+  double step[3][4];
+  for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 4; ++c)
+      step[r][c] = out.posnormalmatrix[r][c];
+  for (int t = 0; t < 8; ++t) {
+    if (((texgens >> t) & 1u) == 0)
+      continue;
+    double now[3][4];
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 4; ++c)
+        now[r][c] = current.texmatrices[t * 3 + r][c];
+    double screen[3][4]; // S * P = T_now * M_now^-1
+    affine_multiply(now, nowInverse, screen);
+    const double k = screen[2][2];
+    if (!(std::fabs(k) > 1e-6) || std::fabs(screen[2][0]) > 1e-3 * std::fabs(k) ||
+        std::fabs(screen[2][1]) > 1e-3 * std::fabs(k) || std::fabs(screen[2][3]) > 1e-3 * std::fabs(k))
+      continue;
+    double moved[3][4];
+    affine_multiply(screen, step, moved);
+    for (int r = 0; r < 3; ++r)
+      for (int c = 0; c < 4; ++c)
+        out.texmatrices[t * 3 + r][c] = static_cast<float>(moved[r][c]);
+  }
+}
+
 const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::VertexShaderConstants& current,
                                              bool repeatsLastDraw, const gxc::PixelShaderConstants* pixel) {
   g_haveBlendedPositions = false;
@@ -2192,8 +2247,12 @@ const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::
                                                         input.haveSamples ? &input.samples : nullptr,
                                                         input.screenSpace ? &input : nullptr,
                                                         input.haveCentre ? &input : nullptr, pixel);
-  if (result != nullptr)
+  if (result != nullptr) {
     bump(g_blendedBlocks);
+    if (input.usedMatrixRows == 0)
+      for (int step = 0; step < g_frameSteps; ++step)
+        follow_screen_texgens(input.positionTexgens, current, g_blended[step]);
+  }
   g_currentTagged = false;
   g_currentAge = 0;
   if (pixel != nullptr)
