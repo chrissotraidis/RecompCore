@@ -58,6 +58,9 @@ enum class OverloadCause : uint8_t {
 void note_overload(OverloadCause cause, double waitMs) noexcept;
 const char* overload_reason(OverloadCause cause) noexcept;
 bool frame_skipped() noexcept;
+// DOL_AURORA_FRAME_INTERP_PACING=step (the menu's "Step down", experimental): 120 Hz and up drop one in-between
+// frame at a time, and common.cpp's overload checks leave out a catch-up frame and waits while pipelines compile.
+bool stepped_pacing() noexcept;
 
 // Counts since the start, for attributing missing in-between frames
 // (DOL_AURORA_FRAME_INTERP_STATS=1 logs them each second as [interp-stats]).
