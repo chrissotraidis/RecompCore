@@ -2470,6 +2470,67 @@ static void encode_effect_mask(const wgpu::CommandEncoder& cmd, FramePacket& fra
   static uint64_t clearedFrame = UINT64_MAX;
   const bool clear = clearedFrame != frameKey;
   clearedFrame = frameKey;
+  // The fast mask in one pass: the mask and the pass over white are the same draws with the same blending over
+  // two clears, so both targets are written at once by each effect's two-target variant (DrawData::maskPipeline).
+  // Only when every effect of the pass has its variant ready; otherwise the two passes below, as before.
+  // DOL_AURORA_EFFECT_MASK_SINGLE=0 keeps the two passes (measuring).
+  static const bool singleAllowed = [] {
+    const char* env = std::getenv("DOL_AURORA_EFFECT_MASK_SINGLE");
+    return env == nullptr || env[0] != '0';
+  }();
+  bool single = small && singleAllowed && post_fx::effect_mask_opacity();
+  for (size_t i = 0; single && i < end && i < passInfo.commands.size(); ++i) {
+    const auto& command = passInfo.commands[i];
+    if (command.type != CommandType::Draw || command.data.draw.type != ShaderType::GXCore || command.flat ||
+        !command.data.draw.gxcore.effect)
+      continue;
+    const auto ref = command.data.draw.gxcore.maskPipeline;
+    single = ref != 0 && pipeline_ready(ref);
+  }
+  if (single) {
+    const webgpu::gpu_prof::Zone bothZone{cmd, "Effects mask (both)"};
+    const bool bothOwn = static_cast<bool>(ownDepthView);
+    const auto format = webgpu::g_frameBuffer.texture.GetFormat();
+    const std::array bothAttachments{
+        wgpu::RenderPassColorAttachment{
+            .view = post_fx::effect_mask_target(passInfo.targetSize, format, true),
+            .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+            .storeOp = wgpu::StoreOp::Store,
+            .clearValue = {0.0, 0.0, 0.0, 0.0},
+        },
+        wgpu::RenderPassColorAttachment{
+            .view = post_fx::effect_white_target(passInfo.targetSize, format, true),
+            .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+            .storeOp = wgpu::StoreOp::Store,
+            .clearValue = {1.0, 1.0, 1.0, 1.0},
+        },
+    };
+    const wgpu::RenderPassDepthStencilAttachment bothDepth{
+        .view = bothOwn ? ownDepthView : smallDepthView,
+        .depthLoadOp = wgpu::LoadOp::Load,
+        .depthStoreOp = wgpu::StoreOp::Store,
+    };
+    const wgpu::RenderPassDescriptor bothDescriptor{
+        .label = "Effects mask (both)",
+        .colorAttachmentCount = bothAttachments.size(),
+        .colorAttachments = bothAttachments.data(),
+        .depthStencilAttachment = &bothDepth,
+        .timestampWrites = webgpu::gpu_prof::pass_writes("Effects mask (both)"),
+    };
+    auto bothPass = cmd.BeginRenderPass(&bothDescriptor);
+    g_softScale = 0.5f;
+    gxcore::set_mask_target(true);
+    if (bothOwn) {
+      render_pass(bothPass, frame, passInfo, 0, end, true, 1);
+      render_pass(bothPass, frame, passInfo, 0, end, true, 2);
+    } else {
+      render_pass(bothPass, frame, passInfo, 0, end, true);
+    }
+    gxcore::set_mask_target(false);
+    g_softScale = 1.f;
+    bothPass.End();
+    return;
+  }
   const webgpu::gpu_prof::Zone zone{cmd, "Effects mask"};
   const std::array attachments{wgpu::RenderPassColorAttachment{
       .view = post_fx::effect_mask_target(passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat(), small),
