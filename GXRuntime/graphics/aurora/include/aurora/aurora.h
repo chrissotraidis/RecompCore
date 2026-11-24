@@ -168,6 +168,11 @@ void aurora_set_efficient_effects(bool on);
    scale (the copy blurred on the GPU). Takes effect at the next copy.
    DOL_AURORA_GAME_DOF sets the starting step. */
 void aurora_set_game_dof(int step);
+/* A cheaper blur for step 1 (the full-size copy blurred and mixed half in): the
+   copy is taken down to half size and blended back over itself in one pass,
+   instead of two full-size blur passes and a copy back. Off by default.
+   DOL_AURORA_GAME_DOF_FAST=1 turns it on at start. Takes effect at the next copy. */
+void aurora_set_game_dof_fast(bool on);
 /* How much farther out that blur starts, 0 to 100: 0 leaves it where the game
    puts it (its room's setting or the camera's focus, whichever is farther);
    each step moves it farther by the same factor, twice as far at about 29 and

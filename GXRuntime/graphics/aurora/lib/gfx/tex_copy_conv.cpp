@@ -10,6 +10,8 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 
 #include "texture_convert.hpp"
@@ -793,14 +795,282 @@ void blur_pass(const wgpu::CommandEncoder& cmd, const wgpu::RenderPipeline& pipe
 }
 } // namespace
 
+// --- The fast blur (set_fast_blur; DOL_AURORA_GAME_DOF_FAST) ------------------
+// The same blur for a small sigma at a fraction of the cost: the copy is taken
+// down to half its size with the linear sampler (a 2x2 box), with four side
+// taps for what the box and the stretch back leave of the sigma, and that half
+// is stretched back over the copy itself with the linear sampler, blended in by
+// `mix` (the blend constant). One full-size pass with one sample, against two
+// with 2 * ceil(3 sigma) + 1 texel loads each and a copy back.
+static constexpr std::string_view FastBlurShader = R"(
+@group(0) @binding(0) var samp: sampler;
+@group(0) @binding(1) var src: texture_2d<f32>;
+struct FastBlurParams {
+    side: f32,
+    pad0: f32,
+    pad1: f32,
+    pad2: f32,
+};
+@group(0) @binding(2) var<uniform> params: FastBlurParams;
+
+struct VertexOutput {
+    @builtin(position) pos: vec4f,
+    @location(0) uv: vec2f,
+};
+var<private> positions: array<vec2f, 3> = array(
+    vec2f(-1.0, 1.0),
+    vec2f(-1.0, -3.0),
+    vec2f(3.0, 1.0),
+);
+var<private> uvs: array<vec2f, 3> = array(
+    vec2f(0.0, 0.0),
+    vec2f(0.0, 2.0),
+    vec2f(2.0, 0.0),
+);
+
+@vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
+    var out: VertexOutput;
+    out.pos = vec4f(positions[vi], 0.0, 1.0);
+    out.uv = uvs[vi];
+    return out;
+}
+
+// Into the half-size target: each sample is the box of 2x2 source texels.
+@fragment fn fs_down(in: VertexOutput) -> @location(0) vec4f {
+    let two = 2.0 / vec2f(textureDimensions(src));
+    var c = textureSampleLevel(src, samp, in.uv, 0.0);
+    if (params.side > 0.0) {
+        c += params.side * (textureSampleLevel(src, samp, in.uv + vec2f(two.x, 0.0), 0.0) +
+                            textureSampleLevel(src, samp, in.uv - vec2f(two.x, 0.0), 0.0) +
+                            textureSampleLevel(src, samp, in.uv + vec2f(0.0, two.y), 0.0) +
+                            textureSampleLevel(src, samp, in.uv - vec2f(0.0, two.y), 0.0));
+        c /= 1.0 + 4.0 * params.side;
+    }
+    return c;
+}
+
+// Over the copy, blended by the constant.
+@fragment fn fs_up(in: VertexOutput) -> @location(0) vec4f {
+    return textureSampleLevel(src, samp, in.uv, 0.0);
+}
+)"sv;
+
+namespace {
+struct FastBlurScratch {
+  wgpu::Texture half;
+  wgpu::TextureView halfView;
+  wgpu::Extent3D size;
+  wgpu::TextureFormat format = wgpu::TextureFormat::Undefined;
+};
+struct FastBlurPipelines {
+  wgpu::RenderPipeline down;
+  wgpu::RenderPipeline up;
+};
+wgpu::BindGroupLayout g_fastBlurLayout;
+wgpu::Sampler g_fastBlurSampler;
+absl::flat_hash_map<uint32_t, FastBlurPipelines> g_fastBlurPipelines; // by wgpu::TextureFormat
+FastBlurScratch g_fastBlurScratch;
+std::atomic<bool> g_fastBlur{[] {
+  const char* env = std::getenv("DOL_AURORA_GAME_DOF_FAST");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}()};
+
+const FastBlurPipelines& fast_blur_pipelines(wgpu::TextureFormat format) {
+  auto& pipelines = g_fastBlurPipelines[static_cast<uint32_t>(format)];
+  if (pipelines.down) {
+    return pipelines;
+  }
+  if (!g_fastBlurLayout) {
+    const std::array entries{
+        wgpu::BindGroupLayoutEntry{
+            .binding = 0,
+            .visibility = wgpu::ShaderStage::Fragment,
+            .sampler = wgpu::SamplerBindingLayout{.type = wgpu::SamplerBindingType::Filtering},
+        },
+        wgpu::BindGroupLayoutEntry{
+            .binding = 1,
+            .visibility = wgpu::ShaderStage::Fragment,
+            .texture = wgpu::TextureBindingLayout{.sampleType = wgpu::TextureSampleType::Float,
+                                                  .viewDimension = wgpu::TextureViewDimension::e2D},
+        },
+        wgpu::BindGroupLayoutEntry{
+            .binding = 2,
+            .visibility = wgpu::ShaderStage::Fragment,
+            .buffer = wgpu::BufferBindingLayout{.type = wgpu::BufferBindingType::Uniform},
+        },
+    };
+    const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+        .label = "Copy Fast Blur Bind Group Layout",
+        .entryCount = entries.size(),
+        .entries = entries.data(),
+    };
+    g_fastBlurLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
+    const wgpu::SamplerDescriptor samplerDescriptor{
+        .label = "Copy Fast Blur Sampler",
+        .addressModeU = wgpu::AddressMode::ClampToEdge,
+        .addressModeV = wgpu::AddressMode::ClampToEdge,
+        .magFilter = wgpu::FilterMode::Linear,
+        .minFilter = wgpu::FilterMode::Linear,
+    };
+    g_fastBlurSampler = g_device.CreateSampler(&samplerDescriptor);
+  }
+  const wgpu::ShaderSourceWGSL wgslSource{wgpu::ShaderSourceWGSL::Init{.code = FastBlurShader.data()}};
+  const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgslSource, .label = "Copy Fast Blur"};
+  const auto module = g_device.CreateShaderModule(&moduleDescriptor);
+  const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{
+      .bindGroupLayoutCount = 1,
+      .bindGroupLayouts = &g_fastBlurLayout,
+  };
+  const auto layout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
+  {
+    const std::array colorTargets{wgpu::ColorTargetState{.format = format}};
+    const wgpu::FragmentState fragmentState{
+        .module = module,
+        .entryPoint = "fs_down",
+        .targetCount = colorTargets.size(),
+        .targets = colorTargets.data(),
+    };
+    const wgpu::RenderPipelineDescriptor pipelineDescriptor{
+        .label = "Copy Fast Blur Down",
+        .layout = layout,
+        .vertex = wgpu::VertexState{.module = module, .entryPoint = "vs_main"},
+        .primitive = wgpu::PrimitiveState{.topology = wgpu::PrimitiveTopology::TriangleList},
+        .fragment = &fragmentState,
+    };
+    pipelines.down = g_device.CreateRenderPipeline(&pipelineDescriptor);
+  }
+  {
+    // result = half * constant + copy * (1 - constant), every channel.
+    const wgpu::BlendComponent component{
+        .operation = wgpu::BlendOperation::Add,
+        .srcFactor = wgpu::BlendFactor::Constant,
+        .dstFactor = wgpu::BlendFactor::OneMinusConstant,
+    };
+    const wgpu::BlendState blend{.color = component, .alpha = component};
+    const std::array colorTargets{wgpu::ColorTargetState{.format = format, .blend = &blend}};
+    const wgpu::FragmentState fragmentState{
+        .module = module,
+        .entryPoint = "fs_up",
+        .targetCount = colorTargets.size(),
+        .targets = colorTargets.data(),
+    };
+    const wgpu::RenderPipelineDescriptor pipelineDescriptor{
+        .label = "Copy Fast Blur Up",
+        .layout = layout,
+        .vertex = wgpu::VertexState{.module = module, .entryPoint = "vs_main"},
+        .primitive = wgpu::PrimitiveState{.topology = wgpu::PrimitiveTopology::TriangleList},
+        .fragment = &fragmentState,
+    };
+    pipelines.up = g_device.CreateRenderPipeline(&pipelineDescriptor);
+  }
+  return pipelines;
+}
+
+void fast_blur_scratch(uint32_t width, uint32_t height, wgpu::TextureFormat format) {
+  if (g_fastBlurScratch.format == format && g_fastBlurScratch.size.width == width &&
+      g_fastBlurScratch.size.height == height) {
+    return;
+  }
+  const wgpu::TextureDescriptor descriptor{
+      .label = "Copy Fast Blur Half",
+      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::RenderAttachment,
+      .dimension = wgpu::TextureDimension::e2D,
+      .size = {width, height, 1},
+      .format = format,
+      .mipLevelCount = 1,
+      .sampleCount = 1,
+  };
+  g_fastBlurScratch.half = g_device.CreateTexture(&descriptor);
+  g_fastBlurScratch.halfView = g_fastBlurScratch.half.CreateView();
+  g_fastBlurScratch.size = {width, height, 1};
+  g_fastBlurScratch.format = format;
+}
+
+void fast_blur_pass(const wgpu::CommandEncoder& cmd, const wgpu::RenderPipeline& pipeline, const wgpu::TextureView& src,
+                    const wgpu::TextureView& target, float side, float mix, bool over) {
+  struct Params {
+    float side;
+    float pad[3];
+  } const params{side, {0.f, 0.f, 0.f}};
+  const wgpu::BufferDescriptor bufferDescriptor{
+      .label = "Copy Fast Blur Params",
+      .usage = wgpu::BufferUsage::Uniform,
+      .size = sizeof(Params),
+      .mappedAtCreation = true,
+  };
+  const auto buffer = g_device.CreateBuffer(&bufferDescriptor);
+  std::memcpy(buffer.GetMappedRange(), &params, sizeof(Params));
+  buffer.Unmap();
+  const std::array entries{
+      wgpu::BindGroupEntry{.binding = 0, .sampler = g_fastBlurSampler},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = src},
+      wgpu::BindGroupEntry{.binding = 2, .buffer = buffer, .size = sizeof(Params)},
+  };
+  const wgpu::BindGroupDescriptor bindGroupDescriptor{
+      .layout = g_fastBlurLayout,
+      .entryCount = entries.size(),
+      .entries = entries.data(),
+  };
+  const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+  const std::array colorAttachments{wgpu::RenderPassColorAttachment{
+      .view = target,
+      .loadOp = over ? wgpu::LoadOp::Load : wgpu::LoadOp::Clear,
+      .storeOp = wgpu::StoreOp::Store,
+      .clearValue = {0.0, 0.0, 0.0, 0.0},
+  }};
+  const wgpu::RenderPassDescriptor passDescriptor{
+      .label = over ? "Copy Fast Blur Up Pass" : "Copy Fast Blur Down Pass",
+      .colorAttachmentCount = colorAttachments.size(),
+      .colorAttachments = colorAttachments.data(),
+  };
+  const auto pass = cmd.BeginRenderPass(&passDescriptor);
+  pass.SetPipeline(pipeline);
+  pass.SetBindGroup(0, bindGroup);
+  if (over) {
+    const wgpu::Color constant{mix, mix, mix, mix};
+    pass.SetBlendConstant(&constant);
+  }
+  pass.Draw(3);
+  pass.End();
+}
+
+// The fast blur stands in for sigmas its box and stretch can make: in the
+// copy's texels, the 2x2 box has a variance of 1/4 and the linear stretch back
+// from half size 2/3, so sigmas from about 0.96; the side taps add the rest
+// (8 side / (1 + 4 side) texels squared), kept small so the cross stays close
+// to round. Light's sigma is 1.
+constexpr float FastBlurBase = 0.25f + 2.f / 3.f;
+bool fast_blur_fits(const TextureHandle& texture, float sigma, float mix) {
+  return g_fastBlur.load(std::memory_order_relaxed) && texture->attachmentTextureView && mix > 0.f && mix <= 1.f &&
+         sigma * sigma >= FastBlurBase && sigma <= 1.25f && texture->size.width >= 4 && texture->size.height >= 4;
+}
+} // namespace
+
+void set_fast_blur(bool on) { g_fastBlur.store(on, std::memory_order_relaxed); }
+bool fast_blur() { return g_fastBlur.load(std::memory_order_relaxed); }
+
 static void blur_shutdown() {
   g_blurPipelines.clear();
   g_blurLayout = {};
   g_blurScratch = {};
+  g_fastBlurPipelines.clear();
+  g_fastBlurLayout = {};
+  g_fastBlurSampler = {};
+  g_fastBlurScratch = {};
 }
 
 void blur(const wgpu::CommandEncoder& cmd, const TextureHandle& texture, float sigma, float mix) {
   if (!texture || !texture->texture) {
+    return;
+  }
+  if (fast_blur_fits(texture, sigma, mix)) {
+    const webgpu::gpu_prof::Zone zone{cmd, "EFB copy blur (fast)"};
+    const auto& pipelines = fast_blur_pipelines(texture->format);
+    fast_blur_scratch((texture->size.width + 1) / 2, (texture->size.height + 1) / 2, texture->format);
+    const float rest = sigma * sigma - FastBlurBase;
+    const float side = rest > 0.f ? rest / (8.f - 4.f * rest) : 0.f;
+    fast_blur_pass(cmd, pipelines.down, texture->sampleTextureView, g_fastBlurScratch.halfView, side, mix, false);
+    fast_blur_pass(cmd, pipelines.up, g_fastBlurScratch.halfView, texture->attachmentTextureView, 0.f, mix, true);
     return;
   }
   const webgpu::gpu_prof::Zone zone{cmd, "EFB copy blur"};

@@ -4722,6 +4722,8 @@ void aurora_set_efficient_effects(bool on) {
 
 void aurora_set_game_dof(int step) { aurora::gfx::gxcore::set_game_dof_step(step); }
 
+void aurora_set_game_dof_fast(bool on) { aurora::gfx::tex_copy_conv::set_fast_blur(on); }
+
 void aurora_set_game_dof_start(int start) { aurora::gfx::gxcore::set_game_dof_start(start); }
 void aurora_set_hd_normals(const char* path) {
   using namespace aurora::gfx::gxcore;
