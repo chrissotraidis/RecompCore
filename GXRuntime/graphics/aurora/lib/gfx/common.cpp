@@ -2509,16 +2509,19 @@ static void encode_effect_mask(const wgpu::CommandEncoder& cmd, FramePacket& fra
   // the sea mask's depth when the effects drawn at their own depth wrote theirs into the first.
   if (!post_fx::effect_mask_opacity())
     return;
-  // The fast mask's depth is made again for this pass: the first may have written an effect's own depth into it.
+  // With effects at their own depth the fast mask's depth is made again for this pass, as the full-size copy is:
+  // the first pass wrote theirs into it. Without, the first pass's half-size depth serves: what an effect that
+  // writes depth wrote there, the pass's depth it was made from already held.
   const wgpu::TextureView whiteDepthView =
       !own ? wgpu::TextureView{}
            : small ? post_fx::effect_mask_small_depth(cmd, {}, true, passInfo.targetSize)
                    : post_fx::effect_mask_depth(cmd, passInfo.targetSize);
   const bool whiteOwn = own && static_cast<bool>(whiteDepthView);
   const wgpu::TextureView whiteSmallDepthView =
-      small && !whiteOwn
-          ? post_fx::effect_mask_small_depth(cmd, passInfo.depthStencilView, false, passInfo.targetSize)
-          : wgpu::TextureView{};
+      !small || whiteOwn ? wgpu::TextureView{}
+                         : smallDepthView ? smallDepthView
+                                          : post_fx::effect_mask_small_depth(cmd, passInfo.depthStencilView, false,
+                                                                             passInfo.targetSize);
   if (small && !whiteOwn && !whiteSmallDepthView)
     return;
   const std::array whiteAttachments{wgpu::RenderPassColorAttachment{
