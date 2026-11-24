@@ -870,10 +870,18 @@ wgpu::BindGroupLayout g_fastBlurLayout;
 wgpu::Sampler g_fastBlurSampler;
 absl::flat_hash_map<uint32_t, FastBlurPipelines> g_fastBlurPipelines; // by wgpu::TextureFormat
 FastBlurScratch g_fastBlurScratch;
-std::atomic<bool> g_fastBlur{[] {
-  const char* env = std::getenv("DOL_AURORA_GAME_DOF_FAST");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}()};
+// -1 until first asked: DOL_AURORA_GAME_DOF_FAST is read then, after the host
+// has put its settings in the environment, unless set_fast_blur came first.
+std::atomic<int> g_fastBlur{-1};
+bool fast_blur_on() {
+  int on = g_fastBlur.load(std::memory_order_relaxed);
+  if (on < 0) {
+    const char* env = std::getenv("DOL_AURORA_GAME_DOF_FAST");
+    on = env != nullptr && env[0] != '\0' && env[0] != '0' ? 1 : 0;
+    g_fastBlur.store(on, std::memory_order_relaxed);
+  }
+  return on != 0;
+}
 
 const FastBlurPipelines& fast_blur_pipelines(wgpu::TextureFormat format) {
   auto& pipelines = g_fastBlurPipelines[static_cast<uint32_t>(format)];
@@ -1041,13 +1049,13 @@ void fast_blur_pass(const wgpu::CommandEncoder& cmd, const wgpu::RenderPipeline&
 // to round. Light's sigma is 1.
 constexpr float FastBlurBase = 0.25f + 2.f / 3.f;
 bool fast_blur_fits(const TextureHandle& texture, float sigma, float mix) {
-  return g_fastBlur.load(std::memory_order_relaxed) && texture->attachmentTextureView && mix > 0.f && mix <= 1.f &&
+  return fast_blur_on() && texture->attachmentTextureView && mix > 0.f && mix <= 1.f &&
          sigma * sigma >= FastBlurBase && sigma <= 1.25f && texture->size.width >= 4 && texture->size.height >= 4;
 }
 } // namespace
 
-void set_fast_blur(bool on) { g_fastBlur.store(on, std::memory_order_relaxed); }
-bool fast_blur() { return g_fastBlur.load(std::memory_order_relaxed); }
+void set_fast_blur(bool on) { g_fastBlur.store(on ? 1 : 0, std::memory_order_relaxed); }
+bool fast_blur() { return fast_blur_on(); }
 
 static void blur_shutdown() {
   g_blurPipelines.clear();
