@@ -2453,14 +2453,26 @@ static void encode_effect_mask(const wgpu::CommandEncoder& cmd, FramePacket& fra
   // effects test against the sea mask's depth, which leaves such effects out: the scenery's. The other effects
   // first, pushed back against it, then those at their own depth: a geyser's sparks drawn on its surface, pushed
   // back against the geyser's depth, failed, and kept its shade.
+  // The fast mask (post_fx::effect_mask_fast()): both passes at half the size, against a half-size depth made
+  // from the pass's (or the sea mask's, for effects at their own depth), the viewports and scissors halved as
+  // for a run of soft effects (g_softScale).
+  const bool small = post_fx::effect_mask_fast() && !passInfo.hasStencil;
   const wgpu::TextureView ownDepthView =
-      ownDepth ? post_fx::effect_mask_depth(cmd, passInfo.targetSize) : wgpu::TextureView{};
+      !ownDepth ? wgpu::TextureView{}
+                : small ? post_fx::effect_mask_small_depth(cmd, {}, true, passInfo.targetSize)
+                        : post_fx::effect_mask_depth(cmd, passInfo.targetSize);
+  const wgpu::TextureView smallDepthView =
+      small && !ownDepthView
+          ? post_fx::effect_mask_small_depth(cmd, passInfo.depthStencilView, false, passInfo.targetSize)
+          : wgpu::TextureView{};
+  if (small && !ownDepthView && !smallDepthView)
+    return;
   static uint64_t clearedFrame = UINT64_MAX;
   const bool clear = clearedFrame != frameKey;
   clearedFrame = frameKey;
   const webgpu::gpu_prof::Zone zone{cmd, "Effects mask"};
   const std::array attachments{wgpu::RenderPassColorAttachment{
-      .view = post_fx::effect_mask_target(passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat()),
+      .view = post_fx::effect_mask_target(passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat(), small),
       .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
       .storeOp = wgpu::StoreOp::Store,
       .clearValue = {0.0, 0.0, 0.0, 0.0},
@@ -2468,7 +2480,7 @@ static void encode_effect_mask(const wgpu::CommandEncoder& cmd, FramePacket& fra
   // The pass's depth as the scene left it: the effects test against it and write none.
   const bool own = static_cast<bool>(ownDepthView) && !passInfo.hasStencil;
   const wgpu::RenderPassDepthStencilAttachment depth{
-      .view = own ? ownDepthView : passInfo.depthStencilView,
+      .view = own ? ownDepthView : small ? smallDepthView : passInfo.depthStencilView,
       .depthLoadOp = wgpu::LoadOp::Load,
       .depthStoreOp = wgpu::StoreOp::Store,
       .stencilLoadOp = passInfo.hasStencil ? wgpu::LoadOp::Load : wgpu::LoadOp::Undefined,
@@ -2482,29 +2494,41 @@ static void encode_effect_mask(const wgpu::CommandEncoder& cmd, FramePacket& fra
       .timestampWrites = webgpu::gpu_prof::pass_writes("Effects mask"),
   };
   auto pass = cmd.BeginRenderPass(&descriptor);
+  if (small)
+    g_softScale = 0.5f;
   if (own) {
     render_pass(pass, frame, passInfo, 0, end, true, 1);
     render_pass(pass, frame, passInfo, 0, end, true, 2);
   } else {
     render_pass(pass, frame, passInfo, 0, end, true);
   }
+  g_softScale = 1.f;
   pass.End();
   // Again over white, for their opacity (post_fx.hpp effect_white_target()): a dark effect blended over the scene
   // (the dust a shutting door raises) adds little over black but hides what is behind it. Against a fresh copy of
   // the sea mask's depth when the effects drawn at their own depth wrote theirs into the first.
   if (!post_fx::effect_mask_opacity())
     return;
+  // The fast mask's depth is made again for this pass: the first may have written an effect's own depth into it.
   const wgpu::TextureView whiteDepthView =
-      own ? post_fx::effect_mask_depth(cmd, passInfo.targetSize) : wgpu::TextureView{};
+      !own ? wgpu::TextureView{}
+           : small ? post_fx::effect_mask_small_depth(cmd, {}, true, passInfo.targetSize)
+                   : post_fx::effect_mask_depth(cmd, passInfo.targetSize);
   const bool whiteOwn = own && static_cast<bool>(whiteDepthView);
+  const wgpu::TextureView whiteSmallDepthView =
+      small && !whiteOwn
+          ? post_fx::effect_mask_small_depth(cmd, passInfo.depthStencilView, false, passInfo.targetSize)
+          : wgpu::TextureView{};
+  if (small && !whiteOwn && !whiteSmallDepthView)
+    return;
   const std::array whiteAttachments{wgpu::RenderPassColorAttachment{
-      .view = post_fx::effect_white_target(passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat()),
+      .view = post_fx::effect_white_target(passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat(), small),
       .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
       .storeOp = wgpu::StoreOp::Store,
       .clearValue = {1.0, 1.0, 1.0, 1.0},
   }};
   const wgpu::RenderPassDepthStencilAttachment whiteDepth{
-      .view = whiteOwn ? whiteDepthView : passInfo.depthStencilView,
+      .view = whiteOwn ? whiteDepthView : small ? whiteSmallDepthView : passInfo.depthStencilView,
       .depthLoadOp = wgpu::LoadOp::Load,
       .depthStoreOp = wgpu::StoreOp::Store,
       .stencilLoadOp = passInfo.hasStencil ? wgpu::LoadOp::Load : wgpu::LoadOp::Undefined,
@@ -2518,12 +2542,15 @@ static void encode_effect_mask(const wgpu::CommandEncoder& cmd, FramePacket& fra
       .timestampWrites = webgpu::gpu_prof::pass_writes("Effects mask (over white)"),
   };
   auto whitePass = cmd.BeginRenderPass(&whiteDescriptor);
+  if (small)
+    g_softScale = 0.5f;
   if (whiteOwn) {
     render_pass(whitePass, frame, passInfo, 0, end, true, 1);
     render_pass(whitePass, frame, passInfo, 0, end, true, 2);
   } else {
     render_pass(whitePass, frame, passInfo, 0, end, true);
   }
+  g_softScale = 1.f;
   whitePass.End();
 }
 #endif
