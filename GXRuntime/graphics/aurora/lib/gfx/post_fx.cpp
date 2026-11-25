@@ -4819,6 +4819,11 @@ void snapshot_monotone_depth(const wgpu::CommandEncoder& cmd, const wgpu::Textur
   g_monoDepthValid = true;
 }
 
+namespace {
+void encode_fxaa(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& size, wgpu::TextureFormat format,
+                 const wgpu::TextureView& dst, uint32_t msaaSamples);
+} // namespace
+
 void encode_late(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
                  const wgpu::Extent3D& size, wgpu::TextureFormat format, const wgpu::TextureView& dst,
                  const wgpu::TextureView& resolve, uint32_t msaaSamples, const Camera& camera,
@@ -4837,6 +4842,7 @@ void encode_late(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene
   g_monoDepthValid = false;
   if (bloom_enabled())
     encode_bloom(cmd, scene, size, format, dst, resolve, msaaSamples);
+  encode_fxaa(cmd, size, format, dst, msaaSamples);
 }
 
 
@@ -5376,6 +5382,7 @@ void shutdown() {
   g_seaMask = {};
   g_exposureSceneView = {};
   g_exposureScene = {};
+  reset_fxaa();
   g_seaMaskDepthView = {};
   g_seaMaskDepth = {};
   g_seaMaskSize = {};
@@ -6383,9 +6390,257 @@ Camera moved_camera(const Camera& camera, const float relative[3][4], float seco
   return moved;
 }
 
+// --- Smooth edges (FXAA; set_fxaa(), DOL_AURORA_FXAA) -------------------------
+// One pass over the finished scene, after every other effect and before the
+// HUD: where the picture has an edge (a step in brightness), the pixel is
+// blended along it. A copy of the frame buffer is read, the frame buffer
+// written. Single-sampled frames only.
+namespace {
+// 0 off, 1 low, 2 medium, 3 high (kFxaaPresets). -1 until first asked:
+// DOL_AURORA_FXAA is read then, after the host's settings.
+std::atomic_int g_fxaa{-1};
+// What a level sets: the least step taken as an edge (a share of the brightest
+// of the five, and in the dark), and how many steps the walk along it takes.
+struct FxaaPreset {
+  float edge;
+  float edgeMin;
+  int walk;
+};
+constexpr FxaaPreset kFxaaPresets[] = {{0.25f, 0.0833f, 5}, {0.166f, 0.0833f, 8}, {0.125f, 0.0625f, 12}};
+wgpu::ShaderModule g_fxaaModule;
+wgpu::RenderPipeline g_fxaaPass;
+int g_fxaaLevel = 0; // the level g_fxaaPass was made for
+wgpu::TextureFormat g_fxaaFormat = wgpu::TextureFormat::Undefined;
+wgpu::Texture g_fxaaScene;
+wgpu::TextureView g_fxaaSceneView;
+
+// The method is FXAA's (T. Lottes): find the edge's direction from the 3x3
+// brightness around the pixel, walk along it both ways to where it ends, and
+// shift the lookup across the edge by how near its end the pixel is; a pixel
+// that stands out from all its neighbours is blended a little with them.
+// A level's values can be set apart: DOL_AURORA_FXAA_EDGE (the least step, as
+// a share of the brightest of the five, taken as an edge), _EDGE_MIN (the least
+// step in the dark), and _SUBPIXEL (0.75 at every level: how much a lone pixel
+// is blended, 0 none).
+constexpr const char* kFxaaShader = R"""(
+override edge: f32 = 0.125;
+override edge_min: f32 = 0.0625;
+override subpixel: f32 = 0.75;
+override quality: i32 = 2; // which row of `steps`
+override walk: i32 = 12;   // how many of its steps
+
+@group(0) @binding(0) var samp: sampler;
+@group(0) @binding(1) var src: texture_2d<f32>;
+
+struct VertexOutput {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
+var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(vec2(0.0, 0.0), vec2(0.0, 2.0), vec2(2.0, 0.0));
+// How far each step of the walk goes, in pixels, a row a level: low's 5 steps reach 16.5 pixels each way,
+// medium's 8 reach 20.5, high's 12 reach 26.5.
+var<private> steps: array<f32, 36> = array<f32, 36>(
+    1.0, 1.5, 2.0, 4.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 4.0, 8.0, 0.0, 0.0, 0.0, 0.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VertexOutput {
+    var out: VertexOutput;
+    out.pos = vec4<f32>(pos[i], 0.0, 1.0);
+    out.uv = uvs[i];
+    return out;
+}
+
+fn luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+fn luma_at(uv: vec2<f32>) -> f32 {
+    return luma(textureSampleLevel(src, samp, uv, 0.0).rgb);
+}
+
+// The EFB's alpha is kept as it was.
+@fragment
+fn fs_fxaa(in: VertexOutput) -> @location(0) vec4<f32> {
+    let t = 1.0 / vec2<f32>(textureDimensions(src));
+    let uv = in.uv;
+    let centre = textureSampleLevel(src, samp, uv, 0.0);
+    let m = luma(centre.rgb);
+    let n = luma_at(uv + vec2(0.0, -t.y));
+    let s = luma_at(uv + vec2(0.0, t.y));
+    let w = luma_at(uv + vec2(-t.x, 0.0));
+    let e = luma_at(uv + vec2(t.x, 0.0));
+    let high = max(m, max(max(n, s), max(w, e)));
+    let low = min(m, min(min(n, s), min(w, e)));
+    let range = high - low;
+    if (range < max(edge_min, high * edge)) {
+        return centre;
+    }
+    let nw = luma_at(uv + vec2(-t.x, -t.y));
+    let ne = luma_at(uv + vec2(t.x, -t.y));
+    let sw = luma_at(uv + vec2(-t.x, t.y));
+    let se = luma_at(uv + vec2(t.x, t.y));
+    // A lone pixel: how far it is from its neighbours' average.
+    let around = (2.0 * (n + s + w + e) + nw + ne + sw + se) / 12.0;
+    let lone = smoothstep(0.0, 1.0, clamp(abs(around - m) / range, 0.0, 1.0));
+    let blend = lone * lone * subpixel;
+    // Which way the edge runs.
+    let across = abs(nw + sw - 2.0 * w) + 2.0 * abs(n + s - 2.0 * m) + abs(ne + se - 2.0 * e);
+    let along = abs(nw + ne - 2.0 * n) + 2.0 * abs(w + e - 2.0 * m) + abs(sw + se - 2.0 * s);
+    let level = across >= along; // the edge runs left to right, not up and down
+    let a = select(w, n, level);
+    let b = select(e, s, level);
+    let ga = abs(a - m);
+    let gb = abs(b - m);
+    let first = ga >= gb; // the edge is on the up or left side
+    let grade = 0.25 * max(ga, gb);
+    var step = select(t.x, t.y, level);
+    var mid = 0.5 * (b + m);
+    if (first) {
+        step = -step;
+        mid = 0.5 * (a + m);
+    }
+    // On the line between the two pixels, walk both ways to the edge's ends.
+    var at = uv;
+    if (level) {
+        at.y += 0.5 * step;
+    } else {
+        at.x += 0.5 * step;
+    }
+    let dir = select(vec2(0.0, t.y), vec2(t.x, 0.0), level);
+    var uv1 = at;
+    var uv2 = at;
+    var end1 = 0.0;
+    var end2 = 0.0;
+    var done1 = false;
+    var done2 = false;
+    for (var i = 0; i < walk; i++) {
+        let far = steps[quality * 12 + i];
+        if (!done1) {
+            uv1 -= dir * far;
+            end1 = luma_at(uv1) - mid;
+            done1 = abs(end1) >= grade;
+        }
+        if (!done2) {
+            uv2 += dir * far;
+            end2 = luma_at(uv2) - mid;
+            done2 = abs(end2) >= grade;
+        }
+        if (done1 && done2) {
+            break;
+        }
+    }
+    let d1 = select(uv.y - uv1.y, uv.x - uv1.x, level);
+    let d2 = select(uv2.y - uv.y, uv2.x - uv.x, level);
+    let nearer = select(end2, end1, d1 < d2);
+    // Shift only where the nearer end steps the other way from the pixel.
+    let good = (nearer < 0.0) != (m < mid);
+    let shift = max(select(0.0, 0.5 - min(d1, d2) / (d1 + d2), good), blend);
+    var out = uv;
+    if (level) {
+        out.y += shift * step;
+    } else {
+        out.x += shift * step;
+    }
+    return vec4(textureSampleLevel(src, samp, out, 0.0).rgb, centre.a);
+}
+)""";
+
+wgpu::RenderPipeline make_fxaa_pipeline(wgpu::TextureFormat format, int level) {
+  const auto& preset = kFxaaPresets[level - 1];
+  if (!g_fxaaModule) {
+    wgpu::ShaderSourceWGSL source{};
+    source.code = kFxaaShader;
+    const wgpu::ShaderModuleDescriptor descriptor{.nextInChain = &source, .label = "Smooth edges (FXAA)"};
+    g_fxaaModule = g_device.CreateShaderModule(&descriptor);
+  }
+  const std::array constants{
+      wgpu::ConstantEntry{.key = "edge", .value = env_float("DOL_AURORA_FXAA_EDGE", preset.edge, 0.f, 1.f)},
+      wgpu::ConstantEntry{.key = "edge_min", .value = env_float("DOL_AURORA_FXAA_EDGE_MIN", preset.edgeMin, 0.f, 1.f)},
+      wgpu::ConstantEntry{.key = "subpixel", .value = env_float("DOL_AURORA_FXAA_SUBPIXEL", 0.75f, 0.f, 1.f)},
+      wgpu::ConstantEntry{.key = "quality", .value = static_cast<double>(level - 1)},
+      wgpu::ConstantEntry{.key = "walk", .value = static_cast<double>(preset.walk)},
+  };
+  const std::array targets{wgpu::ColorTargetState{.format = format, .writeMask = wgpu::ColorWriteMask::All}};
+  const wgpu::FragmentState fragment{
+      .module = g_fxaaModule,
+      .entryPoint = "fs_fxaa",
+      .constantCount = constants.size(),
+      .constants = constants.data(),
+      .targetCount = targets.size(),
+      .targets = targets.data(),
+  };
+  const wgpu::RenderPipelineDescriptor descriptor{
+      .label = "Smooth edges (FXAA)",
+      .layout = g_pipelineLayout,
+      .vertex = {.module = g_fxaaModule, .entryPoint = "vs_main"},
+      .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+      .multisample = {.count = 1, .mask = UINT32_MAX},
+      .fragment = &fragment,
+  };
+  return g_device.CreateRenderPipeline(&descriptor);
+}
+
+// After the last effect, into the frame buffer. Left out where the target isn't the frame buffer, or is multisampled.
+void encode_fxaa(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& size, wgpu::TextureFormat format,
+                 const wgpu::TextureView& dst, uint32_t msaaSamples) {
+  const auto& frame = webgpu::g_frameBuffer;
+  const int level = fxaa_level();
+  if (level == 0 || !g_pipelineLayout || msaaSamples != 1 || size.width < 4 || size.height < 4 ||
+      !frame.texture || dst.Get() != frame.view.Get() || frame.texture.GetWidth() != size.width ||
+      frame.texture.GetHeight() != size.height || frame.texture.GetFormat() != format)
+    return;
+  const webgpu::gpu_prof::Zone zone{cmd, "Smooth edges (FXAA)"};
+  if (!g_fxaaPass || g_fxaaFormat != format || g_fxaaLevel != level) {
+    g_fxaaPass = make_fxaa_pipeline(format, level);
+    g_fxaaFormat = format;
+    g_fxaaLevel = level;
+  }
+  if (!g_fxaaScene || g_fxaaScene.GetWidth() != size.width || g_fxaaScene.GetHeight() != size.height ||
+      g_fxaaScene.GetFormat() != format) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Smooth edges (FXAA) scene",
+        .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding,
+        .size = {size.width, size.height, 1},
+        .format = format,
+    };
+    g_fxaaScene = g_device.CreateTexture(&descriptor);
+    g_fxaaSceneView = g_fxaaScene.CreateView();
+  }
+  const wgpu::TexelCopyTextureInfo from{.texture = frame.texture};
+  const wgpu::TexelCopyTextureInfo to{.texture = g_fxaaScene};
+  const wgpu::Extent3D extent{size.width, size.height, 1};
+  cmd.CopyTextureToTexture(&from, &to, &extent);
+  draw(cmd, "Smooth edges (FXAA)", g_fxaaPass, g_fxaaSceneView, dst, true);
+}
+} // namespace
+
+void reset_fxaa() noexcept {
+  g_fxaaSceneView = {};
+  g_fxaaScene = {};
+  g_fxaaPass = {};
+  g_fxaaFormat = wgpu::TextureFormat::Undefined;
+  g_fxaaModule = {};
+}
+
+int fxaa_level() noexcept {
+  int level = g_fxaa.load(std::memory_order_relaxed);
+  if (level < 0) {
+    const char* env = std::getenv("DOL_AURORA_FXAA");
+    level = env != nullptr ? std::clamp(std::atoi(env), 0, 3) : 0;
+    g_fxaa.store(level, std::memory_order_relaxed);
+  }
+  return level;
+}
+
+void set_fxaa(int level) noexcept { g_fxaa.store(std::clamp(level, 0, 3), std::memory_order_relaxed); }
+
 bool any_enabled() noexcept {
   return bloom_enabled() || far_blur_enabled() || ambient_occlusion_enabled() || cloud_shadows_enabled() ||
-         sun_shadows_enabled() || edge_light_enabled() || torch_light_enabled();
+         sun_shadows_enabled() || edge_light_enabled() || torch_light_enabled() || fxaa_level() != 0;
 }
 
 // The frame buffer's colours before the effects, for the exposure's
@@ -6569,6 +6824,8 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
     draw_monotone(cmd, scene, depthView, size, format, dst, camera, *monotone);
   if (phase == Phase::Full && bloom_enabled())
     encode_bloom(cmd, scene, size, format, dst, resolve, msaaSamples);
+  if (phase == Phase::Full)
+    encode_fxaa(cmd, size, format, dst, msaaSamples);
 }
 
 void encode_bloom(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::Extent3D& size,
@@ -6595,6 +6852,8 @@ void encode_bloom(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scen
 void aurora_set_bloom(bool enabled) { aurora::gfx::post_fx::set_bloom(enabled); }
 
 void aurora_set_far_blur(bool enabled) { aurora::gfx::post_fx::set_far_blur(enabled); }
+
+void aurora_set_fxaa(int level) { aurora::gfx::post_fx::set_fxaa(level); }
 
 void aurora_set_far_blur_level(float level) { aurora::gfx::post_fx::set_far_blur_level(level); }
 
