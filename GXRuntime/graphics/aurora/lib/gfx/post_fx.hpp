@@ -52,13 +52,14 @@ void initialize();
 void shutdown();
 bool bloom_enabled() noexcept;
 void set_bloom(bool enabled) noexcept;
-// Smooth edges (FXAA): one pass over the finished scene, after every other effect and before the HUD, that blends
-// each pixel along the edge it lies on. Its level: 0 off, 1 low, 2 medium, 3 high (how faint an edge it takes and
-// how far along it it looks). Off unless DOL_AURORA_FXAA is 1 to 3 (read when first asked) or set_fxaa().
-// Single-sampled frames only. DOL_AURORA_FXAA_EDGE, _EDGE_MIN and _SUBPIXEL tune a level (post_fx.cpp).
-int fxaa_level() noexcept;
-void set_fxaa(int level) noexcept;
-void reset_fxaa() noexcept; // its targets and pipeline let go (shutdown())
+// Edge smoothing: over the finished scene, after every other effect and before the HUD, each pixel on an edge is
+// blended along it. The mode: 0 off; 1 to 3 FXAA (one pass) low, medium, high; 4 to 6 SMAA (three passes, two
+// lookup tables) low, medium, high. Off unless DOL_AURORA_EDGE_SMOOTHING is 1 to 6 (read when first asked) or
+// set_edge_smoothing(). Single-sampled frames only. DOL_AURORA_FXAA_EDGE, _EDGE_MIN and _SUBPIXEL and
+// DOL_AURORA_SMAA_THRESHOLD tune a level (post_fx.cpp).
+int edge_smoothing() noexcept;
+void set_edge_smoothing(int mode) noexcept;
+void reset_edge_smoothing() noexcept; // its targets and pipelines let go (shutdown())
 bool far_blur_enabled() noexcept;
 void set_far_blur(bool enabled) noexcept;
 void set_far_blur_level(float level) noexcept;

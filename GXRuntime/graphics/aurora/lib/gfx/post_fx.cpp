@@ -1,4 +1,5 @@
 #include "post_fx.hpp"
+#include "smaa_tables.hpp"
 
 #include "dds_io.hpp"
 
@@ -4820,8 +4821,8 @@ void snapshot_monotone_depth(const wgpu::CommandEncoder& cmd, const wgpu::Textur
 }
 
 namespace {
-void encode_fxaa(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& size, wgpu::TextureFormat format,
-                 const wgpu::TextureView& dst, uint32_t msaaSamples);
+void encode_edge_smoothing(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& size, wgpu::TextureFormat format,
+                           const wgpu::TextureView& dst, uint32_t msaaSamples);
 } // namespace
 
 void encode_late(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::TextureView& depthView,
@@ -4842,7 +4843,7 @@ void encode_late(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene
   g_monoDepthValid = false;
   if (bloom_enabled())
     encode_bloom(cmd, scene, size, format, dst, resolve, msaaSamples);
-  encode_fxaa(cmd, size, format, dst, msaaSamples);
+  encode_edge_smoothing(cmd, size, format, dst, msaaSamples);
 }
 
 
@@ -5382,7 +5383,7 @@ void shutdown() {
   g_seaMask = {};
   g_exposureSceneView = {};
   g_exposureScene = {};
-  reset_fxaa();
+  reset_edge_smoothing();
   g_seaMaskDepthView = {};
   g_seaMaskDepth = {};
   g_seaMaskSize = {};
@@ -6390,15 +6391,16 @@ Camera moved_camera(const Camera& camera, const float relative[3][4], float seco
   return moved;
 }
 
-// --- Smooth edges (FXAA; set_fxaa(), DOL_AURORA_FXAA) -------------------------
-// One pass over the finished scene, after every other effect and before the
-// HUD: where the picture has an edge (a step in brightness), the pixel is
-// blended along it. A copy of the frame buffer is read, the frame buffer
-// written. Single-sampled frames only.
+// --- Edge smoothing (set_edge_smoothing(), DOL_AURORA_EDGE_SMOOTHING) ----------
+// Over the finished scene, after every other effect and before the HUD: where
+// the picture has an edge (a step in brightness), the pixel is blended along
+// it. A copy of the frame buffer is read, the frame buffer written.
+// Single-sampled frames only. Two methods: FXAA in one pass, SMAA in three.
 namespace {
-// 0 off, 1 low, 2 medium, 3 high (kFxaaPresets). -1 until first asked:
-// DOL_AURORA_FXAA is read then, after the host's settings.
-std::atomic_int g_fxaa{-1};
+// 0 off; 1 to 3 FXAA low, medium, high (kFxaaPresets); 4 to 6 SMAA low, medium,
+// high (kSmaaPresets). -1 until first asked: DOL_AURORA_EDGE_SMOOTHING is read
+// then, after the host's settings.
+std::atomic_int g_edgeSmoothing{-1};
 // What a level sets: the least step taken as an edge (a share of the brightest
 // of the five, and in the dark), and how many steps the walk along it takes.
 struct FxaaPreset {
@@ -6411,8 +6413,9 @@ wgpu::ShaderModule g_fxaaModule;
 wgpu::RenderPipeline g_fxaaPass;
 int g_fxaaLevel = 0; // the level g_fxaaPass was made for
 wgpu::TextureFormat g_fxaaFormat = wgpu::TextureFormat::Undefined;
-wgpu::Texture g_fxaaScene;
-wgpu::TextureView g_fxaaSceneView;
+// The frame buffer's copy both methods read.
+wgpu::Texture g_smoothScene;
+wgpu::TextureView g_smoothSceneView;
 
 // The method is FXAA's (T. Lottes): find the edge's direction from the 3x3
 // brightness around the pixel, walk along it both ways to where it ends, and
@@ -6584,63 +6587,577 @@ wgpu::RenderPipeline make_fxaa_pipeline(wgpu::TextureFormat format, int level) {
   return g_device.CreateRenderPipeline(&descriptor);
 }
 
+// SMAA 1x (J. Jimenez, J. I. Echevarria, B. Masia, F. Navarro, D. Gutierrez; https://github.com/iryoku/smaa, MIT,
+// the notice is in smaa_tables.hpp), its luma edge detection, blending weights and neighbourhood blending written
+// in WGSL for this renderer:
+// 1. Edges: where a pixel's brightness steps from its left or upper neighbour by more than the threshold, and
+//    the step is not dwarfed by a stronger one beside it (red: an edge at its left, green: at its top).
+// 2. Weights: for each edge pixel, how long the edge line is each way (the search table reads two pixels a
+//    lookup) and what crosses its ends; the area table turns that shape into how much of the pixel the true
+//    edge covers. High also follows diagonal lines and keeps corners sharp.
+// 3. Blend: each pixel mixed with the neighbour across its strongest edge by that coverage.
+// DOL_AURORA_SMAA_THRESHOLD sets a level's threshold apart.
+struct SmaaPreset {
+  float threshold;
+  int steps;     // lookups each way along a level or upright edge, two pixels each
+  int diagSteps; // along a diagonal, 0: not followed
+  int corners;   // 1: corners kept sharp
+};
+constexpr SmaaPreset kSmaaPresets[] = {{0.15f, 4, 0, 0}, {0.1f, 8, 0, 0}, {0.1f, 16, 8, 1}};
+wgpu::ShaderModule g_smaaModule;
+wgpu::BindGroupLayout g_smaaLayout;
+wgpu::PipelineLayout g_smaaPipelineLayout;
+wgpu::RenderPipeline g_smaaEdges, g_smaaWeights, g_smaaBlend;
+int g_smaaLevel = 0; // the level the three were made for
+wgpu::TextureFormat g_smaaFormat = wgpu::TextureFormat::Undefined;
+wgpu::Texture g_smaaEdgeTex, g_smaaWeightTex, g_smaaAreaTex, g_smaaSearchTex;
+wgpu::TextureView g_smaaEdgeView, g_smaaWeightView, g_smaaAreaView, g_smaaSearchView;
+
+constexpr const char* kSmaaShader = R"""(
+override threshold: f32 = 0.1;
+override steps: i32 = 16;
+override diag_steps: i32 = 8;
+override corners: i32 = 1;
+
+@group(0) @binding(0) var samp: sampler;
+// Edges: the scene. Weights: the edges, the area table, the search table. Blend: the scene, the weights.
+@group(0) @binding(1) var tex_a: texture_2d<f32>;
+@group(0) @binding(2) var tex_b: texture_2d<f32>;
+@group(0) @binding(3) var tex_c: texture_2d<f32>;
+
+struct VertexOutput {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+var<private> pos: array<vec2<f32>, 3> = array<vec2<f32>, 3>(vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
+var<private> uvs: array<vec2<f32>, 3> = array<vec2<f32>, 3>(vec2(0.0, 0.0), vec2(0.0, 2.0), vec2(2.0, 0.0));
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VertexOutput {
+    var out: VertexOutput;
+    out.pos = vec4<f32>(pos[i], 0.0, 1.0);
+    out.uv = uvs[i];
+    return out;
+}
+
+// One texel of tex_a, and its size (SMAA_RT_METRICS).
+fn metrics() -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(tex_a));
+    return vec4(1.0 / size, size);
+}
+
+fn luma(uv: vec2<f32>) -> f32 {
+    return dot(textureSampleLevel(tex_a, samp, uv, 0.0).rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+@fragment
+fn fs_edges(in: VertexOutput) -> @location(0) vec4<f32> {
+    let rt = metrics();
+    let uv = in.uv;
+    let l = luma(uv);
+    let left = luma(uv + rt.xy * vec2(-1.0, 0.0));
+    let top = luma(uv + rt.xy * vec2(0.0, -1.0));
+    let delta = abs(vec2(l) - vec2(left, top));
+    var edges = step(vec2(threshold), delta);
+    if (edges.x + edges.y == 0.0) {
+        discard;
+    }
+    let right = luma(uv + rt.xy * vec2(1.0, 0.0));
+    let bottom = luma(uv + rt.xy * vec2(0.0, 1.0));
+    var most = max(delta, abs(vec2(l) - vec2(right, bottom)));
+    let left2 = luma(uv + rt.xy * vec2(-2.0, 0.0));
+    let top2 = luma(uv + rt.xy * vec2(0.0, -2.0));
+    most = max(most, abs(vec2(left, top) - vec2(left2, top2)));
+    // A step half as strong as the strongest beside it is not an edge of its own.
+    edges *= step(vec2(max(most.x, most.y)), 2.0 * delta);
+    return vec4(edges, 0.0, 1.0);
+}
+
+fn edge(uv: vec2<f32>) -> vec2<f32> {
+    return textureSampleLevel(tex_a, samp, uv, 0.0).rg;
+}
+
+// --- Diagonal lines ---
+
+// Two edges read in one bilinear lookup (SMAADecodeDiagBilinearAccess).
+fn decode2(e: vec2<f32>) -> vec2<f32> {
+    return round(vec2(e.x * abs(5.0 * e.x - 3.75), e.y));
+}
+
+fn decode4(e: vec4<f32>) -> vec4<f32> {
+    return round(vec4(e.x * abs(5.0 * e.x - 3.75), e.y, e.z * abs(5.0 * e.z - 3.75), e.w));
+}
+
+struct Diag {
+    d: vec2<f32>, // how far, and whether the line went on
+    e: vec2<f32>, // the edges where it stopped
+};
+
+fn search_diag1(uv: vec2<f32>, dir: vec2<f32>) -> Diag {
+    let rt = metrics();
+    var coord = vec4(uv, -1.0, 1.0);
+    var e = vec2(0.0);
+    while (coord.z < f32(diag_steps - 1) && coord.w > 0.9) {
+        coord = vec4(coord.xy + rt.xy * dir, coord.z + 1.0, coord.w);
+        e = edge(coord.xy);
+        coord.w = dot(e, vec2(0.5));
+    }
+    return Diag(coord.zw, e);
+}
+
+fn search_diag2(uv: vec2<f32>, dir: vec2<f32>) -> Diag {
+    let rt = metrics();
+    var coord = vec4(uv, -1.0, 1.0);
+    coord.x += 0.25 * rt.x;
+    var e = vec2(0.0);
+    while (coord.z < f32(diag_steps - 1) && coord.w > 0.9) {
+        coord = vec4(coord.xy + rt.xy * dir, coord.z + 1.0, coord.w);
+        e = decode2(edge(coord.xy));
+        coord.w = dot(e, vec2(0.5));
+    }
+    return Diag(coord.zw, e);
+}
+
+const area_texel: vec2<f32> = vec2<f32>(1.0 / 160.0, 1.0 / 80.0);
+
+// The table's right half: 20 texels a pattern.
+fn area_diag(dist: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
+    var uv = area_texel * (20.0 * e + dist) + 0.5 * area_texel;
+    uv.x += 0.5;
+    return textureSampleLevel(tex_b, samp, uv, 0.0).rg;
+}
+
+fn diag_weights(uv: vec2<f32>, e: vec2<f32>) -> vec2<f32> {
+    let rt = metrics();
+    var weights = vec2(0.0);
+    var d = vec4(0.0);
+    // Down to the left and up to the right.
+    if (e.r > 0.0) {
+        let s = search_diag1(uv, vec2(-1.0, 1.0));
+        d.x = s.d.x + select(0.0, 1.0, s.e.y > 0.9);
+        d.z = s.d.y;
+    }
+    let s1 = search_diag1(uv, vec2(1.0, -1.0));
+    d.y = s1.d.x;
+    d.w = s1.d.y;
+    if (d.x + d.y > 2.0) {
+        let coords = vec4(-d.x + 0.25, d.x, d.y, -d.y - 0.25) * rt.xyxy + uv.xyxy;
+        let c1 = textureSampleLevel(tex_a, samp, coords.xy, 0.0, vec2<i32>(-1, 0)).rg;
+        let c2 = textureSampleLevel(tex_a, samp, coords.zw, 0.0, vec2<i32>(1, 0)).rg;
+        let c = decode4(vec4(c1, c2)).yxwz;
+        var cc = 2.0 * c.xz + c.yw;
+        cc = select(cc, vec2(0.0), d.zw >= vec2(0.9));
+        weights += area_diag(d.xy, cc);
+    }
+    // Up to the left and down to the right.
+    let s2 = search_diag2(uv, vec2(-1.0, -1.0));
+    d.x = s2.d.x;
+    d.z = s2.d.y;
+    if (textureSampleLevel(tex_a, samp, uv, 0.0, vec2<i32>(1, 0)).r > 0.0) {
+        let s3 = search_diag2(uv, vec2(1.0, 1.0));
+        d.y = s3.d.x + select(0.0, 1.0, s3.e.y > 0.9);
+        d.w = s3.d.y;
+    } else {
+        d.y = 0.0;
+        d.w = 0.0;
+    }
+    if (d.x + d.y > 2.0) {
+        let coords = vec4(-d.x, -d.x, d.y, d.y) * rt.xyxy + uv.xyxy;
+        let cx = textureSampleLevel(tex_a, samp, coords.xy, 0.0, vec2<i32>(-1, 0)).g;
+        let cy = textureSampleLevel(tex_a, samp, coords.xy, 0.0, vec2<i32>(0, -1)).r;
+        let czw = textureSampleLevel(tex_a, samp, coords.zw, 0.0, vec2<i32>(1, 0)).gr;
+        var cc = 2.0 * vec2(cx, czw.x) + vec2(cy, czw.y);
+        cc = select(cc, vec2(0.0), d.zw >= vec2(0.9));
+        weights += area_diag(d.xy, cc).gr;
+    }
+    return weights;
+}
+
+// --- Level and upright lines ---
+
+// How much farther the line goes past the last lookup, from the search table (0, 1 or 2 pixels, as 0, 127, 254).
+fn search_length(e: vec2<f32>, offset: f32) -> f32 {
+    var scale = vec2(66.0, 33.0) * vec2(0.5, -1.0);
+    var bias = vec2(66.0, 33.0) * vec2(offset, 1.0);
+    scale += vec2(-1.0, 1.0);
+    bias += vec2(0.5, -0.5);
+    scale /= vec2(64.0, 16.0);
+    bias /= vec2(64.0, 16.0);
+    return textureSampleLevel(tex_c, samp, scale * e + bias, 0.0).r;
+}
+
+fn search_x_left(start: vec2<f32>, end: f32) -> f32 {
+    let rt = metrics();
+    var uv = start;
+    var e = vec2(0.0, 1.0);
+    // While the line goes on (green) and nothing crosses it (red).
+    while (uv.x > end && e.g > 0.8281 && e.r == 0.0) {
+        e = edge(uv);
+        uv -= vec2(2.0, 0.0) * rt.xy;
+    }
+    let offset = -(255.0 / 127.0) * search_length(e, 0.0) + 3.25;
+    return rt.x * offset + uv.x;
+}
+
+fn search_x_right(start: vec2<f32>, end: f32) -> f32 {
+    let rt = metrics();
+    var uv = start;
+    var e = vec2(0.0, 1.0);
+    while (uv.x < end && e.g > 0.8281 && e.r == 0.0) {
+        e = edge(uv);
+        uv += vec2(2.0, 0.0) * rt.xy;
+    }
+    let offset = -(255.0 / 127.0) * search_length(e, 0.5) + 3.25;
+    return -rt.x * offset + uv.x;
+}
+
+fn search_y_up(start: vec2<f32>, end: f32) -> f32 {
+    let rt = metrics();
+    var uv = start;
+    var e = vec2(1.0, 0.0);
+    while (uv.y > end && e.r > 0.8281 && e.g == 0.0) {
+        e = edge(uv);
+        uv -= vec2(0.0, 2.0) * rt.xy;
+    }
+    let offset = -(255.0 / 127.0) * search_length(e.gr, 0.0) + 3.25;
+    return rt.y * offset + uv.y;
+}
+
+fn search_y_down(start: vec2<f32>, end: f32) -> f32 {
+    let rt = metrics();
+    var uv = start;
+    var e = vec2(1.0, 0.0);
+    while (uv.y < end && e.r > 0.8281 && e.g == 0.0) {
+        e = edge(uv);
+        uv += vec2(0.0, 2.0) * rt.xy;
+    }
+    let offset = -(255.0 / 127.0) * search_length(e.gr, 0.5) + 3.25;
+    return -rt.y * offset + uv.y;
+}
+
+// The table's left half: 16 texels a pattern, by the square root of each distance.
+fn area(dist: vec2<f32>, e1: f32, e2: f32) -> vec2<f32> {
+    let uv = area_texel * (16.0 * round(4.0 * vec2(e1, e2)) + dist) + 0.5 * area_texel;
+    return textureSampleLevel(tex_b, samp, uv, 0.0).rg;
+}
+
+// A corner at a line's end keeps a quarter of its blend, so it stays a corner.
+fn corner_level(weights: vec2<f32>, at: vec4<f32>, d: vec2<f32>) -> vec2<f32> {
+    let ends = step(d.xy, d.yx);
+    let rounding = 0.75 * ends / (ends.x + ends.y);
+    var factor = vec2(1.0);
+    factor.x -= rounding.x * textureSampleLevel(tex_a, samp, at.xy, 0.0, vec2<i32>(0, 1)).r;
+    factor.x -= rounding.y * textureSampleLevel(tex_a, samp, at.zw, 0.0, vec2<i32>(1, 1)).r;
+    factor.y -= rounding.x * textureSampleLevel(tex_a, samp, at.xy, 0.0, vec2<i32>(0, -2)).r;
+    factor.y -= rounding.y * textureSampleLevel(tex_a, samp, at.zw, 0.0, vec2<i32>(1, -2)).r;
+    return weights * clamp(factor, vec2(0.0), vec2(1.0));
+}
+
+fn corner_upright(weights: vec2<f32>, at: vec4<f32>, d: vec2<f32>) -> vec2<f32> {
+    let ends = step(d.xy, d.yx);
+    let rounding = 0.75 * ends / (ends.x + ends.y);
+    var factor = vec2(1.0);
+    factor.x -= rounding.x * textureSampleLevel(tex_a, samp, at.xy, 0.0, vec2<i32>(1, 0)).g;
+    factor.x -= rounding.y * textureSampleLevel(tex_a, samp, at.zw, 0.0, vec2<i32>(1, 1)).g;
+    factor.y -= rounding.x * textureSampleLevel(tex_a, samp, at.xy, 0.0, vec2<i32>(-2, 0)).g;
+    factor.y -= rounding.y * textureSampleLevel(tex_a, samp, at.zw, 0.0, vec2<i32>(-2, 1)).g;
+    return weights * clamp(factor, vec2(0.0), vec2(1.0));
+}
+
+@fragment
+fn fs_weights(in: VertexOutput) -> @location(0) vec4<f32> {
+    let rt = metrics();
+    let uv = in.uv;
+    let pixel = uv * rt.zw;
+    let o0 = rt.xyxy * vec4(-0.25, -0.125, 1.25, -0.125) + uv.xyxy;
+    let o1 = rt.xyxy * vec4(-0.125, -0.25, -0.125, 1.25) + uv.xyxy;
+    let o2 = rt.xxyy * vec4(-2.0, 2.0, -2.0, 2.0) * f32(steps) + vec4(o0.xz, o1.yw);
+    var weights = vec4(0.0);
+    var e = edge(uv);
+    if (e.g > 0.0) { // an edge at its top
+        var level = true;
+        if (diag_steps > 0) {
+            let w = diag_weights(uv, e);
+            weights = vec4(w, weights.zw);
+            level = w.r == -w.g; // no diagonal found
+        }
+        if (level) {
+            var coords = vec3(search_x_left(o0.xy, o2.x), o1.y, 0.0);
+            let e1 = edge(coords.xy).r;
+            coords.z = search_x_right(o0.zw, o2.y);
+            let d = abs(round(rt.zz * vec2(coords.x, coords.z) - pixel.xx));
+            let e2 = textureSampleLevel(tex_a, samp, coords.zy, 0.0, vec2<i32>(1, 0)).r;
+            var w = area(sqrt(d), e1, e2);
+            if (corners > 0) {
+                w = corner_level(w, vec4(coords.x, uv.y, coords.z, uv.y), d);
+            }
+            weights = vec4(w, weights.zw);
+        } else {
+            e.r = 0.0; // the diagonal stands for the upright edge too
+        }
+    }
+    if (e.r > 0.0) { // an edge at its left
+        var coords = vec3(o0.x, search_y_up(o1.xy, o2.z), 0.0);
+        let e1 = edge(coords.xy).g;
+        coords.z = search_y_down(o1.zw, o2.w);
+        let d = abs(round(rt.ww * vec2(coords.y, coords.z) - pixel.yy));
+        let e2 = textureSampleLevel(tex_a, samp, coords.xz, 0.0, vec2<i32>(0, 1)).g;
+        var w = area(sqrt(d), e1, e2);
+        if (corners > 0) {
+            w = corner_upright(w, vec4(uv.x, coords.y, uv.x, coords.z), d);
+        }
+        weights = vec4(weights.xy, w);
+    }
+    return weights;
+}
+
+// tex_a: the scene, tex_b: the weights. The EFB's alpha is kept.
+@fragment
+fn fs_blend(in: VertexOutput) -> @location(0) vec4<f32> {
+    let rt = metrics();
+    let uv = in.uv;
+    let centre = textureSampleLevel(tex_a, samp, uv, 0.0);
+    let here = textureSampleLevel(tex_b, samp, uv, 0.0);
+    // Right, top, left, bottom.
+    let a = vec4(textureSampleLevel(tex_b, samp, uv + vec2(rt.x, 0.0), 0.0).a,
+                 textureSampleLevel(tex_b, samp, uv + vec2(0.0, rt.y), 0.0).g, here.z, here.x);
+    if (a.x + a.y + a.z + a.w < 1e-5) {
+        return centre;
+    }
+    let across = max(a.x, a.z) > max(a.y, a.w);
+    let offset = select(vec4(0.0, a.y, 0.0, a.w), vec4(a.x, 0.0, a.z, 0.0), across);
+    var weight = select(a.yw, a.xz, across);
+    weight /= weight.x + weight.y;
+    let at = offset * vec4(rt.xy, -rt.xy) + uv.xyxy;
+    let colour = weight.x * textureSampleLevel(tex_a, samp, at.xy, 0.0).rgb +
+                 weight.y * textureSampleLevel(tex_a, samp, at.zw, 0.0).rgb;
+    return vec4(colour, centre.a);
+}
+)""";
+
+wgpu::RenderPipeline make_smaa_pipeline(const char* label, const char* entry, wgpu::TextureFormat format,
+                                        const SmaaPreset& preset) {
+  const std::array constants{
+      wgpu::ConstantEntry{.key = "threshold",
+                          .value = env_float("DOL_AURORA_SMAA_THRESHOLD", preset.threshold, 0.f, 0.5f)},
+      wgpu::ConstantEntry{.key = "steps", .value = static_cast<double>(preset.steps)},
+      wgpu::ConstantEntry{.key = "diag_steps", .value = static_cast<double>(preset.diagSteps)},
+      wgpu::ConstantEntry{.key = "corners", .value = static_cast<double>(preset.corners)},
+  };
+  // Each entry point takes only the constants it reads.
+  const bool edges = std::strcmp(entry, "fs_edges") == 0;
+  const bool weights = std::strcmp(entry, "fs_weights") == 0;
+  const std::array targets{wgpu::ColorTargetState{.format = format, .writeMask = wgpu::ColorWriteMask::All}};
+  const wgpu::FragmentState fragment{
+      .module = g_smaaModule,
+      .entryPoint = entry,
+      .constantCount = edges ? 1u : weights ? 3u : 0u,
+      .constants = edges ? constants.data() : constants.data() + 1,
+      .targetCount = targets.size(),
+      .targets = targets.data(),
+  };
+  const wgpu::RenderPipelineDescriptor descriptor{
+      .label = label,
+      .layout = g_smaaPipelineLayout,
+      .vertex = {.module = g_smaaModule, .entryPoint = "vs_main"},
+      .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+      .multisample = {.count = 1, .mask = UINT32_MAX},
+      .fragment = &fragment,
+  };
+  return g_device.CreateRenderPipeline(&descriptor);
+}
+
+wgpu::TextureView make_smaa_table(const char* label, wgpu::Texture& texture, wgpu::TextureFormat format,
+                                  uint32_t width, uint32_t height, uint32_t texelBytes, const unsigned char* data) {
+  const wgpu::TextureDescriptor descriptor{
+      .label = label,
+      .usage = wgpu::TextureUsage::TextureBinding | wgpu::TextureUsage::CopyDst,
+      .size = {width, height, 1},
+      .format = format,
+  };
+  texture = g_device.CreateTexture(&descriptor);
+  const wgpu::TexelCopyTextureInfo dst{.texture = texture};
+  const wgpu::TexelCopyBufferLayout layout{.bytesPerRow = width * texelBytes, .rowsPerImage = height};
+  const wgpu::Extent3D extent{width, height, 1};
+  webgpu::g_queue.WriteTexture(&dst, data, static_cast<size_t>(width) * height * texelBytes, &layout, &extent);
+  return texture.CreateView();
+}
+
+void draw_smaa(const wgpu::CommandEncoder& cmd, const char* label, const wgpu::RenderPipeline& pipeline,
+               const wgpu::TextureView& target, bool load, const wgpu::TextureView& a, const wgpu::TextureView& b,
+               const wgpu::TextureView& c) {
+  const std::array entries{
+      wgpu::BindGroupEntry{.binding = 0, .sampler = g_sampler},
+      wgpu::BindGroupEntry{.binding = 1, .textureView = a},
+      wgpu::BindGroupEntry{.binding = 2, .textureView = b},
+      wgpu::BindGroupEntry{.binding = 3, .textureView = c},
+  };
+  const wgpu::BindGroupDescriptor bindGroupDescriptor{
+      .layout = g_smaaLayout,
+      .entryCount = entries.size(),
+      .entries = entries.data(),
+  };
+  const auto bindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+  const std::array attachments{wgpu::RenderPassColorAttachment{
+      .view = target,
+      .loadOp = load ? wgpu::LoadOp::Load : wgpu::LoadOp::Clear,
+      .storeOp = wgpu::StoreOp::Store,
+      .clearValue = {0.0, 0.0, 0.0, 0.0},
+  }};
+  const wgpu::RenderPassDescriptor descriptor{
+      .label = label,
+      .colorAttachmentCount = attachments.size(),
+      .colorAttachments = attachments.data(),
+      .timestampWrites = webgpu::gpu_prof::pass_writes(label),
+  };
+  const auto pass = cmd.BeginRenderPass(&descriptor);
+  pass.SetPipeline(pipeline);
+  pass.SetBindGroup(0, bindGroup, 0, nullptr);
+  pass.Draw(3);
+  pass.End();
+}
+
+// The scene's copy to the frame buffer in SMAA's three passes.
+void encode_smaa(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& size, wgpu::TextureFormat format,
+                 const wgpu::TextureView& dst, int level) {
+  if (!g_smaaModule) {
+    wgpu::ShaderSourceWGSL source{};
+    source.code = kSmaaShader;
+    const wgpu::ShaderModuleDescriptor descriptor{.nextInChain = &source, .label = "Smooth edges (SMAA)"};
+    g_smaaModule = g_device.CreateShaderModule(&descriptor);
+    std::array<wgpu::BindGroupLayoutEntry, 4> layoutEntries{};
+    layoutEntries[0] = {.binding = 0,
+                        .visibility = wgpu::ShaderStage::Fragment,
+                        .sampler = {.type = wgpu::SamplerBindingType::Filtering}};
+    for (uint32_t i = 1; i < 4; ++i)
+      layoutEntries[i] = {.binding = i,
+                          .visibility = wgpu::ShaderStage::Fragment,
+                          .texture = {.sampleType = wgpu::TextureSampleType::Float,
+                                      .viewDimension = wgpu::TextureViewDimension::e2D}};
+    const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+        .label = "Smooth edges (SMAA)",
+        .entryCount = layoutEntries.size(),
+        .entries = layoutEntries.data(),
+    };
+    g_smaaLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
+    const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{.bindGroupLayoutCount = 1,
+                                                                  .bindGroupLayouts = &g_smaaLayout};
+    g_smaaPipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
+    g_smaaAreaView = make_smaa_table("SMAA area table", g_smaaAreaTex, wgpu::TextureFormat::RG8Unorm,
+                                     smaa::kAreaWidth, smaa::kAreaHeight, 2, smaa::kArea);
+    g_smaaSearchView = make_smaa_table("SMAA search table", g_smaaSearchTex, wgpu::TextureFormat::R8Unorm,
+                                       smaa::kSearchWidth, smaa::kSearchHeight, 1, smaa::kSearch);
+  }
+  if (!g_smaaBlend || g_smaaFormat != format || g_smaaLevel != level) {
+    const auto& preset = kSmaaPresets[level - 1];
+    g_smaaEdges = make_smaa_pipeline("Smooth edges (SMAA) edges", "fs_edges", wgpu::TextureFormat::RG8Unorm, preset);
+    g_smaaWeights =
+        make_smaa_pipeline("Smooth edges (SMAA) weights", "fs_weights", wgpu::TextureFormat::RGBA8Unorm, preset);
+    g_smaaBlend = make_smaa_pipeline("Smooth edges (SMAA) blend", "fs_blend", format, preset);
+    g_smaaFormat = format;
+    g_smaaLevel = level;
+  }
+  if (!g_smaaEdgeTex || g_smaaEdgeTex.GetWidth() != size.width || g_smaaEdgeTex.GetHeight() != size.height) {
+    wgpu::TextureDescriptor descriptor{
+        .label = "Smooth edges (SMAA) edges",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+        .size = {size.width, size.height, 1},
+        .format = wgpu::TextureFormat::RG8Unorm,
+    };
+    g_smaaEdgeTex = g_device.CreateTexture(&descriptor);
+    g_smaaEdgeView = g_smaaEdgeTex.CreateView();
+    descriptor.label = "Smooth edges (SMAA) weights";
+    descriptor.format = wgpu::TextureFormat::RGBA8Unorm;
+    g_smaaWeightTex = g_device.CreateTexture(&descriptor);
+    g_smaaWeightView = g_smaaWeightTex.CreateView();
+  }
+  draw_smaa(cmd, "Smooth edges (SMAA) edges", g_smaaEdges, g_smaaEdgeView, false, g_smoothSceneView,
+            g_smoothSceneView, g_smoothSceneView);
+  draw_smaa(cmd, "Smooth edges (SMAA) weights", g_smaaWeights, g_smaaWeightView, false, g_smaaEdgeView,
+            g_smaaAreaView, g_smaaSearchView);
+  draw_smaa(cmd, "Smooth edges (SMAA) blend", g_smaaBlend, dst, true, g_smoothSceneView, g_smaaWeightView,
+            g_smaaWeightView);
+}
+
 // After the last effect, into the frame buffer. Left out where the target isn't the frame buffer, or is multisampled.
-void encode_fxaa(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& size, wgpu::TextureFormat format,
+void encode_edge_smoothing(const wgpu::CommandEncoder& cmd, const wgpu::Extent3D& size, wgpu::TextureFormat format,
                  const wgpu::TextureView& dst, uint32_t msaaSamples) {
   const auto& frame = webgpu::g_frameBuffer;
-  const int level = fxaa_level();
-  if (level == 0 || !g_pipelineLayout || msaaSamples != 1 || size.width < 4 || size.height < 4 ||
+  const int mode = edge_smoothing();
+  if (mode == 0 || !g_pipelineLayout || msaaSamples != 1 || size.width < 4 || size.height < 4 ||
       !frame.texture || dst.Get() != frame.view.Get() || frame.texture.GetWidth() != size.width ||
       frame.texture.GetHeight() != size.height || frame.texture.GetFormat() != format)
     return;
-  const webgpu::gpu_prof::Zone zone{cmd, "Smooth edges (FXAA)"};
-  if (!g_fxaaPass || g_fxaaFormat != format || g_fxaaLevel != level) {
-    g_fxaaPass = make_fxaa_pipeline(format, level);
-    g_fxaaFormat = format;
-    g_fxaaLevel = level;
-  }
-  if (!g_fxaaScene || g_fxaaScene.GetWidth() != size.width || g_fxaaScene.GetHeight() != size.height ||
-      g_fxaaScene.GetFormat() != format) {
+  const webgpu::gpu_prof::Zone zone{cmd, mode > 3 ? "Smooth edges (SMAA)" : "Smooth edges (FXAA)"};
+  if (!g_smoothScene || g_smoothScene.GetWidth() != size.width || g_smoothScene.GetHeight() != size.height ||
+      g_smoothScene.GetFormat() != format) {
     const wgpu::TextureDescriptor descriptor{
-        .label = "Smooth edges (FXAA) scene",
+        .label = "Smooth edges scene",
         .usage = wgpu::TextureUsage::CopyDst | wgpu::TextureUsage::TextureBinding,
         .size = {size.width, size.height, 1},
         .format = format,
     };
-    g_fxaaScene = g_device.CreateTexture(&descriptor);
-    g_fxaaSceneView = g_fxaaScene.CreateView();
+    g_smoothScene = g_device.CreateTexture(&descriptor);
+    g_smoothSceneView = g_smoothScene.CreateView();
   }
   const wgpu::TexelCopyTextureInfo from{.texture = frame.texture};
-  const wgpu::TexelCopyTextureInfo to{.texture = g_fxaaScene};
+  const wgpu::TexelCopyTextureInfo to{.texture = g_smoothScene};
   const wgpu::Extent3D extent{size.width, size.height, 1};
   cmd.CopyTextureToTexture(&from, &to, &extent);
-  draw(cmd, "Smooth edges (FXAA)", g_fxaaPass, g_fxaaSceneView, dst, true);
+  if (mode > 3) {
+    encode_smaa(cmd, size, format, dst, mode - 3);
+    return;
+  }
+  if (!g_fxaaPass || g_fxaaFormat != format || g_fxaaLevel != mode) {
+    g_fxaaPass = make_fxaa_pipeline(format, mode);
+    g_fxaaFormat = format;
+    g_fxaaLevel = mode;
+  }
+  draw(cmd, "Smooth edges (FXAA)", g_fxaaPass, g_smoothSceneView, dst, true);
 }
 } // namespace
 
-void reset_fxaa() noexcept {
-  g_fxaaSceneView = {};
-  g_fxaaScene = {};
+void reset_edge_smoothing() noexcept {
+  g_smoothSceneView = {};
+  g_smoothScene = {};
   g_fxaaPass = {};
   g_fxaaFormat = wgpu::TextureFormat::Undefined;
   g_fxaaModule = {};
+  g_smaaEdges = {};
+  g_smaaWeights = {};
+  g_smaaBlend = {};
+  g_smaaFormat = wgpu::TextureFormat::Undefined;
+  g_smaaEdgeView = {};
+  g_smaaEdgeTex = {};
+  g_smaaWeightView = {};
+  g_smaaWeightTex = {};
+  g_smaaAreaView = {};
+  g_smaaAreaTex = {};
+  g_smaaSearchView = {};
+  g_smaaSearchTex = {};
+  g_smaaPipelineLayout = {};
+  g_smaaLayout = {};
+  g_smaaModule = {};
 }
 
-int fxaa_level() noexcept {
-  int level = g_fxaa.load(std::memory_order_relaxed);
-  if (level < 0) {
-    const char* env = std::getenv("DOL_AURORA_FXAA");
-    level = env != nullptr ? std::clamp(std::atoi(env), 0, 3) : 0;
-    g_fxaa.store(level, std::memory_order_relaxed);
+int edge_smoothing() noexcept {
+  int mode = g_edgeSmoothing.load(std::memory_order_relaxed);
+  if (mode < 0) {
+    const char* env = std::getenv("DOL_AURORA_EDGE_SMOOTHING");
+    mode = env != nullptr ? std::clamp(std::atoi(env), 0, 6) : 0;
+    g_edgeSmoothing.store(mode, std::memory_order_relaxed);
   }
-  return level;
+  return mode;
 }
 
-void set_fxaa(int level) noexcept { g_fxaa.store(std::clamp(level, 0, 3), std::memory_order_relaxed); }
+void set_edge_smoothing(int mode) noexcept {
+  g_edgeSmoothing.store(std::clamp(mode, 0, 6), std::memory_order_relaxed);
+}
 
 bool any_enabled() noexcept {
   return bloom_enabled() || far_blur_enabled() || ambient_occlusion_enabled() || cloud_shadows_enabled() ||
-         sun_shadows_enabled() || edge_light_enabled() || torch_light_enabled() || fxaa_level() != 0;
+         sun_shadows_enabled() || edge_light_enabled() || torch_light_enabled() || edge_smoothing() != 0;
 }
 
 // The frame buffer's colours before the effects, for the exposure's
@@ -6825,7 +7342,7 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
   if (phase == Phase::Full && bloom_enabled())
     encode_bloom(cmd, scene, size, format, dst, resolve, msaaSamples);
   if (phase == Phase::Full)
-    encode_fxaa(cmd, size, format, dst, msaaSamples);
+    encode_edge_smoothing(cmd, size, format, dst, msaaSamples);
 }
 
 void encode_bloom(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, const wgpu::Extent3D& size,
@@ -6853,7 +7370,7 @@ void aurora_set_bloom(bool enabled) { aurora::gfx::post_fx::set_bloom(enabled); 
 
 void aurora_set_far_blur(bool enabled) { aurora::gfx::post_fx::set_far_blur(enabled); }
 
-void aurora_set_fxaa(int level) { aurora::gfx::post_fx::set_fxaa(level); }
+void aurora_set_edge_smoothing(int mode) { aurora::gfx::post_fx::set_edge_smoothing(mode); }
 
 void aurora_set_far_blur_level(float level) { aurora::gfx::post_fx::set_far_blur_level(level); }
 
