@@ -1396,6 +1396,8 @@ void initialize() {
   initialize_pipeline_cache();
 }
 
+static void reset_msaa_depth();
+
 void shutdown() {
 #ifdef AURORA_ENABLE_GXCORE
   gxcore::wait_interp_jobs();
@@ -1472,6 +1474,7 @@ void shutdown() {
   g_offscreenCache.clear();
   g_offscreenColor = {};
   g_offscreenDepth = {};
+  reset_msaa_depth();
   g_staticBindGroup = {};
   g_staticBindGroupLayout = {};
   g_uniformBindGroup = {};
@@ -2528,6 +2531,103 @@ static void encode_effect_mask(const wgpu::CommandEncoder& cmd, FramePacket& fra
 }
 #endif
 
+// MSAA (DOL_AURORA_MSAA=4): the EFB depth is multisampled, which an EFB depth copy and the depth peek cannot read.
+// Before either, sample 0 of each pixel is written to a single-sample depth texture of the same size, and they read
+// that instead. One sample, not an average: a depth copy wants a depth the scene really had at that pixel.
+static wgpu::RenderPipeline g_msaaDepthPipeline;
+static wgpu::BindGroupLayout g_msaaDepthLayout;
+static wgpu::Texture g_msaaDepthTexture;
+static wgpu::TextureView g_msaaDepthView;
+
+static void reset_msaa_depth() {
+  g_msaaDepthView = {};
+  g_msaaDepthTexture = {};
+  g_msaaDepthPipeline = {};
+  g_msaaDepthLayout = {};
+}
+
+static wgpu::TextureView resolve_msaa_depth(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& source,
+                                            wgpu::Extent3D size) {
+  if (!g_msaaDepthPipeline) {
+    static constexpr std::string_view kShader = R"(
+@group(0) @binding(0) var src: texture_depth_multisampled_2d;
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fs_main(@builtin(position) pos: vec4f) -> @builtin(frag_depth) f32 {
+    return textureLoad(src, vec2i(pos.xy), 0);
+}
+)";
+    wgpu::ShaderSourceWGSL wgsl{};
+    wgsl.code = kShader;
+    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl, .label = "MSAA depth resolve"};
+    const auto module = g_device.CreateShaderModule(&moduleDescriptor);
+    const wgpu::BindGroupLayoutEntry entry{
+        .binding = 0,
+        .visibility = wgpu::ShaderStage::Fragment,
+        .texture = {.sampleType = wgpu::TextureSampleType::Depth,
+                    .viewDimension = wgpu::TextureViewDimension::e2D,
+                    .multisampled = true},
+    };
+    const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+        .label = "MSAA depth resolve", .entryCount = 1, .entries = &entry};
+    g_msaaDepthLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
+    const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{
+        .label = "MSAA depth resolve", .bindGroupLayoutCount = 1, .bindGroupLayouts = &g_msaaDepthLayout};
+    const auto pipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
+    const wgpu::DepthStencilState depthState{
+        .format = webgpu::g_graphicsConfig.depthFormat,
+        .depthWriteEnabled = wgpu::OptionalBool::True,
+        .depthCompare = wgpu::CompareFunction::Always,
+    };
+    const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs_main", .targetCount = 0};
+    const wgpu::RenderPipelineDescriptor descriptor{
+        .label = "MSAA depth resolve",
+        .layout = pipelineLayout,
+        .vertex = {.module = module, .entryPoint = "vs_main"},
+        .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+        .depthStencil = &depthState,
+        .multisample = {.count = 1, .mask = UINT32_MAX},
+        .fragment = &fragment,
+    };
+    g_msaaDepthPipeline = g_device.CreateRenderPipeline(&descriptor);
+  }
+  if (!g_msaaDepthTexture || g_msaaDepthTexture.GetWidth() != size.width ||
+      g_msaaDepthTexture.GetHeight() != size.height) {
+    const wgpu::TextureDescriptor textureDescriptor{
+        .label = "MSAA depth resolve",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+        .dimension = wgpu::TextureDimension::e2D,
+        .size = {size.width, size.height, 1},
+        .format = webgpu::g_graphicsConfig.depthFormat,
+        .mipLevelCount = 1,
+        .sampleCount = 1,
+    };
+    g_msaaDepthTexture = g_device.CreateTexture(&textureDescriptor);
+    g_msaaDepthView = g_msaaDepthTexture.CreateView();
+  }
+  const wgpu::BindGroupEntry bindEntry{.binding = 0, .textureView = source};
+  const wgpu::BindGroupDescriptor bindDescriptor{
+      .label = "MSAA depth resolve", .layout = g_msaaDepthLayout, .entryCount = 1, .entries = &bindEntry};
+  const auto bindGroup = g_device.CreateBindGroup(&bindDescriptor);
+  const webgpu::gpu_prof::Zone zone{cmd, "MSAA depth resolve"};
+  const wgpu::RenderPassDepthStencilAttachment depthAttachment{
+      .view = g_msaaDepthView,
+      .depthLoadOp = wgpu::LoadOp::Clear,
+      .depthStoreOp = wgpu::StoreOp::Store,
+      .depthClearValue = 1.f,
+  };
+  const wgpu::RenderPassDescriptor passDescriptor{
+      .label = "MSAA depth resolve", .colorAttachmentCount = 0, .depthStencilAttachment = &depthAttachment};
+  auto pass = cmd.BeginRenderPass(&passDescriptor);
+  pass.SetPipeline(g_msaaDepthPipeline);
+  pass.SetBindGroup(0, bindGroup);
+  pass.Draw(3);
+  pass.End();
+  return g_msaaDepthView;
+}
+
 static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
   ZoneScoped;
   if (!passInfo.sealed) {
@@ -2981,8 +3081,17 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
   post_fx::end_actor_shadow();
 #endif
 
+  // A multisampled depth is made single-sample once, for whichever of the two below reads it.
+  wgpu::TextureView copyDepthView = passInfo.copySourceDepthView;
+  uint32_t copyDepthSamples = passInfo.msaaSamples;
+  if (passInfo.msaaSamples > 1 && copyDepthView &&
+      ((passInfo.captureDepthSnapshot && !frame_interp::encoding_interpolated()) ||
+       (passInfo.resolveTarget && gx::is_depth_format(passInfo.resolveFormat)))) {
+    copyDepthView = resolve_msaa_depth(cmd, copyDepthView, passInfo.targetSize);
+    copyDepthSamples = 1;
+  }
   if (passInfo.captureDepthSnapshot && !frame_interp::encoding_interpolated()) {
-    depth_peek::encode_frame_snapshot(cmd, passInfo.copySourceDepthView, passInfo.targetSize, passInfo.msaaSamples);
+    depth_peek::encode_frame_snapshot(cmd, copyDepthView, passInfo.targetSize, copyDepthSamples);
   }
 
   if (passInfo.resolveTarget) {
@@ -2991,12 +3100,12 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
     const bool needsScaling = dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
                               dstSize.height != static_cast<uint32_t>(passInfo.resolveRect.height);
     const bool isDepth = gx::is_depth_format(passInfo.resolveFormat);
-    if (isDepth && passInfo.msaaSamples > 1) {
+    if (isDepth && copyDepthSamples > 1) {
       Log.fatal("Depth tex copies from multisampled EFB targets are not supported");
     }
     const tex_copy_conv::ConvRequest convReq{
         .fmt = passInfo.resolveFormat,
-        .srcView = isDepth ? passInfo.copySourceDepthView : passInfo.copySourceView,
+        .srcView = isDepth ? copyDepthView : passInfo.copySourceView,
         .uniformRange = passInfo.resolveUniformRange,
         .dst = passInfo.resolveTarget,
         .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
