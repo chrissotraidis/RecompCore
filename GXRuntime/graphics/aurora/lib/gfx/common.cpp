@@ -1396,6 +1396,8 @@ void initialize() {
   initialize_pipeline_cache();
 }
 
+static void reset_msaa_depth();
+
 void shutdown() {
 #ifdef AURORA_ENABLE_GXCORE
   gxcore::wait_interp_jobs();
@@ -1472,6 +1474,7 @@ void shutdown() {
   g_offscreenCache.clear();
   g_offscreenColor = {};
   g_offscreenDepth = {};
+  reset_msaa_depth();
   g_staticBindGroup = {};
   g_staticBindGroupLayout = {};
   g_uniformBindGroup = {};
@@ -2453,14 +2456,87 @@ static void encode_effect_mask(const wgpu::CommandEncoder& cmd, FramePacket& fra
   // effects test against the sea mask's depth, which leaves such effects out: the scenery's. The other effects
   // first, pushed back against it, then those at their own depth: a geyser's sparks drawn on its surface, pushed
   // back against the geyser's depth, failed, and kept its shade.
+  // The fast mask (post_fx::effect_mask_fast()): both passes at half the size, against a half-size depth made
+  // from the pass's (or the sea mask's, for effects at their own depth), the viewports and scissors halved as
+  // for a run of soft effects (g_softScale).
+  const bool small = post_fx::effect_mask_fast() && !passInfo.hasStencil;
   const wgpu::TextureView ownDepthView =
-      ownDepth ? post_fx::effect_mask_depth(cmd, passInfo.targetSize) : wgpu::TextureView{};
+      !ownDepth ? wgpu::TextureView{}
+                : small ? post_fx::effect_mask_small_depth(cmd, {}, true, passInfo.targetSize)
+                        : post_fx::effect_mask_depth(cmd, passInfo.targetSize);
+  const wgpu::TextureView smallDepthView =
+      small && !ownDepthView
+          ? post_fx::effect_mask_small_depth(cmd, passInfo.depthStencilView, false, passInfo.targetSize)
+          : wgpu::TextureView{};
+  if (small && !ownDepthView && !smallDepthView)
+    return;
   static uint64_t clearedFrame = UINT64_MAX;
   const bool clear = clearedFrame != frameKey;
   clearedFrame = frameKey;
+  // The fast mask in one pass: the mask and the pass over white are the same draws with the same blending over
+  // two clears, so both targets are written at once by each effect's two-target variant (DrawData::maskPipeline).
+  // Only when every effect of the pass has its variant ready; otherwise the two passes below, as before.
+  // DOL_AURORA_EFFECT_MASK_SINGLE=0 keeps the two passes (measuring).
+  static const bool singleAllowed = [] {
+    const char* env = std::getenv("DOL_AURORA_EFFECT_MASK_SINGLE");
+    return env == nullptr || env[0] != '0';
+  }();
+  bool single = small && singleAllowed && post_fx::effect_mask_opacity();
+  for (size_t i = 0; single && i < end && i < passInfo.commands.size(); ++i) {
+    const auto& command = passInfo.commands[i];
+    if (command.type != CommandType::Draw || command.data.draw.type != ShaderType::GXCore || command.flat ||
+        !command.data.draw.gxcore.effect)
+      continue;
+    const auto ref = command.data.draw.gxcore.maskPipeline;
+    single = ref != 0 && pipeline_ready(ref);
+  }
+  if (single) {
+    const webgpu::gpu_prof::Zone bothZone{cmd, "Effects mask (both)"};
+    const bool bothOwn = static_cast<bool>(ownDepthView);
+    const auto format = webgpu::g_frameBuffer.texture.GetFormat();
+    const std::array bothAttachments{
+        wgpu::RenderPassColorAttachment{
+            .view = post_fx::effect_mask_target(passInfo.targetSize, format, true),
+            .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+            .storeOp = wgpu::StoreOp::Store,
+            .clearValue = {0.0, 0.0, 0.0, 0.0},
+        },
+        wgpu::RenderPassColorAttachment{
+            .view = post_fx::effect_white_target(passInfo.targetSize, format, true),
+            .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
+            .storeOp = wgpu::StoreOp::Store,
+            .clearValue = {1.0, 1.0, 1.0, 1.0},
+        },
+    };
+    const wgpu::RenderPassDepthStencilAttachment bothDepth{
+        .view = bothOwn ? ownDepthView : smallDepthView,
+        .depthLoadOp = wgpu::LoadOp::Load,
+        .depthStoreOp = wgpu::StoreOp::Store,
+    };
+    const wgpu::RenderPassDescriptor bothDescriptor{
+        .label = "Effects mask (both)",
+        .colorAttachmentCount = bothAttachments.size(),
+        .colorAttachments = bothAttachments.data(),
+        .depthStencilAttachment = &bothDepth,
+        .timestampWrites = webgpu::gpu_prof::pass_writes("Effects mask (both)"),
+    };
+    auto bothPass = cmd.BeginRenderPass(&bothDescriptor);
+    g_softScale = 0.5f;
+    gxcore::set_mask_target(true);
+    if (bothOwn) {
+      render_pass(bothPass, frame, passInfo, 0, end, true, 1);
+      render_pass(bothPass, frame, passInfo, 0, end, true, 2);
+    } else {
+      render_pass(bothPass, frame, passInfo, 0, end, true);
+    }
+    gxcore::set_mask_target(false);
+    g_softScale = 1.f;
+    bothPass.End();
+    return;
+  }
   const webgpu::gpu_prof::Zone zone{cmd, "Effects mask"};
   const std::array attachments{wgpu::RenderPassColorAttachment{
-      .view = post_fx::effect_mask_target(passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat()),
+      .view = post_fx::effect_mask_target(passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat(), small),
       .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
       .storeOp = wgpu::StoreOp::Store,
       .clearValue = {0.0, 0.0, 0.0, 0.0},
@@ -2468,7 +2544,7 @@ static void encode_effect_mask(const wgpu::CommandEncoder& cmd, FramePacket& fra
   // The pass's depth as the scene left it: the effects test against it and write none.
   const bool own = static_cast<bool>(ownDepthView) && !passInfo.hasStencil;
   const wgpu::RenderPassDepthStencilAttachment depth{
-      .view = own ? ownDepthView : passInfo.depthStencilView,
+      .view = own ? ownDepthView : small ? smallDepthView : passInfo.depthStencilView,
       .depthLoadOp = wgpu::LoadOp::Load,
       .depthStoreOp = wgpu::StoreOp::Store,
       .stencilLoadOp = passInfo.hasStencil ? wgpu::LoadOp::Load : wgpu::LoadOp::Undefined,
@@ -2482,29 +2558,44 @@ static void encode_effect_mask(const wgpu::CommandEncoder& cmd, FramePacket& fra
       .timestampWrites = webgpu::gpu_prof::pass_writes("Effects mask"),
   };
   auto pass = cmd.BeginRenderPass(&descriptor);
+  if (small)
+    g_softScale = 0.5f;
   if (own) {
     render_pass(pass, frame, passInfo, 0, end, true, 1);
     render_pass(pass, frame, passInfo, 0, end, true, 2);
   } else {
     render_pass(pass, frame, passInfo, 0, end, true);
   }
+  g_softScale = 1.f;
   pass.End();
   // Again over white, for their opacity (post_fx.hpp effect_white_target()): a dark effect blended over the scene
   // (the dust a shutting door raises) adds little over black but hides what is behind it. Against a fresh copy of
   // the sea mask's depth when the effects drawn at their own depth wrote theirs into the first.
   if (!post_fx::effect_mask_opacity())
     return;
+  // With effects at their own depth the fast mask's depth is made again for this pass, as the full-size copy is:
+  // the first pass wrote theirs into it. Without, the first pass's half-size depth serves: what an effect that
+  // writes depth wrote there, the pass's depth it was made from already held.
   const wgpu::TextureView whiteDepthView =
-      own ? post_fx::effect_mask_depth(cmd, passInfo.targetSize) : wgpu::TextureView{};
+      !own ? wgpu::TextureView{}
+           : small ? post_fx::effect_mask_small_depth(cmd, {}, true, passInfo.targetSize)
+                   : post_fx::effect_mask_depth(cmd, passInfo.targetSize);
   const bool whiteOwn = own && static_cast<bool>(whiteDepthView);
+  const wgpu::TextureView whiteSmallDepthView =
+      !small || whiteOwn ? wgpu::TextureView{}
+                         : smallDepthView ? smallDepthView
+                                          : post_fx::effect_mask_small_depth(cmd, passInfo.depthStencilView, false,
+                                                                             passInfo.targetSize);
+  if (small && !whiteOwn && !whiteSmallDepthView)
+    return;
   const std::array whiteAttachments{wgpu::RenderPassColorAttachment{
-      .view = post_fx::effect_white_target(passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat()),
+      .view = post_fx::effect_white_target(passInfo.targetSize, webgpu::g_frameBuffer.texture.GetFormat(), small),
       .loadOp = clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load,
       .storeOp = wgpu::StoreOp::Store,
       .clearValue = {1.0, 1.0, 1.0, 1.0},
   }};
   const wgpu::RenderPassDepthStencilAttachment whiteDepth{
-      .view = whiteOwn ? whiteDepthView : passInfo.depthStencilView,
+      .view = whiteOwn ? whiteDepthView : small ? whiteSmallDepthView : passInfo.depthStencilView,
       .depthLoadOp = wgpu::LoadOp::Load,
       .depthStoreOp = wgpu::StoreOp::Store,
       .stencilLoadOp = passInfo.hasStencil ? wgpu::LoadOp::Load : wgpu::LoadOp::Undefined,
@@ -2518,15 +2609,115 @@ static void encode_effect_mask(const wgpu::CommandEncoder& cmd, FramePacket& fra
       .timestampWrites = webgpu::gpu_prof::pass_writes("Effects mask (over white)"),
   };
   auto whitePass = cmd.BeginRenderPass(&whiteDescriptor);
+  if (small)
+    g_softScale = 0.5f;
   if (whiteOwn) {
     render_pass(whitePass, frame, passInfo, 0, end, true, 1);
     render_pass(whitePass, frame, passInfo, 0, end, true, 2);
   } else {
     render_pass(whitePass, frame, passInfo, 0, end, true);
   }
+  g_softScale = 1.f;
   whitePass.End();
 }
 #endif
+
+// MSAA (DOL_AURORA_MSAA=4): the EFB depth is multisampled, which an EFB depth copy and the depth peek cannot read.
+// Before either, sample 0 of each pixel is written to a single-sample depth texture of the same size, and they read
+// that instead. One sample, not an average: a depth copy wants a depth the scene really had at that pixel.
+static wgpu::RenderPipeline g_msaaDepthPipeline;
+static wgpu::BindGroupLayout g_msaaDepthLayout;
+static wgpu::Texture g_msaaDepthTexture;
+static wgpu::TextureView g_msaaDepthView;
+
+static void reset_msaa_depth() {
+  g_msaaDepthView = {};
+  g_msaaDepthTexture = {};
+  g_msaaDepthPipeline = {};
+  g_msaaDepthLayout = {};
+}
+
+static wgpu::TextureView resolve_msaa_depth(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& source,
+                                            wgpu::Extent3D size) {
+  if (!g_msaaDepthPipeline) {
+    static constexpr std::string_view kShader = R"(
+@group(0) @binding(0) var src: texture_depth_multisampled_2d;
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let p = vec2f(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4f(p * 2.0 - 1.0, 0.0, 1.0);
+}
+@fragment fn fs_main(@builtin(position) pos: vec4f) -> @builtin(frag_depth) f32 {
+    return textureLoad(src, vec2i(pos.xy), 0);
+}
+)";
+    wgpu::ShaderSourceWGSL wgsl{};
+    wgsl.code = kShader;
+    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl, .label = "MSAA depth resolve"};
+    const auto module = g_device.CreateShaderModule(&moduleDescriptor);
+    const wgpu::BindGroupLayoutEntry entry{
+        .binding = 0,
+        .visibility = wgpu::ShaderStage::Fragment,
+        .texture = {.sampleType = wgpu::TextureSampleType::Depth,
+                    .viewDimension = wgpu::TextureViewDimension::e2D,
+                    .multisampled = true},
+    };
+    const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+        .label = "MSAA depth resolve", .entryCount = 1, .entries = &entry};
+    g_msaaDepthLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
+    const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{
+        .label = "MSAA depth resolve", .bindGroupLayoutCount = 1, .bindGroupLayouts = &g_msaaDepthLayout};
+    const auto pipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
+    const wgpu::DepthStencilState depthState{
+        .format = webgpu::g_graphicsConfig.depthFormat,
+        .depthWriteEnabled = wgpu::OptionalBool::True,
+        .depthCompare = wgpu::CompareFunction::Always,
+    };
+    const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs_main", .targetCount = 0};
+    const wgpu::RenderPipelineDescriptor descriptor{
+        .label = "MSAA depth resolve",
+        .layout = pipelineLayout,
+        .vertex = {.module = module, .entryPoint = "vs_main"},
+        .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+        .depthStencil = &depthState,
+        .multisample = {.count = 1, .mask = UINT32_MAX},
+        .fragment = &fragment,
+    };
+    g_msaaDepthPipeline = g_device.CreateRenderPipeline(&descriptor);
+  }
+  if (!g_msaaDepthTexture || g_msaaDepthTexture.GetWidth() != size.width ||
+      g_msaaDepthTexture.GetHeight() != size.height) {
+    const wgpu::TextureDescriptor textureDescriptor{
+        .label = "MSAA depth resolve",
+        .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
+        .dimension = wgpu::TextureDimension::e2D,
+        .size = {size.width, size.height, 1},
+        .format = webgpu::g_graphicsConfig.depthFormat,
+        .mipLevelCount = 1,
+        .sampleCount = 1,
+    };
+    g_msaaDepthTexture = g_device.CreateTexture(&textureDescriptor);
+    g_msaaDepthView = g_msaaDepthTexture.CreateView();
+  }
+  const wgpu::BindGroupEntry bindEntry{.binding = 0, .textureView = source};
+  const wgpu::BindGroupDescriptor bindDescriptor{
+      .label = "MSAA depth resolve", .layout = g_msaaDepthLayout, .entryCount = 1, .entries = &bindEntry};
+  const auto bindGroup = g_device.CreateBindGroup(&bindDescriptor);
+  const webgpu::gpu_prof::Zone zone{cmd, "MSAA depth resolve"};
+  const wgpu::RenderPassDepthStencilAttachment depthAttachment{
+      .view = g_msaaDepthView,
+      .depthLoadOp = wgpu::LoadOp::Clear,
+      .depthStoreOp = wgpu::StoreOp::Store,
+      .depthClearValue = 1.f,
+  };
+  const wgpu::RenderPassDescriptor passDescriptor{
+      .label = "MSAA depth resolve", .colorAttachmentCount = 0, .depthStencilAttachment = &depthAttachment};
+  auto pass = cmd.BeginRenderPass(&passDescriptor);
+  pass.SetPipeline(g_msaaDepthPipeline);
+  pass.SetBindGroup(0, bindGroup);
+  pass.Draw(3);
+  pass.End();
+  return g_msaaDepthView;
+}
 
 static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo, uint32_t passIndex) {
   ZoneScoped;
@@ -2981,8 +3172,17 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
   post_fx::end_actor_shadow();
 #endif
 
+  // A multisampled depth is made single-sample once, for whichever of the two below reads it.
+  wgpu::TextureView copyDepthView = passInfo.copySourceDepthView;
+  uint32_t copyDepthSamples = passInfo.msaaSamples;
+  if (passInfo.msaaSamples > 1 && copyDepthView &&
+      ((passInfo.captureDepthSnapshot && !frame_interp::encoding_interpolated()) ||
+       (passInfo.resolveTarget && gx::is_depth_format(passInfo.resolveFormat)))) {
+    copyDepthView = resolve_msaa_depth(cmd, copyDepthView, passInfo.targetSize);
+    copyDepthSamples = 1;
+  }
   if (passInfo.captureDepthSnapshot && !frame_interp::encoding_interpolated()) {
-    depth_peek::encode_frame_snapshot(cmd, passInfo.copySourceDepthView, passInfo.targetSize, passInfo.msaaSamples);
+    depth_peek::encode_frame_snapshot(cmd, copyDepthView, passInfo.targetSize, copyDepthSamples);
   }
 
   if (passInfo.resolveTarget) {
@@ -2991,12 +3191,12 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
     const bool needsScaling = dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
                               dstSize.height != static_cast<uint32_t>(passInfo.resolveRect.height);
     const bool isDepth = gx::is_depth_format(passInfo.resolveFormat);
-    if (isDepth && passInfo.msaaSamples > 1) {
+    if (isDepth && copyDepthSamples > 1) {
       Log.fatal("Depth tex copies from multisampled EFB targets are not supported");
     }
     const tex_copy_conv::ConvRequest convReq{
         .fmt = passInfo.resolveFormat,
-        .srcView = isDepth ? passInfo.copySourceDepthView : passInfo.copySourceView,
+        .srcView = isDepth ? copyDepthView : passInfo.copySourceView,
         .uniformRange = passInfo.resolveUniformRange,
         .dst = passInfo.resolveTarget,
         .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,

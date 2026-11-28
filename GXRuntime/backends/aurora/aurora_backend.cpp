@@ -331,6 +331,12 @@ bool dol_aurora_initialize(int argc, char** argv,
         const char* fullscreen_env = std::getenv("DOL_AURORA_FULLSCREEN");
         config.startFullscreen = fullscreen_env != nullptr && fullscreen_env[0] != '\0' && fullscreen_env[0] != '0';
     }
+    // DOL_AURORA_MSAA=4: draw the game with 4 samples per pixel (multisample anti-aliasing), read once at
+    // startup. WebGPU allows 1 or 4 samples, so any other value leaves it off. A probe: the effects that read the
+    // depth buffer (ambient occlusion, sun and cloud shadows, edge light, far blur, bloom, exposure) and the edge
+    // smoothing filter skip a multisampled frame, so the HD look is off while it is on.
+    if (const char* msaa_env = std::getenv("DOL_AURORA_MSAA"); msaa_env != nullptr && std::atoi(msaa_env) == 4)
+        config.msaa = 4;
     config.allowTextureDumps = backend_config->allow_texture_dumps;
     config.logCallback = gx_aurora::log_callback;
     config.logLevel = backend_config->info_logging ? LOG_INFO : LOG_ERROR;
