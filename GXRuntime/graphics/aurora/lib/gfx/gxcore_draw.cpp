@@ -1,5 +1,6 @@
 #include "gxcore_draw.hpp"
 
+#include <string_view>
 #include <aurora/aurora.h> // aurora_set_forced_anisotropy
 
 #include "../webgpu/gpu.hpp"
@@ -849,6 +850,17 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
     wgsl += "\n@fragment\nfn fs_depth_only() -> @location(0) vec4f {\n"
             "    return vec4f(0.0);\n}\n";
   }
+  if (config.softTarget == 2u) {
+    // The effects' mask in one pass: the generated fragment entry becomes a function, and the entry writes its
+    // colour to both targets. Only asked for where the entry has this plain form (mask_variant_fits()).
+    static constexpr std::string_view kEntry = "@fragment\nfn fs_main(in: VertexOut) -> @location(0) vec4f {\n";
+    const auto at = wgsl.find(kEntry);
+    CHECK(at != std::string::npos && !uber && !depthOnly, "no plain fragment entry for the effects' mask variant");
+    wgsl.replace(at, kEntry.size(), "fn fs_colour(in: VertexOut) -> vec4f {\n");
+    wgsl += "\nstruct MaskOut {\n    @location(0) black: vec4f,\n    @location(1) white: vec4f,\n};\n"
+            "@fragment\nfn fs_main(in: VertexOut) -> MaskOut {\n"
+            "    let c = fs_colour(in);\n    return MaskOut(c, c);\n}\n";
+  }
   wgpu::ShaderSourceWGSL sourceDescriptor{};
   sourceDescriptor.code = wgsl.c_str();
   const wgpu::ShaderModuleDescriptor moduleDescriptor{
@@ -1009,7 +1021,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   // The ubershader draws without early-depth emulation (a frame or two).
   const bool emulateEarlyDepth = !uber && needs_early_depth_emulation(key);
   const bool depthCompare = key.depth_test != 0;
-  const bool softTarget = config.softTarget != 0u;
+  const bool softTarget = config.softTarget == 1u;
+  const bool maskTargets = config.softTarget == 2u;
   const wgpu::DepthStencilState depthStencil{
       .format = g_graphicsConfig.depthFormat,
       .depthWriteEnabled =
@@ -1087,11 +1100,12 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
       .blend = nullptr,
       .writeMask = wgpu::ColorWriteMask::None,
   };
+  const std::array maskColorTargets{colorTarget, colorTarget};
   const wgpu::FragmentState fragmentState{
       .module = module,
       .entryPoint = depthOnly ? "fs_depth_only" : "fs_main",
-      .targetCount = 1,
-      .targets = depthOnly ? &depthOnlyTarget : &colorTarget,
+      .targetCount = maskTargets ? maskColorTargets.size() : size_t{1},
+      .targets = depthOnly ? &depthOnlyTarget : maskTargets ? maskColorTargets.data() : &colorTarget,
   };
 
   auto cullMode = wgpu::CullMode::None;
@@ -1163,6 +1177,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
 namespace {
 // While a run is drawn into the soft effects' buffer (set_soft_target).
 static bool g_softTarget = false;
+// While the effects' mask is drawn in one pass (set_mask_target).
+static bool g_maskTarget = false;
 
 struct PassState {
   WGPUBuffer vertexBuffer = nullptr; // bound whole, or a particle's range
@@ -1183,6 +1199,7 @@ void reset_pass_state() { g_pass = PassState{}; }
 static std::atomic_bool g_efficientEffects{false};
 bool efficient_effects() noexcept { return g_efficientEffects.load(std::memory_order_relaxed); }
 void set_soft_target(bool on) noexcept { g_softTarget = on; }
+void set_mask_target(bool on) noexcept { g_maskTarget = on; }
 static const wgpu::TextureView& empty_texmap_view();
 
 // Wind Waker HD's character light, for the pass being encoded (begin_actor_light_pass()): the group 0 its flagged
@@ -1457,7 +1474,14 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   // recorded with its data (submit_draw_plan), without the depth prepass.
   static const bool uberForced = ubershader_mode() == 2;
   bool uberDraw = false;
-  if (g_softTarget) {
+  if (g_maskTarget) {
+    // The effects' mask in one pass: the two-target variant, checked ready for every effect of the pass before
+    // it was begun (common.cpp encode_effect_mask()).
+    if (data.maskPipeline == 0 || !bind(data.maskPipeline)) {
+      note_draw_left_out(data.batchSize);
+      return;
+    }
+  } else if (g_softTarget) {
     // A run in the soft effects' buffer: their variant, checked ready before
     // the run was given the buffer.
     if (data.softPipeline == 0 || !bind(data.softPipeline)) {
@@ -4465,6 +4489,17 @@ static bool submit_draw_plan_as_is(const gxc::DrawPlan& plan) {
     softConfig.softTarget = 1;
     softPipeline = pipeline_ref(softConfig);
   }
+  // The fast effects' mask: an effect's two-target variant, looked up (and compiled) only while it is on, and
+  // only where the fragment entry is the plain one: no destination alpha (dual-source blending takes one
+  // target), no depth texture, no early depth pass.
+  PipelineRef maskPipeline = 0;
+  if (post_fx::effect_mask_fast() && depthPipeline == 0 && key.shader.use_dst_alpha == 0 && key.shader.ztex_op == 0 &&
+      effect_draw(plan)) {
+    PipelineConfig maskConfig = colorConfig;
+    maskConfig.msaaSamples = 1;
+    maskConfig.softTarget = 2;
+    maskPipeline = pipeline_ref(maskConfig);
+  }
 
   // The ubershader (gxcore_uber.cpp): a draw whose own pipeline is still
   // compiling is drawn with it, with the same result, rather than left out of
@@ -4694,6 +4729,7 @@ static bool submit_draw_plan_as_is(const gxc::DrawPlan& plan) {
       .softEffect = softEffect,
       .softWritesAlpha = plan.pipeline.alpha_update != 0,
       .softPipeline = softPipeline,
+      .maskPipeline = maskPipeline,
       .effect = effect_draw(plan),
       .effectDepth = effectDepth,
       .effectOwnDepth = effectOwnDepth,
@@ -4721,6 +4757,8 @@ void aurora_set_efficient_effects(bool on) {
 }
 
 void aurora_set_game_dof(int step) { aurora::gfx::gxcore::set_game_dof_step(step); }
+
+void aurora_set_game_dof_fast(bool on) { aurora::gfx::tex_copy_conv::set_fast_blur(on); }
 
 void aurora_set_game_dof_start(int start) { aurora::gfx::gxcore::set_game_dof_start(start); }
 void aurora_set_hd_normals(const char* path) {

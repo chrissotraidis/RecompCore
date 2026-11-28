@@ -172,7 +172,17 @@ wgpu::TextureView sea_mask_depth(const wgpu::Extent3D& sceneSize);
 // own pipelines over black, in the frame buffer's format, at the scene's size.
 // The sun shadows, the occlusion and the cloud shadows leave as much of a pixel
 // as it holds unshaded. Asking for it marks it drawn for the next encode().
-wgpu::TextureView effect_mask_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format);
+wgpu::TextureView effect_mask_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format, bool small = false);
+// The fast mask (DOL_AURORA_EFFECT_MASK_FAST, aurora_set_effect_mask_fast; off by default): the mask and the pass
+// over white drawn at half the scene's size (`small`), against a half-size depth, and read between their texels
+// by the cover; a quarter of the fill for each. effect_mask_size() is the mask's size for a scene's.
+bool effect_mask_fast() noexcept;
+void set_effect_mask_fast(bool on) noexcept;
+wgpu::Extent3D effect_mask_size(const wgpu::Extent3D& sceneSize, bool small) noexcept;
+// The fast mask's depth, made anew: the farthest of each 2x2 of the scene's depth (`sceneDepth`), or with `sea` of
+// the sea mask's (for effects drawn at their own depth); none when the source isn't there or this size.
+wgpu::TextureView effect_mask_small_depth(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& sceneDepth,
+                                          bool sea, const wgpu::Extent3D& sceneSize);
 // How far back the effects are drawn into it, a share of their distance
 // (DOL_AURORA_EFFECT_MASK_PUSH, 0.05): what lies on a surface is left out.
 float effect_mask_push() noexcept;
@@ -180,7 +190,7 @@ float effect_mask_push() noexcept;
 // blended over the scene hides of it, which its colour over black doesn't tell (post_fx.cpp effect_cover_view()).
 // Off with DOL_AURORA_EFFECT_MASK_OPACITY=0. Asking for it marks it drawn for the next encode().
 bool effect_mask_opacity() noexcept;
-wgpu::TextureView effect_white_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format);
+wgpu::TextureView effect_white_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format, bool small = false);
 // The effects' mask has an effect that writes depth this frame (common.cpp render_pass(), DrawData::effectDepth):
 // the occlusion, the sun shadows and the cloud shadows then shade from the scenery's depth under it, the sea mask's.
 void note_effect_depth() noexcept;

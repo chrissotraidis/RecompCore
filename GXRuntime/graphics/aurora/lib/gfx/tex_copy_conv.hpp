@@ -29,5 +29,11 @@ void blit(const wgpu::CommandEncoder& cmd, const ConvRequest& req);
 // Blur a colour copy in place: a Gaussian of `sigma` of its pixels, across then
 // down, and `mix` of the blurred result over the sharp copy (1 replaces it).
 void blur(const wgpu::CommandEncoder& cmd, const TextureHandle& texture, float sigma, float mix);
+// The fast blur (aurora_set_game_dof_fast; DOL_AURORA_GAME_DOF_FAST): for a
+// sigma of about 1 texel, blur() takes the copy down to half size and blends
+// that back over the copy in one pass, instead of two full-size passes and a
+// copy back. Off by default.
+void set_fast_blur(bool on);
+bool fast_blur();
 
 } // namespace aurora::gfx::tex_copy_conv

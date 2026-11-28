@@ -80,7 +80,7 @@ wgpu::TextureView g_effectNoneView;
 bool g_effectDepthDrawn = false;
 wgpu::Texture g_shadeDepth;
 wgpu::TextureView g_shadeDepthView;
-wgpu::RenderPipeline g_shadeDepthPass;
+wgpu::RenderPipeline g_shadeDepthPass[2]; // [the mask at half size]
 wgpu::BindGroupLayout g_shadeDepthLayout;
 wgpu::Texture g_effectMaskDepth;
 wgpu::TextureView g_effectMaskDepthView;
@@ -91,8 +91,17 @@ wgpu::TextureView g_effectWhiteView;
 bool g_effectWhiteDrawn = false;
 wgpu::Texture g_effectCover;
 wgpu::TextureView g_effectCoverView;
-wgpu::RenderPipeline g_effectCoverPass[4]; // [own depth * 2 + over white]
-wgpu::BindGroupLayout g_effectCoverLayout[4];
+wgpu::RenderPipeline g_effectCoverPass[8]; // [half size * 4 + own depth * 2 + over white]
+wgpu::BindGroupLayout g_effectCoverLayout[8];
+// The fast mask (effect_mask_fast(), DOL_AURORA_EFFECT_MASK_FAST): the mask and the pass over white at half the
+// scene's size, against a half-size depth (effect_mask_small_depth()); -1 until first asked, so the host's
+// settings are in the environment by then. Whether this frame's mask was drawn so (g_effectMaskSmall).
+int g_effectMaskFast = -1;
+bool g_effectMaskSmall = false;
+wgpu::Texture g_effectSmallDepth;
+wgpu::TextureView g_effectSmallDepthView;
+wgpu::RenderPipeline g_effectSmallDepthPass;
+wgpu::BindGroupLayout g_effectSmallDepthLayout;
 // DOL_AURORA_EFFECT_MASK_OPACITY=0: the effects' share from their colour over black alone (effect_white_target()).
 bool g_effectOpacity = true;
 // DOL_AURORA_EFFECT_MASK_DEBUG=1: the effects the sun shadows leave alone, in
@@ -5385,8 +5394,14 @@ void shutdown() {
   g_effectDepthDrawn = false;
   g_shadeDepthView = {};
   g_shadeDepth = {};
-  g_shadeDepthPass = {};
+  g_shadeDepthPass[0] = {};
+  g_shadeDepthPass[1] = {};
   g_shadeDepthLayout = {};
+  g_effectSmallDepthView = {};
+  g_effectSmallDepth = {};
+  g_effectSmallDepthPass = {};
+  g_effectSmallDepthLayout = {};
+  g_effectMaskSmall = false;
   g_effectMaskDepthView = {};
   g_effectMaskDepth = {};
   g_effectWhiteView = {};
@@ -5394,7 +5409,7 @@ void shutdown() {
   g_effectWhiteDrawn = false;
   g_effectCoverView = {};
   g_effectCover = {};
-  for (int i = 0; i < 4; ++i) {
+  for (int i = 0; i < 8; ++i) {
     g_effectCoverPass[i] = {};
     g_effectCoverLayout[i] = {};
   }
@@ -5999,19 +6014,36 @@ wgpu::TextureView sea_mask_depth(const wgpu::Extent3D& sceneSize) {
   return g_seaMaskDepthView;
 }
 
-wgpu::TextureView effect_mask_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format) {
-  if (!g_effectMask || g_effectMask.GetWidth() != sceneSize.width || g_effectMask.GetHeight() != sceneSize.height ||
+bool effect_mask_fast() noexcept {
+  if (g_effectMaskFast < 0) {
+    const char* env = std::getenv("DOL_AURORA_EFFECT_MASK_FAST");
+    g_effectMaskFast = env != nullptr && env[0] != '\0' && env[0] != '0' ? 1 : 0;
+  }
+  return g_effectMaskFast != 0;
+}
+
+void set_effect_mask_fast(bool on) noexcept { g_effectMaskFast = on ? 1 : 0; }
+
+wgpu::Extent3D effect_mask_size(const wgpu::Extent3D& sceneSize, bool small) noexcept {
+  return small ? wgpu::Extent3D{(sceneSize.width + 1) / 2, (sceneSize.height + 1) / 2, 1}
+               : wgpu::Extent3D{sceneSize.width, sceneSize.height, 1};
+}
+
+wgpu::TextureView effect_mask_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format, bool small) {
+  const auto size = effect_mask_size(sceneSize, small);
+  if (!g_effectMask || g_effectMask.GetWidth() != size.width || g_effectMask.GetHeight() != size.height ||
       g_effectMask.GetFormat() != format) {
     const wgpu::TextureDescriptor descriptor{
         .label = "Effects mask",
         .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
-        .size = {sceneSize.width, sceneSize.height, 1},
+        .size = size,
         .format = format,
     };
     g_effectMask = g_device.CreateTexture(&descriptor);
     g_effectMaskView = g_effectMask.CreateView();
   }
   g_effectMaskDrawn = true;
+  g_effectMaskSmall = small;
   return g_effectMaskView;
 }
 
@@ -6019,13 +6051,14 @@ float effect_mask_push() noexcept { return g_effectPush; }
 
 bool effect_mask_opacity() noexcept { return g_effectOpacity; }
 
-wgpu::TextureView effect_white_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format) {
-  if (!g_effectWhite || g_effectWhite.GetWidth() != sceneSize.width ||
-      g_effectWhite.GetHeight() != sceneSize.height || g_effectWhite.GetFormat() != format) {
+wgpu::TextureView effect_white_target(const wgpu::Extent3D& sceneSize, wgpu::TextureFormat format, bool small) {
+  const auto size = effect_mask_size(sceneSize, small);
+  if (!g_effectWhite || g_effectWhite.GetWidth() != size.width ||
+      g_effectWhite.GetHeight() != size.height || g_effectWhite.GetFormat() != format) {
     const wgpu::TextureDescriptor descriptor{
         .label = "Effects mask (over white)",
         .usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::TextureBinding,
-        .size = {sceneSize.width, sceneSize.height, 1},
+        .size = size,
         .format = format,
     };
     g_effectWhite = g_device.CreateTexture(&descriptor);
@@ -6058,6 +6091,105 @@ wgpu::TextureView effect_mask_depth(const wgpu::CommandEncoder& cmd, const wgpu:
 }
 
 namespace {
+// The fast mask's depth (effect_mask_small_depth()): of each 2x2 of the source, the farthest (reversed Z: the least),
+// so an effect in front of any of the four is drawn there.
+constexpr const char* kEffectSmallDepthShader = R"""(
+@group(0) @binding(0) var source: texture_depth_2d;
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    let uv = vec2(f32((i << 1u) & 2u), f32(i & 2u));
+    return vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
+    let last = vec2<i32>(textureDimensions(source)) - vec2(1);
+    let p = vec2<i32>(pos.xy) * 2;
+    let a = textureLoad(source, min(p, last), 0);
+    let b = textureLoad(source, min(p + vec2(1, 0), last), 0);
+    let c = textureLoad(source, min(p + vec2(0, 1), last), 0);
+    let d = textureLoad(source, min(p + vec2(1, 1), last), 0);
+    return min(min(a, b), min(c, d));
+}
+)""";
+} // namespace
+
+wgpu::TextureView effect_mask_small_depth(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& sceneDepth,
+                                          bool sea, const wgpu::Extent3D& sceneSize) {
+  if (sea && (!g_seaMaskDepthView || g_seaMaskSize.width != sceneSize.width || g_seaMaskSize.height != sceneSize.height))
+    return {};
+  const wgpu::TextureView& source = sea ? g_seaMaskDepthView : sceneDepth;
+  if (!source)
+    return {};
+  const auto size = effect_mask_size(sceneSize, true);
+  if (!g_effectSmallDepthPass) {
+    wgpu::ShaderSourceWGSL wgsl{};
+    wgsl.code = kEffectSmallDepthShader;
+    const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &wgsl, .label = "Effects mask depth (half)"};
+    const auto module = g_device.CreateShaderModule(&moduleDescriptor);
+    const std::array layoutEntries{
+        wgpu::BindGroupLayoutEntry{.binding = 0, .visibility = wgpu::ShaderStage::Fragment,
+                                   .texture = {.sampleType = wgpu::TextureSampleType::Depth}},
+    };
+    const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
+        .label = "Effects mask depth (half)", .entryCount = layoutEntries.size(), .entries = layoutEntries.data()};
+    g_effectSmallDepthLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
+    const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{
+        .label = "Effects mask depth (half)", .bindGroupLayoutCount = 1, .bindGroupLayouts = &g_effectSmallDepthLayout};
+    const auto pipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
+    const wgpu::DepthStencilState depth{
+        .format = kSeaMaskDepthFormat,
+        .depthWriteEnabled = true,
+        .depthCompare = wgpu::CompareFunction::Always,
+    };
+    const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs_main", .targetCount = 0, .targets = nullptr};
+    const wgpu::RenderPipelineDescriptor descriptor{
+        .label = "Effects mask depth (half)",
+        .layout = pipelineLayout,
+        .vertex = {.module = module, .entryPoint = "vs_main"},
+        .primitive = {.topology = wgpu::PrimitiveTopology::TriangleList},
+        .depthStencil = &depth,
+        .multisample = {.count = 1, .mask = UINT32_MAX},
+        .fragment = &fragment,
+    };
+    g_effectSmallDepthPass = g_device.CreateRenderPipeline(&descriptor);
+  }
+  if (!g_effectSmallDepth || g_effectSmallDepth.GetWidth() != size.width || g_effectSmallDepth.GetHeight() != size.height) {
+    const wgpu::TextureDescriptor descriptor{
+        .label = "Effects mask depth (half)",
+        .usage = wgpu::TextureUsage::RenderAttachment,
+        .size = size,
+        .format = kSeaMaskDepthFormat,
+    };
+    g_effectSmallDepth = g_device.CreateTexture(&descriptor);
+    g_effectSmallDepthView = g_effectSmallDepth.CreateView();
+  }
+  const std::array entries{wgpu::BindGroupEntry{.binding = 0, .textureView = source}};
+  const wgpu::BindGroupDescriptor groupDescriptor{
+      .layout = g_effectSmallDepthLayout, .entryCount = entries.size(), .entries = entries.data()};
+  const auto group = g_device.CreateBindGroup(&groupDescriptor);
+  const wgpu::RenderPassDepthStencilAttachment depth{
+      .view = g_effectSmallDepthView,
+      .depthLoadOp = wgpu::LoadOp::Clear,
+      .depthStoreOp = wgpu::StoreOp::Store,
+      .depthClearValue = 0.f,
+  };
+  const wgpu::RenderPassDescriptor descriptor{
+      .label = "Effects mask depth (half)",
+      .colorAttachmentCount = 0,
+      .depthStencilAttachment = &depth,
+      .timestampWrites = webgpu::gpu_prof::pass_writes("Effects mask depth (half)"),
+  };
+  const auto pass = cmd.BeginRenderPass(&descriptor);
+  pass.SetPipeline(g_effectSmallDepthPass);
+  pass.SetBindGroup(0, group);
+  pass.Draw(3);
+  pass.End();
+  return g_effectSmallDepthView;
+}
+
+namespace {
 // The shading's depth (shading_depth()): the scene's, but where an effect that writes depth covers a pixel (the
 // effects' mask has it there, and the sea mask's depth, which leaves such effects out, is farther), the sea mask's:
 // the scenery's under the effect, which Wind Waker HD lights before it draws its effects.
@@ -6065,6 +6197,8 @@ constexpr const char* kShadeDepthShader = R"""(
 @group(0) @binding(0) var scene_depth: texture_depth_2d;
 @group(0) @binding(1) var mask_depth: texture_depth_2d;
 @group(0) @binding(2) var effects: texture_2d<f32>;
+// The mask at half the scene's size (the fast mask): its texel over this pixel.
+override mask_small: bool = false;
 
 @vertex
 fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -6077,7 +6211,7 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
     let p = vec2<i32>(pos.xy);
     let d = textureLoad(scene_depth, p, 0);
     let m = textureLoad(mask_depth, p, 0);
-    let e = textureLoad(effects, p, 0).rgb;
+    let e = textureLoad(effects, select(p, p / 2, mask_small), 0).rgb;
     // Reversed Z: farther is less.
     if (max(e.r, max(e.g, e.b)) > 0.5 / 255.0 && m < d * 0.9999) {
         return m;
@@ -6088,11 +6222,13 @@ fn fs_main(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
 
 wgpu::TextureView shading_depth(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView,
                                 const wgpu::Extent3D& size) {
+  const auto maskSize = effect_mask_size(size, g_effectMaskSmall);
   if (!g_effectDepthDrawn || !g_effectMaskView || !g_seaMaskDepthView || g_seaMaskSize.width != size.width ||
-      g_seaMaskSize.height != size.height || !g_effectMask || g_effectMask.GetWidth() != size.width ||
-      g_effectMask.GetHeight() != size.height)
+      g_seaMaskSize.height != size.height || !g_effectMask || g_effectMask.GetWidth() != maskSize.width ||
+      g_effectMask.GetHeight() != maskSize.height)
     return depthView;
-  if (!g_shadeDepthPass) {
+  const int small = g_effectMaskSmall ? 1 : 0;
+  if (!g_shadeDepthPass[small]) {
     wgpu::ShaderSourceWGSL source{};
     source.code = kShadeDepthShader;
     const wgpu::ShaderModuleDescriptor moduleDescriptor{.nextInChain = &source, .label = "Shading depth"};
@@ -6107,7 +6243,8 @@ wgpu::TextureView shading_depth(const wgpu::CommandEncoder& cmd, const wgpu::Tex
     };
     const wgpu::BindGroupLayoutDescriptor layoutDescriptor{
         .label = "Shading depth", .entryCount = layoutEntries.size(), .entries = layoutEntries.data()};
-    g_shadeDepthLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
+    if (!g_shadeDepthLayout)
+      g_shadeDepthLayout = g_device.CreateBindGroupLayout(&layoutDescriptor);
     const wgpu::PipelineLayoutDescriptor pipelineLayoutDescriptor{
         .label = "Shading depth", .bindGroupLayoutCount = 1, .bindGroupLayouts = &g_shadeDepthLayout};
     const auto pipelineLayout = g_device.CreatePipelineLayout(&pipelineLayoutDescriptor);
@@ -6116,7 +6253,13 @@ wgpu::TextureView shading_depth(const wgpu::CommandEncoder& cmd, const wgpu::Tex
         .depthWriteEnabled = true,
         .depthCompare = wgpu::CompareFunction::Always,
     };
-    const wgpu::FragmentState fragment{.module = module, .entryPoint = "fs_main", .targetCount = 0, .targets = nullptr};
+    const std::array constants{wgpu::ConstantEntry{.key = "mask_small", .value = small ? 1.0 : 0.0}};
+    const wgpu::FragmentState fragment{.module = module,
+                                       .entryPoint = "fs_main",
+                                       .constantCount = constants.size(),
+                                       .constants = constants.data(),
+                                       .targetCount = 0,
+                                       .targets = nullptr};
     const wgpu::RenderPipelineDescriptor descriptor{
         .label = "Shading depth",
         .layout = pipelineLayout,
@@ -6126,7 +6269,7 @@ wgpu::TextureView shading_depth(const wgpu::CommandEncoder& cmd, const wgpu::Tex
         .multisample = {.count = 1, .mask = UINT32_MAX},
         .fragment = &fragment,
     };
-    g_shadeDepthPass = g_device.CreateRenderPipeline(&descriptor);
+    g_shadeDepthPass[small] = g_device.CreateRenderPipeline(&descriptor);
   }
   if (!g_shadeDepth || g_shadeDepth.GetWidth() != size.width || g_shadeDepth.GetHeight() != size.height) {
     const wgpu::TextureDescriptor descriptor{
@@ -6159,7 +6302,7 @@ wgpu::TextureView shading_depth(const wgpu::CommandEncoder& cmd, const wgpu::Tex
       .timestampWrites = webgpu::gpu_prof::pass_writes("Shading depth"),
   };
   const auto pass = cmd.BeginRenderPass(&descriptor);
-  pass.SetPipeline(g_shadeDepthPass);
+  pass.SetPipeline(g_shadeDepthPass[small]);
   pass.SetBindGroup(0, group);
   pass.Draw(3);
   pass.End();
@@ -6179,6 +6322,23 @@ constexpr const char* kEffectCoverShader = R"""(
 @group(0) @binding(3) var mask_depth: texture_depth_2d;
 override opacity: bool = true;
 override effect_gain: f32 = 2.0;
+// The mask and the pass over white at half the scene's size (the fast mask): read between their texels.
+override mask_small: bool = false;
+
+fn tap(t: texture_2d<f32>, p: vec2<i32>) -> vec3<f32> {
+    if (!mask_small) {
+        return textureLoad(t, p, 0).rgb;
+    }
+    let last = vec2<i32>(textureDimensions(t)) - vec2(1);
+    let at = (vec2<f32>(p) + vec2(0.5)) * 0.5 - vec2(0.5);
+    let base = vec2<i32>(floor(at));
+    let f = at - floor(at);
+    let a = textureLoad(t, clamp(base, vec2(0), last), 0).rgb;
+    let b = textureLoad(t, clamp(base + vec2(1, 0), vec2(0), last), 0).rgb;
+    let c = textureLoad(t, clamp(base + vec2(0, 1), vec2(0), last), 0).rgb;
+    let d = textureLoad(t, clamp(base + vec2(1, 1), vec2(0), last), 0).rgb;
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
 
 @vertex
 fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
@@ -6187,11 +6347,11 @@ fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
 }
 
 fn share(p: vec2<i32>) -> vec3<f32> {
-    let b = textureLoad(black, p, 0).rgb;
+    let b = tap(black, p);
     if (!opacity) {
         return b;
     }
-    let t = clamp(vec3(1.0) - textureLoad(white, p, 0).rgb + b, vec3(0.0), vec3(1.0));
+    let t = clamp(vec3(1.0) - tap(white, p) + b, vec3(0.0), vec3(1.0));
     return max(b, vec3(max(t.r, max(t.g, t.b)) / max(effect_gain, 1e-3)));
 }
 
@@ -6204,7 +6364,7 @@ fn fs_plain(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 fn fs_own(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     let p = vec2<i32>(pos.xy);
     let c = share(p);
-    let b = textureLoad(black, p, 0).rgb;
+    let b = tap(black, p);
     // Reversed Z: nearer is more.
     let own = max(b.r, max(b.g, b.b)) > 0.5 / 255.0 &&
               textureLoad(mask_depth, p, 0) < textureLoad(scene_depth, p, 0) * 0.9999;
@@ -6215,14 +6375,15 @@ fn fs_own(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 // The cover the shading reads for this frame's effects (kEffectCoverShader), or none when the mask isn't there.
 wgpu::TextureView effect_cover_view(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& depthView,
                                     const wgpu::Extent3D& size, uint32_t msaaSamples) {
-  const bool white = g_effectOpacity && g_effectWhiteDrawn && g_effectWhite && g_effectWhite.GetWidth() == size.width &&
-                     g_effectWhite.GetHeight() == size.height;
+  const auto maskSize = effect_mask_size(size, g_effectMaskSmall);
+  const bool white = g_effectOpacity && g_effectWhiteDrawn && g_effectWhite &&
+                     g_effectWhite.GetWidth() == maskSize.width && g_effectWhite.GetHeight() == maskSize.height;
   g_effectWhiteDrawn = false;
   const int own = g_effectDepthDrawn && depthView && msaaSamples == 1 && g_seaMaskDepthView &&
                           g_seaMaskSize.width == size.width && g_seaMaskSize.height == size.height
                       ? 1
                       : 0;
-  const int key = own * 2 + (white ? 1 : 0);
+  const int key = (g_effectMaskSmall ? 4 : 0) + own * 2 + (white ? 1 : 0);
   if (!g_effectCoverPass[key]) {
     wgpu::ShaderSourceWGSL source{};
     source.code = kEffectCoverShader;
@@ -6247,6 +6408,7 @@ wgpu::TextureView effect_cover_view(const wgpu::CommandEncoder& cmd, const wgpu:
     const std::array constants{
         wgpu::ConstantEntry{.key = "opacity", .value = white ? 1.0 : 0.0},
         wgpu::ConstantEntry{.key = "effect_gain", .value = g_effectGain},
+        wgpu::ConstantEntry{.key = "mask_small", .value = g_effectMaskSmall ? 1.0 : 0.0},
     };
     const wgpu::ColorTargetState target{.format = wgpu::TextureFormat::RGBA8Unorm,
                                         .writeMask = wgpu::ColorWriteMask::All};
@@ -6425,8 +6587,9 @@ void encode(const wgpu::CommandEncoder& cmd, const wgpu::TextureView& scene, con
   // The effects drawn over the scene, which the shading below leaves (common.cpp
   // encode_effect_mask()), or a black texel: no effects this frame.
   effect_none_view();
-  const bool effects = g_effectMaskDrawn && g_effectMask && g_effectMask.GetWidth() == size.width &&
-                       g_effectMask.GetHeight() == size.height;
+  const auto effectMaskSize = effect_mask_size(size, g_effectMaskSmall);
+  const bool effects = g_effectMaskDrawn && g_effectMask && g_effectMask.GetWidth() == effectMaskSize.width &&
+                       g_effectMask.GetHeight() == effectMaskSize.height;
   g_effectMaskDrawn = false;
   // Their share of each pixel (effect_cover_view(), from the mask and the pass over white).
   const wgpu::TextureView effectView =

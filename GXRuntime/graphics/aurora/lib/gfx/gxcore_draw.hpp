@@ -94,6 +94,10 @@ struct DrawData {
   bool softEffect = false;
   bool softWritesAlpha = false;
   PipelineRef softPipeline = 0;
+  // An effect's variant that writes its colour to two targets (PipelineConfig::softTarget 2), made while the fast
+  // effects' mask is on; 0 for an effect it can't stand in for (destination alpha, a depth texture, an early
+  // depth pass), which keeps the mask at two passes.
+  PipelineRef maskPipeline = 0;
   // An effect (effect_draw()): blended over the scene and writing no depth, so
   // the HD look's shading from the depth buffer would take it for the scenery
   // behind it; drawn again into the effects' mask (post_fx.hpp effect_mask_target()).
@@ -172,6 +176,9 @@ struct PipelineConfig {
   // 1: drawn into the soft effects' buffer (soft_effects.hpp): one sample, no
   // depth attachment, alpha blended (One, OneMinusSrcAlpha) so the buffer
   // holds the run's coverage, colour and alpha always written.
+  // 2: an effect's variant for the effects' mask in one pass (post_fx.hpp effect_mask_fast()): the same pipeline
+  // with its colour written to two targets, the mask over black and the one over white. No new field, so the
+  // pipelines made before it keep their place in the cache.
   uint32_t softTarget = 0;
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);
@@ -188,6 +195,9 @@ void reset_pass_state();
 // soft variant (render()).
 bool efficient_effects() noexcept;
 void set_soft_target(bool on) noexcept;
+// While the effects' mask is drawn in one pass into its two targets: draws bind their two-target variant
+// (DrawData::maskPipeline).
+void set_mask_target(bool on) noexcept;
 // Wind Waker HD's character light (gxc ShaderKey::hd_actor_light, DOL_AURORA_ACTOR_LIGHT_HD=1) for the pass about
 // to be encoded (common.cpp render()): `camera` the frame's camera, null for a pass that keeps the GameCube shading
 // (MSAA, offscreen, an EFB copy's pass of another size); `sunMap` this frame's shadow map or null; `size` the
