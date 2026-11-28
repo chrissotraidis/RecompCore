@@ -194,6 +194,12 @@ void aurora_set_bloom(bool enabled);
    sharp, before bloom. Takes effect at the next frame. DOL_AURORA_FAR_BLUR=1
    sets the starting value. */
 void aurora_set_far_blur(bool enabled);
+/* Edge smoothing: over the finished scene, after the other effects and
+   before the HUD, each pixel on an edge is blended along it. mode: 0 off;
+   1 to 3 FXAA (one pass) low, medium, high; 4 to 6 SMAA (three passes) low,
+   medium, high. Takes effect at the next frame. DOL_AURORA_EDGE_SMOOTHING
+   sets the starting value. */
+void aurora_set_edge_smoothing(int mode);
 /* Wind Waker HD's far blur level for the hour (its DOF presets: wwHD_basic 1.2 by day, wwHD_night 0.65, blended
    over 06:00-08:00 and 18:00-20:00), used with DOL_AURORA_FAR_BLUR_HD=1: the blend is clamp(level x (distance -
    start) / (end - start)) times DOL_AURORA_FAR_BLUR_AMOUNT. 1.2 until set. Takes effect at the next frame. */
