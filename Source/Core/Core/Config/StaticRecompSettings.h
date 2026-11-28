@@ -10,5 +10,8 @@ extern const Info<u32> MAIN_STATICRECOMP_IDLE_PC;
 extern const Info<u32> MAIN_STATICRECOMP_SECONDARY_IDLE_PC;
 extern const Info<u32> MAIN_STATICRECOMP_CALLER_IDLE_PC;
 extern const Info<u32> MAIN_STATICRECOMP_CALLER_IDLE_LR;
+extern const Info<u32> MAIN_STATICRECOMP_YIELD_IDLE_PC;
+extern const Info<u32> MAIN_STATICRECOMP_YIELD_IDLE_CALLER_OFFSET;
+extern const Info<std::string> MAIN_STATICRECOMP_YIELD_IDLE_CALLERS;
 extern const Info<std::string> MAIN_STATICRECOMP_FALLBACK_RANGES;
 }  // namespace Config
