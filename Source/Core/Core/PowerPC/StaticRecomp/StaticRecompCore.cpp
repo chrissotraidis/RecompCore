@@ -13,6 +13,7 @@
 #include "Common/DynamicLibrary.h"
 #include "Common/FileUtil.h"
 #include "Common/Logging/Log.h"
+#include "Common/Swap.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/StaticRecompSettings.h"
 #include "Core/Config/ConfigManager.h"
@@ -235,6 +236,32 @@ void StaticRecompCore::Init()
   if (m_caller_idle_pc != 0 && m_caller_idle_lr != 0)
     std::fprintf(stderr, "[staticrecomp] caller idle pc=%08x lr=%08x\n", m_caller_idle_pc,
                  m_caller_idle_lr);
+  m_yield_idle_pc = Config::Get(Config::MAIN_STATICRECOMP_YIELD_IDLE_PC);
+  m_yield_idle_caller_offset = Config::Get(Config::MAIN_STATICRECOMP_YIELD_IDLE_CALLER_OFFSET);
+  m_yield_idle_callers.clear();
+  {
+    const std::string callers = Config::Get(Config::MAIN_STATICRECOMP_YIELD_IDLE_CALLERS);
+    const char* cursor = callers.c_str();
+    while (*cursor != '\0')
+    {
+      char* end = nullptr;
+      const unsigned long value = std::strtoul(cursor, &end, 0);
+      if (end == cursor)
+      {
+        ++cursor;
+        continue;
+      }
+      if (value != 0)
+        m_yield_idle_callers.push_back(static_cast<u32>(value));
+      cursor = end;
+    }
+    std::sort(m_yield_idle_callers.begin(), m_yield_idle_callers.end());
+  }
+  if (m_yield_idle_pc != 0 && m_yield_idle_callers.empty())
+    m_yield_idle_pc = 0;
+  if (m_yield_idle_pc != 0)
+    std::fprintf(stderr, "[staticrecomp] yield idle pc=%08x caller_offset=%u callers=%zu\n",
+                 m_yield_idle_pc, m_yield_idle_caller_offset, m_yield_idle_callers.size());
   m_lockstep_verifier = std::make_unique<StaticRecompLockstep::StaticRecompLockstepVerifier>(*this);
   m_lockstep_verifier->Init();
 
@@ -358,20 +385,37 @@ void StaticRecompCore::FlushDispatchBurstSamples(bool final)
   }
 }
 
+// True at the yield's return point when the caller saved on the guest stack is a configured wait
+// loop. The stack slot is read from MEM1 only; any other address is not a yield idle.
+bool StaticRecompCore::IsYieldIdle() const
+{
+  if (m_yield_idle_pc == 0 || m_guest.pc != m_yield_idle_pc || m_guest.ram == nullptr)
+    return false;
+  const u32 slot = m_guest.gpr[1] + m_yield_idle_caller_offset;
+  if ((slot & 0xC0000000u) != 0x80000000u)
+    return false;
+  const u32 offset = slot & 0x3FFFFFFFu;
+  if (offset > m_guest.ram_size || m_guest.ram_size - offset < 4)
+    return false;
+  const u32 caller = Common::swap32(m_guest.ram + offset);
+  return std::binary_search(m_yield_idle_callers.begin(), m_yield_idle_callers.end(), caller);
+}
+
 void StaticRecompCore::Shutdown()
 {
   g_static_recomp_core = nullptr;
   std::fprintf(stderr,
                "[staticrecomp] shutdown: native=%llu fallback=%llu native_exc=%llu hook_fb=%llu "
                "smc_failed=%u verifications=%llu reverify_events=%llu bursts=%llu cycles=%llu "
-               "caller_idle=%llu secondary_idle=%llu\n",
+               "caller_idle=%llu secondary_idle=%llu yield_idle=%llu\n",
                (unsigned long long)m_native_dispatches, (unsigned long long)m_fallback_steps,
                (unsigned long long)m_native_exceptions,
                (unsigned long long)m_hook_fallback_instructions, m_failed_chunks,
                (unsigned long long)m_verifications, (unsigned long long)m_reverify_events,
                (unsigned long long)m_bursts, (unsigned long long)m_charged_cycles,
                (unsigned long long)m_caller_idle_hits,
-               (unsigned long long)m_secondary_idle_hits);
+               (unsigned long long)m_secondary_idle_hits,
+               (unsigned long long)m_yield_idle_hits);
   std::vector<std::pair<u32, u64>> dispatch_samples(m_dispatch_samples.begin(),
                                                     m_dispatch_samples.end());
   std::sort(dispatch_samples.begin(), dispatch_samples.end(),

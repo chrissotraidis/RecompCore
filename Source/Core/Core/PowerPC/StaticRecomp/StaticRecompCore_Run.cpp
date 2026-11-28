@@ -272,7 +272,10 @@ void StaticRecompCore::RunWithDiagnostics()
           const bool caller_idle = m_caller_idle_pc != 0 && m_caller_idle_lr != 0 &&
                                    m_guest.pc == m_caller_idle_pc &&
                                    m_guest.lr == m_caller_idle_lr;
-          if (configured_idle || secondary_idle || caller_idle)
+          // The PC compare stays inline: this runs after every dispatch.
+          const bool yield_idle =
+              m_yield_idle_pc != 0 && m_guest.pc == m_yield_idle_pc && IsYieldIdle();
+          if (configured_idle || secondary_idle || caller_idle || yield_idle)
           {
             const bool canonical_boundary =
                 m_caller_idle_pc != 0 && m_caller_idle_lr != 0 ? caller_idle : configured_idle;
@@ -282,6 +285,8 @@ void StaticRecompCore::RunWithDiagnostics()
             m_system.GetCoreTiming().Idle();
             if (caller_idle)
               ++m_caller_idle_hits;
+            if (yield_idle)
+              ++m_yield_idle_hits;
             if (secondary_idle)
             {
               if (m_secondary_idle_hits == 0)

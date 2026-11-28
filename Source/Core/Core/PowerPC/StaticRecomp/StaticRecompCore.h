@@ -299,6 +299,13 @@ private:
   u32 m_caller_idle_pc = 0;
   u32 m_caller_idle_lr = 0;
   u64 m_caller_idle_hits = 0;
+  // Idle at a yield function's return when its saved caller is a wait loop. Direct calls into the
+  // yield never pass the dispatcher at its entry, so the entry-qualified caller idle misses them.
+  u32 m_yield_idle_pc = 0;
+  u32 m_yield_idle_caller_offset = 0;
+  std::vector<u32> m_yield_idle_callers;
+  u64 m_yield_idle_hits = 0;
+  bool IsYieldIdle() const;
   u64 m_netplay_boundary_sequence = 0;
   NetplayBoundarySnapshot m_netplay_boundary_snapshot{};
 };
